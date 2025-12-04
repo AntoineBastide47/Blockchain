@@ -4,7 +4,9 @@ use crate::network::transport::Transport;
 use bytes::Bytes;
 use std::time::Duration;
 
+mod core;
 mod network;
+mod types;
 
 #[tokio::main]
 async fn main() {

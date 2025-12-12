@@ -1,22 +1,15 @@
 //! 32-byte SHA3-256 hash type with zero-allocation operations.
 
 use rand::RngCore;
-use std::fmt;
 
 /// SHA3-256 hash length in bytes.
-pub const HASH_LEN: usize = 32;
+const HASH_LEN: usize = 32;
 
 /// Fixed-size 32-byte hash used throughout the blockchain.
 ///
 /// This type is `Copy` for performance - hashes are passed frequently during
 /// block validation and should live on the stack to avoid heap allocations.
 /// At 32 bytes, copying is cheaper than reference indirection on modern CPUs.
-///
-/// # Examples
-/// ```
-/// let hash = Hash::zero();
-/// let hash2 = hash; // Cheap copy, not a move
-/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Hash(pub [u8; HASH_LEN]);
 
@@ -57,14 +50,5 @@ impl Hash {
         let mut buf = vec![0u8; HASH_LEN];
         rand::rng().fill_bytes(&mut buf);
         Hash::from_vec(buf)
-    }
-}
-
-impl fmt::Display for Hash {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for byte in &self.0 {
-            write!(f, "{:02x}", byte)?;
-        }
-        Ok(())
     }
 }

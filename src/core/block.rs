@@ -40,6 +40,7 @@ impl BinaryCodec for Header {
         w.write_u64::<LittleEndian>(self.timestamp)?;
         w.write_u64::<LittleEndian>(self.nonce)?;
         w.write_all(&self.previous_block.0)?;
+        w.write_all(&self.merkle_root.0)?;
 
         Ok(())
     }
@@ -50,6 +51,7 @@ impl BinaryCodec for Header {
         self.timestamp = r.read_u64::<LittleEndian>()?;
         self.nonce = r.read_u64::<LittleEndian>()?;
         r.read_exact(&mut self.previous_block.0)?;
+        r.read_exact(&mut self.merkle_root.0)?;
 
         Ok(())
     }
@@ -83,6 +85,7 @@ impl BinaryCodec for Block {
         for tx in &mut self.transactions {
             tx.decode(&mut r)?;
         }
+        self.header_hash = self.header.hash()?;
 
         Ok(())
     }
@@ -177,5 +180,89 @@ mod tests {
         let block = Block::new(create_header(1, 10, 13459265), vec![])
             .expect("Encoding error while creating the header_hash variable");
         assert_ne!(block.header_hash, Hash::zero(), "Hashing failed");
+    }
+
+    #[test]
+    fn test_hash_determinism() {
+        let header = create_header(1, 5, 12345);
+        let hash1 = header.hash().expect("Failed to hash header");
+        let hash2 = header.hash().expect("Failed to hash header");
+        assert_eq!(hash1, hash2, "Same header should produce same hash");
+    }
+
+    #[test]
+    fn test_different_headers_different_hashes() {
+        let header1 = create_header(1, 5, 12345);
+        let header2 = create_header(1, 5, 12346);
+        let hash1 = header1.hash().expect("Failed to hash header");
+        let hash2 = header2.hash().expect("Failed to hash header");
+        assert_ne!(
+            hash1, hash2,
+            "Different headers should produce different hashes"
+        );
+    }
+
+    #[test]
+    fn test_genesis_block() {
+        let genesis_header = Header {
+            version: 0,
+            height: 0,
+            timestamp: 0,
+            nonce: 0,
+            previous_block: Hash::zero(),
+            merkle_root: Hash::zero(),
+        };
+        let block = Block::new(genesis_header, vec![]).expect("Failed to create genesis block");
+        assert_eq!(block.header.height, 0);
+        assert_eq!(block.header.previous_block, Hash::zero());
+        assert_ne!(block.header_hash, Hash::zero());
+    }
+
+    #[test]
+    fn test_header_decode_insufficient_data() {
+        let mut buf: Vec<u8> = Vec::new();
+        let header = create_header(1, 3, 93482432);
+        header
+            .encode(&mut buf)
+            .expect("Could not encode the header");
+
+        // Truncate buffer to simulate corrupted data
+        buf.truncate(50);
+
+        let mut decoded = empty_header();
+        let result = decoded.decode(buf.as_slice());
+        assert!(result.is_err(), "Should fail with insufficient data");
+    }
+
+    #[test]
+    fn test_header_max_values() {
+        let header = Header {
+            version: u32::MAX,
+            height: u32::MAX,
+            timestamp: u64::MAX,
+            nonce: u64::MAX,
+            previous_block: Hash::random(),
+            merkle_root: Hash::random(),
+        };
+
+        let mut buf: Vec<u8> = Vec::new();
+        header.encode(&mut buf).expect("Could not encode header");
+
+        let mut decoded = empty_header();
+        decoded
+            .decode(buf.as_slice())
+            .expect("Could not decode header");
+        assert_eq!(header, decoded);
+    }
+
+    #[test]
+    fn test_block_hash_consistency() {
+        let header = create_header(2, 100, 999999);
+        let block1 = Block::new(header.clone(), vec![]).expect("Failed to create block");
+        let block2 = Block::new(header, vec![]).expect("Failed to create block");
+        assert_eq!(
+            block1.header_hash, block2.header_hash,
+            "Blocks with same header should have same hash"
+        );
     }
 }

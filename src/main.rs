@@ -5,6 +5,7 @@ use bytes::Bytes;
 use std::time::Duration;
 
 mod core;
+mod crypto;
 mod network;
 mod types;
 

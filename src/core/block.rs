@@ -1,9 +1,9 @@
 //! Blockchain block and header structures with memory-optimized layouts.
 
 use crate::core::transaction::Transaction;
-use crate::types::binary_codec::BinaryCodec;
+use crate::types::binary_codec::{BinaryCodec, BinaryCodecHash};
 use crate::types::hash::Hash;
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use borsh::{BorshDeserialize, BorshSerialize};
 use std::io::{Read, Write};
 use tokio::io;
 
@@ -17,7 +17,7 @@ use tokio::io;
 /// [version: u32][height: u32][timestamp: u64][nonce: u64]
 /// [previous_block: [u8; 32]][merkle_root: [u8; 32]]
 /// ```
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, BinaryCodec)]
 pub struct Header {
     /// Protocol version for future upgrades
     pub version: u32,
@@ -33,30 +33,6 @@ pub struct Header {
     pub merkle_root: Hash,
 }
 
-impl BinaryCodec for Header {
-    fn encode<W: Write>(&self, mut w: W) -> io::Result<()> {
-        w.write_u32::<LittleEndian>(self.version)?;
-        w.write_u32::<LittleEndian>(self.height)?;
-        w.write_u64::<LittleEndian>(self.timestamp)?;
-        w.write_u64::<LittleEndian>(self.nonce)?;
-        w.write_all(&self.previous_block.0)?;
-        w.write_all(&self.merkle_root.0)?;
-
-        Ok(())
-    }
-
-    fn decode<R: Read>(&mut self, mut r: R) -> io::Result<()> {
-        self.version = r.read_u32::<LittleEndian>()?;
-        self.height = r.read_u32::<LittleEndian>()?;
-        self.timestamp = r.read_u64::<LittleEndian>()?;
-        self.nonce = r.read_u64::<LittleEndian>()?;
-        r.read_exact(&mut self.previous_block.0)?;
-        r.read_exact(&mut self.merkle_root.0)?;
-
-        Ok(())
-    }
-}
-
 /// Immutable block containing header and transactions.
 ///
 /// Blocks are validated once upon receipt and never modified.
@@ -70,24 +46,19 @@ pub struct Block {
     pub header_hash: Hash,
 }
 
-impl BinaryCodec for Block {
-    fn encode<W: Write>(&self, mut w: W) -> io::Result<()> {
-        self.header.encode(&mut w)?;
-        for tx in &self.transactions {
-            tx.encode(&mut w)?;
-        }
-
+impl BorshSerialize for Block {
+    fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        self.header.serialize(writer)?;
+        self.transactions.serialize(writer)?;
         Ok(())
     }
+}
 
-    fn decode<R: Read>(&mut self, mut r: R) -> io::Result<()> {
-        self.header.decode(&mut r)?;
-        for tx in &mut self.transactions {
-            tx.decode(&mut r)?;
-        }
-        self.header_hash = self.header.hash()?;
-
-        Ok(())
+impl BorshDeserialize for Block {
+    fn deserialize_reader<R: Read>(reader: &mut R) -> io::Result<Self> {
+        let header = Header::deserialize_reader(reader)?;
+        let transactions: Vec<Transaction> = BorshDeserialize::deserialize_reader(reader)?;
+        Block::new(header, transactions)
     }
 }
 
@@ -112,18 +83,8 @@ impl Block {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::binary_codec::BinaryCodecHash;
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn empty_header() -> Header {
-        Header {
-            version: 0,
-            height: 0,
-            timestamp: 0,
-            nonce: 0,
-            previous_block: Hash::zero(),
-            merkle_root: Hash::zero(),
-        }
-    }
 
     fn create_header(version: u32, height: u32, nonce: u64) -> Header {
         Header {
@@ -144,13 +105,11 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         let header = create_header(1, 3, 93482432);
         header
-            .encode(&mut buf)
+            .serialize(&mut buf)
             .expect("Could not encode the header");
 
-        let mut decoded = empty_header();
-        decoded
-            .decode(buf.as_slice())
-            .expect("Could not decode the header");
+        let decoded =
+            Header::deserialize_reader(&mut buf.as_slice()).expect("Could not decode the header");
         assert_eq!(
             header, decoded,
             "The decoded header does not match the original header"
@@ -162,13 +121,12 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         let block = Block::new(create_header(1, 10, 13459265), vec![])
             .expect("Encoding error while creating the header_hash variable");
-        block.encode(&mut buf).expect("Could not encode the block");
+        block
+            .serialize(&mut buf)
+            .expect("Could not encode the block");
 
-        let mut decoded = Block::new(empty_header(), vec![])
-            .expect("Encoding error while creating the header_hash variable");
-        decoded
-            .decode(buf.as_slice())
-            .expect("Could not decode the block");
+        let decoded =
+            Block::deserialize_reader(&mut buf.as_slice()).expect("Could not decode the block");
         assert_eq!(
             block, decoded,
             "The decoded block does not match the original block"
@@ -223,14 +181,13 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         let header = create_header(1, 3, 93482432);
         header
-            .encode(&mut buf)
+            .serialize(&mut buf)
             .expect("Could not encode the header");
 
         // Truncate buffer to simulate corrupted data
         buf.truncate(50);
 
-        let mut decoded = empty_header();
-        let result = decoded.decode(buf.as_slice());
+        let result = Header::deserialize_reader(&mut buf.as_slice());
         assert!(result.is_err(), "Should fail with insufficient data");
     }
 
@@ -246,20 +203,18 @@ mod tests {
         };
 
         let mut buf: Vec<u8> = Vec::new();
-        header.encode(&mut buf).expect("Could not encode header");
+        header.serialize(&mut buf).expect("Could not encode header");
 
-        let mut decoded = empty_header();
-        decoded
-            .decode(buf.as_slice())
-            .expect("Could not decode header");
+        let decoded =
+            Header::deserialize_reader(&mut buf.as_slice()).expect("Could not decode header");
         assert_eq!(header, decoded);
     }
 
     #[test]
     fn test_block_hash_consistency() {
         let header = create_header(2, 100, 999999);
-        let block1 = Block::new(header.clone(), vec![]).expect("Failed to create block");
-        let block2 = Block::new(header, vec![]).expect("Failed to create block");
+        let block1 = Block::new(header, vec![]).expect("Failed to create block");
+        let block2 = Block::new(block1.header, vec![]).expect("Failed to create block");
         assert_eq!(
             block1.header_hash, block2.header_hash,
             "Blocks with same header should have same hash"

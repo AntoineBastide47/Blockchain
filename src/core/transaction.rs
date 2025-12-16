@@ -1,7 +1,6 @@
 //! Transaction structure with reference-counted data storage.
 
-use crate::types::binary_codec::BinaryCodec;
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use borsh::{BorshDeserialize, BorshSerialize};
 use bytes::Bytes;
 use std::io::{Read, Write};
 
@@ -20,18 +19,18 @@ pub struct Transaction {
     data: Bytes,
 }
 
-impl BinaryCodec for Transaction {
-    fn encode<W: Write>(&self, mut w: W) -> std::io::Result<()> {
-        w.write_u32::<LittleEndian>(self.data.len() as u32)?;
-        w.write_all(&self.data)?;
-        Ok(())
+impl BorshSerialize for Transaction {
+    fn serialize<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        let data: &[u8] = &self.data;
+        data.serialize(writer)
     }
+}
 
-    fn decode<R: Read>(&mut self, mut r: R) -> std::io::Result<()> {
-        let len = r.read_u32::<LittleEndian>()? as usize;
-        let mut buf = vec![0u8; len];
-        r.read_exact(&mut buf)?;
-        self.data = Bytes::from(buf);
-        Ok(())
+impl BorshDeserialize for Transaction {
+    fn deserialize_reader<R: Read>(reader: &mut R) -> std::io::Result<Self> {
+        let data = Vec::<u8>::deserialize_reader(reader)?;
+        Ok(Transaction {
+            data: Bytes::from(data),
+        })
     }
 }

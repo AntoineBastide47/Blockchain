@@ -3,7 +3,7 @@
 //! Aggregates incoming RPCs from all registered transports into a single
 //! processing loop for unified message handling.
 
-use crate::network::transport::{RPC, Transport};
+use crate::network::transport::{Rpc, Transport};
 use std::sync::Arc;
 use tokio::sync::mpsc::channel;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -20,14 +20,14 @@ pub struct ServerOps {
 /// enabling centralized message processing regardless of transport type.
 pub struct Server {
     options: ServerOps,
-    tx: Sender<RPC>,
-    rx: Receiver<RPC>,
+    tx: Sender<Rpc>,
+    rx: Receiver<Rpc>,
 }
 
 impl Server {
     /// Creates a new server with the specified configuration.
-    pub fn new(options: ServerOps) -> Server {
-        let (tx, rx) = channel::<RPC>(1024);
+    pub fn new(options: ServerOps) -> Self {
+        let (tx, rx) = channel::<Rpc>(1024);
         Server { options, tx, rx }
     }
 
@@ -38,12 +38,8 @@ impl Server {
     pub async fn start(&mut self) {
         self.init_transports().await;
 
-        loop {
-            if let Some(rpc) = self.rx.recv().await {
-                println!("{} sent: {:?}", rpc.from, rpc.payload);
-            } else {
-                break;
-            }
+        while let Some(rpc) = self.rx.recv().await {
+            println!("{} sent: {:?}", rpc.from, rpc.payload);
         }
 
         println!("Server shut down");

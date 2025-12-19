@@ -3,7 +3,7 @@
 //! Enables direct message passing between nodes without network I/O,
 //! ideal for unit tests and single-process simulations.
 
-use crate::network::transport::{RPC, Transport, TransportError};
+use crate::network::transport::{Rpc, Transport, TransportError};
 use bytes::Bytes;
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -16,8 +16,8 @@ use tokio::sync::mpsc::{Receiver, Sender, channel};
 /// without network overhead. Thread-safe and suitable for concurrent use.
 pub struct LocalTransport {
     peers: DashMap<String, Arc<LocalTransport>>,
-    tx: Sender<RPC>,
-    rx: Mutex<Option<Receiver<RPC>>>,
+    tx: Sender<Rpc>,
+    rx: Mutex<Option<Receiver<Rpc>>>,
     address: Arc<str>,
 }
 
@@ -46,7 +46,7 @@ impl LocalTransport {
 
 #[async_trait::async_trait]
 impl Transport for LocalTransport {
-    async fn consume(&self) -> Receiver<RPC> {
+    async fn consume(&self) -> Receiver<Rpc> {
         let mut guard = self.rx.lock().await;
         guard.take().unwrap()
     }
@@ -60,7 +60,7 @@ impl Transport for LocalTransport {
         };
 
         peer.tx
-            .send(RPC {
+            .send(Rpc {
                 from: self.address.clone(),
                 payload,
             })

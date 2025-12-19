@@ -10,3 +10,5 @@
 pub mod address;
 pub mod binary_codec;
 pub mod hash;
+pub mod serializable_bytes;
+pub mod serializable_signature;

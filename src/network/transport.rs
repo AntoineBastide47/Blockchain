@@ -20,7 +20,7 @@ pub enum TransportError {
 }
 
 /// Remote procedure call message containing sender address and payload data.
-pub struct RPC {
+pub struct Rpc {
     /// Address of the sender.
     pub from: Arc<str>,
     /// Raw message payload.
@@ -36,7 +36,7 @@ pub trait Transport: Send + Sync {
     /// Returns a receiver for incoming RPC messages.
     ///
     /// Messages can be consumed from the receiver to process incoming network traffic.
-    async fn consume(&self) -> Receiver<RPC>;
+    async fn consume(&self) -> Receiver<Rpc>;
 
     /// Sends a message to a specific address.
     ///

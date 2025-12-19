@@ -59,4 +59,7 @@ pub trait BinaryCodecHash: BorshSerialize + BorshDeserialize {
     }
 }
 
+// Automatically implements BinaryCodecHash for any type that has BorshSerialize + BorshDeserialize.
+// Without it: You'd need to manually write impl BinaryCodecHash for Header {} for every type.
+// With it: Just #[derive(BinaryCodec)] and header.hash() works.
 impl<T: BorshSerialize + BorshDeserialize> BinaryCodecHash for T {}

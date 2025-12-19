@@ -10,7 +10,7 @@ const HASH_LEN: usize = 32;
 /// This type is `Copy` for performance - hashes are passed frequently during
 /// block validation and should live on the stack to avoid heap allocations.
 /// At 32 bytes, copying is cheaper than reference indirection on modern CPUs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, BinaryCodec)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, BinaryCodec, Default)]
 pub struct Hash(pub [u8; HASH_LEN]);
 
 impl Hash {
@@ -38,8 +38,12 @@ impl Hash {
     ///
     /// Panics if the vector length is not exactly 32 bytes.
     pub fn from_vec(b: Vec<u8>) -> Hash {
-        let slice = b.as_slice();
-        Hash::from_bytes(slice)
+        Hash::from_bytes(b.as_slice())
+    }
+
+    /// Returns the hash as a byte slice.
+    pub fn as_slice(&self) -> &[u8] {
+        &self.0
     }
 
     /// Generates a cryptographically random hash for testing.

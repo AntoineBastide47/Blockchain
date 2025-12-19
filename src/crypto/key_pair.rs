@@ -1,17 +1,21 @@
 //! Schnorr signature key pairs on secp256k1.
 
 use crate::types::address::Address;
+use crate::types::serializable_bytes::SerializableBytes;
+pub(crate) use crate::types::serializable_signature::SerializableSignature;
+use borsh::{BorshDeserialize, BorshSerialize};
 use k256::ecdsa::signature::Signer;
 use k256::schnorr::signature::Verifier;
-use k256::schnorr::{Signature, SigningKey, VerifyingKey};
+use k256::schnorr::{SigningKey, VerifyingKey};
 use rand_core::OsRng;
 use sha3::{Digest, Sha3_256};
+use std::io::{Read, Write};
 
 /// Private key for signing transactions.
 ///
 /// Generated using cryptographically secure randomness from the OS.
 /// Never serialized or transmitted over the network.
-struct PrivateKey {
+pub struct PrivateKey {
     key: SigningKey,
 }
 
@@ -23,10 +27,10 @@ struct PrivateKey {
 /// This type is `Copy` (52 bytes total: 32 for key + 20 for address) for performance.
 /// Public keys are passed frequently during transaction validation, and stack
 /// allocation avoids heap overhead and improves cache locality.
-#[derive(Copy, Clone)]
-struct PublicKey {
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PublicKey {
     pub key: VerifyingKey,
-    address: Address,
+    pub address: Address,
 }
 
 impl PrivateKey {
@@ -40,12 +44,12 @@ impl PrivateKey {
 
     /// Derives the corresponding public key.
     pub fn public_key(&self) -> PublicKey {
-        PublicKey::new(&self)
+        PublicKey::new(self)
     }
 
     /// Signs arbitrary data, producing a Schnorr signature.
-    pub fn sign(&self, data: &[u8]) -> Signature {
-        self.key.sign(&data)
+    pub fn sign(&self, data: &SerializableBytes) -> SerializableSignature {
+        SerializableSignature(self.key.sign(data))
     }
 }
 
@@ -53,11 +57,11 @@ impl PublicKey {
     /// Derives a public key from a private key and computes its address.
     ///
     /// Address derivation: SHA3-256(verifying_key_bytes)[12..32]
-    pub(crate) fn new(private: &PrivateKey) -> PublicKey {
+    pub(crate) fn new(private: &PrivateKey) -> Self {
         let vk = private.key.verifying_key();
 
         let mut hasher = Sha3_256::new();
-        hasher.update(&vk.to_bytes());
+        hasher.update(vk.to_bytes());
         let full: [u8; 32] = hasher.finalize().into();
 
         let mut addr = [0u8; 20];
@@ -77,8 +81,26 @@ impl PublicKey {
     /// Verifies a Schnorr signature against the given data.
     ///
     /// Returns `true` if the signature is valid, `false` otherwise.
-    pub fn verify(&self, data: &[u8], signature: Signature) -> bool {
-        self.key.verify(data, &signature).is_ok()
+    pub fn verify(&self, data: &[u8], signature: SerializableSignature) -> bool {
+        self.key.verify(data, &signature.0).is_ok()
+    }
+}
+
+impl BorshSerialize for PublicKey {
+    fn serialize<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        let key_bytes: [u8; 32] = self.key.to_bytes().into();
+        key_bytes.serialize(writer)?;
+        self.address.serialize(writer)
+    }
+}
+
+impl BorshDeserialize for PublicKey {
+    fn deserialize_reader<R: Read>(reader: &mut R) -> std::io::Result<Self> {
+        let key_bytes = <[u8; 32]>::deserialize_reader(reader)?;
+        let key = VerifyingKey::from_bytes(&key_bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let address = Address::deserialize_reader(reader)?;
+        Ok(PublicKey { key, address })
     }
 }
 
@@ -92,7 +114,7 @@ mod tests {
         let public = private.public_key();
 
         let data = "Hello World".as_bytes();
-        let signature = private.sign(data);
+        let signature = private.sign(&SerializableBytes::from(data));
         assert_eq!(true, public.verify(data, signature));
     }
 
@@ -103,7 +125,7 @@ mod tests {
         let private_2 = PrivateKey::new();
 
         let data = "Hello World".as_bytes();
-        let signature = private_2.sign(data);
+        let signature = private_2.sign(&SerializableBytes::from(data));
         assert_ne!(true, public.verify(data, signature));
     }
 
@@ -114,7 +136,7 @@ mod tests {
         let public_2 = private_2.public_key();
 
         let data = "Hello World".as_bytes();
-        let signature = private.sign(data);
+        let signature = private.sign(&SerializableBytes::from(data));
         assert_ne!(true, public_2.verify(data, signature));
     }
 
@@ -125,7 +147,7 @@ mod tests {
 
         let original_data = "Hello World".as_bytes();
         let tampered_data = "Hello World!".as_bytes();
-        let signature = private.sign(original_data);
+        let signature = private.sign(&SerializableBytes::from(original_data));
 
         assert_eq!(false, public.verify(tampered_data, signature));
     }
@@ -136,7 +158,7 @@ mod tests {
         let public = private.public_key();
 
         let data = b"";
-        let signature = private.sign(data);
+        let signature = private.sign(&SerializableBytes::from(data));
         assert_eq!(true, public.verify(data, signature));
     }
 
@@ -165,7 +187,7 @@ mod tests {
         let public = private.public_key();
 
         let data = vec![0xAB; 10000];
-        let signature = private.sign(&data);
+        let signature = private.sign(&SerializableBytes::from(&data));
         assert_eq!(true, public.verify(&data, signature));
     }
 }

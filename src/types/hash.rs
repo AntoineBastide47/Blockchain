@@ -10,7 +10,7 @@ const HASH_LEN: usize = 32;
 /// This type is `Copy` for performance - hashes are passed frequently during
 /// block validation and should live on the stack to avoid heap allocations.
 /// At 32 bytes, copying is cheaper than reference indirection on modern CPUs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, BinaryCodec, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, BinaryCodec, Default, Hash)]
 pub struct Hash(pub [u8; HASH_LEN]);
 
 impl Hash {

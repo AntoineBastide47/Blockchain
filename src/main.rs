@@ -1,3 +1,5 @@
+//! A blockchain implementation in Rust.
+
 use crate::network::local_transport::LocalTransport;
 use crate::network::server::{Server, ServerOps};
 use crate::network::transport::Transport;
@@ -7,6 +9,7 @@ use std::time::Duration;
 mod core;
 mod crypto;
 mod network;
+mod test_utils;
 mod types;
 
 #[tokio::main]

@@ -115,7 +115,7 @@ mod tests {
 
         let data = "Hello World".as_bytes();
         let signature = private.sign(&SerializableBytes::from(data));
-        assert_eq!(true, public.verify(data, signature));
+        assert!(public.verify(data, signature));
     }
 
     #[test]
@@ -126,7 +126,7 @@ mod tests {
 
         let data = "Hello World".as_bytes();
         let signature = private_2.sign(&SerializableBytes::from(data));
-        assert_ne!(true, public.verify(data, signature));
+        assert!(!public.verify(data, signature));
     }
 
     #[test]
@@ -137,7 +137,7 @@ mod tests {
 
         let data = "Hello World".as_bytes();
         let signature = private.sign(&SerializableBytes::from(data));
-        assert_ne!(true, public_2.verify(data, signature));
+        assert!(!public_2.verify(data, signature));
     }
 
     #[test]
@@ -149,7 +149,7 @@ mod tests {
         let tampered_data = "Hello World!".as_bytes();
         let signature = private.sign(&SerializableBytes::from(original_data));
 
-        assert_eq!(false, public.verify(tampered_data, signature));
+        assert!(!public.verify(tampered_data, signature));
     }
 
     #[test]
@@ -159,7 +159,7 @@ mod tests {
 
         let data = b"";
         let signature = private.sign(&SerializableBytes::from(data));
-        assert_eq!(true, public.verify(data, signature));
+        assert!(public.verify(data, signature));
     }
 
     #[test]
@@ -188,6 +188,6 @@ mod tests {
 
         let data = vec![0xAB; 10000];
         let signature = private.sign(&SerializableBytes::from(&data));
-        assert_eq!(true, public.verify(&data, signature));
+        assert!(public.verify(&data, signature));
     }
 }

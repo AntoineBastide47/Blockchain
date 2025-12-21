@@ -10,6 +10,7 @@ use crate::types::hash::Hash;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io;
+use tracing::{info, warn};
 
 /// The main blockchain structure holding headers and validation logic.
 ///
@@ -42,12 +43,12 @@ impl<V: Validator, S: Storage> Blockchain<V, S> {
     }
 
     /// Returns true if a block with the given hash exists.
-    pub fn has_block(&self, hash: &Hash) -> bool {
+    pub fn has_block(&self, hash: Hash) -> bool {
         self.storage.has_block(hash)
     }
 
     /// Returns the block with the given hash, if it exists.
-    pub fn get_block(&self, hash: &Hash) -> Option<Arc<Block>> {
+    pub fn get_block(&self, hash: Hash) -> Option<Arc<Block>> {
         self.storage.get_block(hash)
     }
 
@@ -82,11 +83,21 @@ impl<V: Validator, S: Storage> Blockchain<V, S> {
     ///
     /// Returns `true` if the block passes validation, `false` otherwise.
     pub fn add_block(&mut self, block: Arc<Block>) -> bool {
-        if self.validator.validate_block(&block, &self.storage) {
-            self.storage.append_block(block);
-            true
-        } else {
-            false
+        match self.validator.validate_block(&block, &self.storage) {
+            Ok(_) => {
+                info!(
+                    height = block.header.height,
+                    hash = %block.header_hash,
+                    "adding new block"
+                );
+
+                self.storage.append_block(block);
+                true
+            }
+            Err(err) => {
+                warn!(hash = %block.header_hash, error = %err, "block rejected");
+                false
+            }
         }
     }
 }
@@ -98,20 +109,37 @@ mod tests {
     use crate::crypto::key_pair::PrivateKey;
     use crate::test_utils::utils::create_genesis;
     use crate::types::hash::Hash;
+    use thiserror::Error;
+
+    #[derive(Debug, Error)]
+    enum TestError {
+        #[error("dummy error")]
+        Dummy,
+    }
 
     #[derive(Clone)]
     struct AcceptAllValidator;
     impl Validator for AcceptAllValidator {
-        fn validate_block<S: Storage>(&self, _block: &Block, _storage: &S) -> bool {
-            true
+        type Error = TestError;
+        fn validate_block<S: Storage>(
+            &self,
+            _block: &Block,
+            _storage: &S,
+        ) -> Result<(), Self::Error> {
+            Ok(())
         }
     }
 
     #[derive(Clone)]
     struct RejectAllValidator;
     impl Validator for RejectAllValidator {
-        fn validate_block<S: Storage>(&self, _block: &Block, _storage: &S) -> bool {
-            false
+        type Error = TestError;
+        fn validate_block<S: Storage>(
+            &self,
+            _block: &Block,
+            _storage: &S,
+        ) -> Result<(), Self::Error> {
+            Err(TestError::Dummy)
         }
     }
 
@@ -132,7 +160,7 @@ mod tests {
         let hash = block.header_hash;
         let bc = Blockchain::new(block);
         assert_eq!(bc.height(), 0);
-        assert!(bc.get_block(&hash).is_some());
+        assert!(bc.get_block(hash).is_some());
     }
 
     #[test]
@@ -193,5 +221,6 @@ mod tests {
 
         let block = bc.build_block(PrivateKey::new(), vec![]).unwrap();
         assert!(bc.add_block(block));
+        assert_eq!(bc.height(), block_count + 1);
     }
 }

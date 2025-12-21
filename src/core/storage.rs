@@ -14,13 +14,13 @@ use std::sync::Arc;
 /// concurrent access from multiple network handlers.
 pub trait Storage: Send + Sync {
     /// Returns `true` if a block with the given hash exists.
-    fn has_block(&self, hash: &Hash) -> bool;
+    fn has_block(&self, hash: Hash) -> bool;
 
     /// Retrieves a block header by its hash.
-    fn get_header(&self, hash: &Hash) -> Option<Header>;
+    fn get_header(&self, hash: Hash) -> Option<Header>;
 
     /// Retrieves a full block by its hash.
-    fn get_block(&self, hash: &Hash) -> Option<Arc<Block>>;
+    fn get_block(&self, hash: Hash) -> Option<Arc<Block>>;
 
     /// Appends a block to storage and updates the chain tip.
     fn append_block(&mut self, block: Arc<Block>);
@@ -69,16 +69,16 @@ impl InMemoryStorage {
 }
 
 impl Storage for InMemoryStorage {
-    fn has_block(&self, hash: &Hash) -> bool {
-        self.blocks.contains_key(hash)
+    fn has_block(&self, hash: Hash) -> bool {
+        self.blocks.contains_key(&hash)
     }
 
-    fn get_header(&self, hash: &Hash) -> Option<Header> {
-        self.headers.get(hash).copied()
+    fn get_header(&self, hash: Hash) -> Option<Header> {
+        self.headers.get(&hash).copied()
     }
 
-    fn get_block(&self, hash: &Hash) -> Option<Arc<Block>> {
-        self.blocks.get(hash).cloned()
+    fn get_block(&self, hash: Hash) -> Option<Arc<Block>> {
+        self.blocks.get(&hash).cloned()
     }
 
     fn append_block(&mut self, block: Arc<Block>) {

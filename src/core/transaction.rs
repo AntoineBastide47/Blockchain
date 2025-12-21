@@ -10,7 +10,7 @@ use blockchain_derive::BinaryCodec;
 /// and often referenced by multiple blocks during reorganizations.
 #[derive(Debug, PartialEq, Eq, BinaryCodec)]
 pub struct Transaction {
-    pub public_key: PublicKey,
+    pub from: PublicKey,
     pub signature: SerializableSignature,
     pub data: SerializableBytes,
 }
@@ -18,14 +18,14 @@ pub struct Transaction {
 impl Transaction {
     pub fn new(data: SerializableBytes, key: PrivateKey) -> Self {
         Transaction {
-            public_key: key.public_key(),
+            from: key.public_key(),
             signature: key.sign(&data),
             data,
         }
     }
 
     pub fn verify(&self) -> bool {
-        self.public_key.verify(&self.data, self.signature)
+        self.from.verify(&self.data, self.signature)
     }
 }
 
@@ -52,7 +52,7 @@ mod tests {
         let data = SerializableBytes::from(b"payload".as_slice());
 
         let mut tx = Transaction::new(data, key1);
-        tx.public_key = key2.public_key();
+        tx.from = key2.public_key();
 
         assert!(!tx.verify());
     }

@@ -10,6 +10,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use std::io::{Read, Write};
 use std::sync::Arc;
 use tokio::io;
+use tracing::warn;
 
 /// Block header containing metadata and cryptographic commitments.
 ///
@@ -97,8 +98,22 @@ impl Block {
     }
 
     pub fn verify(&self) -> bool {
-        self.validator
+        if !self
+            .validator
             .verify(self.header_hash.as_slice(), self.signature)
+        {
+            warn!(block=%self.header_hash, "invalid block signature");
+            return false;
+        }
+
+        for t in &self.transactions {
+            if !t.verify() {
+                warn!(block=%self.header_hash, "invalid transaction signature in block");
+                return false;
+            }
+        }
+
+        true
     }
 }
 

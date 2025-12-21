@@ -5,11 +5,15 @@
 
 use crate::core::block::Block;
 use crate::core::storage::Storage;
+use std::error::Error;
+use std::fmt::Debug;
 
 /// Trait for validating blocks before they are added to the chain.
 ///
 /// Implementations must be thread-safe for concurrent validation.
 pub trait Validator: Send + Sync {
+    type Error: Debug + Error;
+
     /// Validates a block against the current chain state.
     ///
     /// # Arguments
@@ -20,7 +24,7 @@ pub trait Validator: Send + Sync {
     /// # Returns
     ///
     /// `true` if the block is valid and can be added to the chain.
-    fn validate_block<S: Storage>(&self, block: &Block, storage: &S) -> bool;
+    fn validate_block<S: Storage>(&self, block: &Block, storage: &S) -> Result<(), Self::Error>;
 }
 
 /// Default block validator implementing consensus rules.
@@ -33,12 +37,46 @@ pub trait Validator: Send + Sync {
 #[derive(Clone, Default)]
 pub struct BlockValidator;
 
+/// Errors that can occur during block validation operations.
+#[derive(Debug, thiserror::Error)]
+pub enum BlockValidatorError {
+    #[error("invalid block height: expected {expected}, got {actual}")]
+    InvalidHeight { expected: u32, actual: u32 },
+
+    #[error("previous block hash mismatch")]
+    PreviousHashMismatch,
+
+    #[error("block already exists")]
+    BlockExists,
+
+    #[error("invalid block signature")]
+    InvalidSignature,
+}
+
 impl Validator for BlockValidator {
-    fn validate_block<S: Storage>(&self, block: &Block, storage: &S) -> bool {
-        storage.height().checked_add(1) == Some(block.header.height)
-            && block.header.previous_block == storage.tip()
-            && !storage.has_block(&block.header_hash)
-            && block.verify()
+    type Error = BlockValidatorError;
+    fn validate_block<S: Storage>(&self, block: &Block, storage: &S) -> Result<(), Self::Error> {
+        let expected_height = storage.height().checked_add(1);
+        if expected_height != Some(block.header.height) {
+            return Err(BlockValidatorError::InvalidHeight {
+                expected: expected_height.unwrap_or(0),
+                actual: block.header.height,
+            });
+        }
+
+        if block.header.previous_block != storage.tip() {
+            return Err(BlockValidatorError::PreviousHashMismatch);
+        }
+
+        if storage.has_block(block.header_hash) {
+            return Err(BlockValidatorError::BlockExists);
+        }
+
+        if !block.verify() {
+            return Err(BlockValidatorError::InvalidSignature);
+        }
+
+        Ok(())
     }
 }
 
@@ -71,7 +109,7 @@ mod tests {
         let validator = BlockValidator;
 
         let block = create_block(1, genesis.header_hash);
-        assert!(validator.validate_block(&block, &storage));
+        assert!(validator.validate_block(&block, &storage).is_ok());
     }
 
     #[test]
@@ -81,7 +119,7 @@ mod tests {
         let validator = BlockValidator;
 
         let block = create_block(5, genesis.header_hash);
-        assert!(!validator.validate_block(&block, &storage));
+        assert!(validator.validate_block(&block, &storage).is_err());
     }
 
     #[test]
@@ -91,7 +129,7 @@ mod tests {
         let validator = BlockValidator;
 
         let block = create_block(1, Hash::random());
-        assert!(!validator.validate_block(&block, &storage));
+        assert!(validator.validate_block(&block, &storage).is_err());
     }
 
     #[test]
@@ -100,18 +138,18 @@ mod tests {
         let validator = BlockValidator;
 
         let block = create_block(0, Hash::zero());
-        assert!(!validator.validate_block(&block, &storage));
+        assert!(validator.validate_block(&block, &storage).is_err());
     }
 
     struct EmptyStorage;
     impl Storage for EmptyStorage {
-        fn has_block(&self, _: &Hash) -> bool {
+        fn has_block(&self, _: Hash) -> bool {
             false
         }
-        fn get_header(&self, _: &Hash) -> Option<Header> {
+        fn get_header(&self, _: Hash) -> Option<Header> {
             None
         }
-        fn get_block(&self, _: &Hash) -> Option<Arc<Block>> {
+        fn get_block(&self, _: Hash) -> Option<Arc<Block>> {
             None
         }
         fn append_block(&mut self, _: Arc<Block>) {}

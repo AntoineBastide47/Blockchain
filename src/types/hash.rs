@@ -1,6 +1,7 @@
 //! 32-byte SHA3-256 hash type with zero-allocation operations.
 
 use crate::types::binary_codec::BinaryCodec;
+use std::fmt;
 
 /// SHA3-256 hash length in bytes.
 const HASH_LEN: usize = 32;
@@ -56,5 +57,14 @@ impl Hash {
         let mut buf = vec![0u8; HASH_LEN];
         rand::rng().fill_bytes(&mut buf);
         Hash::from_vec(buf)
+    }
+}
+
+impl fmt::Display for Hash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in &self.0 {
+            write!(f, "{:02x}", byte)?;
+        }
+        Ok(())
     }
 }

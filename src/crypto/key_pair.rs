@@ -15,6 +15,7 @@ use std::io::{Read, Write};
 ///
 /// Generated using cryptographically secure randomness from the OS.
 /// Never serialized or transmitted over the network.
+#[derive(Clone)]
 pub struct PrivateKey {
     key: SigningKey,
 }

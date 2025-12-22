@@ -34,6 +34,9 @@ async fn main() {
 
     let options = ServerOps {
         transports: vec![tr_local, tr_remote],
+        private_key: None,
+        transaction_pool_capacity: None,
+        block_time: Duration::new(12, 0),
     };
 
     let mut server = Server::new(options);

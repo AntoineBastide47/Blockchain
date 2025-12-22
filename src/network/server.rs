@@ -3,15 +3,27 @@
 //! Aggregates incoming RPCs from all registered transports into a single
 //! processing loop for unified message handling.
 
+use crate::core::transaction::Transaction;
+use crate::crypto::key_pair::PrivateKey;
 use crate::network::transport::{Rpc, Transport};
+use crate::network::txpool::TxPool;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc::channel;
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::time::interval;
+use tracing::{info, warn};
 
 /// Configuration options for the server.
 pub struct ServerOps {
     /// Transport layers to aggregate for message processing.
     pub transports: Vec<Arc<dyn Transport>>,
+    /// If set, this node becomes a validator node
+    pub private_key: Option<PrivateKey>,
+    /// The max capacity of the transaction pool hosted on this node
+    pub transaction_pool_capacity: Option<usize>,
+    /// How often new block are created
+    pub block_time: Duration,
 }
 
 /// Blockchain server managing multiple transport layers.
@@ -20,15 +32,25 @@ pub struct ServerOps {
 /// enabling centralized message processing regardless of transport type.
 pub struct Server {
     options: ServerOps,
-    tx: Sender<Rpc>,
+    is_validator: bool,
+    tx_pool: TxPool,
+    sx: Sender<Rpc>,
     rx: Receiver<Rpc>,
 }
 
 impl Server {
     /// Creates a new server with the specified configuration.
     pub fn new(options: ServerOps) -> Self {
-        let (tx, rx) = channel::<Rpc>(1024);
-        Server { options, tx, rx }
+        let (sx, rx) = channel::<Rpc>(1024);
+        let is_validator = options.private_key.is_some();
+        let transaction_pool = TxPool::new(options.transaction_pool_capacity);
+        Server {
+            options,
+            is_validator,
+            tx_pool: transaction_pool,
+            sx,
+            rx,
+        }
     }
 
     /// Starts the server and begins processing incoming messages.
@@ -37,12 +59,26 @@ impl Server {
     /// Blocks until all transport channels close.
     pub async fn start(&mut self) {
         self.init_transports().await;
+        let mut ticker = interval(self.options.block_time);
 
-        while let Some(rpc) = self.rx.recv().await {
-            println!("{} sent: {:?}", rpc.from, rpc.payload);
+        loop {
+            tokio::select! {
+                Some(rpc) = self.rx.recv() => {
+                    info!("{} sent: {:?}", rpc.from, rpc.payload);
+                }
+                _ = ticker.tick() => {
+                    if self.is_validator {
+                        self.create_block().await;
+                    }
+                    // produce block, flush tx pool, etc
+                }
+                else => {
+                    break;
+                }
+            }
         }
 
-        println!("Server shut down");
+        info!("Server shut down");
     }
 
     /// Spawns async tasks to forward messages from each transport to the main channel.
@@ -50,7 +86,7 @@ impl Server {
         for transport in &self.options.transports {
             // Clone the transport and sender pointers to move them to a new thread
             let tr = transport.clone();
-            let sender = self.tx.clone();
+            let sender = self.sx.clone();
 
             // Create a new thread were we listen to all the rpc's received by each transport
             // on each of their associated thread, and then send them all to the main thread
@@ -61,6 +97,22 @@ impl Server {
                     let _ = sender.send(rpc).await;
                 }
             });
+        }
+    }
+
+    async fn create_block(&self) {
+        info!("do stuff every x seconds");
+    }
+
+    async fn handle_transaction(&self, transaction: Transaction) {
+        let verified = transaction.verify();
+        if verified && !self.tx_pool.contains(transaction.hash) {
+            info!(hash=%transaction.hash, "adding a new transaction to the pool");
+            self.tx_pool.append(transaction);
+        } else if !verified {
+            warn!(hash=%transaction.hash, "attempting to add a new transaction to the pool that hasn't been verified");
+        } else {
+            warn!(hash=%transaction.hash, "attempting to add a new transaction to the pool that already is in it");
         }
     }
 }

@@ -253,10 +253,8 @@ mod tests {
 
     #[test]
     fn new_with_transactions() {
-        use crate::types::serializable_bytes::SerializableBytes;
-
         let key = PrivateKey::new();
-        let tx = Transaction::new(SerializableBytes::from(b"data".as_slice()), key);
+        let tx = Transaction::new(b"data".as_slice(), key).expect("Hashing failed");
 
         let block = create_block(create_header(1), vec![tx]);
         assert_eq!(block.transactions.len(), 1);

@@ -11,7 +11,7 @@ use std::io::{Read, Write};
 ///
 /// Uses `SerializableBytes` for zero-copy sharing - transactions are immutable after creation
 /// and often referenced by multiple blocks during reorganizations.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transaction {
     pub from: PublicKey,
     pub signature: SerializableSignature,
@@ -135,9 +135,9 @@ mod tests {
         let hash1 = tx.hash().expect("Hashing failed");
         let hash2 = tx.hash().expect("Hashing failed");
 
+        assert_eq!(hash1, hash2, "rehashing twice");
         assert_eq!(tx.hash, hash1);
         assert_eq!(tx.hash, hash2);
-        assert_eq!(hash1, hash2);
     }
 
     #[test]

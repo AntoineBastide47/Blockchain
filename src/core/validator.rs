@@ -86,8 +86,8 @@ mod tests {
     use crate::core::block::{Block, Header};
     use crate::core::storage::InMemoryStorage;
     use crate::crypto::key_pair::PrivateKey;
-    use crate::test_utils::utils::create_genesis;
     use crate::types::hash::Hash;
+    use crate::utils::test_utils::utils::create_genesis;
     use std::sync::Arc;
 
     fn create_block(height: u32, previous: Hash) -> Arc<Block> {

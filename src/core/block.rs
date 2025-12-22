@@ -6,11 +6,11 @@ use crate::types::binary_codec::{BinaryCodec, BinaryCodecHash};
 use crate::types::hash::Hash;
 use crate::types::serializable_bytes::SerializableBytes;
 use crate::types::serializable_signature::SerializableSignature;
+use crate::warn;
 use borsh::{BorshDeserialize, BorshSerialize};
 use std::io::{Read, Write};
 use std::sync::Arc;
 use tokio::io;
-use tracing::warn;
 
 /// Block header containing metadata and cryptographic commitments.
 ///
@@ -102,13 +102,16 @@ impl Block {
             .validator
             .verify(self.header_hash.as_slice(), self.signature)
         {
-            warn!(block=%self.header_hash, "invalid block signature");
+            warn!("invalid block signature: block={}", self.header_hash);
             return false;
         }
 
         for t in &self.transactions {
             if !t.verify() {
-                warn!(block=%self.header_hash, "invalid transaction signature in block");
+                warn!(
+                    "invalid transaction signature in block: block={}",
+                    self.header_hash
+                );
                 return false;
             }
         }

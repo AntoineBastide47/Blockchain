@@ -7,12 +7,12 @@ use crate::core::transaction::Transaction;
 use crate::crypto::key_pair::PrivateKey;
 use crate::network::transport::{Rpc, Transport};
 use crate::network::txpool::TxPool;
+use crate::{info, warn};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::channel;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::interval;
-use tracing::{info, warn};
 
 /// Configuration options for the server.
 pub struct ServerOps {
@@ -70,7 +70,6 @@ impl Server {
                     if self.is_validator {
                         self.create_block().await;
                     }
-                    // produce block, flush tx pool, etc
                 }
                 else => {
                     break;
@@ -101,18 +100,30 @@ impl Server {
     }
 
     async fn create_block(&self) {
-        info!("do stuff every x seconds");
+        info!(
+            "create a block every {} seconds",
+            self.options.block_time.as_secs()
+        );
     }
 
     async fn handle_transaction(&self, transaction: Transaction) {
         let verified = transaction.verify();
         if verified && !self.tx_pool.contains(transaction.hash) {
-            info!(hash=%transaction.hash, "adding a new transaction to the pool");
+            info!(
+                "adding a new transaction to the pool: hash={}",
+                transaction.hash
+            );
             self.tx_pool.append(transaction);
         } else if !verified {
-            warn!(hash=%transaction.hash, "attempting to add a new transaction to the pool that hasn't been verified");
+            warn!(
+                "attempting to add a new transaction to the pool that hasn't been verified: hash={}",
+                transaction.hash
+            );
         } else {
-            warn!(hash=%transaction.hash, "attempting to add a new transaction to the pool that already is in it");
+            warn!(
+                "attempting to add a new transaction to the pool that already is in it: hash={}",
+                transaction.hash
+            );
         }
     }
 }

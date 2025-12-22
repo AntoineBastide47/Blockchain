@@ -3,14 +3,15 @@
 use crate::network::local_transport::LocalTransport;
 use crate::network::server::{Server, ServerOps};
 use crate::network::transport::Transport;
+use crate::utils::log;
 use bytes::Bytes;
 use std::time::Duration;
 
 mod core;
 mod crypto;
 mod network;
-mod test_utils;
 mod types;
+mod utils;
 
 #[tokio::main]
 async fn main() {
@@ -39,6 +40,7 @@ async fn main() {
         block_time: Duration::new(12, 0),
     };
 
+    log::init(log::Level::Info);
     let mut server = Server::new(options);
     server.start().await;
 }

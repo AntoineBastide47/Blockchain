@@ -7,10 +7,10 @@ use crate::core::validator::{BlockValidator, Validator};
 use crate::crypto::key_pair::PrivateKey;
 use crate::types::binary_codec::BinaryCodecHash;
 use crate::types::hash::Hash;
+use crate::{info, warn};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io;
-use tracing::{info, warn};
 
 /// The main blockchain structure holding headers and validation logic.
 ///
@@ -86,16 +86,15 @@ impl<V: Validator, S: Storage> Blockchain<V, S> {
         match self.validator.validate_block(&block, &self.storage) {
             Ok(_) => {
                 info!(
-                    height = block.header.height,
-                    hash = %block.header_hash,
-                    "adding new block"
+                    "adding new block: height={}, hash={}",
+                    block.header.height, block.header_hash
                 );
 
                 self.storage.append_block(block);
                 true
             }
             Err(err) => {
-                warn!(hash = %block.header_hash, error = %err, "block rejected");
+                warn!("block rejected: hash={}, error={}", block.header_hash, err);
                 false
             }
         }
@@ -107,8 +106,8 @@ mod tests {
     use super::*;
     use crate::core::block::Header;
     use crate::crypto::key_pair::PrivateKey;
-    use crate::test_utils::utils::create_genesis;
     use crate::types::hash::Hash;
+    use crate::utils::test_utils::utils::create_genesis;
     use thiserror::Error;
 
     #[derive(Debug, Error)]

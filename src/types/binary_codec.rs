@@ -50,8 +50,7 @@ pub trait BinaryCodecHash: BorshSerialize + BorshDeserialize {
     /// hash computations during block validation.
     ///
     /// # Performance
-    /// Zero-allocation implementation. On a typical block header (~88 bytes),
-    /// this saves ~100 bytes of heap allocation per hash.
+    /// Zero-allocation implementation. On a block header, this saves ~100 bytes of heap allocation per hash.
     fn hash(&self) -> Result<Hash> {
         let mut hasher = Sha3_256::new();
         self.serialize(&mut HasherWriter(&mut hasher))?;
@@ -60,6 +59,6 @@ pub trait BinaryCodecHash: BorshSerialize + BorshDeserialize {
 }
 
 // Automatically implements BinaryCodecHash for any type that has BorshSerialize + BorshDeserialize.
-// Without it: You'd need to manually write impl BinaryCodecHash for Header {} for every type.
-// With it: Just #[derive(BinaryCodec)] and header.hash() works.
+// Without it: You'd need to manually write impl BinaryCodecHash for MyClass {} for every type.
+// With it: Just #[derive(BinaryCodec)] and MyClass.hash() works.
 impl<T: BorshSerialize + BorshDeserialize> BinaryCodecHash for T {}

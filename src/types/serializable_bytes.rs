@@ -25,6 +25,12 @@ impl Deref for SerializableBytes {
     }
 }
 
+impl From<Bytes> for SerializableBytes {
+    fn from(v: Bytes) -> Self {
+        SerializableBytes(v)
+    }
+}
+
 impl From<Vec<u8>> for SerializableBytes {
     fn from(v: Vec<u8>) -> Self {
         SerializableBytes(Bytes::from(v))

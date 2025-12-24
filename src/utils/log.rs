@@ -7,18 +7,14 @@ use std::sync::atomic::{AtomicU8, Ordering};
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Level {
-    Trace = 0,
-    Debug = 1,
-    Info = 2,
-    Warn = 3,
-    Error = 4,
+    Info = 1,
+    Warn = 2,
+    Error = 34,
 }
 
 impl Display for Level {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Level::Trace => write!(f, "TRACE"),
-            Level::Debug => write!(f, "DEBUG"),
             Level::Info => write!(f, "INFO"),
             Level::Warn => write!(f, "WARN"),
             Level::Error => write!(f, "ERROR"),

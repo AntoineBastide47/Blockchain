@@ -17,8 +17,9 @@
 //! - **Named structs**: `struct Foo { a: u32, b: u64 }`
 //! - **Tuple structs**: `struct Bar(u32, u64)`
 //! - **Unit structs**: `struct Baz`
+//! - **Enums**: `enum Status { Active, Pending { id: u32 }, Error(String) }`
 //!
-//! Enums and unions are not currently supported.
+//! Unions are not supported.
 //!
 //! # Binary Format
 //!
@@ -31,7 +32,7 @@
 
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, Data, DeriveInput, Fields};
+use syn::{parse_macro_input, Data, DataEnum, DeriveInput, Fields};
 
 /// Derives `BorshSerialize` and `BorshDeserialize` for a struct.
 ///
@@ -105,10 +106,9 @@ pub fn derive_binary_codec(input: TokenStream) -> TokenStream {
                 generate_unit_struct_impl(name, &impl_generics, &ty_generics, where_clause)
             }
         },
-        // Enums are not supported - emit a compile error.
-        Data::Enum(_) => {
-            syn::Error::new_spanned(&input, "BinaryCodec derive does not support enums yet")
-                .to_compile_error()
+        // Handle enum types.
+        Data::Enum(data_enum) => {
+            generate_enum_impl(name, &impl_generics, &ty_generics, where_clause, data_enum)
         }
         // Unions are not supported - emit a compile error.
         Data::Union(_) => {
@@ -238,6 +238,129 @@ fn generate_unit_struct_impl(
         impl #impl_generics ::borsh::BorshDeserialize for #name #ty_generics #where_clause {
             fn deserialize_reader<R: ::std::io::Read>(_reader: &mut R) -> ::std::io::Result<Self> {
                 Ok(Self)
+            }
+        }
+    }
+}
+
+/// Generates `BorshSerialize` and `BorshDeserialize` for enums.
+///
+/// Enums are serialized with a u8 discriminant followed by variant fields.
+/// Supports unit variants, tuple variants, and struct variants.
+///
+/// # Binary Format
+///
+/// - Discriminant: u8 variant index (0, 1, 2, ...)
+/// - Fields: serialized in declaration order (if any)
+fn generate_enum_impl(
+    name: &syn::Ident,
+    impl_generics: &syn::ImplGenerics,
+    ty_generics: &syn::TypeGenerics,
+    where_clause: Option<&syn::WhereClause>,
+    data_enum: &DataEnum,
+) -> proc_macro2::TokenStream {
+    // Generate serialize match arms for each variant.
+    let serialize_arms = data_enum.variants.iter().enumerate().map(|(idx, variant)| {
+        let variant_name = &variant.ident;
+        let idx = idx as u8;
+
+        match &variant.fields {
+            // Unit variant: `Variant`
+            Fields::Unit => {
+                quote! {
+                    Self::#variant_name => {
+                        ::borsh::BorshSerialize::serialize(&#idx, writer)?;
+                    }
+                }
+            }
+            // Tuple variant: `Variant(T1, T2, ...)`
+            Fields::Unnamed(fields) => {
+                let field_names: Vec<_> = (0..fields.unnamed.len())
+                    .map(|i| quote::format_ident!("f{}", i))
+                    .collect();
+                let serialize_fields = field_names.iter().map(|f| {
+                    quote! { ::borsh::BorshSerialize::serialize(#f, writer)?; }
+                });
+                quote! {
+                    Self::#variant_name(#(#field_names),*) => {
+                        ::borsh::BorshSerialize::serialize(&#idx, writer)?;
+                        #(#serialize_fields)*
+                    }
+                }
+            }
+            // Struct variant: `Variant { a: T1, b: T2, ... }`
+            Fields::Named(fields) => {
+                let field_names: Vec<_> = fields.named.iter().map(|f| &f.ident).collect();
+                let serialize_fields = field_names.iter().map(|f| {
+                    quote! { ::borsh::BorshSerialize::serialize(#f, writer)?; }
+                });
+                quote! {
+                    Self::#variant_name { #(#field_names),* } => {
+                        ::borsh::BorshSerialize::serialize(&#idx, writer)?;
+                        #(#serialize_fields)*
+                    }
+                }
+            }
+        }
+    });
+
+    // Generate deserialize match arms for each variant.
+    let deserialize_arms = data_enum.variants.iter().enumerate().map(|(idx, variant)| {
+        let variant_name = &variant.ident;
+        let idx = idx as u8;
+
+        match &variant.fields {
+            // Unit variant: `Variant`
+            Fields::Unit => {
+                quote! {
+                    #idx => Ok(Self::#variant_name),
+                }
+            }
+            // Tuple variant: `Variant(T1, T2, ...)`
+            Fields::Unnamed(fields) => {
+                let deserialize_fields = (0..fields.unnamed.len()).map(|_| {
+                    quote! { ::borsh::BorshDeserialize::deserialize_reader(reader)?, }
+                });
+                quote! {
+                    #idx => Ok(Self::#variant_name(#(#deserialize_fields)*)),
+                }
+            }
+            // Struct variant: `Variant { a: T1, b: T2, ... }`
+            Fields::Named(fields) => {
+                let deserialize_fields = fields.named.iter().map(|f| {
+                    let field_name = &f.ident;
+                    quote! { #field_name: ::borsh::BorshDeserialize::deserialize_reader(reader)?, }
+                });
+                quote! {
+                    #idx => Ok(Self::#variant_name { #(#deserialize_fields)* }),
+                }
+            }
+        }
+    });
+
+    // Generate the full name as a string for error messages.
+    let name_str = name.to_string();
+
+    quote! {
+        impl #impl_generics ::borsh::BorshSerialize for #name #ty_generics #where_clause {
+            fn serialize<W: ::std::io::Write>(&self, writer: &mut W) -> ::std::io::Result<()> {
+                match self {
+                    #(#serialize_arms)*
+                }
+                Ok(())
+            }
+        }
+
+        impl #impl_generics ::borsh::BorshDeserialize for #name #ty_generics #where_clause {
+            fn deserialize_reader<R: ::std::io::Read>(reader: &mut R) -> ::std::io::Result<Self> {
+                let variant_idx: u8 = ::borsh::BorshDeserialize::deserialize_reader(reader)?;
+                match variant_idx {
+                    #(#deserialize_arms)*
+                    _ => Err(::std::io::Error::new(
+                        ::std::io::ErrorKind::InvalidData,
+                        format!("Invalid {} variant index: {}", #name_str, variant_idx),
+                    )),
+                }
             }
         }
     }

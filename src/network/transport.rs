@@ -3,8 +3,9 @@
 //! Defines the Transport trait and RPC message structure used by all
 //! network implementations to send and receive data between nodes.
 
+use crate::network::rpc::Rpc;
+use crate::types::serializable_bytes::SerializableBytes;
 use bytes::Bytes;
-use std::sync::Arc;
 use tokio::sync::mpsc::Receiver;
 
 /// Errors that can occur during transport operations.
@@ -17,14 +18,6 @@ pub enum TransportError {
     /// Failed to send message to the specified address.
     #[error("failed to send message to {0}")]
     SendFailed(String),
-}
-
-/// Remote procedure call message containing sender address and payload data.
-pub struct Rpc {
-    /// Address of the sender.
-    pub from: Arc<str>,
-    /// Raw message payload.
-    pub payload: Bytes,
 }
 
 /// Async transport layer for network communication between nodes.
@@ -47,8 +40,14 @@ pub trait Transport: Send + Sync {
     /// # Errors
     /// Returns `TransportError::PeerNotFound` if the peer is not in the routing table.
     /// Returns `TransportError::SendFailed` if the message cannot be sent.
-    async fn send_message(&self, to: Arc<str>, payload: Bytes) -> Result<(), TransportError>;
+    async fn send_message(&self, to: String, payload: Bytes) -> Result<(), TransportError>;
+
+    /// Broadcasts data to all connected peers.
+    ///
+    /// # Errors
+    /// Returns an error string if any peer transmission fails.
+    async fn broadcast(&self, data: SerializableBytes) -> Result<(), String>;
 
     /// Returns the local address of this transport.
-    fn addr(&self) -> Arc<str>;
+    fn addr(&self) -> String;
 }

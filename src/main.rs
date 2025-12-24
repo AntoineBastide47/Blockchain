@@ -1,11 +1,16 @@
 //! A blockchain implementation in Rust.
 
+use crate::core::transaction::Transaction;
+use crate::crypto::key_pair::PrivateKey;
 use crate::network::local_transport::LocalTransport;
+use crate::network::rpc::{Message, MessageType, Rpc};
 use crate::network::server::{Server, ServerOps};
-use crate::network::transport::Transport;
+use crate::network::transport::{Transport, TransportError};
 use crate::utils::log;
-use bytes::Bytes;
+use borsh::BorshSerialize;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc::channel;
 
 mod core;
 mod crypto;
@@ -26,21 +31,42 @@ async fn main() {
     let tr_remote_tokio = tr_remote.clone();
     tokio::spawn(async move {
         loop {
-            let _ = tr_remote_tokio
-                .send_message(tr_local_tokio.addr(), Bytes::from("Hello World"))
-                .await;
+            let _ = send_transaction(tr_remote_tokio.clone(), tr_local_tokio.addr()).await;
             tokio::time::sleep(Duration::new(1, 0)).await;
         }
     });
 
-    let options = ServerOps {
-        transports: vec![tr_local, tr_remote],
-        private_key: None,
-        transaction_pool_capacity: None,
-        block_time: Duration::new(12, 0),
-    };
-
+    let options = ServerOps::default(tr_local, Duration::new(12, 0));
     log::init(log::Level::Info);
-    let mut server = Server::new(options);
-    server.start().await;
+
+    let server = Arc::new(Server::new(options));
+    let (sx, rx) = channel::<Rpc>(1024);
+    server.start(sx, rx).await;
+}
+
+/// Sends a random transaction to a peer node.
+///
+/// Creates a new transaction with random 32-byte data, signs it with a fresh keypair,
+/// wraps it in a protocol message, and transmits it via the transport layer.
+async fn send_transaction(tr: Arc<LocalTransport>, to: String) -> Result<(), TransportError> {
+    use rand::RngCore;
+
+    let key = PrivateKey::new();
+    let mut buf = vec![0u8; 32];
+    rand::rng().fill_bytes(&mut buf);
+    let data: &[u8] = buf.as_slice();
+
+    let tx = Transaction::new(data, key).map_err(|e| TransportError::SendFailed(e.to_string()))?;
+
+    let mut buf = Vec::new();
+    tx.serialize(&mut buf)
+        .map_err(|e| TransportError::SendFailed(e.to_string()))?;
+
+    let msg = Message::new(MessageType::Transaction, buf);
+
+    let mut buf = Vec::new();
+    msg.serialize(&mut buf)
+        .map_err(|e| TransportError::SendFailed(e.to_string()))?;
+
+    tr.send_message(to, buf.into()).await
 }

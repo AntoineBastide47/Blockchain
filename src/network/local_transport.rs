@@ -3,7 +3,9 @@
 //! Enables direct message passing between nodes without network I/O,
 //! ideal for unit tests and single-process simulations.
 
-use crate::network::transport::{Rpc, Transport, TransportError};
+use crate::network::rpc::Rpc;
+use crate::network::transport::{Transport, TransportError};
+use crate::types::serializable_bytes::SerializableBytes;
 use bytes::Bytes;
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -18,7 +20,7 @@ pub struct LocalTransport {
     peers: DashMap<String, Arc<LocalTransport>>,
     tx: Sender<Rpc>,
     rx: Mutex<Option<Receiver<Rpc>>>,
-    address: Arc<str>,
+    address: String,
 }
 
 impl LocalTransport {
@@ -29,7 +31,7 @@ impl LocalTransport {
         let (tx, rx) = channel(1024);
 
         Arc::new(LocalTransport {
-            address: Arc::from(address),
+            address: address.to_string(),
             peers: DashMap::new(),
             tx,
             rx: Mutex::new(Some(rx)),
@@ -51,7 +53,7 @@ impl Transport for LocalTransport {
         guard.take().unwrap()
     }
 
-    async fn send_message(&self, to: Arc<str>, payload: Bytes) -> Result<(), TransportError> {
+    async fn send_message(&self, to: String, payload: Bytes) -> Result<(), TransportError> {
         let peer = match self.peers.get(to.trim()) {
             Some(r) => r.value().clone(),
             None => {
@@ -60,15 +62,21 @@ impl Transport for LocalTransport {
         };
 
         peer.tx
-            .send(Rpc {
-                from: self.address.clone(),
-                payload,
-            })
+            .send(Rpc::new(self.address.clone(), payload))
             .await
             .map_err(|_| TransportError::SendFailed(to.to_string()))
     }
 
-    fn addr(&self) -> Arc<str> {
+    async fn broadcast(&self, data: SerializableBytes) -> Result<(), String> {
+        for peer in &self.peers {
+            if let Err(e) = self.send_message(peer.addr(), data.0.clone()).await {
+                return Err(e.to_string());
+            }
+        }
+        Ok(())
+    }
+
+    fn addr(&self) -> String {
         self.address.clone()
     }
 }
@@ -109,6 +117,30 @@ mod tests {
 
         let received = rx.recv().await.unwrap();
         assert_eq!(received.from, tr_a.address);
-        assert_eq!(received.payload, payload);
+        assert_eq!(received.payload, payload.into());
+    }
+
+    #[tokio::test]
+    async fn test_broadcast() {
+        let tr_a = LocalTransport::new("A");
+        let tr_b = LocalTransport::new("B");
+        let tr_c = LocalTransport::new("C");
+
+        tr_a.connect(tr_b.clone()).await;
+        tr_a.connect(tr_c.clone()).await;
+
+        let mut rx_b = tr_b.consume().await;
+        let mut rx_c = tr_c.consume().await;
+
+        let payload = SerializableBytes::new("Broadcast message");
+        tr_a.broadcast(payload.clone()).await.unwrap();
+
+        let received_b = rx_b.recv().await.unwrap();
+        assert_eq!(received_b.from, tr_a.address);
+        assert_eq!(received_b.payload, payload.clone());
+
+        let received_c = rx_c.recv().await.unwrap();
+        assert_eq!(received_c.from, tr_a.address);
+        assert_eq!(received_c.payload, payload);
     }
 }

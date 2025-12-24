@@ -92,7 +92,7 @@ pub trait RpcProcessor: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use borsh::{BorshDeserialize, BorshSerialize};
+    use borsh::BorshDeserialize;
 
     #[test]
     fn message_serialization_roundtrip() {

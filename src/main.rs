@@ -39,7 +39,7 @@ async fn main() {
     let options = ServerOps::default(tr_local, Duration::new(12, 0));
     log::init(log::Level::Info);
 
-    let server = Arc::new(Server::new(options));
+    let server = Server::new(options);
     let (sx, rx) = channel::<Rpc>(1024);
     server.start(sx, rx).await;
 }

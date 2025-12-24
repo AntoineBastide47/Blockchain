@@ -58,14 +58,19 @@ pub struct Server {
 
 impl Server {
     /// Creates a new server with the specified configuration.
-    pub fn new(options: ServerOps) -> Self {
+    pub fn new(options: ServerOps) -> Arc<Self> {
         let is_validator = options.private_key.is_some();
         let tx_pool = TxPool::new(options.transaction_pool_capacity);
-        Server {
+        let server = Arc::new(Self {
             options,
             is_validator,
             tx_pool,
-        }
+        });
+
+        let server_thread = server.clone();
+        tokio::spawn(async move { server_thread.validator_loop().await });
+
+        server
     }
 
     /// Starts the server and begins processing incoming messages.
@@ -74,7 +79,6 @@ impl Server {
     /// Blocks until the transport channel closes.
     pub async fn start(self: Arc<Self>, sx: Sender<Rpc>, mut rx: Receiver<Rpc>) {
         self.init_transport(sx).await;
-        let mut ticker = interval(self.options.block_time);
 
         loop {
             tokio::select! {
@@ -94,11 +98,6 @@ impl Server {
                         Err(e) => error!("failed to process rpc: {}", e)
                     }
                 }
-                _ = ticker.tick() => {
-                    if self.is_validator {
-                        self.create_block().await;
-                    }
-                }
                 else => {
                     break;
                 }
@@ -106,6 +105,18 @@ impl Server {
         }
 
         info!("Server shut down");
+    }
+
+    async fn validator_loop(&self) {
+        let mut ticker = interval(self.options.block_time);
+
+        loop {
+            ticker.tick().await;
+
+            if self.is_validator {
+                self.create_block().await;
+            }
+        }
     }
 
     /// Spawns an async task to forward messages from the transport to the main channel.
@@ -222,8 +233,8 @@ mod tests {
     use super::*;
     use crate::crypto::key_pair::PrivateKey;
 
-    #[test]
-    fn server_is_validator_when_private_key_set() {
+    #[tokio::test]
+    async fn server_is_validator_when_private_key_set() {
         let transport = LocalTransport::new("validator");
         let mut options = ServerOps::default(transport, Duration::from_secs(10));
         options.private_key = Some(PrivateKey::new());
@@ -232,8 +243,8 @@ mod tests {
         assert!(server.is_validator);
     }
 
-    #[test]
-    fn server_is_not_validator_without_private_key() {
+    #[tokio::test]
+    async fn server_is_not_validator_without_private_key() {
         let transport = LocalTransport::new("node");
         let options = ServerOps::default(transport, Duration::from_secs(10));
 

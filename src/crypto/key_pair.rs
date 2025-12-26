@@ -36,11 +36,18 @@ pub struct PublicKey {
 
 impl PrivateKey {
     /// Generates a new random private key using OS-provided entropy.
-    pub fn new() -> PrivateKey {
+    pub fn new() -> Self {
         let mut rng = OsRng;
-        PrivateKey {
+        Self {
             key: SigningKey::random(&mut rng),
         }
+    }
+
+    /// Creates a private key from raw bytes.
+    ///
+    /// Returns `None` if the bytes do not represent a valid scalar for secp256k1.
+    pub fn from_bytes(bytes: &[u8; 32]) -> Option<Self> {
+        SigningKey::from_bytes(bytes).ok().map(|key| Self { key })
     }
 
     /// Derives the corresponding public key.
@@ -190,5 +197,62 @@ mod tests {
         let data = vec![0xAB; 10000];
         let signature = private.sign(&SerializableBytes::from(&data));
         assert!(public.verify(&data, signature));
+    }
+
+    #[test]
+    fn from_bytes_with_valid_key() {
+        let bytes: [u8; 32] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
+            0x1d, 0x1e, 0x1f, 0x20,
+        ];
+        let key = PrivateKey::from_bytes(&bytes);
+        assert!(key.is_some());
+    }
+
+    #[test]
+    fn from_bytes_with_zero_key_fails() {
+        let bytes: [u8; 32] = [0u8; 32];
+        let key = PrivateKey::from_bytes(&bytes);
+        assert!(key.is_none());
+    }
+
+    #[test]
+    fn from_bytes_produces_deterministic_key() {
+        let bytes: [u8; 32] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
+            0x1d, 0x1e, 0x1f, 0x20,
+        ];
+        let key1 = PrivateKey::from_bytes(&bytes).unwrap();
+        let key2 = PrivateKey::from_bytes(&bytes).unwrap();
+
+        assert_eq!(key1.public_key().address(), key2.public_key().address());
+    }
+
+    #[test]
+    fn from_bytes_sign_verify_roundtrip() {
+        let bytes: [u8; 32] = [
+            0xaa, 0xbb, 0xcc, 0xdd, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
+            0x1d, 0x1e, 0x1f, 0x20,
+        ];
+        let private = PrivateKey::from_bytes(&bytes).unwrap();
+        let public = private.public_key();
+
+        let data = b"test message";
+        let signature = private.sign(&SerializableBytes::from(data));
+        assert!(public.verify(data, signature));
+    }
+
+    #[test]
+    fn from_bytes_different_bytes_different_keys() {
+        let bytes1: [u8; 32] = [1u8; 32];
+        let bytes2: [u8; 32] = [2u8; 32];
+
+        let key1 = PrivateKey::from_bytes(&bytes1).unwrap();
+        let key2 = PrivateKey::from_bytes(&bytes2).unwrap();
+
+        assert_ne!(key1.public_key().address(), key2.public_key().address());
     }
 }

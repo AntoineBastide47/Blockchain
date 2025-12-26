@@ -42,11 +42,15 @@ pub trait Transport: Send + Sync {
     /// Returns `TransportError::SendFailed` if the message cannot be sent.
     async fn send_message(&self, to: String, payload: Bytes) -> Result<(), TransportError>;
 
-    /// Broadcasts data to all connected peers.
+    /// Broadcasts data to all connected peers except the sender.
+    ///
+    /// # Arguments
+    /// * `from` - Address of the sender to exclude from broadcast
+    /// * `data` - Message data to broadcast
     ///
     /// # Errors
     /// Returns an error string if any peer transmission fails.
-    async fn broadcast(&self, data: SerializableBytes) -> Result<(), String>;
+    async fn broadcast(&self, from: String, data: SerializableBytes) -> Result<(), String>;
 
     /// Returns the local address of this transport.
     fn addr(&self) -> String;

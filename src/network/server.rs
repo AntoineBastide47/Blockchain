@@ -2,7 +2,11 @@
 //!
 //! Processes incoming RPCs from the server's transport in a unified event loop.
 
+use crate::core::block::{Block, Header};
+use crate::core::blockchain::Blockchain;
+use crate::core::storage::ThreadSafeMemoryStorage;
 use crate::core::transaction::Transaction;
+use crate::core::validator::BlockValidator;
 use crate::crypto::key_pair::PrivateKey;
 use crate::network::local_transport::LocalTransport;
 use crate::network::rpc::{
@@ -10,67 +14,104 @@ use crate::network::rpc::{
 };
 use crate::network::transport::Transport;
 use crate::network::txpool::TxPool;
-use crate::{error, info, warn};
+use crate::types::hash::Hash;
+use crate::utils::log::Logger;
 use borsh::{BorshDeserialize, BorshSerialize};
-use bytes::Bytes;
 use std::io::Cursor;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::interval;
 
-/// Configuration options for the server.
-pub struct ServerOps {
-    /// Optional custom handler for incoming RPC messages. Uses default handler if `None`.
-    pub rpc_handler: Option<HandleRpcFn>,
-    /// This server's transport layer (its network identity).
-    pub transport: Arc<LocalTransport>,
-    /// If set, this node becomes a validator node.
-    pub private_key: Option<PrivateKey>,
-    /// The max capacity of the transaction pool hosted on this node.
-    pub transaction_pool_capacity: Option<usize>,
-    /// How often new blocks are created.
-    pub block_time: Duration,
-}
+/// Well-known private key bytes used exclusively for signing the genesis block.
+/// This key has no authority beyond genesis; it exists solely to produce a
+/// deterministic, verifiable genesis block signature across all nodes.
+const GENESIS_PRIVATE_KEY_BYTES: [u8; 32] = [
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+    0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
+];
 
-impl ServerOps {
-    /// Creates server options with sensible defaults for a non-validator node.
-    pub fn default(transport: Arc<LocalTransport>, block_time: Duration) -> Self {
-        Self {
-            rpc_handler: None,
-            transport,
-            private_key: None,
-            transaction_pool_capacity: None,
-            block_time,
-        }
-    }
-}
+/// The genesis block, lazily initialized once and shared across all server instances.
+static GENESIS_BLOCK: LazyLock<Arc<Block>> = LazyLock::new(|| {
+    let header = Header {
+        version: 1,
+        height: 0,
+        timestamp: 0,
+        previous_block: Hash::zero(),
+        data_hash: Hash::zero(),
+        merkle_root: Hash::zero(),
+    };
+    let genesis_key = PrivateKey::from_bytes(&GENESIS_PRIVATE_KEY_BYTES)
+        .expect("GENESIS_PRIVATE_KEY_BYTES must be a valid secp256k1 scalar");
+    Block::new(header, genesis_key, vec![]).expect("genesis block creation must not fail")
+});
 
 /// Blockchain server managing a single transport layer.
 ///
 /// Processes RPC messages from the transport in an event loop,
 /// handling transactions and block creation.
 pub struct Server {
-    options: ServerOps,
+    /// Logger instance for this server.
+    logger: Logger,
+    /// Optional custom handler for incoming RPC messages. Uses default handler if `None`.
+    rpc_handler: Option<HandleRpcFn>,
+    /// This server's transport layer (its network identity).
+    transport: Arc<LocalTransport>,
+    /// If set, this node becomes a validator node.
+    private_key: Option<PrivateKey>,
+    /// How often new blocks are created.
+    block_time: Duration,
+    /// Whether this node participates in block creation.
     is_validator: bool,
+    /// Pool of pending transactions awaiting inclusion in a block.
     tx_pool: TxPool,
+    /// The local blockchain state with block validation and persistent storage.
+    chain: Blockchain<BlockValidator, ThreadSafeMemoryStorage>,
 }
 
 impl Server {
-    /// Creates a new server with the specified configuration.
-    pub fn new(options: ServerOps) -> Arc<Self> {
-        let is_validator = options.private_key.is_some();
-        let tx_pool = TxPool::new(options.transaction_pool_capacity);
+    /// Returns the shared genesis block.
+    fn genesis_block() -> Arc<Block> {
+        Arc::clone(&GENESIS_BLOCK)
+    }
+
+    /// Creates a new server with full configuration options.
+    ///
+    /// Sets `is_validator` to true if `private_key` is provided.
+    pub fn new(
+        id: impl Into<Arc<str>>,
+        transport: Arc<LocalTransport>,
+        block_time: Duration,
+        private_key: Option<PrivateKey>,
+        transaction_pool_capacity: Option<usize>,
+        rpc_handler: Option<HandleRpcFn>,
+    ) -> Arc<Self> {
+        let is_validator = private_key.is_some();
+        let logger = Logger::new(id);
         let server = Arc::new(Self {
-            options,
+            logger: logger.clone(),
+            rpc_handler,
+            transport,
+            private_key,
             is_validator,
-            tx_pool,
+            tx_pool: TxPool::new(transaction_pool_capacity),
+            block_time,
+            chain: Blockchain::new(Self::genesis_block(), logger),
         });
 
         let server_thread = server.clone();
         tokio::spawn(async move { server_thread.validator_loop().await });
 
         server
+    }
+
+    /// Creates a new server with sensible defaults for a non-validator node.
+    pub fn default(
+        id: impl Into<Arc<str>>,
+        transport: Arc<LocalTransport>,
+        block_time: Duration,
+    ) -> Arc<Self> {
+        Self::new(id, transport, block_time, None, None, None)
     }
 
     /// Starts the server and begins processing incoming messages.
@@ -83,7 +124,7 @@ impl Server {
         loop {
             tokio::select! {
                 Some(rpc) = rx.recv() => {
-                    let result = match &self.options.rpc_handler {
+                    let result = match &self.rpc_handler {
                         Some(handler) => handler(rpc),
                         None => handle_rpc(rpc),
                     };
@@ -91,11 +132,11 @@ impl Server {
                     match result {
                         Ok(msg) => {
                             if let Err(e) = &self.clone().process_message(msg).await {
-                                error!("failed to process rpc: {}", e)
+                                self.logger.error(&format!("failed to process rpc: {}", e));
                             }
 
                         },
-                        Err(e) => error!("failed to process rpc: {}", e)
+                        Err(e) => self.logger.error(&format!("failed to process rpc: {}", e))
                     }
                 }
                 else => {
@@ -104,24 +145,28 @@ impl Server {
             }
         }
 
-        info!("Server shut down");
+        self.logger.info("Server shut down");
     }
 
     async fn validator_loop(&self) {
-        let mut ticker = interval(self.options.block_time);
+        let mut ticker = interval(self.block_time);
+        self.logger.info(&format!(
+            "starting the validator loop: block_time={}",
+            self.block_time.as_secs()
+        ));
 
         loop {
             ticker.tick().await;
 
             if self.is_validator {
-                self.create_block().await;
+                self.create_new_block().await;
             }
         }
     }
 
     /// Spawns an async task to forward messages from the transport to the main channel.
     async fn init_transport(&self, sx: Sender<Rpc>) {
-        let tr = self.options.transport.clone();
+        let tr = self.transport.clone();
         tokio::spawn(async move {
             let mut rx = tr.consume().await;
             while let Some(rpc) = rx.recv().await {
@@ -130,14 +175,44 @@ impl Server {
         });
     }
 
-    async fn create_block(&self) {
-        info!(
-            "create a block every {} seconds",
-            self.options.block_time.as_secs()
-        );
+    async fn create_new_block(&self) {
+        match self.chain.build_block(
+            self.private_key.clone().unwrap(),
+            self.tx_pool.transactions(),
+            // TODO: when better transactions are implemented, use a complexity function to determine how many transactions can be added to each block
+        ) {
+            Ok(block) => {
+                if self.chain.add_block(block) {
+                    self.tx_pool.flush()
+                }
+            }
+            Err(e) => self.logger.error(&format!("{e}")),
+        }
     }
+
+    /// Validates and adds a transaction to the local pool.
+    pub fn add_to_pool(&self, transaction: &Transaction) -> Result<(), String> {
+        if !transaction.verify() {
+            return Err(format!(
+                "cannot add unverified transaction: hash={}",
+                transaction.hash
+            ));
+        }
+        self.tx_pool.append(transaction.clone());
+        Ok(())
+    }
+
+    /// Returns a reference to the server's transport.
+    pub fn transport(&self) -> &Arc<LocalTransport> {
+        &self.transport
+    }
+
     /// Serializes and broadcasts a transaction to all connected peers.
-    async fn broadcast_transaction(&self, transaction: Transaction) -> Result<(), String> {
+    async fn broadcast_transaction(
+        &self,
+        from: String,
+        transaction: Transaction,
+    ) -> Result<(), String> {
         let mut buf = Vec::new();
         match transaction.serialize(&mut buf) {
             Ok(_) => {
@@ -145,7 +220,7 @@ impl Server {
                 let mut buf = Vec::new();
 
                 match msg.serialize(&mut buf) {
-                    Ok(_) => self.broadcast(buf.into()).await,
+                    Ok(_) => self.transport.broadcast(from, buf.into()).await,
                     Err(e) => Err(e.to_string()),
                 }
             }
@@ -153,25 +228,20 @@ impl Server {
         }
     }
 
-    /// Broadcasts raw payload bytes to all connected peers via the transport layer.
-    async fn broadcast(&self, payload: Bytes) -> Result<(), String> {
-        self.options.transport.broadcast(payload.into()).await
-    }
-
     /// Validates and adds a transaction to the pool, then broadcasts to peers.
     ///
     /// Skips duplicate transactions. Returns an error if verification fails.
     async fn process_transaction(
         self: Arc<Self>,
-        _from: String,
+        from: String,
         transaction: Transaction,
     ) -> Result<(), String> {
         if self.tx_pool.contains(transaction.hash) {
-            warn!(
+            self.logger.warn(&format!(
                 "({}) attempting to add a new transaction to the pool that already is in it: hash={}",
-                self.options.transport.addr(),
+                self.transport.addr(),
                 transaction.hash
-            );
+            ));
             return Ok(());
         }
 
@@ -182,13 +252,14 @@ impl Server {
             ));
         }
 
-        info!(
-            "adding a new transaction to the pool: hash={}",
-            transaction.hash
-        );
+        // self.logger.info(&format!(
+        //     "adding a new transaction to the pool: hash={} pool_size={}",
+        //     transaction.hash,
+        //     self.tx_pool.length()
+        // ));
         self.tx_pool.append(transaction.clone());
 
-        tokio::spawn(async move { self.broadcast_transaction(transaction.clone()).await });
+        tokio::spawn(async move { self.broadcast_transaction(from, transaction.clone()).await });
 
         Ok(())
     }
@@ -236,19 +307,21 @@ mod tests {
     #[tokio::test]
     async fn server_is_validator_when_private_key_set() {
         let transport = LocalTransport::new("validator");
-        let mut options = ServerOps::default(transport, Duration::from_secs(10));
-        options.private_key = Some(PrivateKey::new());
-
-        let server = Server::new(options);
+        let server = Server::new(
+            "test-validator",
+            transport,
+            Duration::from_secs(10),
+            Some(PrivateKey::new()),
+            None,
+            None,
+        );
         assert!(server.is_validator);
     }
 
     #[tokio::test]
     async fn server_is_not_validator_without_private_key() {
         let transport = LocalTransport::new("node");
-        let options = ServerOps::default(transport, Duration::from_secs(10));
-
-        let server = Server::new(options);
+        let server = Server::default("test-node", transport, Duration::from_secs(10));
         assert!(!server.is_validator);
     }
 

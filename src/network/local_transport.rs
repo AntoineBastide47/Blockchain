@@ -38,11 +38,12 @@ impl LocalTransport {
         })
     }
 
-    /// Establishes a connection to another transport node.
+    /// Establishes a bidirectional connection to another transport node.
     ///
-    /// Adds the peer to this transport's routing table for message delivery.
-    pub async fn connect(&self, other: Arc<LocalTransport>) {
-        self.peers.insert(other.addr().to_string(), other);
+    /// Both transports are added to each other's routing tables.
+    pub async fn connect(self: &Arc<LocalTransport>, other: &Arc<LocalTransport>) {
+        self.peers.insert(other.addr(), other.clone());
+        other.peers.insert(self.addr(), self.clone());
     }
 }
 
@@ -67,8 +68,11 @@ impl Transport for LocalTransport {
             .map_err(|_| TransportError::SendFailed(to.to_string()))
     }
 
-    async fn broadcast(&self, data: SerializableBytes) -> Result<(), String> {
+    async fn broadcast(&self, from: String, data: SerializableBytes) -> Result<(), String> {
         for peer in &self.peers {
+            if from == peer.addr() {
+                continue;
+            }
             if let Err(e) = self.send_message(peer.addr(), data.0.clone()).await {
                 return Err(e.to_string());
             }
@@ -90,8 +94,8 @@ mod tests {
         let tr_a = LocalTransport::new("A");
         let tr_b = LocalTransport::new("B");
 
-        tr_a.connect(tr_b.clone()).await;
-        tr_b.connect(tr_a.clone()).await;
+        tr_a.connect(&tr_b).await;
+        tr_b.connect(&tr_a).await;
 
         assert!(tr_a.peers.contains_key("B"));
         assert_eq!(tr_a.peers.get("B").unwrap().addr(), tr_b.addr());
@@ -105,8 +109,8 @@ mod tests {
         let tr_a = LocalTransport::new("A");
         let tr_b = LocalTransport::new("B");
 
-        tr_a.connect(tr_b.clone()).await;
-        tr_b.connect(tr_a.clone()).await;
+        tr_a.connect(&tr_b).await;
+        tr_b.connect(&tr_a).await;
 
         let mut rx = tr_b.consume().await;
 
@@ -126,14 +130,14 @@ mod tests {
         let tr_b = LocalTransport::new("B");
         let tr_c = LocalTransport::new("C");
 
-        tr_a.connect(tr_b.clone()).await;
-        tr_a.connect(tr_c.clone()).await;
+        tr_a.connect(&tr_b).await;
+        tr_a.connect(&tr_c).await;
 
         let mut rx_b = tr_b.consume().await;
         let mut rx_c = tr_c.consume().await;
 
         let payload = SerializableBytes::new("Broadcast message");
-        tr_a.broadcast(payload.clone()).await.unwrap();
+        tr_a.broadcast(tr_a.addr(), payload.clone()).await.unwrap();
 
         let received_b = rx_b.recv().await.unwrap();
         assert_eq!(received_b.from, tr_a.address);
@@ -142,5 +146,98 @@ mod tests {
         let received_c = rx_c.recv().await.unwrap();
         assert_eq!(received_c.from, tr_a.address);
         assert_eq!(received_c.payload, payload);
+    }
+
+    #[tokio::test]
+    async fn connect_is_bidirectional() {
+        let tr_a = LocalTransport::new("A");
+        let tr_b = LocalTransport::new("B");
+
+        // Single connect call should add both directions
+        tr_a.connect(&tr_b).await;
+
+        assert!(tr_a.peers.contains_key("B"));
+        assert!(tr_b.peers.contains_key("A"));
+    }
+
+    #[tokio::test]
+    async fn connect_multiple_peers() {
+        let tr_a = LocalTransport::new("A");
+        let tr_b = LocalTransport::new("B");
+        let tr_c = LocalTransport::new("C");
+
+        tr_a.connect(&tr_b).await;
+        tr_a.connect(&tr_c).await;
+
+        assert_eq!(tr_a.peers.len(), 2);
+        assert!(tr_a.peers.contains_key("B"));
+        assert!(tr_a.peers.contains_key("C"));
+
+        // B and C should only have A as peer
+        assert_eq!(tr_b.peers.len(), 1);
+        assert_eq!(tr_c.peers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn broadcast_excludes_sender() {
+        let tr_a = LocalTransport::new("A");
+        let tr_b = LocalTransport::new("B");
+        let tr_c = LocalTransport::new("C");
+
+        tr_a.connect(&tr_b).await;
+        tr_b.connect(&tr_c).await;
+
+        let mut rx_a = tr_a.consume().await;
+        let mut rx_c = tr_c.consume().await;
+
+        let payload = SerializableBytes::new("Broadcast from B");
+        tr_b.broadcast(tr_b.addr(), payload.clone()).await.unwrap();
+
+        // A and C should receive the message
+        let received_a = rx_a.recv().await.unwrap();
+        assert_eq!(received_a.from, tr_b.address);
+
+        let received_c = rx_c.recv().await.unwrap();
+        assert_eq!(received_c.from, tr_b.address);
+    }
+
+    #[tokio::test]
+    async fn send_to_nonexistent_peer_fails() {
+        let tr_a = LocalTransport::new("A");
+
+        let result = tr_a
+            .send_message("NonExistent".to_string(), Bytes::from("test"))
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn addr_returns_correct_address() {
+        let tr = LocalTransport::new("TestAddr");
+        assert_eq!(tr.addr(), "TestAddr");
+    }
+
+    #[tokio::test]
+    async fn chain_topology_message_passing() {
+        // A -> B -> C topology
+        let tr_a = LocalTransport::new("A");
+        let tr_b = LocalTransport::new("B");
+        let tr_c = LocalTransport::new("C");
+
+        tr_a.connect(&tr_b).await;
+        tr_b.connect(&tr_c).await;
+
+        let mut rx_b = tr_b.consume().await;
+
+        // A sends to B
+        tr_a.send_message(tr_b.addr(), Bytes::from("from A"))
+            .await
+            .unwrap();
+        let msg = rx_b.recv().await.unwrap();
+        assert_eq!(msg.from, "A");
+
+        // A cannot send directly to C (not connected)
+        let result = tr_a.send_message(tr_c.addr(), Bytes::from("test")).await;
+        assert!(result.is_err());
     }
 }

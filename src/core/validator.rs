@@ -5,6 +5,7 @@
 
 use crate::core::block::Block;
 use crate::core::storage::Storage;
+use crate::utils::log::Logger;
 use std::error::Error;
 use std::fmt::Debug;
 
@@ -20,11 +21,17 @@ pub trait Validator: Send + Sync {
     ///
     /// * `block` - The block to validate.
     /// * `storage` - Current chain state for context.
+    /// * `logger` - Logger for validation messages.
     ///
     /// # Returns
     ///
     /// `true` if the block is valid and can be added to the chain.
-    fn validate_block<S: Storage>(&self, block: &Block, storage: &S) -> Result<(), Self::Error>;
+    fn validate_block<S: Storage>(
+        &self,
+        block: &Block,
+        storage: &S,
+        logger: &Logger,
+    ) -> Result<(), Self::Error>;
 }
 
 /// Default block validator implementing consensus rules.
@@ -55,7 +62,12 @@ pub enum BlockValidatorError {
 
 impl Validator for BlockValidator {
     type Error = BlockValidatorError;
-    fn validate_block<S: Storage>(&self, block: &Block, storage: &S) -> Result<(), Self::Error> {
+    fn validate_block<S: Storage>(
+        &self,
+        block: &Block,
+        storage: &S,
+        logger: &Logger,
+    ) -> Result<(), Self::Error> {
         let expected_height = storage.height().checked_add(1);
         if expected_height != Some(block.header.height) {
             return Err(BlockValidatorError::InvalidHeight {
@@ -72,7 +84,7 @@ impl Validator for BlockValidator {
             return Err(BlockValidatorError::BlockExists);
         }
 
-        if !block.verify() {
+        if !block.verify(logger) {
             return Err(BlockValidatorError::InvalidSignature);
         }
 
@@ -89,6 +101,10 @@ mod tests {
     use crate::types::hash::Hash;
     use crate::utils::test_utils::utils::create_genesis;
     use std::sync::Arc;
+
+    fn test_logger() -> Logger {
+        Logger::new("test")
+    }
 
     fn create_block(height: u32, previous: Hash) -> Arc<Block> {
         let header = Header {
@@ -109,7 +125,11 @@ mod tests {
         let validator = BlockValidator;
 
         let block = create_block(1, genesis.header_hash);
-        assert!(validator.validate_block(&block, &storage).is_ok());
+        assert!(
+            validator
+                .validate_block(&block, &storage, &test_logger())
+                .is_ok()
+        );
     }
 
     #[test]
@@ -119,7 +139,11 @@ mod tests {
         let validator = BlockValidator;
 
         let block = create_block(5, genesis.header_hash);
-        assert!(validator.validate_block(&block, &storage).is_err());
+        assert!(
+            validator
+                .validate_block(&block, &storage, &test_logger())
+                .is_err()
+        );
     }
 
     #[test]
@@ -129,7 +153,11 @@ mod tests {
         let validator = BlockValidator;
 
         let block = create_block(1, Hash::random());
-        assert!(validator.validate_block(&block, &storage).is_err());
+        assert!(
+            validator
+                .validate_block(&block, &storage, &test_logger())
+                .is_err()
+        );
     }
 
     #[test]
@@ -138,11 +166,19 @@ mod tests {
         let validator = BlockValidator;
 
         let block = create_block(0, Hash::zero());
-        assert!(validator.validate_block(&block, &storage).is_err());
+        assert!(
+            validator
+                .validate_block(&block, &storage, &test_logger())
+                .is_err()
+        );
     }
 
     struct EmptyStorage;
     impl Storage for EmptyStorage {
+        fn new(_genesis: Arc<Block>) -> Self {
+            Self
+        }
+
         fn has_block(&self, _: Hash) -> bool {
             false
         }
@@ -152,7 +188,7 @@ mod tests {
         fn get_block(&self, _: Hash) -> Option<Arc<Block>> {
             None
         }
-        fn append_block(&mut self, _: Arc<Block>) {}
+        fn append_block(&self, _: Arc<Block>) {}
         fn height(&self) -> u32 {
             0
         }

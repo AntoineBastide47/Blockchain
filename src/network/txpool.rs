@@ -1,16 +1,30 @@
+//! Transaction pool for pending transactions awaiting block inclusion.
+//!
+//! Provides thread-safe storage and ordering of unconfirmed transactions.
+
 use crate::core::transaction::Transaction;
 use crate::types::hash::Hash;
 use dashmap::DashMap;
 use std::sync::RwLock;
 
-const TXPOOL_CAPACITY: usize = 100_000;
+/// Default transaction pool capacity.
+pub const TXPOOL_CAPACITY: usize = 100_000;
 
+/// Thread-safe pool of pending transactions.
+///
+/// Maintains insertion order for deterministic block construction while
+/// providing O(1) duplicate detection via hash lookup.
 pub struct TxPool {
+    /// Transactions indexed by hash for fast lookup and deduplication.
     transactions: DashMap<Hash, Transaction>,
+    /// Insertion order for deterministic transaction ordering in blocks.
     order: RwLock<Vec<Hash>>,
 }
 
 impl TxPool {
+    /// Creates a new transaction pool with the given capacity.
+    ///
+    /// Uses `TXPOOL_CAPACITY` if `None` is provided.
     pub fn new(capacity: Option<usize>) -> Self {
         let cap = capacity.unwrap_or(TXPOOL_CAPACITY);
 
@@ -20,10 +34,12 @@ impl TxPool {
         }
     }
 
+    /// Returns `true` if the pool contains a transaction with the given hash.
     pub fn contains(&self, hash: Hash) -> bool {
         self.transactions.contains_key(&hash)
     }
 
+    /// Adds a transaction to the pool if not already present.
     pub fn append(&self, transaction: Transaction) {
         let mut order = self.order.write().unwrap();
         order.push(transaction.hash);
@@ -33,15 +49,18 @@ impl TxPool {
             .or_insert(transaction);
     }
 
+    /// Returns the number of transactions in the pool.
     pub fn length(&self) -> usize {
         self.transactions.len()
     }
 
+    /// Removes all transactions from the pool.
     pub fn flush(&self) {
         self.transactions.clear()
     }
 
-    pub fn transactions(&self) -> Box<[Transaction]> {
+    /// Returns all transactions in insertion order.
+    pub fn transactions(&self) -> Vec<Transaction> {
         let order = self.order.read().unwrap();
 
         order
@@ -100,5 +119,104 @@ mod tests {
 
         pool.flush();
         assert_eq!(pool.length(), 0);
+    }
+
+    #[test]
+    fn contains_returns_false_for_empty_pool() {
+        let pool = TxPool::new(None);
+        let key = PrivateKey::new();
+        let tx = Transaction::new(b"test", key).expect("Hashing failed");
+        assert!(!pool.contains(tx.hash));
+    }
+
+    #[test]
+    fn contains_returns_true_after_append() {
+        let pool = TxPool::new(None);
+        let key = PrivateKey::new();
+        let tx = Transaction::new(b"test", key).expect("Hashing failed");
+        let hash = tx.hash;
+
+        pool.append(tx);
+        assert!(pool.contains(hash));
+    }
+
+    #[test]
+    fn transactions_returns_empty_vec_for_empty_pool() {
+        let pool = TxPool::new(None);
+        assert!(pool.transactions().is_empty());
+    }
+
+    #[test]
+    fn flush_clears_transactions_but_order_vector_remains() {
+        let pool = TxPool::new(None);
+        let key = PrivateKey::new();
+
+        for i in 0..5 {
+            let tx =
+                Transaction::new(i.to_string().as_bytes(), key.clone()).expect("Hashing failed");
+            pool.append(tx);
+        }
+
+        assert_eq!(pool.length(), 5);
+        pool.flush();
+        assert_eq!(pool.length(), 0);
+
+        // Transactions should be empty after flush
+        assert!(pool.transactions().is_empty());
+    }
+
+    #[test]
+    fn custom_capacity_is_respected() {
+        let pool = TxPool::new(Some(10));
+        assert_eq!(pool.length(), 0);
+    }
+
+    #[test]
+    fn duplicate_transaction_not_added_twice() {
+        let pool = TxPool::new(None);
+        let key = PrivateKey::new();
+        let tx = Transaction::new(b"same data", key).expect("Hashing failed");
+        let hash = tx.hash;
+
+        pool.append(tx.clone());
+        pool.append(tx);
+
+        assert_eq!(pool.length(), 1);
+        assert!(pool.contains(hash));
+    }
+
+    #[test]
+    fn transactions_with_same_data_different_keys_are_distinct() {
+        let pool = TxPool::new(None);
+        let key1 = PrivateKey::new();
+        let key2 = PrivateKey::new();
+
+        let tx1 = Transaction::new(b"same data", key1).expect("Hashing failed");
+        let tx2 = Transaction::new(b"same data", key2).expect("Hashing failed");
+
+        pool.append(tx1);
+        pool.append(tx2);
+
+        assert_eq!(pool.length(), 2);
+    }
+
+    #[test]
+    fn large_pool_maintains_order() {
+        let pool = TxPool::new(None);
+        let mut hashes = Vec::new();
+
+        for i in 0..1000 {
+            let tx = Transaction::new(i.to_string().as_bytes(), PrivateKey::new())
+                .expect("Hashing failed");
+            hashes.push(tx.hash);
+            pool.append(tx);
+        }
+
+        let pool_txs = pool.transactions();
+        assert_eq!(pool_txs.len(), 1000);
+
+        for (i, tx) in pool_txs.iter().enumerate() {
+            assert_eq!(tx.hash, hashes[i]);
+        }
     }
 }

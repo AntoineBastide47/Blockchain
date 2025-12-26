@@ -1,13 +1,13 @@
 //! Core blockchain data structure and block management.
 
 use crate::core::block::{Block, Header};
-use crate::core::storage::{InMemoryStorage, Storage};
+use crate::core::storage::{Storage, ThreadSafeMemoryStorage};
 use crate::core::transaction::Transaction;
 use crate::core::validator::{BlockValidator, Validator};
 use crate::crypto::key_pair::PrivateKey;
 use crate::types::binary_codec::BinaryCodecHash;
 use crate::types::hash::Hash;
-use crate::{info, warn};
+use crate::utils::log::Logger;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io;
@@ -16,27 +16,33 @@ use tokio::io;
 ///
 /// Generic over validator and storage types for zero-cost abstraction.
 pub struct Blockchain<V: Validator, S: Storage> {
+    /// Block storage backend.
     pub storage: S,
+    /// Block validator for consensus rules.
     pub validator: V,
+    /// Logger for chain operations.
+    logger: Logger,
 }
 
-impl Blockchain<BlockValidator, InMemoryStorage> {
-    // TODO: switch to non testing storage protocol
+impl Blockchain<BlockValidator, ThreadSafeMemoryStorage> {
     /// Creates a new blockchain with default validator and in-memory storage.
-    pub fn new(genesis: Arc<Block>) -> Self {
-        Blockchain {
-            storage: InMemoryStorage::new(genesis),
+    pub fn new(genesis: Arc<Block>, logger: Logger) -> Self {
+        logger.info(&format!(
+            "adding a new block to the chain: height={} hash={} transactions={}",
+            genesis.header.height,
+            genesis.header_hash,
+            genesis.transactions.len()
+        ));
+
+        Self {
+            storage: ThreadSafeMemoryStorage::new(genesis),
             validator: BlockValidator,
+            logger,
         }
     }
 }
 
 impl<V: Validator, S: Storage> Blockchain<V, S> {
-    /// Creates a new blockchain with custom validator and storage.
-    pub fn with_validator_and_storage(validator: V, storage: S) -> Self {
-        Blockchain { storage, validator }
-    }
-
     /// Returns the height of the chain.
     pub fn height(&self) -> u32 {
         self.storage.height()
@@ -82,19 +88,54 @@ impl<V: Validator, S: Storage> Blockchain<V, S> {
     /// Attempts to add a block to the chain.
     ///
     /// Returns `true` if the block passes validation, `false` otherwise.
-    pub fn add_block(&mut self, block: Arc<Block>) -> bool {
-        match self.validator.validate_block(&block, &self.storage) {
+    pub fn add_block(&self, block: Arc<Block>) -> bool {
+        match self
+            .validator
+            .validate_block(&block, &self.storage, &self.logger)
+        {
             Ok(_) => {
-                info!(
-                    "adding new block: height={}, hash={}",
-                    block.header.height, block.header_hash
-                );
+                self.logger.info(&format!(
+                    "adding a new block to the chain: height={} hash={} transactions={}",
+                    block.header.height,
+                    block.header_hash,
+                    block.transactions.len()
+                ));
 
                 self.storage.append_block(block);
                 true
             }
             Err(err) => {
-                warn!("block rejected: hash={}, error={}", block.header_hash, err);
+                self.logger.warn(&format!(
+                    "block rejected: hash={} error={}",
+                    block.header_hash, err
+                ));
+                false
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn add_block_mut(&mut self, block: Arc<Block>) -> bool {
+        match self
+            .validator
+            .validate_block(&block, &self.storage, &self.logger)
+        {
+            Ok(_) => {
+                self.logger.info(&format!(
+                    "adding a new block to the chain: height={} hash={} transactions={}",
+                    block.header.height,
+                    block.header_hash,
+                    block.transactions.len()
+                ));
+
+                self.storage.append_block_mut(block);
+                true
+            }
+            Err(err) => {
+                self.logger.warn(&format!(
+                    "block rejected: hash={} error={}",
+                    block.header_hash, err
+                ));
                 false
             }
         }
@@ -105,10 +146,28 @@ impl<V: Validator, S: Storage> Blockchain<V, S> {
 mod tests {
     use super::*;
     use crate::core::block::Header;
+    use crate::core::storage::InMemoryStorage;
     use crate::crypto::key_pair::PrivateKey;
     use crate::types::hash::Hash;
     use crate::utils::test_utils::utils::create_genesis;
     use thiserror::Error;
+
+    fn test_logger() -> Logger {
+        Logger::new("test")
+    }
+
+    /// Creates a new blockchain with custom validator and storage.
+    pub fn with_validator_and_storage<V: Validator, S: Storage>(
+        validator: V,
+        storage: S,
+        logger: Logger,
+    ) -> Blockchain<V, S> {
+        Blockchain {
+            storage,
+            validator,
+            logger,
+        }
+    }
 
     #[derive(Debug, Error)]
     enum TestError {
@@ -116,7 +175,6 @@ mod tests {
         Dummy,
     }
 
-    #[derive(Clone)]
     struct AcceptAllValidator;
     impl Validator for AcceptAllValidator {
         type Error = TestError;
@@ -124,12 +182,12 @@ mod tests {
             &self,
             _block: &Block,
             _storage: &S,
+            _logger: &Logger,
         ) -> Result<(), Self::Error> {
             Ok(())
         }
     }
 
-    #[derive(Clone)]
     struct RejectAllValidator;
     impl Validator for RejectAllValidator {
         type Error = TestError;
@@ -137,6 +195,7 @@ mod tests {
             &self,
             _block: &Block,
             _storage: &S,
+            _logger: &Logger,
         ) -> Result<(), Self::Error> {
             Err(TestError::Dummy)
         }
@@ -157,7 +216,7 @@ mod tests {
     fn new_creates_blockchain_with_genesis() {
         let block = create_genesis();
         let hash = block.header_hash;
-        let bc = Blockchain::new(block);
+        let bc = Blockchain::new(block, test_logger());
         assert_eq!(bc.height(), 0);
         assert!(bc.get_block(hash).is_some());
     }
@@ -166,29 +225,31 @@ mod tests {
     fn height_increases_with_blocks() {
         let genesis = create_genesis();
         let storage = InMemoryStorage::new(genesis.clone());
-        let mut bc = Blockchain::with_validator_and_storage(AcceptAllValidator, storage);
+        let mut bc = with_validator_and_storage(AcceptAllValidator, storage, test_logger());
 
         let block1 = Block::new(
-            create_header(1, genesis.header_hash),
+            create_header(1, bc.storage.tip()),
             PrivateKey::new(),
             vec![],
         )
         .unwrap();
 
-        assert!(bc.add_block(block1));
+        assert!(bc.add_block_mut(block1));
         assert_eq!(bc.height(), 1);
     }
 
     #[test]
     fn add_block_respects_validator() {
         let genesis = create_genesis();
-        let mut accept_bc = Blockchain::with_validator_and_storage(
+        let mut accept_bc = with_validator_and_storage(
             AcceptAllValidator,
             InMemoryStorage::new(genesis.clone()),
+            test_logger(),
         );
-        let mut reject_bc = Blockchain::with_validator_and_storage(
+        let mut reject_bc = with_validator_and_storage(
             RejectAllValidator,
             InMemoryStorage::new(genesis.clone()),
+            test_logger(),
         );
 
         let block = Block::new(
@@ -198,28 +259,29 @@ mod tests {
         )
         .unwrap();
 
-        assert!(accept_bc.add_block(block.clone()));
-        assert!(!reject_bc.add_block(block));
+        assert!(accept_bc.add_block_mut(block.clone()));
+        assert!(!reject_bc.add_block_mut(block));
     }
 
     #[test]
     fn add_blocks() {
         let genesis = create_genesis();
-        let mut bc = Blockchain::with_validator_and_storage(
+        let mut bc = with_validator_and_storage(
             AcceptAllValidator,
             InMemoryStorage::new(genesis.clone()),
+            test_logger(),
         );
 
         let block_count = 100;
         for _i in 1..=block_count {
             let block = bc.build_block(PrivateKey::new(), vec![]).unwrap();
-            assert!(bc.add_block(block));
+            assert!(bc.add_block_mut(block));
         }
 
         assert_eq!(bc.height(), block_count);
 
         let block = bc.build_block(PrivateKey::new(), vec![]).unwrap();
-        assert!(bc.add_block(block));
+        assert!(bc.add_block_mut(block));
         assert_eq!(bc.height(), block_count + 1);
     }
 }

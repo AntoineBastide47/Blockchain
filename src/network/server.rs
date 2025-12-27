@@ -182,8 +182,14 @@ impl Server {
             // TODO: when better transactions are implemented, use a complexity function to determine how many transactions can be added to each block
         ) {
             Ok(block) => {
-                if self.chain.add_block(block) {
-                    self.tx_pool.flush()
+                if self.chain.add_block(block.clone()) {
+                    self.tx_pool.flush();
+                    if let Err(e) = self
+                        .broadcast_block(self.logger.id.to_string(), block)
+                        .await
+                    {
+                        self.logger.warn(&format!("could not broadcast block: {e}"));
+                    }
                 }
             }
             Err(e) => self.logger.error(&format!("{e}")),
@@ -206,6 +212,28 @@ impl Server {
     pub fn transport(&self) -> &Arc<LocalTransport> {
         &self.transport
     }
+}
+
+// Broadcasting
+impl Server {
+    /// Wraps a payload in a protocol message and broadcasts to all connected peers.
+    ///
+    /// The `from` address is passed through to exclude the sender from receiving
+    /// their own broadcast.
+    async fn broadcast(
+        &self,
+        from: String,
+        payload: Vec<u8>,
+        msg_type: MessageType,
+    ) -> Result<(), String> {
+        let msg = Message::new(msg_type, payload);
+        let mut buf = Vec::new();
+
+        match msg.serialize(&mut buf) {
+            Ok(_) => self.transport.broadcast(from, buf.into()).await,
+            Err(e) => Err(e.to_string()),
+        }
+    }
 
     /// Serializes and broadcasts a transaction to all connected peers.
     async fn broadcast_transaction(
@@ -215,16 +243,34 @@ impl Server {
     ) -> Result<(), String> {
         let mut buf = Vec::new();
         match transaction.serialize(&mut buf) {
-            Ok(_) => {
-                let msg = Message::new(MessageType::Transaction, buf);
-                let mut buf = Vec::new();
-
-                match msg.serialize(&mut buf) {
-                    Ok(_) => self.transport.broadcast(from, buf.into()).await,
-                    Err(e) => Err(e.to_string()),
-                }
-            }
+            Ok(_) => self.broadcast(from, buf, MessageType::Transaction).await,
             Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Serializes and broadcasts a block to all connected peers.
+    async fn broadcast_block(&self, from: String, block: Arc<Block>) -> Result<(), String> {
+        let mut buf = Vec::new();
+        match block.serialize(&mut buf) {
+            Ok(_) => self.broadcast(from, buf, MessageType::Block).await,
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl RpcProcessor for Server {
+    async fn process_message(
+        self: Arc<Self>,
+        decoded_message: DecodedMessage,
+    ) -> Result<(), String> {
+        match decoded_message.data {
+            DecodedMessageData::Transaction(tx) => {
+                self.process_transaction(decoded_message.from, tx).await
+            }
+            DecodedMessageData::Block(block) => {
+                self.process_block(decoded_message.from, block).await
+            }
         }
     }
 
@@ -263,20 +309,18 @@ impl Server {
 
         Ok(())
     }
-}
 
-#[async_trait::async_trait]
-impl RpcProcessor for Server {
-    async fn process_message(
-        self: Arc<Self>,
-        decoded_message: DecodedMessage,
-    ) -> Result<(), String> {
-        match decoded_message.data {
-            DecodedMessageData::Transaction(tx) => {
-                self.process_transaction(decoded_message.from, tx).await
-            }
-            DecodedMessageData::Block(_) => todo!(),
+    /// Adds a received block to the chain and broadcasts it to peers.
+    ///
+    /// Returns `Ok` if the block was successfully added, or an error if
+    /// validation failed or the block was already present.
+    async fn process_block(self: Arc<Self>, from: String, block: Block) -> Result<(), String> {
+        let arc_block = Arc::new(block);
+        if self.chain.add_block(arc_block.clone()) {
+            tokio::spawn(async move { self.broadcast_block(from, arc_block).await });
+            return Ok(());
         }
+        Err("".to_string())
     }
 }
 
@@ -289,13 +333,21 @@ fn handle_rpc(rpc: Rpc) -> Result<DecodedMessage, String> {
         MessageType::Transaction => {
             let mut reader = Cursor::new(&msg.data.0);
             let tx = Transaction::deserialize_reader(&mut reader)
-                .map_err(|e| format!("failed to decode transaction: {}", e))?;
+                .map_err(|e| format!("failed to decode transaction: {e}"))?;
             Ok(DecodedMessage {
                 from: rpc.from.clone(),
                 data: DecodedMessageData::Transaction(tx),
             })
         }
-        MessageType::Block => Err("message header for block not implemented yet".to_string()),
+        MessageType::Block => {
+            let mut reader = Cursor::new(&msg.data.0);
+            let block = Block::deserialize_reader(&mut reader)
+                .map_err(|e| format!("failed to decode block: {e}"))?;
+            Ok(DecodedMessage {
+                from: rpc.from.clone(),
+                data: DecodedMessageData::Block(block),
+            })
+        }
     }
 }
 
@@ -369,5 +421,105 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("failed to decode transaction"));
+    }
+
+    fn create_test_block(transactions: Vec<Transaction>) -> Arc<Block> {
+        let header = Header {
+            version: 1,
+            height: 1,
+            timestamp: 1234567890,
+            previous_block: Hash::zero(),
+            data_hash: Hash::zero(),
+            merkle_root: Hash::zero(),
+        };
+        Block::new(header, PrivateKey::new(), transactions).expect("block creation failed")
+    }
+
+    #[test]
+    fn handle_rpc_decodes_valid_block() {
+        let block = create_test_block(vec![]);
+
+        let mut block_bytes = Vec::new();
+        block.serialize(&mut block_bytes).unwrap();
+
+        let msg = Message::new(MessageType::Block, block_bytes);
+        let mut msg_bytes = Vec::new();
+        msg.serialize(&mut msg_bytes).unwrap();
+
+        let rpc = Rpc::new("block_sender", msg_bytes);
+        let result = handle_rpc(rpc).expect("should decode successfully");
+
+        assert_eq!(result.from, "block_sender");
+        match result.data {
+            DecodedMessageData::Block(decoded_block) => {
+                assert_eq!(decoded_block.header_hash, block.header_hash);
+                assert_eq!(decoded_block.header.height, 1);
+            }
+            _ => panic!("expected Block variant"),
+        }
+    }
+
+    #[test]
+    fn handle_rpc_rejects_invalid_block_data() {
+        let msg = Message::new(MessageType::Block, vec![0x00, 0x01, 0x02]);
+        let mut msg_bytes = Vec::new();
+        msg.serialize(&mut msg_bytes).unwrap();
+
+        let rpc = Rpc::new("sender", msg_bytes);
+        let result = handle_rpc(rpc);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("failed to decode block"));
+    }
+
+    #[test]
+    fn handle_rpc_preserves_block_transactions() {
+        let key = PrivateKey::new();
+        let tx1 = Transaction::new(b"tx1".as_slice(), key.clone()).unwrap();
+        let tx2 = Transaction::new(b"tx2".as_slice(), key).unwrap();
+        let tx1_hash = tx1.hash;
+        let tx2_hash = tx2.hash;
+
+        let block = create_test_block(vec![tx1, tx2]);
+
+        let mut block_bytes = Vec::new();
+        block.serialize(&mut block_bytes).unwrap();
+
+        let msg = Message::new(MessageType::Block, block_bytes);
+        let mut msg_bytes = Vec::new();
+        msg.serialize(&mut msg_bytes).unwrap();
+
+        let rpc = Rpc::new("sender", msg_bytes);
+        let result = handle_rpc(rpc).expect("should decode successfully");
+
+        match result.data {
+            DecodedMessageData::Block(decoded_block) => {
+                assert_eq!(decoded_block.transactions.len(), 2);
+                assert_eq!(decoded_block.transactions[0].hash, tx1_hash);
+                assert_eq!(decoded_block.transactions[1].hash, tx2_hash);
+            }
+            _ => panic!("expected Block variant"),
+        }
+    }
+
+    #[test]
+    fn handle_rpc_decodes_block_with_truncated_data() {
+        let block = create_test_block(vec![]);
+
+        let mut block_bytes = Vec::new();
+        block.serialize(&mut block_bytes).unwrap();
+
+        // Truncate the block data
+        block_bytes.truncate(block_bytes.len() / 2);
+
+        let msg = Message::new(MessageType::Block, block_bytes);
+        let mut msg_bytes = Vec::new();
+        msg.serialize(&mut msg_bytes).unwrap();
+
+        let rpc = Rpc::new("sender", msg_bytes);
+        let result = handle_rpc(rpc);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("failed to decode block"));
     }
 }

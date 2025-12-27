@@ -33,6 +33,16 @@ async fn main() {
     tr_a.connect(&tr_b).await;
     tr_b.connect(&tr_c).await;
 
+    let connect_tr = tr_c.clone();
+    tokio::spawn(async move {
+        sleep(Duration::new(7, 0)).await;
+        let tr_late = LocalTransport::new("Late");
+        let server_late = make_server(tr_late.clone(), None);
+        tr_late.connect(&connect_tr).await;
+        let (sx, rx) = channel::<Rpc>(1024);
+        server_late.start(sx, rx).await
+    });
+
     log::init(log::Level::Info);
 
     let main_server = make_server(tr_local, Some(PrivateKey::new()));

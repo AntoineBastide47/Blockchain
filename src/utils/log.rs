@@ -84,7 +84,7 @@ fn log_with_id(level: Level, id: Option<&str>, message: &str) {
 /// allowing differentiation between multiple components (e.g., server instances).
 #[derive(Clone)]
 pub struct Logger {
-    id: Arc<str>,
+    pub id: Arc<str>,
 }
 
 impl Logger {

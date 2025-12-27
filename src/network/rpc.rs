@@ -7,6 +7,7 @@ use crate::core::block::Block;
 use crate::core::transaction::Transaction;
 use crate::types::serializable_bytes::SerializableBytes;
 use blockchain_derive::BinaryCodec;
+use std::format;
 use std::sync::Arc;
 
 /// Discriminant for message payload types.
@@ -86,7 +87,24 @@ pub type HandleRpcFn = fn(Rpc) -> Result<DecodedMessage, String>;
 /// Provides handlers for each message type after deserialization.
 #[async_trait::async_trait]
 pub trait RpcProcessor: Send + Sync {
+    /// Routes a decoded message to the appropriate type-specific handler.
+    ///
+    /// Dispatches to `process_transaction` or `process_block` based on the message payload.
     async fn process_message(self: Arc<Self>, decoded: DecodedMessage) -> Result<(), String>;
+
+    /// Validates and adds a transaction to the pool, then broadcasts to peers.
+    ///
+    /// Skips duplicate transactions. Returns an error if verification fails.
+    async fn process_transaction(
+        self: Arc<Self>,
+        from: String,
+        transaction: Transaction,
+    ) -> Result<(), String>;
+
+    /// Validates and adds a block to the chain, then broadcasts to peers.
+    ///
+    /// Returns an error if the block fails validation or cannot be added.
+    async fn process_block(self: Arc<Self>, from: String, block: Block) -> Result<(), String>;
 }
 
 #[cfg(test)]

@@ -4,13 +4,14 @@
 
 use crate::core::block::{Block, Header};
 use crate::core::blockchain::Blockchain;
-use crate::core::storage::ThreadSafeMemoryStorage;
+use crate::core::storage::{StorageError, ThreadSafeMemoryStorage};
 use crate::core::transaction::Transaction;
 use crate::core::validator::BlockValidator;
 use crate::crypto::key_pair::PrivateKey;
 use crate::network::local_transport::LocalTransport;
 use crate::network::rpc::{
-    DecodedMessage, DecodedMessageData, HandleRpcFn, Message, MessageType, Rpc, RpcProcessor,
+    DecodedMessage, DecodedMessageData, HandleRpcFn, Message, MessageType, Rpc, RpcError,
+    RpcProcessor,
 };
 use crate::network::transport::{Transport, TransportError};
 use crate::network::txpool::TxPool;
@@ -46,6 +47,25 @@ static GENESIS_BLOCK: LazyLock<Arc<Block>> = LazyLock::new(|| {
         .expect("GENESIS_PRIVATE_KEY_BYTES must be a valid secp256k1 scalar");
     Block::new(header, genesis_key, vec![])
 });
+
+/// Errors produced by the server while handling RPCs and state updates.
+#[derive(Debug, blockchain_derive::Error)]
+pub enum ServerError {
+    #[error("transaction failed verification: hash={0}")]
+    InvalidTransaction(Hash),
+
+    #[error("block rejected by chain: hash={hash} error={source}")]
+    BlockRejected { hash: Hash, source: StorageError },
+
+    #[error("transport error: {0}")]
+    Transport(TransportError),
+}
+
+impl From<TransportError> for ServerError {
+    fn from(err: TransportError) -> Self {
+        ServerError::Transport(err)
+    }
+}
 
 /// Blockchain server managing a single transport layer.
 ///
@@ -137,7 +157,7 @@ impl Server {
                             }
 
                         },
-                        Err(e) => self.logger.error(&format!("failed to process rpc: {}", e))
+                        Err(e) => self.logger.error(&format!("failed to decode rpc: {}", e))
                     }
                 }
                 else => {
@@ -181,24 +201,26 @@ impl Server {
             self.private_key.clone().unwrap(),
             self.tx_pool.transactions(),
         );
-        if self.chain.add_block(block.clone()) {
-            self.tx_pool.flush();
-            if let Err(e) = self
-                .broadcast_block(self.logger.id.to_string(), block)
-                .await
-            {
-                self.logger.warn(&format!("could not broadcast block: {e}"));
+        match self.chain.add_block(block.clone()) {
+            Ok(_) => {
+                self.tx_pool.flush();
+                if let Err(e) = self
+                    .broadcast_block(self.logger.id.to_string(), block)
+                    .await
+                {
+                    self.logger.warn(&format!("could not broadcast block: {e}"));
+                }
             }
+            Err(err) => self
+                .logger
+                .warn(&format!("could not add newly built block: {err}")),
         }
     }
 
     /// Validates and adds a transaction to the local pool.
-    pub fn add_to_pool(&self, transaction: &Transaction) -> Result<(), String> {
+    pub fn add_to_pool(&self, transaction: &Transaction) -> Result<(), ServerError> {
         if !transaction.verify() {
-            return Err(format!(
-                "cannot add unverified transaction: hash={}",
-                transaction.hash
-            ));
+            return Err(ServerError::InvalidTransaction(transaction.hash));
         }
         self.tx_pool.append(transaction.clone());
         Ok(())
@@ -246,7 +268,7 @@ impl Server {
         self: Arc<Self>,
         from: String,
         transaction: Transaction,
-    ) -> Result<(), String> {
+    ) -> Result<(), ServerError> {
         if self.tx_pool.contains(transaction.hash) {
             self.logger.warn(&format!(
                 "({}) attempting to add a new transaction to the pool that already is in it: hash={}",
@@ -257,17 +279,14 @@ impl Server {
         }
 
         if !transaction.verify() {
-            return Err(format!(
-                "attempting to add a new transaction to the pool that hasn't been verified: hash={}",
-                transaction.hash
-            ));
+            return Err(ServerError::InvalidTransaction(transaction.hash));
         }
 
-        self.logger.info(&format!(
-            "adding a new transaction to the pool: hash={} pool_size={}",
-            transaction.hash,
-            self.tx_pool.length()
-        ));
+        // self.logger.info(&format!(
+        //     "adding a new transaction to the pool: hash={} pool_size={}",
+        //     transaction.hash,
+        //     self.tx_pool.length()
+        // ));
         self.tx_pool.append(transaction.clone());
 
         tokio::spawn(async move { self.broadcast_transaction(from, transaction.clone()).await });
@@ -279,23 +298,28 @@ impl Server {
     ///
     /// Returns `Ok` if the block was successfully added, or an error if
     /// validation failed or the block was already present.
-    async fn process_block(self: Arc<Self>, from: String, block: Block) -> Result<(), String> {
+    async fn process_block(self: Arc<Self>, from: String, block: Block) -> Result<(), ServerError> {
         let arc_block = Arc::new(block);
-        if self.chain.add_block(arc_block.clone()) {
-            let hashes: Vec<Hash> = arc_block.transactions.iter().map(|tx| tx.hash).collect();
-            self.tx_pool.remove_batch(&hashes);
-            tokio::spawn(async move { self.broadcast_block(from, arc_block).await });
-            return Ok(());
-        }
-        Err("".to_string())
+        self.chain
+            .add_block(arc_block.clone())
+            .map_err(|e| ServerError::BlockRejected {
+                hash: arc_block.header_hash,
+                source: e,
+            })?;
+
+        let hashes: Vec<Hash> = arc_block.transactions.iter().map(|tx| tx.hash).collect();
+        self.tx_pool.remove_batch(&hashes);
+        tokio::spawn(async move { self.broadcast_block(from, arc_block).await });
+        Ok(())
     }
 }
 
 impl RpcProcessor for Server {
+    type Error = ServerError;
     fn process_message(
         self: Arc<Self>,
         decoded_message: DecodedMessage,
-    ) -> BoxFuture<'static, Result<(), String>> {
+    ) -> BoxFuture<'static, Result<(), Self::Error>> {
         Box::pin(async move {
             match decoded_message.data {
                 DecodedMessageData::Transaction(tx) => {
@@ -310,14 +334,16 @@ impl RpcProcessor for Server {
 }
 
 /// Default RPC handler that deserializes messages based on their type header.
-fn handle_rpc(rpc: Rpc) -> Result<DecodedMessage, String> {
-    let msg = Message::from_bytes(rpc.payload.as_ref())
-        .map_err(|e| format!("failed to decode message from {}: {:?}", rpc.from, e))?;
+fn handle_rpc(rpc: Rpc) -> Result<DecodedMessage, RpcError> {
+    let msg = Message::from_bytes(rpc.payload.as_ref()).map_err(|e| RpcError::Message {
+        from: rpc.from.clone(),
+        details: format!("{e:?}"),
+    })?;
 
     match msg.header {
         MessageType::Transaction => {
             let tx = Transaction::from_bytes(msg.data.as_ref())
-                .map_err(|e| format!("failed to decode transaction: {e:?}"))?;
+                .map_err(|e| RpcError::Transaction(format!("{e:?}")))?;
             Ok(DecodedMessage {
                 from: rpc.from.clone(),
                 data: DecodedMessageData::Transaction(tx),
@@ -325,7 +351,7 @@ fn handle_rpc(rpc: Rpc) -> Result<DecodedMessage, String> {
         }
         MessageType::Block => {
             let block = Block::from_bytes(msg.data.as_ref())
-                .map_err(|e| format!("failed to decode block: {e:?}"))?;
+                .map_err(|e| RpcError::Block(format!("{e:?}")))?;
             Ok(DecodedMessage {
                 from: rpc.from.clone(),
                 data: DecodedMessageData::Block(block),
@@ -386,8 +412,7 @@ mod tests {
         let rpc = Rpc::new("bad_sender", vec![0xFF, 0xFF, 0xFF]);
         let result = handle_rpc(rpc);
 
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("failed to decode message"));
+        assert!(matches!(result, Err(RpcError::Message { .. })));
     }
 
     #[test]
@@ -398,8 +423,7 @@ mod tests {
         let rpc = Rpc::new("sender", msg_bytes);
         let result = handle_rpc(rpc);
 
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("failed to decode transaction"));
+        assert!(matches!(result, Err(RpcError::Transaction { .. })));
     }
 
     fn create_test_block(transactions: Vec<Transaction>) -> Arc<Block> {
@@ -443,8 +467,7 @@ mod tests {
         let rpc = Rpc::new("sender", msg_bytes);
         let result = handle_rpc(rpc);
 
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("failed to decode block"));
+        assert!(matches!(result, Err(RpcError::Block { .. })));
     }
 
     #[test]
@@ -488,7 +511,6 @@ mod tests {
         let rpc = Rpc::new("sender", msg_bytes);
         let result = handle_rpc(rpc);
 
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("failed to decode block"));
+        assert!(matches!(result, Err(RpcError::Block { .. })));
     }
 }

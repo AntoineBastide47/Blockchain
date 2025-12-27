@@ -8,6 +8,8 @@ use crate::core::transaction::Transaction;
 use crate::types::bytes::Bytes;
 use crate::types::wrapper_types::BoxFuture;
 use blockchain_derive::BinaryCodec;
+use std::error::Error;
+use std::fmt::Debug;
 use std::sync::Arc;
 
 /// Discriminant for message payload types.
@@ -77,20 +79,34 @@ pub struct DecodedMessage {
     pub data: DecodedMessageData,
 }
 
+/// Errors that can occur while decoding RPC messages.
+#[derive(Debug, blockchain_derive::Error)]
+pub enum RpcError {
+    #[error("failed to decode message from {from}: {details}")]
+    Message { from: String, details: String },
+
+    #[error("failed to decode transaction: {0}")]
+    Transaction(String),
+
+    #[error("failed to decode block: {0}")]
+    Block(String),
+}
+
 /// Function signature for custom RPC handlers.
 ///
-/// Takes a raw RPC message and returns a decoded message or an error string.
-pub type HandleRpcFn = fn(Rpc) -> Result<DecodedMessage, String>;
+/// Takes a raw RPC message and returns a decoded message or a decoding error.
+pub type HandleRpcFn = fn(Rpc) -> Result<DecodedMessage, RpcError>;
 
 /// Trait for processing decoded message payloads.
 ///
 /// Implementors handle decoded RPC messages after deserialization.
 pub trait RpcProcessor: Send + Sync {
+    type Error: Debug + Error;
     /// Routes a decoded message to the appropriate type-specific handler.
     fn process_message(
         self: Arc<Self>,
         decoded: DecodedMessage,
-    ) -> BoxFuture<'static, Result<(), String>>;
+    ) -> BoxFuture<'static, Result<(), Self::Error>>;
 }
 
 #[cfg(test)]

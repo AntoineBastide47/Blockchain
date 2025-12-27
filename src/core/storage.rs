@@ -9,6 +9,16 @@ use std::collections::HashMap;
 
 use std::sync::{Arc, Mutex};
 
+/// Errors that can occur while interacting with storage backends.
+#[derive(Debug, blockchain_derive::Error)]
+pub enum StorageError {
+    #[error("block does not extend current tip: expected previous hash {expected}, got {actual}")]
+    NotOnTip { expected: Hash, actual: Hash },
+
+    #[error("block validation failed: {0}")]
+    ValidationFailed(String),
+}
+
 /// Storage backend for blockchain data.
 ///
 /// Implementations must be thread-safe (`Send + Sync`) to support
@@ -27,7 +37,7 @@ pub trait Storage: Send + Sync {
     fn get_block(&self, hash: Hash) -> Option<Arc<Block>>;
 
     /// Appends a block to storage and updates the chain tip (thread-safe).
-    fn append_block(&self, _block: Arc<Block>) -> Result<(), String>;
+    fn append_block(&self, _block: Arc<Block>) -> Result<(), StorageError>;
 
     /// Returns the current chain height (genesis = 0).
     fn height(&self) -> u32;
@@ -90,11 +100,15 @@ impl Storage for ThreadSafeMemoryStorage {
         inner.blocks.get(&hash).cloned()
     }
 
-    fn append_block(&self, block: Arc<Block>) -> Result<(), String> {
+    fn append_block(&self, block: Arc<Block>) -> Result<(), StorageError> {
         let mut inner = self.inner.lock().unwrap();
 
-        if block.header.previous_block != inner.tip {
-            return Err("Invalid chain".to_string());
+        let expected_tip = inner.tip;
+        if block.header.previous_block != expected_tip {
+            return Err(StorageError::NotOnTip {
+                expected: expected_tip,
+                actual: block.header.previous_block,
+            });
         }
 
         let hash = block.header_hash;
@@ -178,7 +192,7 @@ pub mod tests {
             self.blocks.get(&hash).cloned()
         }
 
-        fn append_block(&self, _block: Arc<Block>) -> Result<(), String> {
+        fn append_block(&self, _block: Arc<Block>) -> Result<(), StorageError> {
             panic!(
                 "TestStorage::append_block is not supported. Use append_block_mut from StorageExtForTests trait instead."
             )

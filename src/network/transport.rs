@@ -57,7 +57,7 @@ pub trait Transport: Send + Sync {
     /// * `data` - Message data to broadcast
     ///
     /// # Errors
-    /// Returns an error string if any peer transmission fails.
+    /// Returns a `TransportError` if any peer transmission fails.
     fn broadcast(
         self: &Arc<Self>,
         from: String,

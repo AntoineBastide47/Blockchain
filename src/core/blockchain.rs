@@ -1,7 +1,7 @@
 //! Core blockchain data structure and block management.
 
 use crate::core::block::{Block, Header};
-use crate::core::storage::{Storage, ThreadSafeMemoryStorage};
+use crate::core::storage::{Storage, StorageError, ThreadSafeMemoryStorage};
 use crate::core::transaction::Transaction;
 use crate::core::validator::{BlockValidator, Validator};
 use crate::crypto::key_pair::PrivateKey;
@@ -82,8 +82,12 @@ impl<V: Validator, S: Storage> Blockchain<V, S> {
 
     /// Attempts to add a block to the chain.
     ///
-    /// Returns `true` if the block passes validation, `false` otherwise.
-    pub fn add_block(&self, block: Arc<Block>) -> bool {
+    /// Returns an error if validation or storage persistence fails.
+    pub fn add_block(&self, block: Arc<Block>) -> Result<(), StorageError> {
+        let block_height = block.header.height;
+        let block_hash = block.header_hash;
+        let tx_count = block.transactions.len();
+
         match self
             .validator
             .validate_block(&block, &self.storage, &self.logger)
@@ -91,19 +95,17 @@ impl<V: Validator, S: Storage> Blockchain<V, S> {
             Ok(_) => {
                 self.logger.info(&format!(
                     "adding a new block to the chain: height={} hash={} transactions={}",
-                    block.header.height,
-                    block.header_hash,
-                    block.transactions.len()
+                    block_height, block_hash, tx_count
                 ));
 
-                self.storage.append_block(block).is_ok()
+                self.storage.append_block(block)
             }
             Err(err) => {
                 self.logger.warn(&format!(
                     "block rejected: hash={} error={}",
-                    block.header_hash, err
+                    block_hash, err
                 ));
-                false
+                Err(StorageError::ValidationFailed(err.to_string()))
             }
         }
     }
@@ -139,7 +141,7 @@ mod tests {
     pub fn add_block_mut<V: Validator, S: Storage + StorageExtForTests>(
         chain: &mut Blockchain<V, S>,
         block: Arc<Block>,
-    ) -> bool {
+    ) -> Result<(), StorageError> {
         match chain
             .validator
             .validate_block(&block, &chain.storage, &chain.logger)
@@ -153,14 +155,14 @@ mod tests {
                 ));
 
                 chain.storage.append_block_mut(block);
-                true
+                Ok(())
             }
             Err(err) => {
                 chain.logger.warn(&format!(
                     "block rejected: hash={} error={}",
                     block.header_hash, err
                 ));
-                false
+                Err(StorageError::ValidationFailed(err.to_string()))
             }
         }
     }
@@ -229,7 +231,7 @@ mod tests {
             vec![],
         );
 
-        assert!(add_block_mut(&mut bc, block1));
+        assert!(add_block_mut(&mut bc, block1).is_ok());
         assert_eq!(bc.height(), 1);
     }
 
@@ -253,8 +255,8 @@ mod tests {
             vec![],
         );
 
-        assert!(add_block_mut(&mut accept_bc, block.clone()));
-        assert!(!add_block_mut(&mut reject_bc, block));
+        assert!(add_block_mut(&mut accept_bc, block.clone()).is_ok());
+        assert!(add_block_mut(&mut reject_bc, block).is_err());
     }
 
     #[test]
@@ -269,13 +271,13 @@ mod tests {
         let block_count = 100;
         for _i in 1..=block_count {
             let block = bc.build_block(PrivateKey::new(), vec![]);
-            assert!(add_block_mut(&mut bc, block));
+            assert!(add_block_mut(&mut bc, block).is_ok());
         }
 
         assert_eq!(bc.height(), block_count);
 
         let block = bc.build_block(PrivateKey::new(), vec![]);
-        assert!(add_block_mut(&mut bc, block));
+        assert!(add_block_mut(&mut bc, block).is_ok());
         assert_eq!(bc.height(), block_count + 1);
     }
 }

@@ -96,7 +96,7 @@ impl Validator for BlockValidator {
 mod tests {
     use super::*;
     use crate::core::block::{Block, Header};
-    use crate::core::storage::tests::TestStorage;
+    use crate::core::storage::{StorageError, tests::TestStorage};
     use crate::crypto::key_pair::PrivateKey;
     use crate::types::hash::Hash;
     use crate::utils::test_utils::utils::{create_genesis, random_hash};
@@ -188,7 +188,7 @@ mod tests {
         fn get_block(&self, _: Hash) -> Option<Arc<Block>> {
             None
         }
-        fn append_block(&self, _: Arc<Block>) -> Result<(), String> {
+        fn append_block(&self, _: Arc<Block>) -> Result<(), StorageError> {
             Ok(())
         }
         fn height(&self) -> u32 {

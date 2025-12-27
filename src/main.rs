@@ -6,10 +6,11 @@ use crate::core::transaction::Transaction;
 use crate::crypto::key_pair::PrivateKey;
 use crate::network::local_transport::LocalTransport;
 use crate::network::rpc::{Message, MessageType, Rpc};
-use crate::network::server::Server;
-use crate::network::transport::Transport;
+use crate::network::server::{Server, ServerError};
+use crate::network::transport::{Transport, TransportError};
 use crate::types::encoding::Encode;
-use crate::utils::log;
+use crate::utils::log::{self, Logger};
+use blockchain_derive::Error;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::channel;
@@ -20,6 +21,28 @@ mod crypto;
 mod network;
 mod types;
 mod utils;
+
+/// Errors that can occur when sending a transaction from the main loop.
+#[derive(Debug, Error)]
+enum SendTransactionError {
+    #[error("failed to add transaction to pool: {0}")]
+    AddToPool(ServerError),
+
+    #[error("failed to send over transport: {0}")]
+    Transport(TransportError),
+}
+
+impl From<ServerError> for SendTransactionError {
+    fn from(err: ServerError) -> Self {
+        SendTransactionError::AddToPool(err)
+    }
+}
+
+impl From<TransportError> for SendTransactionError {
+    fn from(err: TransportError) -> Self {
+        SendTransactionError::Transport(err)
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -50,10 +73,13 @@ async fn main() {
 
     let server_for_tx = main_server.clone();
     let tr_a_addr = tr_a.addr();
+    let logger_for_tx = Logger::new("main");
     tokio::spawn(async move {
         let mut i: u8 = 0;
         loop {
-            let _ = send_transaction(&server_for_tx, tr_a_addr.clone(), i).await;
+            if let Err(e) = send_transaction(&server_for_tx, tr_a_addr.clone(), i).await {
+                logger_for_tx.error(&format!("failed to send transaction {i}: {e}"));
+            }
             i += 1;
             sleep(Duration::new(1, 0)).await;
         }
@@ -92,7 +118,11 @@ fn init_remote_servers(transports: Vec<Arc<LocalTransport>>) {
 ///
 /// Creates a new transaction with random 32-byte data, signs it with a fresh keypair,
 /// adds it to the local pool, and transmits it to the specified peer.
-async fn send_transaction(server: &Server, to: String, index: u8) -> Result<(), String> {
+async fn send_transaction(
+    server: &Server,
+    to: String,
+    index: u8,
+) -> Result<(), SendTransactionError> {
     let key = PrivateKey::new();
     let data = vec![index; 32];
 
@@ -100,9 +130,7 @@ async fn send_transaction(server: &Server, to: String, index: u8) -> Result<(), 
     let msg = Message::new(MessageType::Transaction, tx.to_bytes());
     server.add_to_pool(&tx)?;
 
-    server
-        .transport()
-        .send_message(to, msg.to_bytes())
-        .await
-        .map_err(|e| e.to_string())
+    server.transport().send_message(to, msg.to_bytes()).await?;
+
+    Ok(())
 }

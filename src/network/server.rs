@@ -12,12 +12,13 @@ use crate::network::local_transport::LocalTransport;
 use crate::network::rpc::{
     DecodedMessage, DecodedMessageData, HandleRpcFn, Message, MessageType, Rpc, RpcProcessor,
 };
-use crate::network::transport::Transport;
+use crate::network::transport::{Transport, TransportError};
 use crate::network::txpool::TxPool;
+use crate::types::bytes::Bytes;
+use crate::types::encoding::{Decode, Encode};
 use crate::types::hash::Hash;
+use crate::types::wrapper_types::BoxFuture;
 use crate::utils::log::Logger;
-use borsh::{BorshDeserialize, BorshSerialize};
-use std::io::Cursor;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -43,7 +44,7 @@ static GENESIS_BLOCK: LazyLock<Arc<Block>> = LazyLock::new(|| {
     };
     let genesis_key = PrivateKey::from_bytes(&GENESIS_PRIVATE_KEY_BYTES)
         .expect("GENESIS_PRIVATE_KEY_BYTES must be a valid secp256k1 scalar");
-    Block::new(header, genesis_key, vec![]).expect("genesis block creation must not fail")
+    Block::new(header, genesis_key, vec![])
 });
 
 /// Blockchain server managing a single transport layer.
@@ -176,23 +177,18 @@ impl Server {
     }
 
     async fn create_new_block(&self) {
-        match self.chain.build_block(
+        let block = self.chain.build_block(
             self.private_key.clone().unwrap(),
             self.tx_pool.transactions(),
-            // TODO: when better transactions are implemented, use a complexity function to determine how many transactions can be added to each block
-        ) {
-            Ok(block) => {
-                if self.chain.add_block(block.clone()) {
-                    self.tx_pool.flush();
-                    if let Err(e) = self
-                        .broadcast_block(self.logger.id.to_string(), block)
-                        .await
-                    {
-                        self.logger.warn(&format!("could not broadcast block: {e}"));
-                    }
-                }
+        );
+        if self.chain.add_block(block.clone()) {
+            self.tx_pool.flush();
+            if let Err(e) = self
+                .broadcast_block(self.logger.id.to_string(), block)
+                .await
+            {
+                self.logger.warn(&format!("could not broadcast block: {e}"));
             }
-            Err(e) => self.logger.error(&format!("{e}")),
         }
     }
 
@@ -212,10 +208,7 @@ impl Server {
     pub fn transport(&self) -> &Arc<LocalTransport> {
         &self.transport
     }
-}
 
-// Broadcasting
-impl Server {
     /// Wraps a payload in a protocol message and broadcasts to all connected peers.
     ///
     /// The `from` address is passed through to exclude the sender from receiving
@@ -223,16 +216,11 @@ impl Server {
     async fn broadcast(
         &self,
         from: String,
-        payload: Vec<u8>,
+        payload: Bytes,
         msg_type: MessageType,
-    ) -> Result<(), String> {
+    ) -> Result<(), TransportError> {
         let msg = Message::new(msg_type, payload);
-        let mut buf = Vec::new();
-
-        match msg.serialize(&mut buf) {
-            Ok(_) => self.transport.broadcast(from, buf.into()).await,
-            Err(e) => Err(e.to_string()),
-        }
+        self.transport.broadcast(from, msg.to_bytes()).await
     }
 
     /// Serializes and broadcasts a transaction to all connected peers.
@@ -240,38 +228,15 @@ impl Server {
         &self,
         from: String,
         transaction: Transaction,
-    ) -> Result<(), String> {
-        let mut buf = Vec::new();
-        match transaction.serialize(&mut buf) {
-            Ok(_) => self.broadcast(from, buf, MessageType::Transaction).await,
-            Err(e) => Err(e.to_string()),
-        }
+    ) -> Result<(), TransportError> {
+        self.broadcast(from, transaction.to_bytes(), MessageType::Transaction)
+            .await
     }
 
     /// Serializes and broadcasts a block to all connected peers.
-    async fn broadcast_block(&self, from: String, block: Arc<Block>) -> Result<(), String> {
-        let mut buf = Vec::new();
-        match block.serialize(&mut buf) {
-            Ok(_) => self.broadcast(from, buf, MessageType::Block).await,
-            Err(e) => Err(e.to_string()),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl RpcProcessor for Server {
-    async fn process_message(
-        self: Arc<Self>,
-        decoded_message: DecodedMessage,
-    ) -> Result<(), String> {
-        match decoded_message.data {
-            DecodedMessageData::Transaction(tx) => {
-                self.process_transaction(decoded_message.from, tx).await
-            }
-            DecodedMessageData::Block(block) => {
-                self.process_block(decoded_message.from, block).await
-            }
-        }
+    async fn broadcast_block(&self, from: String, block: Arc<Block>) -> Result<(), TransportError> {
+        self.broadcast(from, block.to_bytes(), MessageType::Block)
+            .await
     }
 
     /// Validates and adds a transaction to the pool, then broadcasts to peers.
@@ -298,11 +263,11 @@ impl RpcProcessor for Server {
             ));
         }
 
-        // self.logger.info(&format!(
-        //     "adding a new transaction to the pool: hash={} pool_size={}",
-        //     transaction.hash,
-        //     self.tx_pool.length()
-        // ));
+        self.logger.info(&format!(
+            "adding a new transaction to the pool: hash={} pool_size={}",
+            transaction.hash,
+            self.tx_pool.length()
+        ));
         self.tx_pool.append(transaction.clone());
 
         tokio::spawn(async move { self.broadcast_transaction(from, transaction.clone()).await });
@@ -317,6 +282,8 @@ impl RpcProcessor for Server {
     async fn process_block(self: Arc<Self>, from: String, block: Block) -> Result<(), String> {
         let arc_block = Arc::new(block);
         if self.chain.add_block(arc_block.clone()) {
+            let hashes: Vec<Hash> = arc_block.transactions.iter().map(|tx| tx.hash).collect();
+            self.tx_pool.remove_batch(&hashes);
             tokio::spawn(async move { self.broadcast_block(from, arc_block).await });
             return Ok(());
         }
@@ -324,25 +291,41 @@ impl RpcProcessor for Server {
     }
 }
 
+impl RpcProcessor for Server {
+    fn process_message(
+        self: Arc<Self>,
+        decoded_message: DecodedMessage,
+    ) -> BoxFuture<'static, Result<(), String>> {
+        Box::pin(async move {
+            match decoded_message.data {
+                DecodedMessageData::Transaction(tx) => {
+                    self.process_transaction(decoded_message.from, tx).await
+                }
+                DecodedMessageData::Block(block) => {
+                    self.process_block(decoded_message.from, block).await
+                }
+            }
+        })
+    }
+}
+
 /// Default RPC handler that deserializes messages based on their type header.
 fn handle_rpc(rpc: Rpc) -> Result<DecodedMessage, String> {
-    let msg = Message::try_from_slice(rpc.payload.as_ref())
-        .map_err(|e| format!("failed to decode message from {}: {}", rpc.from, e))?;
+    let msg = Message::from_bytes(rpc.payload.as_ref())
+        .map_err(|e| format!("failed to decode message from {}: {:?}", rpc.from, e))?;
 
     match msg.header {
         MessageType::Transaction => {
-            let mut reader = Cursor::new(&msg.data.0);
-            let tx = Transaction::deserialize_reader(&mut reader)
-                .map_err(|e| format!("failed to decode transaction: {e}"))?;
+            let tx = Transaction::from_bytes(msg.data.as_ref())
+                .map_err(|e| format!("failed to decode transaction: {e:?}"))?;
             Ok(DecodedMessage {
                 from: rpc.from.clone(),
                 data: DecodedMessageData::Transaction(tx),
             })
         }
         MessageType::Block => {
-            let mut reader = Cursor::new(&msg.data.0);
-            let block = Block::deserialize_reader(&mut reader)
-                .map_err(|e| format!("failed to decode block: {e}"))?;
+            let block = Block::from_bytes(msg.data.as_ref())
+                .map_err(|e| format!("failed to decode block: {e:?}"))?;
             Ok(DecodedMessage {
                 from: rpc.from.clone(),
                 data: DecodedMessageData::Block(block),
@@ -380,14 +363,11 @@ mod tests {
     #[test]
     fn handle_rpc_decodes_valid_transaction() {
         let key = PrivateKey::new();
-        let tx = Transaction::new(b"test data".as_slice(), key).unwrap();
-
-        let mut tx_bytes = Vec::new();
-        tx.serialize(&mut tx_bytes).unwrap();
+        let tx = Transaction::new(b"test data".as_slice(), key);
+        let tx_bytes = tx.to_bytes();
 
         let msg = Message::new(MessageType::Transaction, tx_bytes);
-        let mut msg_bytes = Vec::new();
-        msg.serialize(&mut msg_bytes).unwrap();
+        let msg_bytes = msg.to_bytes();
 
         let rpc = Rpc::new("sender", msg_bytes);
         let result = handle_rpc(rpc).expect("should decode successfully");
@@ -413,8 +393,7 @@ mod tests {
     #[test]
     fn handle_rpc_rejects_invalid_transaction_data() {
         let msg = Message::new(MessageType::Transaction, vec![0x00, 0x01, 0x02]);
-        let mut msg_bytes = Vec::new();
-        msg.serialize(&mut msg_bytes).unwrap();
+        let msg_bytes = msg.to_bytes();
 
         let rpc = Rpc::new("sender", msg_bytes);
         let result = handle_rpc(rpc);
@@ -432,19 +411,16 @@ mod tests {
             data_hash: Hash::zero(),
             merkle_root: Hash::zero(),
         };
-        Block::new(header, PrivateKey::new(), transactions).expect("block creation failed")
+        Block::new(header, PrivateKey::new(), transactions)
     }
 
     #[test]
     fn handle_rpc_decodes_valid_block() {
         let block = create_test_block(vec![]);
-
-        let mut block_bytes = Vec::new();
-        block.serialize(&mut block_bytes).unwrap();
+        let block_bytes = block.to_bytes();
 
         let msg = Message::new(MessageType::Block, block_bytes);
-        let mut msg_bytes = Vec::new();
-        msg.serialize(&mut msg_bytes).unwrap();
+        let msg_bytes = msg.to_bytes();
 
         let rpc = Rpc::new("block_sender", msg_bytes);
         let result = handle_rpc(rpc).expect("should decode successfully");
@@ -462,8 +438,7 @@ mod tests {
     #[test]
     fn handle_rpc_rejects_invalid_block_data() {
         let msg = Message::new(MessageType::Block, vec![0x00, 0x01, 0x02]);
-        let mut msg_bytes = Vec::new();
-        msg.serialize(&mut msg_bytes).unwrap();
+        let msg_bytes = msg.to_bytes();
 
         let rpc = Rpc::new("sender", msg_bytes);
         let result = handle_rpc(rpc);
@@ -475,19 +450,16 @@ mod tests {
     #[test]
     fn handle_rpc_preserves_block_transactions() {
         let key = PrivateKey::new();
-        let tx1 = Transaction::new(b"tx1".as_slice(), key.clone()).unwrap();
-        let tx2 = Transaction::new(b"tx2".as_slice(), key).unwrap();
+        let tx1 = Transaction::new(b"tx1".as_slice(), key.clone());
+        let tx2 = Transaction::new(b"tx2".as_slice(), key);
         let tx1_hash = tx1.hash;
         let tx2_hash = tx2.hash;
 
         let block = create_test_block(vec![tx1, tx2]);
-
-        let mut block_bytes = Vec::new();
-        block.serialize(&mut block_bytes).unwrap();
+        let block_bytes = block.to_bytes();
 
         let msg = Message::new(MessageType::Block, block_bytes);
-        let mut msg_bytes = Vec::new();
-        msg.serialize(&mut msg_bytes).unwrap();
+        let msg_bytes = msg.to_bytes();
 
         let rpc = Rpc::new("sender", msg_bytes);
         let result = handle_rpc(rpc).expect("should decode successfully");
@@ -505,16 +477,13 @@ mod tests {
     #[test]
     fn handle_rpc_decodes_block_with_truncated_data() {
         let block = create_test_block(vec![]);
-
-        let mut block_bytes = Vec::new();
-        block.serialize(&mut block_bytes).unwrap();
+        let mut block_bytes = block.to_bytes();
 
         // Truncate the block data
         block_bytes.truncate(block_bytes.len() / 2);
 
         let msg = Message::new(MessageType::Block, block_bytes);
-        let mut msg_bytes = Vec::new();
-        msg.serialize(&mut msg_bytes).unwrap();
+        let msg_bytes = msg.to_bytes();
 
         let rpc = Rpc::new("sender", msg_bytes);
         let result = handle_rpc(rpc);

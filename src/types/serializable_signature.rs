@@ -1,8 +1,7 @@
-use borsh::{BorshDeserialize, BorshSerialize};
+use crate::types::encoding::{Decode, DecodeError, Encode, EncodeSink};
 use k256::schnorr::Signature;
-use std::io::{Read, Write};
 
-/// Wrapper around `Signature` that implements Borsh serialization.
+/// Wrapper around `Signature` that implements serialization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SerializableSignature(pub Signature);
 
@@ -18,18 +17,16 @@ impl From<Signature> for SerializableSignature {
     }
 }
 
-impl BorshSerialize for SerializableSignature {
-    fn serialize<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        let bytes: [u8; 64] = self.0.to_bytes();
-        bytes.serialize(writer)
+impl Encode for SerializableSignature {
+    fn encode<S: EncodeSink>(&self, out: &mut S) {
+        out.write(&self.0.to_bytes());
     }
 }
 
-impl BorshDeserialize for SerializableSignature {
-    fn deserialize_reader<R: Read>(reader: &mut R) -> std::io::Result<Self> {
-        let bytes = <[u8; 64]>::deserialize_reader(reader)?;
-        let sig = Signature::try_from(bytes.as_slice())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+impl Decode for SerializableSignature {
+    fn decode(input: &mut &[u8]) -> Result<Self, DecodeError> {
+        let bytes = <[u8; 64]>::decode(input)?;
+        let sig = Signature::try_from(bytes.as_slice()).map_err(|_| DecodeError::InvalidValue)?;
         Ok(SerializableSignature(sig))
     }
 }

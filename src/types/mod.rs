@@ -9,6 +9,8 @@
 
 pub mod address;
 pub mod binary_codec;
+pub mod bytes;
+pub mod encoding;
 pub mod hash;
-pub mod serializable_bytes;
 pub mod serializable_signature;
+pub mod wrapper_types;

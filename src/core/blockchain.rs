@@ -10,16 +10,15 @@ use crate::types::hash::Hash;
 use crate::utils::log::Logger;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::io;
 
 /// The main blockchain structure holding headers and validation logic.
 ///
 /// Generic over validator and storage types for zero-cost abstraction.
 pub struct Blockchain<V: Validator, S: Storage> {
     /// Block storage backend.
-    pub storage: S,
+    storage: S,
     /// Block validator for consensus rules.
-    pub validator: V,
+    validator: V,
     /// Logger for chain operations.
     logger: Logger,
 }
@@ -61,11 +60,7 @@ impl<V: Validator, S: Storage> Blockchain<V, S> {
     /// Builds a new block linked to the current tip.
     ///
     /// Automatically sets the correct `previous_block` hash and `height`.
-    pub fn build_block(
-        &self,
-        validator: PrivateKey,
-        transactions: Vec<Transaction>,
-    ) -> io::Result<Arc<Block>> {
+    pub fn build_block(&self, validator: PrivateKey, transactions: Vec<Transaction>) -> Arc<Block> {
         let tip = self.storage.tip();
         let height = self.storage.height() + 1;
         let timestamp = SystemTime::now()
@@ -78,7 +73,7 @@ impl<V: Validator, S: Storage> Blockchain<V, S> {
             height,
             timestamp,
             previous_block: tip,
-            data_hash: transactions.hash()?,
+            data_hash: transactions.hash(),
             merkle_root: Hash::zero(),
         };
 
@@ -101,35 +96,7 @@ impl<V: Validator, S: Storage> Blockchain<V, S> {
                     block.transactions.len()
                 ));
 
-                self.storage.append_block(block);
-                true
-            }
-            Err(err) => {
-                self.logger.warn(&format!(
-                    "block rejected: hash={} error={}",
-                    block.header_hash, err
-                ));
-                false
-            }
-        }
-    }
-
-    #[cfg(test)]
-    pub fn add_block_mut(&mut self, block: Arc<Block>) -> bool {
-        match self
-            .validator
-            .validate_block(&block, &self.storage, &self.logger)
-        {
-            Ok(_) => {
-                self.logger.info(&format!(
-                    "adding a new block to the chain: height={} hash={} transactions={}",
-                    block.header.height,
-                    block.header_hash,
-                    block.transactions.len()
-                ));
-
-                self.storage.append_block_mut(block);
-                true
+                self.storage.append_block(block).is_ok()
             }
             Err(err) => {
                 self.logger.warn(&format!(
@@ -146,11 +113,11 @@ impl<V: Validator, S: Storage> Blockchain<V, S> {
 mod tests {
     use super::*;
     use crate::core::block::Header;
-    use crate::core::storage::InMemoryStorage;
+    use crate::core::storage::tests::{StorageExtForTests, TestStorage};
     use crate::crypto::key_pair::PrivateKey;
     use crate::types::hash::Hash;
-    use crate::utils::test_utils::utils::create_genesis;
-    use thiserror::Error;
+    use crate::utils::test_utils::utils::{create_genesis, random_hash};
+    use blockchain_derive::Error;
 
     fn test_logger() -> Logger {
         Logger::new("test")
@@ -166,6 +133,35 @@ mod tests {
             storage,
             validator,
             logger,
+        }
+    }
+
+    pub fn add_block_mut<V: Validator, S: Storage + StorageExtForTests>(
+        chain: &mut Blockchain<V, S>,
+        block: Arc<Block>,
+    ) -> bool {
+        match chain
+            .validator
+            .validate_block(&block, &chain.storage, &chain.logger)
+        {
+            Ok(_) => {
+                chain.logger.info(&format!(
+                    "adding a new block to the chain: height={} hash={} transactions={}",
+                    block.header.height,
+                    block.header_hash,
+                    block.transactions.len()
+                ));
+
+                chain.storage.append_block_mut(block);
+                true
+            }
+            Err(err) => {
+                chain.logger.warn(&format!(
+                    "block rejected: hash={} error={}",
+                    block.header_hash, err
+                ));
+                false
+            }
         }
     }
 
@@ -207,7 +203,7 @@ mod tests {
             height,
             timestamp: 0,
             previous_block: previous,
-            data_hash: Hash::random(),
+            data_hash: random_hash(),
             merkle_root: Hash::zero(),
         }
     }
@@ -224,17 +220,16 @@ mod tests {
     #[test]
     fn height_increases_with_blocks() {
         let genesis = create_genesis();
-        let storage = InMemoryStorage::new(genesis.clone());
+        let storage = TestStorage::new(genesis.clone());
         let mut bc = with_validator_and_storage(AcceptAllValidator, storage, test_logger());
 
         let block1 = Block::new(
             create_header(1, bc.storage.tip()),
             PrivateKey::new(),
             vec![],
-        )
-        .unwrap();
+        );
 
-        assert!(bc.add_block_mut(block1));
+        assert!(add_block_mut(&mut bc, block1));
         assert_eq!(bc.height(), 1);
     }
 
@@ -243,12 +238,12 @@ mod tests {
         let genesis = create_genesis();
         let mut accept_bc = with_validator_and_storage(
             AcceptAllValidator,
-            InMemoryStorage::new(genesis.clone()),
+            TestStorage::new(genesis.clone()),
             test_logger(),
         );
         let mut reject_bc = with_validator_and_storage(
             RejectAllValidator,
-            InMemoryStorage::new(genesis.clone()),
+            TestStorage::new(genesis.clone()),
             test_logger(),
         );
 
@@ -256,11 +251,10 @@ mod tests {
             create_header(1, genesis.header_hash),
             PrivateKey::new(),
             vec![],
-        )
-        .unwrap();
+        );
 
-        assert!(accept_bc.add_block_mut(block.clone()));
-        assert!(!reject_bc.add_block_mut(block));
+        assert!(add_block_mut(&mut accept_bc, block.clone()));
+        assert!(!add_block_mut(&mut reject_bc, block));
     }
 
     #[test]
@@ -268,20 +262,20 @@ mod tests {
         let genesis = create_genesis();
         let mut bc = with_validator_and_storage(
             AcceptAllValidator,
-            InMemoryStorage::new(genesis.clone()),
+            TestStorage::new(genesis.clone()),
             test_logger(),
         );
 
         let block_count = 100;
         for _i in 1..=block_count {
-            let block = bc.build_block(PrivateKey::new(), vec![]).unwrap();
-            assert!(bc.add_block_mut(block));
+            let block = bc.build_block(PrivateKey::new(), vec![]);
+            assert!(add_block_mut(&mut bc, block));
         }
 
         assert_eq!(bc.height(), block_count);
 
-        let block = bc.build_block(PrivateKey::new(), vec![]).unwrap();
-        assert!(bc.add_block_mut(block));
+        let block = bc.build_block(PrivateKey::new(), vec![]);
+        assert!(add_block_mut(&mut bc, block));
         assert_eq!(bc.height(), block_count + 1);
     }
 }

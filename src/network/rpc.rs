@@ -5,9 +5,9 @@
 
 use crate::core::block::Block;
 use crate::core::transaction::Transaction;
-use crate::types::serializable_bytes::SerializableBytes;
+use crate::types::bytes::Bytes;
+use crate::types::wrapper_types::BoxFuture;
 use blockchain_derive::BinaryCodec;
-use std::format;
 use std::sync::Arc;
 
 /// Discriminant for message payload types.
@@ -27,12 +27,12 @@ pub struct Message {
     /// Type discriminant for payload deserialization.
     pub(crate) header: MessageType,
     /// Serialized payload data.
-    pub(crate) data: SerializableBytes,
+    pub(crate) data: Bytes,
 }
 
 impl Message {
     /// Creates a new message with the given type and payload.
-    pub fn new(header: MessageType, data: impl Into<SerializableBytes>) -> Self {
+    pub fn new(header: MessageType, data: impl Into<Bytes>) -> Self {
         Self {
             header,
             data: data.into(),
@@ -46,12 +46,12 @@ pub struct Rpc {
     /// Address of the sender.
     pub(crate) from: String,
     /// Raw message payload.
-    pub(crate) payload: SerializableBytes,
+    pub(crate) payload: Bytes,
 }
 
 impl Rpc {
     /// Creates a new RPC message from the given sender and payload.
-    pub fn new(from: impl Into<String>, payload: impl Into<SerializableBytes>) -> Self {
+    pub fn new(from: impl Into<String>, payload: impl Into<Bytes>) -> Self {
         Self {
             from: from.into(),
             payload: payload.into(),
@@ -84,43 +84,29 @@ pub type HandleRpcFn = fn(Rpc) -> Result<DecodedMessage, String>;
 
 /// Trait for processing decoded message payloads.
 ///
-/// Provides handlers for each message type after deserialization.
-#[async_trait::async_trait]
+/// Implementors handle decoded RPC messages after deserialization.
 pub trait RpcProcessor: Send + Sync {
     /// Routes a decoded message to the appropriate type-specific handler.
-    ///
-    /// Dispatches to `process_transaction` or `process_block` based on the message payload.
-    async fn process_message(self: Arc<Self>, decoded: DecodedMessage) -> Result<(), String>;
-
-    /// Validates and adds a transaction to the pool, then broadcasts to peers.
-    ///
-    /// Skips duplicate transactions. Returns an error if verification fails.
-    async fn process_transaction(
+    fn process_message(
         self: Arc<Self>,
-        from: String,
-        transaction: Transaction,
-    ) -> Result<(), String>;
-
-    /// Validates and adds a block to the chain, then broadcasts to peers.
-    ///
-    /// Returns an error if the block fails validation or cannot be added.
-    async fn process_block(self: Arc<Self>, from: String, block: Block) -> Result<(), String>;
+        decoded: DecodedMessage,
+    ) -> BoxFuture<'static, Result<(), String>>;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use borsh::BorshDeserialize;
+    use crate::types::encoding::{Decode, Encode};
 
     #[test]
     fn message_serialization_roundtrip() {
-        let payload = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let payload = Bytes::new(vec![0xDE, 0xAD, 0xBE, 0xEF]);
         let msg = Message::new(MessageType::Transaction, payload.clone());
 
-        let encoded = borsh::to_vec(&msg).expect("serialization failed");
-        let decoded = Message::try_from_slice(&encoded).expect("deserialization failed");
+        let encoded = msg.to_bytes();
+        let decoded = Message::from_bytes(encoded.as_slice()).expect("deserialization failed");
 
-        assert_eq!(decoded.data.as_ref(), payload.as_slice());
+        assert_eq!(decoded.data, payload);
     }
 
     #[test]
@@ -128,8 +114,8 @@ mod tests {
         let payload = vec![1, 2, 3, 4, 5];
         let rpc = Rpc::new("node_a", payload.clone());
 
-        let encoded = borsh::to_vec(&rpc).expect("serialization failed");
-        let decoded = Rpc::try_from_slice(&encoded).expect("deserialization failed");
+        let encoded = rpc.to_bytes();
+        let decoded = Rpc::from_bytes(encoded.as_slice()).expect("deserialization failed");
 
         assert_eq!(decoded.from, "node_a");
         assert_eq!(decoded.payload.as_ref(), payload.as_slice());
@@ -140,8 +126,8 @@ mod tests {
         let tx_msg = Message::new(MessageType::Transaction, vec![]);
         let block_msg = Message::new(MessageType::Block, vec![]);
 
-        let tx_bytes = borsh::to_vec(&tx_msg).unwrap();
-        let block_bytes = borsh::to_vec(&block_msg).unwrap();
+        let tx_bytes = tx_msg.to_bytes();
+        let block_bytes = block_msg.to_bytes();
 
         // First byte is the discriminant
         assert_eq!(tx_bytes[0], 0, "Transaction discriminant should be 0");

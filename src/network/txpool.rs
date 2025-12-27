@@ -56,7 +56,17 @@ impl TxPool {
 
     /// Removes all transactions from the pool.
     pub fn flush(&self) {
-        self.transactions.clear()
+        self.transactions.clear();
+        self.order.write().unwrap().clear();
+    }
+
+    /// Removes transactions with the given hashes from the pool.
+    pub fn remove_batch(&self, hashes: &[Hash]) {
+        for hash in hashes {
+            self.transactions.remove(hash);
+        }
+        let mut order = self.order.write().unwrap();
+        order.retain(|h| self.transactions.contains_key(h));
     }
 
     /// Returns all transactions in insertion order.
@@ -82,11 +92,11 @@ mod tests {
         assert_eq!(pool.length(), 0);
 
         let key = PrivateKey::new();
-        let tx = Transaction::new(b"Hello World", key.clone()).expect("Hashing failed");
+        let tx = Transaction::new(b"Hello World", key.clone());
         pool.append(tx);
         assert_eq!(pool.length(), 1);
 
-        let tx = Transaction::new(b"Hello World", key.clone()).expect("Hashing failed");
+        let tx = Transaction::new(b"Hello World", key.clone());
         pool.append(tx);
         assert_eq!(pool.length(), 1);
 
@@ -101,8 +111,7 @@ mod tests {
 
         let mut txs: Vec<Transaction> = vec![];
         for i in 0..=100 {
-            let tx = Transaction::new(i.to_string().as_bytes(), PrivateKey::new())
-                .expect("Hashing failed");
+            let tx = Transaction::new(i.to_string().as_bytes(), PrivateKey::new());
             txs.push(tx.clone());
             pool.append(tx);
         }
@@ -125,7 +134,7 @@ mod tests {
     fn contains_returns_false_for_empty_pool() {
         let pool = TxPool::new(None);
         let key = PrivateKey::new();
-        let tx = Transaction::new(b"test", key).expect("Hashing failed");
+        let tx = Transaction::new(b"test", key);
         assert!(!pool.contains(tx.hash));
     }
 
@@ -133,7 +142,7 @@ mod tests {
     fn contains_returns_true_after_append() {
         let pool = TxPool::new(None);
         let key = PrivateKey::new();
-        let tx = Transaction::new(b"test", key).expect("Hashing failed");
+        let tx = Transaction::new(b"test", key);
         let hash = tx.hash;
 
         pool.append(tx);
@@ -152,8 +161,7 @@ mod tests {
         let key = PrivateKey::new();
 
         for i in 0..5 {
-            let tx =
-                Transaction::new(i.to_string().as_bytes(), key.clone()).expect("Hashing failed");
+            let tx = Transaction::new(i.to_string().as_bytes(), key.clone());
             pool.append(tx);
         }
 
@@ -175,7 +183,7 @@ mod tests {
     fn duplicate_transaction_not_added_twice() {
         let pool = TxPool::new(None);
         let key = PrivateKey::new();
-        let tx = Transaction::new(b"same data", key).expect("Hashing failed");
+        let tx = Transaction::new(b"same data", key);
         let hash = tx.hash;
 
         pool.append(tx.clone());
@@ -191,8 +199,8 @@ mod tests {
         let key1 = PrivateKey::new();
         let key2 = PrivateKey::new();
 
-        let tx1 = Transaction::new(b"same data", key1).expect("Hashing failed");
-        let tx2 = Transaction::new(b"same data", key2).expect("Hashing failed");
+        let tx1 = Transaction::new(b"same data", key1);
+        let tx2 = Transaction::new(b"same data", key2);
 
         pool.append(tx1);
         pool.append(tx2);
@@ -206,8 +214,7 @@ mod tests {
         let mut hashes = Vec::new();
 
         for i in 0..1000 {
-            let tx = Transaction::new(i.to_string().as_bytes(), PrivateKey::new())
-                .expect("Hashing failed");
+            let tx = Transaction::new(i.to_string().as_bytes(), PrivateKey::new());
             hashes.push(tx.hash);
             pool.append(tx);
         }

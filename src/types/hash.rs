@@ -4,7 +4,7 @@ use crate::types::binary_codec::BinaryCodec;
 use std::fmt;
 
 /// SHA3-256 hash length in bytes.
-const HASH_LEN: usize = 32;
+pub const HASH_LEN: usize = 32;
 
 /// Fixed-size 32-byte hash used throughout the blockchain.
 ///
@@ -45,18 +45,6 @@ impl Hash {
     /// Returns the hash as a byte slice.
     pub fn as_slice(&self) -> &[u8] {
         &self.0
-    }
-
-    /// Generates a cryptographically random hash for testing.
-    ///
-    /// Only available in test builds to prevent misuse in production code.
-    #[cfg(test)]
-    pub fn random() -> Hash {
-        use rand::RngCore;
-
-        let mut buf = vec![0u8; HASH_LEN];
-        rand::rng().fill_bytes(&mut buf);
-        Hash::from_vec(buf)
     }
 }
 

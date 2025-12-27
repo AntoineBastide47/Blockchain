@@ -4,12 +4,13 @@
 //! network implementations to send and receive data between nodes.
 
 use crate::network::rpc::Rpc;
-use crate::types::serializable_bytes::SerializableBytes;
-use bytes::Bytes;
+use crate::types::bytes::Bytes;
+use crate::types::wrapper_types::BoxFuture;
+use std::sync::Arc;
 use tokio::sync::mpsc::Receiver;
 
 /// Errors that can occur during transport operations.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, blockchain_derive::Error)]
 pub enum TransportError {
     /// Peer with the specified address was not found.
     #[error("peer not found: {0}")]
@@ -18,18 +19,21 @@ pub enum TransportError {
     /// Failed to send message to the specified address.
     #[error("failed to send message to {0}")]
     SendFailed(String),
+
+    /// Failed to send message to the specified address.
+    #[error("failed to broadcast: {0}")]
+    BroadcastFailed(String),
 }
 
 /// Async transport layer for network communication between nodes.
 ///
 /// Implementors provide the underlying mechanism for sending and receiving messages
 /// between network peers in a blockchain network.
-#[async_trait::async_trait]
 pub trait Transport: Send + Sync {
     /// Returns a receiver for incoming RPC messages.
     ///
     /// Messages can be consumed from the receiver to process incoming network traffic.
-    async fn consume(&self) -> Receiver<Rpc>;
+    fn consume(self: &Arc<Self>) -> BoxFuture<'static, Receiver<Rpc>>;
 
     /// Sends a message to a specific address.
     ///
@@ -40,7 +44,11 @@ pub trait Transport: Send + Sync {
     /// # Errors
     /// Returns `TransportError::PeerNotFound` if the peer is not in the routing table.
     /// Returns `TransportError::SendFailed` if the message cannot be sent.
-    async fn send_message(&self, to: String, payload: Bytes) -> Result<(), TransportError>;
+    fn send_message(
+        self: &Arc<Self>,
+        to: String,
+        payload: Bytes,
+    ) -> BoxFuture<'static, Result<(), TransportError>>;
 
     /// Broadcasts data to all connected peers except the sender.
     ///
@@ -50,8 +58,12 @@ pub trait Transport: Send + Sync {
     ///
     /// # Errors
     /// Returns an error string if any peer transmission fails.
-    async fn broadcast(&self, from: String, data: SerializableBytes) -> Result<(), String>;
+    fn broadcast(
+        self: &Arc<Self>,
+        from: String,
+        data: Bytes,
+    ) -> BoxFuture<'static, Result<(), TransportError>>;
 
     /// Returns the local address of this transport.
-    fn addr(&self) -> String;
+    fn addr(self: &Arc<Self>) -> String;
 }

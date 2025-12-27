@@ -5,8 +5,8 @@
 
 use crate::network::rpc::Rpc;
 use crate::network::transport::{Transport, TransportError};
-use crate::types::serializable_bytes::SerializableBytes;
-use bytes::Bytes;
+use crate::types::bytes::Bytes;
+use crate::types::wrapper_types::BoxFuture;
 use dashmap::DashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -19,7 +19,7 @@ use tokio::sync::mpsc::{Receiver, Sender, channel};
 pub struct LocalTransport {
     peers: DashMap<String, Arc<LocalTransport>>,
     tx: Sender<Rpc>,
-    rx: Mutex<Option<Receiver<Rpc>>>,
+    rx: Arc<Mutex<Option<Receiver<Rpc>>>>,
     address: String,
 }
 
@@ -34,7 +34,7 @@ impl LocalTransport {
             address: address.to_string(),
             peers: DashMap::new(),
             tx,
-            rx: Mutex::new(Some(rx)),
+            rx: Arc::new(Mutex::new(Some(rx))),
         })
     }
 
@@ -47,40 +47,60 @@ impl LocalTransport {
     }
 }
 
-#[async_trait::async_trait]
 impl Transport for LocalTransport {
-    async fn consume(&self) -> Receiver<Rpc> {
-        let mut guard = self.rx.lock().await;
-        guard.take().unwrap()
+    fn consume(self: &Arc<Self>) -> BoxFuture<'static, Receiver<Rpc>> {
+        let rx = self.rx.clone();
+
+        Box::pin(async move {
+            let mut guard = rx.lock().await;
+            guard.take().expect("receiver already taken")
+        })
     }
 
-    async fn send_message(&self, to: String, payload: Bytes) -> Result<(), TransportError> {
-        let peer = match self.peers.get(to.trim()) {
-            Some(r) => r.value().clone(),
-            None => {
-                return Err(TransportError::PeerNotFound(to.to_string()));
-            }
-        };
+    fn send_message(
+        self: &Arc<Self>,
+        to: String,
+        payload: Bytes,
+    ) -> BoxFuture<'static, Result<(), TransportError>> {
+        let peers = self.peers.clone();
+        let address = self.address.clone();
 
-        peer.tx
-            .send(Rpc::new(self.address.clone(), payload))
-            .await
-            .map_err(|_| TransportError::SendFailed(to.to_string()))
+        Box::pin(async move {
+            let peer = match peers.get(to.trim()) {
+                Some(r) => r.value().clone(),
+                None => return Err(TransportError::PeerNotFound(to)),
+            };
+
+            peer.tx
+                .send(Rpc::new(address, payload))
+                .await
+                .map_err(|_| TransportError::SendFailed(to))
+        })
     }
 
-    async fn broadcast(&self, from: String, data: SerializableBytes) -> Result<(), String> {
-        for peer in &self.peers {
-            if from == peer.addr() {
-                continue;
+    fn broadcast(
+        self: &Arc<Self>,
+        from: String,
+        data: Bytes,
+    ) -> BoxFuture<'static, Result<(), TransportError>> {
+        let peers = self.peers.clone();
+        let this = self.clone();
+
+        Box::pin(async move {
+            for peer in peers.iter() {
+                if from == peer.addr() {
+                    continue;
+                }
+
+                if let Err(e) = this.send_message(peer.addr(), data.clone()).await {
+                    return Err(TransportError::BroadcastFailed(e.to_string()));
+                }
             }
-            if let Err(e) = self.send_message(peer.addr(), data.0.clone()).await {
-                return Err(e.to_string());
-            }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
-    fn addr(&self) -> String {
+    fn addr(self: &Arc<Self>) -> String {
         self.address.clone()
     }
 }
@@ -121,7 +141,7 @@ mod tests {
 
         let received = rx.recv().await.unwrap();
         assert_eq!(received.from, tr_a.address);
-        assert_eq!(received.payload, payload.into());
+        assert_eq!(received.payload, payload);
     }
 
     #[tokio::test]
@@ -136,7 +156,7 @@ mod tests {
         let mut rx_b = tr_b.consume().await;
         let mut rx_c = tr_c.consume().await;
 
-        let payload = SerializableBytes::new("Broadcast message");
+        let payload = Bytes::new("Broadcast message");
         tr_a.broadcast(tr_a.addr(), payload.clone()).await.unwrap();
 
         let received_b = rx_b.recv().await.unwrap();
@@ -190,7 +210,7 @@ mod tests {
         let mut rx_a = tr_a.consume().await;
         let mut rx_c = tr_c.consume().await;
 
-        let payload = SerializableBytes::new("Broadcast from B");
+        let payload = Bytes::new("Broadcast from B");
         tr_b.broadcast(tr_b.addr(), payload.clone()).await.unwrap();
 
         // A and C should receive the message

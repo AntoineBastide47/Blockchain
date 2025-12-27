@@ -45,7 +45,7 @@ pub trait Validator: Send + Sync {
 pub struct BlockValidator;
 
 /// Errors that can occur during block validation operations.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, blockchain_derive::Error)]
 pub enum BlockValidatorError {
     #[error("invalid block height: expected {expected}, got {actual}")]
     InvalidHeight { expected: u32, actual: u32 },
@@ -96,10 +96,10 @@ impl Validator for BlockValidator {
 mod tests {
     use super::*;
     use crate::core::block::{Block, Header};
-    use crate::core::storage::InMemoryStorage;
+    use crate::core::storage::tests::TestStorage;
     use crate::crypto::key_pair::PrivateKey;
     use crate::types::hash::Hash;
-    use crate::utils::test_utils::utils::create_genesis;
+    use crate::utils::test_utils::utils::{create_genesis, random_hash};
     use std::sync::Arc;
 
     fn test_logger() -> Logger {
@@ -112,16 +112,16 @@ mod tests {
             height,
             timestamp: 0,
             previous_block: previous,
-            data_hash: Hash::random(),
+            data_hash: random_hash(),
             merkle_root: Hash::zero(),
         };
-        Block::new(header, PrivateKey::new(), vec![]).unwrap()
+        Block::new(header, PrivateKey::new(), vec![])
     }
 
     #[test]
     fn valid_block_accepted() {
         let genesis = create_genesis();
-        let storage = InMemoryStorage::new(genesis.clone());
+        let storage = TestStorage::new(genesis.clone());
         let validator = BlockValidator;
 
         let block = create_block(1, genesis.header_hash);
@@ -135,7 +135,7 @@ mod tests {
     #[test]
     fn wrong_height_rejected() {
         let genesis = create_genesis();
-        let storage = InMemoryStorage::new(genesis.clone());
+        let storage = TestStorage::new(genesis.clone());
         let validator = BlockValidator;
 
         let block = create_block(5, genesis.header_hash);
@@ -149,10 +149,10 @@ mod tests {
     #[test]
     fn wrong_previous_hash_rejected() {
         let genesis = create_genesis();
-        let storage = InMemoryStorage::new(genesis.clone());
+        let storage = TestStorage::new(genesis.clone());
         let validator = BlockValidator;
 
-        let block = create_block(1, Hash::random());
+        let block = create_block(1, random_hash());
         assert!(
             validator
                 .validate_block(&block, &storage, &test_logger())
@@ -188,7 +188,9 @@ mod tests {
         fn get_block(&self, _: Hash) -> Option<Arc<Block>> {
             None
         }
-        fn append_block(&self, _: Arc<Block>) {}
+        fn append_block(&self, _: Arc<Block>) -> Result<(), String> {
+            Ok(())
+        }
         fn height(&self) -> u32 {
             0
         }

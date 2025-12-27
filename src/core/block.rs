@@ -2,15 +2,13 @@
 
 use crate::core::transaction::Transaction;
 use crate::crypto::key_pair::{PrivateKey, PublicKey};
-use crate::types::binary_codec::{BinaryCodec, BinaryCodecHash};
+use crate::types::binary_codec::{BinaryCodec, BinaryCodecHash, Decode};
+use crate::types::bytes::Bytes;
+use crate::types::encoding::{DecodeError, Encode, EncodeSink};
 use crate::types::hash::Hash;
-use crate::types::serializable_bytes::SerializableBytes;
 use crate::types::serializable_signature::SerializableSignature;
 use crate::utils::log::Logger;
-use borsh::{BorshDeserialize, BorshSerialize};
-use std::io::{Read, Write};
 use std::sync::Arc;
-use tokio::io;
 
 /// Block header containing metadata and cryptographic commitments.
 ///
@@ -47,23 +45,22 @@ pub struct Block {
     pub transactions: Box<[Transaction]>,
 }
 
-impl BorshSerialize for Block {
-    fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        self.header.serialize(writer)?;
-        self.validator.serialize(writer)?;
-        self.signature.serialize(writer)?;
-        self.transactions.serialize(writer)?;
-        Ok(())
+impl Encode for Block {
+    fn encode<S: EncodeSink>(&self, out: &mut S) {
+        self.header.encode(out);
+        self.validator.encode(out);
+        self.signature.encode(out);
+        self.transactions.encode(out);
     }
 }
 
-impl BorshDeserialize for Block {
-    fn deserialize_reader<R: Read>(reader: &mut R) -> io::Result<Self> {
-        let header = Header::deserialize_reader(reader)?;
-        let validator = PublicKey::deserialize_reader(reader)?;
-        let signature = SerializableSignature::deserialize_reader(reader)?;
-        let transactions: Vec<Transaction> = BorshDeserialize::deserialize_reader(reader)?;
-        let header_hash = header.hash()?;
+impl Decode for Block {
+    fn decode(input: &mut &[u8]) -> Result<Self, DecodeError> {
+        let header = Header::decode(input)?;
+        let validator = PublicKey::decode(input)?;
+        let signature = SerializableSignature::decode(input)?;
+        let transactions: Vec<Transaction> = Decode::decode(input)?;
+        let header_hash = header.hash();
         Ok(Block {
             header,
             header_hash,
@@ -86,17 +83,17 @@ impl Block {
         mut header: Header,
         validator: PrivateKey,
         transactions: Vec<Transaction>,
-    ) -> io::Result<Arc<Self>> {
-        header.data_hash = transactions.hash()?;
-        let header_hash = header.hash()?;
+    ) -> Arc<Self> {
+        header.data_hash = transactions.hash();
+        let header_hash = header.hash();
 
-        Ok(Arc::new(Block {
+        Arc::new(Block {
             header,
             header_hash,
             validator: validator.public_key(),
-            signature: validator.sign(&SerializableBytes::from(header_hash.as_slice())),
+            signature: validator.sign(&Bytes::new(header_hash.as_slice())),
             transactions: transactions.into_boxed_slice(),
-        }))
+        })
     }
 
     /// Verifies the block's cryptographic integrity.
@@ -129,23 +126,12 @@ impl Block {
             }
         }
 
-        match self.transactions.hash() {
-            Ok(hash) => {
-                if hash != self.header.data_hash {
-                    logger.warn(&format!(
-                        "invalid data hash in block: block={}",
-                        self.header_hash
-                    ));
-                    return false;
-                }
-            }
-            Err(e) => {
-                logger.warn(&format!(
-                    "block verification failed: block={} error={}",
-                    self.header_hash, e
-                ));
-                return false;
-            }
+        if self.transactions.hash() != self.header.data_hash {
+            logger.warn(&format!(
+                "invalid data hash in block: block={}",
+                self.header_hash
+            ));
+            return false;
         }
 
         true
@@ -157,6 +143,7 @@ mod tests {
     use super::*;
     use crate::crypto::key_pair::PrivateKey;
     use crate::types::binary_codec::BinaryCodecHash;
+    use crate::utils::test_utils::utils::random_hash;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn test_logger() -> Logger {
@@ -171,27 +158,23 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos() as u64,
-            previous_block: Hash::random(),
-            data_hash: Hash::random(),
-            merkle_root: Hash::random(),
+            previous_block: random_hash(),
+            data_hash: random_hash(),
+            merkle_root: random_hash(),
         }
     }
 
     fn create_block(header: Header, transactions: Vec<Transaction>) -> Arc<Block> {
         let key = PrivateKey::new();
-        Block::new(header, key, transactions).expect("Failed to create block")
+        Block::new(header, key, transactions)
     }
 
     #[test]
     fn test_header_binary_codec() {
-        let mut buf: Vec<u8> = Vec::new();
         let header = create_header(3);
-        header
-            .serialize(&mut buf)
-            .expect("Could not encode the header");
+        let buf = header.to_bytes();
 
-        let decoded =
-            Header::deserialize_reader(&mut buf.as_slice()).expect("Could not decode the header");
+        let decoded = Header::from_bytes(buf.as_slice()).expect("Could not decode the header");
         assert_eq!(
             header, decoded,
             "The decoded header does not match the original header"
@@ -202,8 +185,8 @@ mod tests {
     fn test_different_headers_different_hashes() {
         let header1 = create_header(5);
         let header2 = create_header(5);
-        let hash1 = header1.hash().expect("Failed to hash header");
-        let hash2 = header2.hash().expect("Failed to hash header");
+        let hash1 = header1.hash();
+        let hash2 = header2.hash();
         assert_ne!(
             hash1, hash2,
             "Different headers should produce different hashes"
@@ -228,15 +211,11 @@ mod tests {
 
     #[test]
     fn test_header_decode_insufficient_data() {
-        let mut buf: Vec<u8> = Vec::new();
         let header = create_header(3);
-        header
-            .serialize(&mut buf)
-            .expect("Could not encode the header");
-
+        let mut buf = header.to_bytes();
         buf.truncate(50);
 
-        let result = Header::deserialize_reader(&mut buf.as_slice());
+        let result = Header::from_bytes(buf.as_slice());
         assert!(result.is_err(), "Should fail with insufficient data");
     }
 
@@ -246,16 +225,13 @@ mod tests {
             version: u32::MAX,
             height: u32::MAX,
             timestamp: u64::MAX,
-            data_hash: Hash::random(),
-            previous_block: Hash::random(),
-            merkle_root: Hash::random(),
+            data_hash: random_hash(),
+            previous_block: random_hash(),
+            merkle_root: random_hash(),
         };
 
-        let mut buf: Vec<u8> = Vec::new();
-        header.serialize(&mut buf).expect("Could not encode header");
-
-        let decoded =
-            Header::deserialize_reader(&mut buf.as_slice()).expect("Could not decode header");
+        let buf = header.to_bytes();
+        let decoded = Header::from_bytes(buf.as_slice()).expect("Could not decode header");
         assert_eq!(header, decoded);
     }
 
@@ -286,14 +262,14 @@ mod tests {
     #[test]
     fn verify_fails_with_tampered_header_hash() {
         let mut block = Arc::try_unwrap(create_block(create_header(1), vec![])).unwrap();
-        block.header_hash = Hash::random();
+        block.header_hash = random_hash();
         assert!(!block.verify(&test_logger()));
     }
 
     #[test]
     fn new_with_transactions() {
         let key = PrivateKey::new();
-        let tx = Transaction::new(b"data".as_slice(), key).expect("Hashing failed");
+        let tx = Transaction::new(b"data".as_slice(), key);
 
         let block = create_block(create_header(1), vec![tx]);
         assert_eq!(block.transactions.len(), 1);
@@ -303,21 +279,21 @@ mod tests {
     #[test]
     fn verify_fails_with_tampered_data_hash() {
         let key = PrivateKey::new();
-        let tx = Transaction::new(b"data".as_slice(), key).expect("Hashing failed");
+        let tx = Transaction::new(b"data".as_slice(), key);
 
         let mut block = Arc::try_unwrap(create_block(create_header(1), vec![tx])).unwrap();
-        block.header.data_hash = Hash::random();
+        block.header.data_hash = random_hash();
         assert!(!block.verify(&test_logger()));
     }
 
     #[test]
     fn verify_fails_with_tampered_transaction() {
         let key = PrivateKey::new();
-        let tx = Transaction::new(b"original".as_slice(), key.clone()).expect("Hashing failed");
+        let tx = Transaction::new(b"original".as_slice(), key.clone());
 
         let mut block = Arc::try_unwrap(create_block(create_header(1), vec![tx])).unwrap();
 
-        let tampered_tx = Transaction::new(b"tampered".as_slice(), key).expect("Hashing failed");
+        let tampered_tx = Transaction::new(b"tampered".as_slice(), key);
         block.transactions = vec![tampered_tx].into_boxed_slice();
 
         assert!(!block.verify(&test_logger()));
@@ -328,12 +304,12 @@ mod tests {
         let key1 = PrivateKey::new();
         let key2 = PrivateKey::new();
 
-        let mut tx = Transaction::new(b"data".as_slice(), key1).expect("Hashing failed");
+        let mut tx = Transaction::new(b"data".as_slice(), key1);
         tx.from = key2.public_key();
 
         let header = create_header(1);
         let validator = PrivateKey::new();
-        let block = Block::new(header, validator, vec![tx]).expect("Block creation failed");
+        let block = Block::new(header, validator, vec![tx]);
 
         assert!(!block.verify(&test_logger()));
     }
@@ -341,12 +317,12 @@ mod tests {
     #[test]
     fn new_computes_data_hash_from_transactions() {
         let key = PrivateKey::new();
-        let tx1 = Transaction::new(b"tx1".as_slice(), key.clone()).expect("Hashing failed");
-        let tx2 = Transaction::new(b"tx2".as_slice(), key).expect("Hashing failed");
+        let tx1 = Transaction::new(b"tx1".as_slice(), key.clone());
+        let tx2 = Transaction::new(b"tx2".as_slice(), key);
 
         let header = create_header(1);
         let validator = PrivateKey::new();
-        let block = Block::new(header, validator, vec![tx1, tx2]).expect("Block creation failed");
+        let block = Block::new(header, validator, vec![tx1, tx2]);
 
         assert_ne!(block.header.data_hash, Hash::zero());
         assert!(block.verify(&test_logger()));
@@ -357,7 +333,7 @@ mod tests {
         let mut txs = Vec::new();
         for i in 0..10 {
             let key = PrivateKey::new();
-            let tx = Transaction::new(format!("tx{}", i).as_bytes(), key).expect("Hashing failed");
+            let tx = Transaction::new(format!("tx{}", i).as_bytes(), key);
             txs.push(tx);
         }
 
@@ -370,7 +346,7 @@ mod tests {
     fn empty_block_has_valid_data_hash() {
         let header = create_header(1);
         let validator = PrivateKey::new();
-        let block = Block::new(header, validator, vec![]).expect("Block creation failed");
+        let block = Block::new(header, validator, vec![]);
 
         assert!(block.verify(&test_logger()));
     }

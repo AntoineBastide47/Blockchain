@@ -23,7 +23,9 @@
 //! assert_eq!(value, decoded);
 //! ```
 
+use crate::network::txpool::MAX_TRANSACTION_PER_BLOCK;
 use crate::types::bytes::Bytes;
+use blockchain_derive::Error;
 
 /// Sink for writing encoded bytes.
 ///
@@ -92,14 +94,21 @@ pub trait Encode {
 }
 
 /// Errors that can occur during decoding.
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum DecodeError {
     /// Input ended before expected data was read.
+    #[error("unexpected eof")]
     UnexpectedEof,
     /// Data does not represent a valid value for the target type.
+    #[error("invalid value")]
     InvalidValue,
     /// Length prefix exceeds maximum allowed size.
-    LengthOverflow,
+    #[error("expected max size of {expected} for {type_name}, got: {actual}")]
+    LengthOverflow {
+        expected: usize,
+        actual: String,
+        type_name: String,
+    },
 }
 
 /// Trait for types that can be deserialized from binary format.
@@ -194,7 +203,11 @@ impl Encode for usize {
 impl Decode for usize {
     fn decode(input: &mut &[u8]) -> Result<Self, DecodeError> {
         let v = u64::decode(input)?;
-        usize::try_from(v).map_err(|_| DecodeError::LengthOverflow)
+        usize::try_from(v).map_err(|_| DecodeError::LengthOverflow {
+            expected: usize::MAX,
+            actual: v.to_string(),
+            type_name: "usize".to_string(),
+        })
     }
 }
 
@@ -226,14 +239,15 @@ impl<T: Encode> Encode for Vec<T> {
     }
 }
 
-/// Maximum allowed length for decoded vectors to prevent memory exhaustion.
-const MAX_VEC_LEN: usize = 1_000_000;
-
 impl<T: Decode> Decode for Vec<T> {
     fn decode(input: &mut &[u8]) -> Result<Self, DecodeError> {
         let len = usize::decode(input)?;
-        if len > MAX_VEC_LEN {
-            return Err(DecodeError::LengthOverflow);
+        if len > MAX_TRANSACTION_PER_BLOCK {
+            return Err(DecodeError::LengthOverflow {
+                expected: MAX_TRANSACTION_PER_BLOCK,
+                actual: len.to_string(),
+                type_name: "Vec".to_string(),
+            });
         }
 
         let mut vec = Vec::with_capacity(len);
@@ -375,7 +389,7 @@ mod tests {
     }
 
     #[test]
-    fn to_bytes_preallocates_exact_capacity() {
+    fn to_bytes_pre_allocates_exact_capacity() {
         let data: Vec<u8> = vec![1, 2, 3, 4, 5];
         let bytes = data.to_bytes();
         // Vec encodes as: 8-byte length + elements
@@ -500,10 +514,17 @@ mod tests {
     #[test]
     fn vec_length_overflow() {
         // Encode a length greater than MAX_VEC_LEN
-        let huge_len: u64 = (MAX_VEC_LEN as u64) + 1;
+        let huge_len: u64 = (MAX_TRANSACTION_PER_BLOCK as u64) + 1;
         let bytes = huge_len.to_bytes();
         let result = Vec::<u8>::from_bytes(&bytes);
-        assert!(matches!(result, Err(DecodeError::LengthOverflow)));
+        assert!(matches!(
+            result,
+            Err(DecodeError::LengthOverflow {
+                expected: _,
+                actual: _,
+                type_name: _
+            })
+        ));
     }
 
     // ========== Box<[T]> Tests ==========

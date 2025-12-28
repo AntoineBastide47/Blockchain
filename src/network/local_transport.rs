@@ -87,16 +87,21 @@ impl Transport for LocalTransport {
         let this = self.clone();
 
         Box::pin(async move {
+            let mut errors = Vec::new();
             for peer in peers.iter() {
                 if from == peer.addr() {
                     continue;
                 }
 
                 if let Err(e) = this.send_message(peer.addr(), data.clone()).await {
-                    return Err(TransportError::BroadcastFailed(e.to_string()));
+                    errors.push(e.to_string());
                 }
             }
-            Ok(())
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(TransportError::BroadcastFailed(errors.join("; ")))
+            }
         })
     }
 

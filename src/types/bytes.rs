@@ -90,14 +90,22 @@ impl Deref for Bytes {
 
 impl Encode for Bytes {
     fn encode<S: EncodeSink>(&self, out: &mut S) {
-        self.0.encode(out)
+        self.0.len().encode(out);
+        for item in self.clone().0.iter() {
+            item.encode(out);
+        }
     }
 }
 
 impl Decode for Bytes {
     fn decode(input: &mut &[u8]) -> Result<Self, DecodeError> {
-        let decoded = Vec::<u8>::decode(input)?;
-        Ok(Bytes::new(decoded))
+        let len = usize::decode(input)?;
+
+        let mut vec = Vec::<u8>::with_capacity(len);
+        for _ in 0..len {
+            vec.push(u8::decode(input)?);
+        }
+        Ok(Bytes::from_vec(vec))
     }
 }
 

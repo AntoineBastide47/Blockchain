@@ -10,6 +10,8 @@ use std::sync::RwLock;
 
 /// Default transaction pool capacity.
 pub const TXPOOL_CAPACITY: usize = 100_000;
+/// Maximum number of transactions returned for block building.
+pub const MAX_TRANSACTION_PER_BLOCK: usize = 20_000;
 
 /// Thread-safe pool of pending transactions.
 ///
@@ -20,6 +22,8 @@ pub struct TxPool {
     transactions: DashMap<Hash, Transaction>,
     /// Insertion order for deterministic transaction ordering in blocks.
     order: RwLock<Vec<Hash>>,
+    /// Maximum number of transactions the pool will accept.
+    capacity: usize,
 }
 
 impl TxPool {
@@ -27,11 +31,12 @@ impl TxPool {
     ///
     /// Uses `TXPOOL_CAPACITY` if `None` is provided.
     pub fn new(capacity: Option<usize>) -> Self {
-        let cap = capacity.unwrap_or(TXPOOL_CAPACITY);
+        let cap = capacity.unwrap_or(TXPOOL_CAPACITY).max(1);
 
         Self {
             transactions: DashMap::with_capacity(cap),
             order: RwLock::new(Vec::with_capacity(cap)),
+            capacity: cap,
         }
     }
 
@@ -43,6 +48,10 @@ impl TxPool {
     /// Adds a transaction to the pool if not already present.
     pub fn append(&self, transaction: Transaction) {
         let hash = transaction.hash;
+
+        if self.length() >= self.capacity {
+            return;
+        }
 
         // Fast path for duplicates to avoid bloating the ordering vector.
         match self.transactions.entry(hash) {
@@ -79,11 +88,14 @@ impl TxPool {
     }
 
     /// Returns all transactions in insertion order.
+    ///
+    /// TODO: replace with size or gas algorithm
     pub fn transactions(&self) -> Vec<Transaction> {
         let order = self.order.read().unwrap();
 
         order
             .iter()
+            .take(MAX_TRANSACTION_PER_BLOCK)
             .filter_map(|h| self.transactions.get(h).map(|e| e.clone()))
             .collect()
     }
@@ -178,7 +190,6 @@ mod tests {
         pool.flush();
         assert_eq!(pool.length(), 0);
 
-        // Transactions should be empty after flush
         assert!(pool.transactions().is_empty());
     }
 
@@ -201,6 +212,38 @@ mod tests {
         assert_eq!(pool.length(), 1);
         assert!(pool.contains(hash));
         assert_eq!(pool.transactions().len(), 1);
+    }
+
+    #[test]
+    fn append_rejects_when_full() {
+        let pool = TxPool::new(Some(1));
+        let key = PrivateKey::new();
+
+        let tx1 = Transaction::new(b"one", key.clone());
+        let tx2 = Transaction::new(b"two", key);
+
+        pool.append(tx1.clone());
+        pool.append(tx2.clone()); // should be rejected due to capacity
+
+        let txs = pool.transactions();
+        assert_eq!(txs.len(), 1);
+        assert_eq!(txs[0].hash, tx1.hash);
+        assert!(!pool.contains(tx2.hash));
+    }
+
+    #[test]
+    fn transactions_are_capped() {
+        let size: usize = 100;
+        let pool = TxPool::new(Some(size));
+        let key = PrivateKey::new();
+
+        for i in 0..size {
+            let tx = Transaction::new(i.to_string().as_bytes(), key.clone());
+            pool.append(tx);
+        }
+
+        let txs = pool.transactions();
+        assert_eq!(txs.len(), size);
     }
 
     #[test]

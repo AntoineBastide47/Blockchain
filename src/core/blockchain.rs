@@ -5,7 +5,6 @@ use crate::core::storage::{Storage, StorageError, ThreadSafeMemoryStorage};
 use crate::core::transaction::Transaction;
 use crate::core::validator::{BlockValidator, Validator};
 use crate::crypto::key_pair::PrivateKey;
-use crate::types::binary_codec::BinaryCodecHash;
 use crate::types::hash::Hash;
 use crate::utils::log::Logger;
 use std::sync::Arc;
@@ -73,7 +72,7 @@ impl<V: Validator, S: Storage> Blockchain<V, S> {
             height,
             timestamp,
             previous_block: tip,
-            data_hash: transactions.hash(),
+            data_hash: Hash::zero(),
             merkle_root: Hash::zero(),
         };
 

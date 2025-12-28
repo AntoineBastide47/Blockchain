@@ -5,6 +5,7 @@
 use crate::core::transaction::Transaction;
 use crate::types::hash::Hash;
 use dashmap::DashMap;
+use std::collections::HashSet;
 use std::sync::RwLock;
 
 /// Default transaction pool capacity.
@@ -41,12 +42,17 @@ impl TxPool {
 
     /// Adds a transaction to the pool if not already present.
     pub fn append(&self, transaction: Transaction) {
-        let mut order = self.order.write().unwrap();
-        order.push(transaction.hash);
+        let hash = transaction.hash;
 
-        self.transactions
-            .entry(transaction.hash)
-            .or_insert(transaction);
+        // Fast path for duplicates to avoid bloating the ordering vector.
+        match self.transactions.entry(hash) {
+            dashmap::mapref::entry::Entry::Occupied(_) => (),
+            dashmap::mapref::entry::Entry::Vacant(v) => {
+                v.insert(transaction);
+                let mut order = self.order.write().unwrap();
+                order.push(hash);
+            }
+        }
     }
 
     /// Returns the number of transactions in the pool.
@@ -62,11 +68,14 @@ impl TxPool {
 
     /// Removes transactions with the given hashes from the pool.
     pub fn remove_batch(&self, hashes: &[Hash]) {
-        for hash in hashes {
+        let removals: HashSet<Hash> = hashes.iter().copied().collect();
+
+        for hash in &removals {
             self.transactions.remove(hash);
         }
+
         let mut order = self.order.write().unwrap();
-        order.retain(|h| self.transactions.contains_key(h));
+        order.retain(|h| !removals.contains(h));
     }
 
     /// Returns all transactions in insertion order.
@@ -191,6 +200,7 @@ mod tests {
 
         assert_eq!(pool.length(), 1);
         assert!(pool.contains(hash));
+        assert_eq!(pool.transactions().len(), 1);
     }
 
     #[test]
@@ -206,6 +216,27 @@ mod tests {
         pool.append(tx2);
 
         assert_eq!(pool.length(), 2);
+    }
+
+    #[test]
+    fn remove_batch_prunes_order_once() {
+        let pool = TxPool::new(None);
+        let key = PrivateKey::new();
+
+        let tx1 = Transaction::new(b"first", key.clone());
+        let tx2 = Transaction::new(b"second", key);
+
+        pool.append(tx1.clone());
+        pool.append(tx2.clone());
+
+        pool.remove_batch(&[tx1.hash, tx1.hash]);
+
+        assert!(!pool.contains(tx1.hash));
+        assert!(pool.contains(tx2.hash));
+
+        let remaining = pool.transactions();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].hash, tx2.hash);
     }
 
     #[test]

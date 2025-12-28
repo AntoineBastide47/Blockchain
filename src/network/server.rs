@@ -120,8 +120,10 @@ impl Server {
             chain: Blockchain::new(Self::genesis_block(), logger),
         });
 
-        let server_thread = server.clone();
-        tokio::spawn(async move { server_thread.validator_loop().await });
+        if is_validator {
+            let server_thread = server.clone();
+            tokio::spawn(async move { server_thread.validator_loop().await });
+        }
 
         server
     }
@@ -178,10 +180,7 @@ impl Server {
 
         loop {
             ticker.tick().await;
-
-            if self.is_validator {
-                self.create_new_block().await;
-            }
+            self.create_new_block().await;
         }
     }
 

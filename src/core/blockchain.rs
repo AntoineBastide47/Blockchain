@@ -14,6 +14,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 ///
 /// Generic over validator and storage types for zero-cost abstraction.
 pub struct Blockchain<V: Validator, S: Storage> {
+    /// Chain identifier.
+    pub id: u64,
     /// Block storage backend.
     storage: S,
     /// Block validator for consensus rules.
@@ -24,7 +26,10 @@ pub struct Blockchain<V: Validator, S: Storage> {
 
 impl Blockchain<BlockValidator, ThreadSafeMemoryStorage> {
     /// Creates a new blockchain with default validator and in-memory storage.
-    pub fn new(genesis: Arc<Block>, logger: Logger) -> Self {
+    ///
+    /// The `id` parameter is the chain identifier used for transaction signing
+    /// and verification, preventing replay attacks across different chains.
+    pub fn new(id: u64, genesis: Arc<Block>, logger: Logger) -> Self {
         logger.info(&format!(
             "adding a new block to the chain: height={} hash={} transactions={}",
             genesis.header.height,
@@ -33,6 +38,7 @@ impl Blockchain<BlockValidator, ThreadSafeMemoryStorage> {
         ));
 
         Self {
+            id,
             storage: ThreadSafeMemoryStorage::new(genesis),
             validator: BlockValidator,
             logger,
@@ -89,7 +95,7 @@ impl<V: Validator, S: Storage> Blockchain<V, S> {
 
         match self
             .validator
-            .validate_block(&block, &self.storage, &self.logger)
+            .validate_block(&block, &self.storage, &self.logger, self.id)
         {
             Ok(_) => {
                 self.logger.info(&format!(
@@ -120,17 +126,21 @@ mod tests {
     use crate::utils::test_utils::utils::{create_genesis, random_hash};
     use blockchain_derive::Error;
 
+    const TEST_CHAIN_ID: u64 = 93;
+
     fn test_logger() -> Logger {
         Logger::new("test")
     }
 
     /// Creates a new blockchain with custom validator and storage.
     pub fn with_validator_and_storage<V: Validator, S: Storage>(
+        id: u64,
         validator: V,
         storage: S,
         logger: Logger,
     ) -> Blockchain<V, S> {
         Blockchain {
+            id,
             storage,
             validator,
             logger,
@@ -143,7 +153,7 @@ mod tests {
     ) -> Result<(), StorageError> {
         match chain
             .validator
-            .validate_block(&block, &chain.storage, &chain.logger)
+            .validate_block(&block, &chain.storage, &chain.logger, TEST_CHAIN_ID)
         {
             Ok(_) => {
                 chain.logger.info(&format!(
@@ -180,6 +190,7 @@ mod tests {
             _block: &Block,
             _storage: &S,
             _logger: &Logger,
+            _chain_id: u64,
         ) -> Result<(), Self::Error> {
             Ok(())
         }
@@ -193,6 +204,7 @@ mod tests {
             _block: &Block,
             _storage: &S,
             _logger: &Logger,
+            _chain_id: u64,
         ) -> Result<(), Self::Error> {
             Err(TestError::Dummy)
         }
@@ -213,7 +225,7 @@ mod tests {
     fn new_creates_blockchain_with_genesis() {
         let block = create_genesis();
         let hash = block.header_hash;
-        let bc = Blockchain::new(block, test_logger());
+        let bc = Blockchain::new(TEST_CHAIN_ID, block, test_logger());
         assert_eq!(bc.height(), 0);
         assert!(bc.get_block(hash).is_some());
     }
@@ -222,7 +234,8 @@ mod tests {
     fn height_increases_with_blocks() {
         let genesis = create_genesis();
         let storage = TestStorage::new(genesis.clone());
-        let mut bc = with_validator_and_storage(AcceptAllValidator, storage, test_logger());
+        let mut bc =
+            with_validator_and_storage(TEST_CHAIN_ID, AcceptAllValidator, storage, test_logger());
 
         let block1 = Block::new(
             create_header(1, bc.storage.tip()),
@@ -238,11 +251,13 @@ mod tests {
     fn add_block_respects_validator() {
         let genesis = create_genesis();
         let mut accept_bc = with_validator_and_storage(
+            TEST_CHAIN_ID,
             AcceptAllValidator,
             TestStorage::new(genesis.clone()),
             test_logger(),
         );
         let mut reject_bc = with_validator_and_storage(
+            TEST_CHAIN_ID,
             RejectAllValidator,
             TestStorage::new(genesis.clone()),
             test_logger(),
@@ -262,6 +277,7 @@ mod tests {
     fn add_blocks() {
         let genesis = create_genesis();
         let mut bc = with_validator_and_storage(
+            TEST_CHAIN_ID,
             AcceptAllValidator,
             TestStorage::new(genesis.clone()),
             test_logger(),

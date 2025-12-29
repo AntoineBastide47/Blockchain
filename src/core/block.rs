@@ -100,11 +100,14 @@ impl Block {
     ///
     /// Checks that:
     /// - The validator signature is valid for the header hash.
-    /// - All transaction signatures are valid.
+    /// - All transaction signatures are valid for the given chain ID.
     /// - The data hash matches the hash of the transactions.
     ///
+    /// The `chain_id` parameter ensures transactions are verified against the
+    /// correct chain, preventing cross-chain replay attacks.
+    ///
     /// Logs warnings for any verification failures.
-    pub fn verify(&self, logger: &Logger) -> bool {
+    pub fn verify(&self, logger: &Logger, chain_id: u64) -> bool {
         if !self
             .validator
             .verify(self.header_hash.as_slice(), self.signature)
@@ -117,7 +120,7 @@ impl Block {
         }
 
         for t in &self.transactions {
-            if !t.verify() {
+            if !t.verify(chain_id) {
                 logger.warn(&format!(
                     "invalid transaction signature in block: block={}",
                     self.header_hash
@@ -145,6 +148,8 @@ mod tests {
     use crate::types::binary_codec::BinaryCodecHash;
     use crate::utils::test_utils::utils::random_hash;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    const TEST_CHAIN_ID: u64 = 832489;
 
     fn test_logger() -> Logger {
         Logger::new("test")
@@ -249,54 +254,54 @@ mod tests {
     #[test]
     fn new_creates_verifiable_block() {
         let block = create_block(create_header(1), vec![]);
-        assert!(block.verify(&test_logger()));
+        assert!(block.verify(&test_logger(), TEST_CHAIN_ID));
     }
 
     #[test]
     fn verify_fails_with_wrong_validator() {
         let mut block = Arc::try_unwrap(create_block(create_header(1), vec![])).unwrap();
         block.validator = PrivateKey::new().public_key();
-        assert!(!block.verify(&test_logger()));
+        assert!(!block.verify(&test_logger(), TEST_CHAIN_ID));
     }
 
     #[test]
     fn verify_fails_with_tampered_header_hash() {
         let mut block = Arc::try_unwrap(create_block(create_header(1), vec![])).unwrap();
         block.header_hash = random_hash();
-        assert!(!block.verify(&test_logger()));
+        assert!(!block.verify(&test_logger(), TEST_CHAIN_ID));
     }
 
     #[test]
     fn new_with_transactions() {
         let key = PrivateKey::new();
-        let tx = Transaction::new(b"data".as_slice(), key);
+        let tx = Transaction::new(b"data".as_slice(), key, TEST_CHAIN_ID);
 
         let block = create_block(create_header(1), vec![tx]);
         assert_eq!(block.transactions.len(), 1);
-        assert!(block.verify(&test_logger()));
+        assert!(block.verify(&test_logger(), TEST_CHAIN_ID));
     }
 
     #[test]
     fn verify_fails_with_tampered_data_hash() {
         let key = PrivateKey::new();
-        let tx = Transaction::new(b"data".as_slice(), key);
+        let tx = Transaction::new(b"data".as_slice(), key, TEST_CHAIN_ID);
 
         let mut block = Arc::try_unwrap(create_block(create_header(1), vec![tx])).unwrap();
         block.header.data_hash = random_hash();
-        assert!(!block.verify(&test_logger()));
+        assert!(!block.verify(&test_logger(), TEST_CHAIN_ID));
     }
 
     #[test]
     fn verify_fails_with_tampered_transaction() {
         let key = PrivateKey::new();
-        let tx = Transaction::new(b"original".as_slice(), key.clone());
+        let tx = Transaction::new(b"original".as_slice(), key.clone(), TEST_CHAIN_ID);
 
         let mut block = Arc::try_unwrap(create_block(create_header(1), vec![tx])).unwrap();
 
-        let tampered_tx = Transaction::new(b"tampered".as_slice(), key);
+        let tampered_tx = Transaction::new(b"tampered".as_slice(), key, TEST_CHAIN_ID);
         block.transactions = vec![tampered_tx].into_boxed_slice();
 
-        assert!(!block.verify(&test_logger()));
+        assert!(!block.verify(&test_logger(), TEST_CHAIN_ID));
     }
 
     #[test]
@@ -304,28 +309,28 @@ mod tests {
         let key1 = PrivateKey::new();
         let key2 = PrivateKey::new();
 
-        let mut tx = Transaction::new(b"data".as_slice(), key1);
+        let mut tx = Transaction::new(b"data".as_slice(), key1, TEST_CHAIN_ID);
         tx.from = key2.public_key();
 
         let header = create_header(1);
         let validator = PrivateKey::new();
         let block = Block::new(header, validator, vec![tx]);
 
-        assert!(!block.verify(&test_logger()));
+        assert!(!block.verify(&test_logger(), TEST_CHAIN_ID));
     }
 
     #[test]
     fn new_computes_data_hash_from_transactions() {
         let key = PrivateKey::new();
-        let tx1 = Transaction::new(b"tx1".as_slice(), key.clone());
-        let tx2 = Transaction::new(b"tx2".as_slice(), key);
+        let tx1 = Transaction::new(b"tx1".as_slice(), key.clone(), TEST_CHAIN_ID);
+        let tx2 = Transaction::new(b"tx2".as_slice(), key, TEST_CHAIN_ID);
 
         let header = create_header(1);
         let validator = PrivateKey::new();
         let block = Block::new(header, validator, vec![tx1, tx2]);
 
         assert_ne!(block.header.data_hash, Hash::zero());
-        assert!(block.verify(&test_logger()));
+        assert!(block.verify(&test_logger(), TEST_CHAIN_ID));
     }
 
     #[test]
@@ -333,13 +338,13 @@ mod tests {
         let mut txs = Vec::new();
         for i in 0..10 {
             let key = PrivateKey::new();
-            let tx = Transaction::new(format!("tx{}", i).as_bytes(), key);
+            let tx = Transaction::new(format!("tx{}", i).as_bytes(), key, TEST_CHAIN_ID);
             txs.push(tx);
         }
 
         let block = create_block(create_header(1), txs);
         assert_eq!(block.transactions.len(), 10);
-        assert!(block.verify(&test_logger()));
+        assert!(block.verify(&test_logger(), TEST_CHAIN_ID));
     }
 
     #[test]
@@ -348,6 +353,6 @@ mod tests {
         let validator = PrivateKey::new();
         let block = Block::new(header, validator, vec![]);
 
-        assert!(block.verify(&test_logger()));
+        assert!(block.verify(&test_logger(), TEST_CHAIN_ID));
     }
 }

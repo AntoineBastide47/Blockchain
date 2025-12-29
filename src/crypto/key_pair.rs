@@ -2,7 +2,6 @@
 
 use crate::types::address::{ADDRESS_SIZE, Address};
 use crate::types::binary_codec::Decode;
-use crate::types::bytes::Bytes;
 use crate::types::encoding::{DecodeError, Encode, EncodeSink};
 pub(crate) use crate::types::serializable_signature::SerializableSignature;
 use k256::ecdsa::signature::Signer;
@@ -56,7 +55,7 @@ impl PrivateKey {
     }
 
     /// Signs arbitrary data, producing a Schnorr signature.
-    pub fn sign(&self, data: &Bytes) -> SerializableSignature {
+    pub fn sign(&self, data: &[u8]) -> SerializableSignature {
         SerializableSignature(self.key.sign(data))
     }
 }
@@ -122,6 +121,7 @@ impl Decode for PublicKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::bytes::Bytes;
 
     #[test]
     fn test_sign_verify_success() {

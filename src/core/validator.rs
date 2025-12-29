@@ -22,15 +22,17 @@ pub trait Validator: Send + Sync {
     /// * `block` - The block to validate.
     /// * `storage` - Current chain state for context.
     /// * `logger` - Logger for validation messages.
+    /// * `chain_id` - Chain identifier for transaction signature verification.
     ///
     /// # Returns
     ///
-    /// `true` if the block is valid and can be added to the chain.
+    /// `Ok(())` if the block is valid and can be added to the chain.
     fn validate_block<S: Storage>(
         &self,
         block: &Block,
         storage: &S,
         logger: &Logger,
+        chain_id: u64,
     ) -> Result<(), Self::Error>;
 }
 
@@ -67,6 +69,7 @@ impl Validator for BlockValidator {
         block: &Block,
         storage: &S,
         logger: &Logger,
+        chain_id: u64,
     ) -> Result<(), Self::Error> {
         let expected_height = storage.height().checked_add(1);
         if expected_height != Some(block.header.height) {
@@ -84,7 +87,7 @@ impl Validator for BlockValidator {
             return Err(BlockValidatorError::BlockExists);
         }
 
-        if !block.verify(logger) {
+        if !block.verify(logger, chain_id) {
             return Err(BlockValidatorError::InvalidSignature);
         }
 
@@ -101,6 +104,8 @@ mod tests {
     use crate::types::hash::Hash;
     use crate::utils::test_utils::utils::{create_genesis, random_hash};
     use std::sync::Arc;
+
+    const TEST_CHAIN_ID: u64 = 872539;
 
     fn test_logger() -> Logger {
         Logger::new("test")
@@ -127,7 +132,7 @@ mod tests {
         let block = create_block(1, genesis.header_hash);
         assert!(
             validator
-                .validate_block(&block, &storage, &test_logger())
+                .validate_block(&block, &storage, &test_logger(), TEST_CHAIN_ID)
                 .is_ok()
         );
     }
@@ -141,7 +146,7 @@ mod tests {
         let block = create_block(5, genesis.header_hash);
         assert!(
             validator
-                .validate_block(&block, &storage, &test_logger())
+                .validate_block(&block, &storage, &test_logger(), TEST_CHAIN_ID)
                 .is_err()
         );
     }
@@ -155,7 +160,7 @@ mod tests {
         let block = create_block(1, random_hash());
         assert!(
             validator
-                .validate_block(&block, &storage, &test_logger())
+                .validate_block(&block, &storage, &test_logger(), TEST_CHAIN_ID)
                 .is_err()
         );
     }
@@ -168,7 +173,7 @@ mod tests {
         let block = create_block(0, Hash::zero());
         assert!(
             validator
-                .validate_block(&block, &storage, &test_logger())
+                .validate_block(&block, &storage, &test_logger(), TEST_CHAIN_ID)
                 .is_err()
         );
     }

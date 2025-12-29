@@ -25,6 +25,12 @@ use std::time::Duration;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::interval;
 
+/// Chain identifier for development and testing environments.
+///
+/// Using chain ID 0 ensures transactions signed for development cannot be
+/// replayed on production networks with different chain IDs.
+pub const DEV_CHAIN_ID: u64 = 0;
+
 /// Well-known private key bytes used exclusively for signing the genesis block.
 /// This key has no authority beyond genesis; it exists solely to produce a
 /// deterministic, verifiable genesis block signature across all nodes.
@@ -117,7 +123,7 @@ impl Server {
             is_validator,
             tx_pool: TxPool::new(transaction_pool_capacity),
             block_time,
-            chain: Blockchain::new(Self::genesis_block(), logger),
+            chain: Blockchain::new(DEV_CHAIN_ID, Self::genesis_block(), logger),
         });
 
         if is_validator {
@@ -218,10 +224,12 @@ impl Server {
 
     /// Validates and adds a transaction to the local pool.
     pub fn add_to_pool(&self, transaction: &Transaction) -> Result<(), ServerError> {
-        if !transaction.verify() {
-            return Err(ServerError::InvalidTransaction(transaction.hash));
+        if !transaction.verify(self.chain.id) {
+            return Err(ServerError::InvalidTransaction(
+                transaction.id(self.chain.id),
+            ));
         }
-        self.tx_pool.append(transaction.clone());
+        self.tx_pool.append(transaction.clone(), self.chain.id);
         Ok(())
     }
 
@@ -268,25 +276,27 @@ impl Server {
         from: String,
         transaction: Transaction,
     ) -> Result<(), ServerError> {
-        if self.tx_pool.contains(transaction.hash) {
+        if self.tx_pool.contains(transaction.id(self.chain.id)) {
             self.logger.warn(&format!(
                 "({}) attempting to add a new transaction to the pool that already is in it: hash={}",
                 self.transport.addr(),
-                transaction.hash
+                transaction.id(self.chain.id)
             ));
             return Ok(());
         }
 
-        if !transaction.verify() {
-            return Err(ServerError::InvalidTransaction(transaction.hash));
+        if !transaction.verify(self.chain.id) {
+            return Err(ServerError::InvalidTransaction(
+                transaction.id(self.chain.id),
+            ));
         }
 
         // self.logger.info(&format!(
         //     "adding a new transaction to the pool: hash={} pool_size={}",
-        //     transaction.hash,
+        //     transaction.tx_id(self.chain.id),
         //     self.tx_pool.length()
         // ));
-        self.tx_pool.append(transaction.clone());
+        self.tx_pool.append(transaction.clone(), self.chain.id);
 
         tokio::spawn(async move { self.broadcast_transaction(from, transaction.clone()).await });
 
@@ -306,7 +316,11 @@ impl Server {
                 source: e,
             })?;
 
-        let hashes: Vec<Hash> = arc_block.transactions.iter().map(|tx| tx.hash).collect();
+        let hashes: Vec<Hash> = arc_block
+            .transactions
+            .iter()
+            .map(|tx| tx.id(self.chain.id))
+            .collect();
         self.tx_pool.remove_batch(&hashes);
         tokio::spawn(async move { self.broadcast_block(from, arc_block).await });
         Ok(())
@@ -364,6 +378,8 @@ mod tests {
     use super::*;
     use crate::crypto::key_pair::PrivateKey;
 
+    const TEST_CHAIN_ID: u64 = 10;
+
     #[tokio::test]
     async fn server_is_validator_when_private_key_set() {
         let transport = LocalTransport::new("validator");
@@ -388,7 +404,7 @@ mod tests {
     #[test]
     fn handle_rpc_decodes_valid_transaction() {
         let key = PrivateKey::new();
-        let tx = Transaction::new(b"test data".as_slice(), key);
+        let tx = Transaction::new(b"test data".as_slice(), key, TEST_CHAIN_ID);
         let tx_bytes = tx.to_bytes();
 
         let msg = Message::new(MessageType::Transaction, tx_bytes);
@@ -400,7 +416,7 @@ mod tests {
         assert_eq!(result.from, "sender");
         match result.data {
             DecodedMessageData::Transaction(decoded_tx) => {
-                assert_eq!(decoded_tx.hash, tx.hash);
+                assert_eq!(decoded_tx.id(TEST_CHAIN_ID), tx.id(TEST_CHAIN_ID));
             }
             _ => panic!("expected Transaction variant"),
         }
@@ -472,10 +488,10 @@ mod tests {
     #[test]
     fn handle_rpc_preserves_block_transactions() {
         let key = PrivateKey::new();
-        let tx1 = Transaction::new(b"tx1".as_slice(), key.clone());
-        let tx2 = Transaction::new(b"tx2".as_slice(), key);
-        let tx1_hash = tx1.hash;
-        let tx2_hash = tx2.hash;
+        let tx1 = Transaction::new(b"tx1".as_slice(), key.clone(), TEST_CHAIN_ID);
+        let tx2 = Transaction::new(b"tx2".as_slice(), key, TEST_CHAIN_ID);
+        let tx1_hash = tx1.id(TEST_CHAIN_ID);
+        let tx2_hash = tx2.id(TEST_CHAIN_ID);
 
         let block = create_test_block(vec![tx1, tx2]);
         let block_bytes = block.to_bytes();
@@ -489,8 +505,8 @@ mod tests {
         match result.data {
             DecodedMessageData::Block(decoded_block) => {
                 assert_eq!(decoded_block.transactions.len(), 2);
-                assert_eq!(decoded_block.transactions[0].hash, tx1_hash);
-                assert_eq!(decoded_block.transactions[1].hash, tx2_hash);
+                assert_eq!(decoded_block.transactions[0].id(TEST_CHAIN_ID), tx1_hash);
+                assert_eq!(decoded_block.transactions[1].id(TEST_CHAIN_ID), tx2_hash);
             }
             _ => panic!("expected Block variant"),
         }

@@ -46,8 +46,11 @@ impl TxPool {
     }
 
     /// Adds a transaction to the pool if not already present.
-    pub fn append(&self, transaction: Transaction) {
-        let hash = transaction.hash;
+    ///
+    /// The `chain_id` is used to compute the transaction ID for deduplication.
+    /// Silently drops the transaction if the pool is at capacity.
+    pub fn append(&self, transaction: Transaction, chain_id: u64) {
+        let hash = transaction.id(chain_id);
 
         if self.length() >= self.capacity {
             return;
@@ -107,18 +110,20 @@ mod tests {
     use crate::crypto::key_pair::PrivateKey;
     use crate::network::txpool::TxPool;
 
+    const TEST_CHAIN_ID: u64 = 284528;
+
     #[test]
     fn text_tx_pool() {
         let pool = TxPool::new(None);
         assert_eq!(pool.length(), 0);
 
         let key = PrivateKey::new();
-        let tx = Transaction::new(b"Hello World", key.clone());
-        pool.append(tx);
+        let tx = Transaction::new(b"Hello World", key.clone(), TEST_CHAIN_ID);
+        pool.append(tx, TEST_CHAIN_ID);
         assert_eq!(pool.length(), 1);
 
-        let tx = Transaction::new(b"Hello World", key.clone());
-        pool.append(tx);
+        let tx = Transaction::new(b"Hello World", key.clone(), TEST_CHAIN_ID);
+        pool.append(tx, TEST_CHAIN_ID);
         assert_eq!(pool.length(), 1);
 
         pool.flush();
@@ -132,16 +137,16 @@ mod tests {
 
         let mut txs: Vec<Transaction> = vec![];
         for i in 0..=100 {
-            let tx = Transaction::new(i.to_string().as_bytes(), PrivateKey::new());
+            let tx = Transaction::new(i.to_string().as_bytes(), PrivateKey::new(), TEST_CHAIN_ID);
             txs.push(tx.clone());
-            pool.append(tx);
+            pool.append(tx, TEST_CHAIN_ID);
         }
 
         let pool_txs = pool.transactions();
         for i in 0..=100 {
             assert_eq!(
-                pool_txs.get(i).unwrap().hash,
-                txs.get(i).unwrap().hash,
+                pool_txs.get(i).unwrap().id(TEST_CHAIN_ID),
+                txs.get(i).unwrap().id(TEST_CHAIN_ID),
                 "failed at index {}",
                 i
             );
@@ -155,18 +160,18 @@ mod tests {
     fn contains_returns_false_for_empty_pool() {
         let pool = TxPool::new(None);
         let key = PrivateKey::new();
-        let tx = Transaction::new(b"test", key);
-        assert!(!pool.contains(tx.hash));
+        let tx = Transaction::new(b"test", key, TEST_CHAIN_ID);
+        assert!(!pool.contains(tx.id(TEST_CHAIN_ID)));
     }
 
     #[test]
     fn contains_returns_true_after_append() {
         let pool = TxPool::new(None);
         let key = PrivateKey::new();
-        let tx = Transaction::new(b"test", key);
-        let hash = tx.hash;
+        let tx = Transaction::new(b"test", key, TEST_CHAIN_ID);
+        let hash = tx.id(TEST_CHAIN_ID);
 
-        pool.append(tx);
+        pool.append(tx, TEST_CHAIN_ID);
         assert!(pool.contains(hash));
     }
 
@@ -182,8 +187,8 @@ mod tests {
         let key = PrivateKey::new();
 
         for i in 0..5 {
-            let tx = Transaction::new(i.to_string().as_bytes(), key.clone());
-            pool.append(tx);
+            let tx = Transaction::new(i.to_string().as_bytes(), key.clone(), TEST_CHAIN_ID);
+            pool.append(tx, TEST_CHAIN_ID);
         }
 
         assert_eq!(pool.length(), 5);
@@ -203,11 +208,11 @@ mod tests {
     fn duplicate_transaction_not_added_twice() {
         let pool = TxPool::new(None);
         let key = PrivateKey::new();
-        let tx = Transaction::new(b"same data", key);
-        let hash = tx.hash;
+        let tx = Transaction::new(b"same data", key, TEST_CHAIN_ID);
+        let hash = tx.id(TEST_CHAIN_ID);
 
-        pool.append(tx.clone());
-        pool.append(tx);
+        pool.append(tx.clone(), TEST_CHAIN_ID);
+        pool.append(tx, TEST_CHAIN_ID);
 
         assert_eq!(pool.length(), 1);
         assert!(pool.contains(hash));
@@ -219,16 +224,16 @@ mod tests {
         let pool = TxPool::new(Some(1));
         let key = PrivateKey::new();
 
-        let tx1 = Transaction::new(b"one", key.clone());
-        let tx2 = Transaction::new(b"two", key);
+        let tx1 = Transaction::new(b"one", key.clone(), TEST_CHAIN_ID);
+        let tx2 = Transaction::new(b"two", key, TEST_CHAIN_ID);
 
-        pool.append(tx1.clone());
-        pool.append(tx2.clone()); // should be rejected due to capacity
+        pool.append(tx1.clone(), TEST_CHAIN_ID);
+        pool.append(tx2.clone(), TEST_CHAIN_ID); // should be rejected due to capacity
 
         let txs = pool.transactions();
         assert_eq!(txs.len(), 1);
-        assert_eq!(txs[0].hash, tx1.hash);
-        assert!(!pool.contains(tx2.hash));
+        assert_eq!(txs[0].id(TEST_CHAIN_ID), tx1.id(TEST_CHAIN_ID));
+        assert!(!pool.contains(tx2.id(TEST_CHAIN_ID)));
     }
 
     #[test]
@@ -238,8 +243,8 @@ mod tests {
         let key = PrivateKey::new();
 
         for i in 0..size {
-            let tx = Transaction::new(i.to_string().as_bytes(), key.clone());
-            pool.append(tx);
+            let tx = Transaction::new(i.to_string().as_bytes(), key.clone(), TEST_CHAIN_ID);
+            pool.append(tx, TEST_CHAIN_ID);
         }
 
         let txs = pool.transactions();
@@ -252,11 +257,11 @@ mod tests {
         let key1 = PrivateKey::new();
         let key2 = PrivateKey::new();
 
-        let tx1 = Transaction::new(b"same data", key1);
-        let tx2 = Transaction::new(b"same data", key2);
+        let tx1 = Transaction::new(b"same data", key1, TEST_CHAIN_ID);
+        let tx2 = Transaction::new(b"same data", key2, TEST_CHAIN_ID);
 
-        pool.append(tx1);
-        pool.append(tx2);
+        pool.append(tx1, TEST_CHAIN_ID);
+        pool.append(tx2, TEST_CHAIN_ID);
 
         assert_eq!(pool.length(), 2);
     }
@@ -266,20 +271,20 @@ mod tests {
         let pool = TxPool::new(None);
         let key = PrivateKey::new();
 
-        let tx1 = Transaction::new(b"first", key.clone());
-        let tx2 = Transaction::new(b"second", key);
+        let tx1 = Transaction::new(b"first", key.clone(), TEST_CHAIN_ID);
+        let tx2 = Transaction::new(b"second", key, TEST_CHAIN_ID);
 
-        pool.append(tx1.clone());
-        pool.append(tx2.clone());
+        pool.append(tx1.clone(), TEST_CHAIN_ID);
+        pool.append(tx2.clone(), TEST_CHAIN_ID);
 
-        pool.remove_batch(&[tx1.hash, tx1.hash]);
+        pool.remove_batch(&[tx1.id(TEST_CHAIN_ID), tx1.id(TEST_CHAIN_ID)]);
 
-        assert!(!pool.contains(tx1.hash));
-        assert!(pool.contains(tx2.hash));
+        assert!(!pool.contains(tx1.id(TEST_CHAIN_ID)));
+        assert!(pool.contains(tx2.id(TEST_CHAIN_ID)));
 
         let remaining = pool.transactions();
         assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].hash, tx2.hash);
+        assert_eq!(remaining[0].id(TEST_CHAIN_ID), tx2.id(TEST_CHAIN_ID));
     }
 
     #[test]
@@ -288,16 +293,16 @@ mod tests {
         let mut hashes = Vec::new();
 
         for i in 0..1000 {
-            let tx = Transaction::new(i.to_string().as_bytes(), PrivateKey::new());
-            hashes.push(tx.hash);
-            pool.append(tx);
+            let tx = Transaction::new(i.to_string().as_bytes(), PrivateKey::new(), TEST_CHAIN_ID);
+            hashes.push(tx.id(TEST_CHAIN_ID));
+            pool.append(tx, TEST_CHAIN_ID);
         }
 
         let pool_txs = pool.transactions();
         assert_eq!(pool_txs.len(), 1000);
 
         for (i, tx) in pool_txs.iter().enumerate() {
-            assert_eq!(tx.hash, hashes[i]);
+            assert_eq!(tx.id(TEST_CHAIN_ID), hashes[i]);
         }
     }
 }

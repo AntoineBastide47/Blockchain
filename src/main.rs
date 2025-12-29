@@ -6,7 +6,7 @@ use crate::core::transaction::Transaction;
 use crate::crypto::key_pair::PrivateKey;
 use crate::network::local_transport::LocalTransport;
 use crate::network::rpc::{Message, MessageType, Rpc};
-use crate::network::server::{Server, ServerError};
+use crate::network::server::{DEV_CHAIN_ID, Server, ServerError};
 use crate::network::transport::{Transport, TransportError};
 use crate::types::encoding::Encode;
 use crate::utils::log::{self, Logger};
@@ -126,7 +126,7 @@ async fn send_transaction(
     let key = PrivateKey::new();
     let data = vec![index; 32];
 
-    let tx = Transaction::new(data, key);
+    let tx = Transaction::new(data, key, DEV_CHAIN_ID);
     let msg = Message::new(MessageType::Transaction, tx.to_bytes());
     server.add_to_pool(&tx)?;
 

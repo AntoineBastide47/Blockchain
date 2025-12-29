@@ -23,9 +23,14 @@
 //! assert_eq!(value, decoded);
 //! ```
 
-use crate::network::txpool::MAX_TRANSACTION_PER_BLOCK;
 use crate::types::bytes::Bytes;
 use blockchain_derive::Error;
+use std::mem;
+
+/// Maximum number of elements allowed when decoding a vector to avoid unbounded allocations.
+pub const MAX_VEC_LEN: usize = 1_000_000;
+/// Maximum total bytes allowed when decoding a vector to avoid OOM.
+pub const MAX_VEC_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
 
 /// Sink for writing encoded bytes.
 ///
@@ -232,6 +237,16 @@ impl Decode for bool {
 // Vec<T>
 impl<T: Encode> Encode for Vec<T> {
     fn encode<S: EncodeSink>(&self, out: &mut S) {
+        let elem_bytes = mem::size_of::<T>().max(1);
+        let total_bytes = self.len().saturating_mul(elem_bytes);
+
+        // If the vector is too large, emit an empty vector to avoid panicking or
+        // allocating excessive buffers. The counterpart decode will reject it.
+        if self.len() > MAX_VEC_LEN || total_bytes > MAX_VEC_BYTES {
+            0usize.encode(out);
+            return;
+        }
+
         self.len().encode(out);
         for item in self {
             item.encode(out);
@@ -242,10 +257,26 @@ impl<T: Encode> Encode for Vec<T> {
 impl<T: Decode> Decode for Vec<T> {
     fn decode(input: &mut &[u8]) -> Result<Self, DecodeError> {
         let len = usize::decode(input)?;
-        if len > MAX_TRANSACTION_PER_BLOCK {
+        if len > MAX_VEC_LEN {
             return Err(DecodeError::LengthOverflow {
-                expected: MAX_TRANSACTION_PER_BLOCK,
+                expected: MAX_VEC_LEN,
                 actual: len.to_string(),
+                type_name: "Vec".to_string(),
+            });
+        }
+
+        let elem_bytes = mem::size_of::<T>().max(1);
+        let total_bytes = len
+            .checked_mul(elem_bytes)
+            .ok_or(DecodeError::LengthOverflow {
+                expected: MAX_VEC_BYTES,
+                actual: "overflow".to_string(),
+                type_name: "Vec".to_string(),
+            })?;
+        if total_bytes > MAX_VEC_BYTES {
+            return Err(DecodeError::LengthOverflow {
+                expected: MAX_VEC_BYTES,
+                actual: total_bytes.to_string(),
                 type_name: "Vec".to_string(),
             });
         }
@@ -514,9 +545,26 @@ mod tests {
     #[test]
     fn vec_length_overflow() {
         // Encode a length greater than MAX_VEC_LEN
-        let huge_len: u64 = (MAX_TRANSACTION_PER_BLOCK as u64) + 1;
+        let huge_len: u64 = (MAX_VEC_LEN as u64) + 1;
         let bytes = huge_len.to_bytes();
         let result = Vec::<u8>::from_bytes(&bytes);
+        assert!(matches!(
+            result,
+            Err(DecodeError::LengthOverflow {
+                expected: _,
+                actual: _,
+                type_name: _
+            })
+        ));
+    }
+
+    #[test]
+    fn vec_byte_length_overflow() {
+        // len is within MAX_VEC_LEN but exceeds MAX_VEC_BYTES when accounting for element size.
+        let oversized_len: usize = (MAX_VEC_BYTES / std::mem::size_of::<u32>()) + 1;
+        let mut bytes = Vec::new();
+        (oversized_len as u64).encode(&mut bytes);
+        let result = Vec::<u32>::from_bytes(&bytes);
         assert!(matches!(
             result,
             Err(DecodeError::LengthOverflow {

@@ -25,7 +25,6 @@
 
 use crate::types::bytes::Bytes;
 use blockchain_derive::Error;
-use std::mem;
 
 /// Maximum number of elements allowed when decoding a vector to avoid unbounded allocations.
 pub const MAX_VEC_LEN: usize = 1_000_000;
@@ -237,7 +236,7 @@ impl Decode for bool {
 // Vec<T>
 impl<T: Encode> Encode for Vec<T> {
     fn encode<S: EncodeSink>(&self, out: &mut S) {
-        let elem_bytes = mem::size_of::<T>().max(1);
+        let elem_bytes = size_of::<T>().max(1);
         let total_bytes = self.len().saturating_mul(elem_bytes);
 
         // If the vector is too large, emit an empty vector to avoid panicking or
@@ -265,7 +264,7 @@ impl<T: Decode> Decode for Vec<T> {
             });
         }
 
-        let elem_bytes = mem::size_of::<T>().max(1);
+        let elem_bytes = size_of::<T>().max(1);
         let total_bytes = len
             .checked_mul(elem_bytes)
             .ok_or(DecodeError::LengthOverflow {
@@ -561,7 +560,7 @@ mod tests {
     #[test]
     fn vec_byte_length_overflow() {
         // len is within MAX_VEC_LEN but exceeds MAX_VEC_BYTES when accounting for element size.
-        let oversized_len: usize = (MAX_VEC_BYTES / std::mem::size_of::<u32>()) + 1;
+        let oversized_len: usize = (MAX_VEC_BYTES / size_of::<u32>()) + 1;
         let mut bytes = Vec::new();
         (oversized_len as u64).encode(&mut bytes);
         let result = Vec::<u32>::from_bytes(&bytes);

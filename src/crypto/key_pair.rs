@@ -1,8 +1,7 @@
 //! Schnorr signature key pairs on secp256k1.
 
 use crate::types::address::{ADDRESS_SIZE, Address};
-use crate::types::binary_codec::Decode;
-use crate::types::encoding::{DecodeError, Encode, EncodeSink};
+use crate::types::encoding::{Decode, DecodeError, Encode, EncodeSink};
 pub(crate) use crate::types::serializable_signature::SerializableSignature;
 use k256::ecdsa::signature::Signer;
 use k256::schnorr::signature::Verifier;

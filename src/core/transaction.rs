@@ -1,12 +1,10 @@
 //! Transaction structure with reference-counted data storage.
 
 use crate::crypto::key_pair::{PrivateKey, PublicKey, SerializableSignature};
-use crate::types::binary_codec::BinaryCodecHash;
 use crate::types::bytes::Bytes;
 use crate::types::encoding::{Decode, DecodeError, Encode, EncodeSink};
 use crate::types::hash::Hash;
 use blockchain_derive::BinaryCodec;
-use sha3::{Digest, Sha3_256};
 use std::sync::OnceLock;
 
 /// Unsigned transaction used internally for signing and verification.
@@ -32,16 +30,6 @@ impl UnsignedTransaction {
         chain_id.encode(&mut buf);
         self.encode(&mut buf);
         buf
-    }
-
-    /// Converts to a signed transaction by attaching the given signature.
-    pub fn to_signed(&self, signature: SerializableSignature) -> Transaction {
-        Transaction {
-            from: self.from,
-            signature,
-            data: self.data.clone(),
-            cached_id: OnceLock::new(),
-        }
     }
 }
 
@@ -73,11 +61,14 @@ impl Transaction {
             from: key.public_key(),
             data: data.clone(),
         };
+        let signature = Hash::sha3_from_bytes(&unsigned.signing_bytes(chain_id));
 
-        let signing_bytes = unsigned.signing_bytes(chain_id);
-        let hash = Sha3_256::digest(&signing_bytes);
-
-        unsigned.to_signed(key.sign(hash.as_slice()))
+        Transaction {
+            from: unsigned.from,
+            signature: key.sign(signature.as_slice()),
+            data: unsigned.data,
+            cached_id: OnceLock::new(),
+        }
     }
 
     /// Returns the bytes that were signed to produce this transaction's signature.
@@ -100,10 +91,8 @@ impl Transaction {
             let mut buf = Vec::<u8>::new();
             buf.extend_from_slice(b"TXID");
             chain_id.encode(&mut buf);
-            self.from.encode(&mut buf);
-            self.signature.encode(&mut buf);
-            self.data.encode(&mut buf);
-            buf.hash()
+            self.encode(&mut buf);
+            Hash::sha3_from_bytes(&buf)
         })
     }
 
@@ -111,7 +100,7 @@ impl Transaction {
     ///
     /// Returns `true` if the signature is valid for the given chain ID.
     pub fn verify(&self, chain_id: u64) -> bool {
-        let hash = Sha3_256::digest(self.signing_bytes(chain_id));
+        let hash = Hash::sha3_from_bytes(&self.signing_bytes(chain_id));
         self.from.verify(hash.as_slice(), self.signature)
     }
 }

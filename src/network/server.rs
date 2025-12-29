@@ -20,7 +20,7 @@ use crate::types::encoding::{Decode, Encode};
 use crate::types::hash::Hash;
 use crate::types::wrapper_types::BoxFuture;
 use crate::utils::log::Logger;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::interval;
@@ -38,21 +38,6 @@ const GENESIS_PRIVATE_KEY_BYTES: [u8; 32] = [
     0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
     0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
 ];
-
-/// The genesis block, lazily initialized once and shared across all server instances.
-static GENESIS_BLOCK: LazyLock<Arc<Block>> = LazyLock::new(|| {
-    let header = Header {
-        version: 1,
-        height: 0,
-        timestamp: 0,
-        previous_block: Hash::zero(),
-        data_hash: Hash::zero(),
-        merkle_root: Hash::zero(),
-    };
-    let genesis_key = PrivateKey::from_bytes(&GENESIS_PRIVATE_KEY_BYTES)
-        .expect("GENESIS_PRIVATE_KEY_BYTES must be a valid secp256k1 scalar");
-    Block::new(header, genesis_key, vec![])
-});
 
 /// Errors produced by the server while handling RPCs and state updates.
 #[derive(Debug, blockchain_derive::Error)]
@@ -97,9 +82,21 @@ pub struct Server {
 }
 
 impl Server {
-    /// Returns the shared genesis block.
-    fn genesis_block() -> Arc<Block> {
-        Arc::clone(&GENESIS_BLOCK)
+    /// The genesis block, lazily initialized once and shared across all server instances.
+    pub fn genesis_block(chain_id: u64) -> Arc<Block> {
+        let header = Header {
+            version: 1,
+            height: 0,
+            timestamp: 0,
+            previous_block: Hash::zero(),
+            data_hash: Hash::zero(),
+            merkle_root: Hash::zero(),
+        };
+
+        let genesis_key = PrivateKey::from_bytes(&GENESIS_PRIVATE_KEY_BYTES)
+            .expect("GENESIS_PRIVATE_KEY_BYTES must be a valid secp256k1 scalar");
+
+        Block::new(header, genesis_key, vec![], chain_id)
     }
 
     /// Creates a new server with full configuration options.
@@ -115,6 +112,7 @@ impl Server {
     ) -> Arc<Self> {
         let is_validator = private_key.is_some();
         let logger = Logger::new(id);
+        let chain_id = DEV_CHAIN_ID;
         let server = Arc::new(Self {
             logger: logger.clone(),
             rpc_handler,
@@ -123,7 +121,7 @@ impl Server {
             is_validator,
             tx_pool: TxPool::new(transaction_pool_capacity),
             block_time,
-            chain: Blockchain::new(DEV_CHAIN_ID, Self::genesis_block(), logger),
+            chain: Blockchain::new(chain_id, Self::genesis_block(chain_id), logger),
         });
 
         if is_validator {
@@ -312,7 +310,7 @@ impl Server {
         self.chain
             .add_block(arc_block.clone())
             .map_err(|e| ServerError::BlockRejected {
-                hash: arc_block.header_hash,
+                hash: arc_block.header_hash(self.chain.id),
                 source: e,
             })?;
 
@@ -450,7 +448,7 @@ mod tests {
             data_hash: Hash::zero(),
             merkle_root: Hash::zero(),
         };
-        Block::new(header, PrivateKey::new(), transactions)
+        Block::new(header, PrivateKey::new(), transactions, TEST_CHAIN_ID)
     }
 
     #[test]
@@ -467,7 +465,10 @@ mod tests {
         assert_eq!(result.from, "block_sender");
         match result.data {
             DecodedMessageData::Block(decoded_block) => {
-                assert_eq!(decoded_block.header_hash, block.header_hash);
+                assert_eq!(
+                    decoded_block.header_hash(TEST_CHAIN_ID),
+                    block.header_hash(TEST_CHAIN_ID)
+                );
                 assert_eq!(decoded_block.header.height, 1);
             }
             _ => panic!("expected Block variant"),

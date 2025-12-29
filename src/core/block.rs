@@ -2,13 +2,12 @@
 
 use crate::core::transaction::Transaction;
 use crate::crypto::key_pair::{PrivateKey, PublicKey};
-use crate::types::binary_codec::{BinaryCodec, BinaryCodecHash, Decode};
-use crate::types::bytes::Bytes;
-use crate::types::encoding::{DecodeError, Encode, EncodeSink};
+use crate::types::encoding::{Decode, DecodeError, Encode, EncodeSink};
 use crate::types::hash::Hash;
 use crate::types::serializable_signature::SerializableSignature;
 use crate::utils::log::Logger;
-use std::sync::Arc;
+use blockchain_derive::BinaryCodec;
+use std::sync::{Arc, OnceLock};
 
 /// Block header containing metadata and cryptographic commitments.
 ///
@@ -30,19 +29,58 @@ pub struct Header {
     pub merkle_root: Hash,
 }
 
+impl Header {
+    /// Computes the chain-specific hash of this header.
+    ///
+    /// The hash includes a domain separator ("BLOCK_HEADER"), the chain ID,
+    /// and all header fields to prevent cross-chain replay attacks.
+    fn compute_hash(&self, chain_id: u64) -> Hash {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"BLOCK_HEADER");
+        chain_id.encode(&mut buf);
+        self.encode(&mut buf);
+        Hash::sha3_from_bytes(&buf)
+    }
+}
+
+/// Constructs the data that validators sign when producing a block.
+///
+/// Includes a domain separator ("BLOCK"), the chain ID, and the header hash
+/// to bind the signature to a specific chain and block.
+fn block_sign_data(chain_id: u64, hash: Hash) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"BLOCK");
+    chain_id.encode(&mut buf);
+    hash.encode(&mut buf);
+    buf
+}
+
+/// Intermediate block state before signing.
+///
+/// Used during block construction to hold all block data before
+/// the validator signature is computed and attached.
+struct UnsignedBlock {
+    /// Block metadata and cryptographic commitments.
+    pub header: Header,
+    /// Public key of the validator producing this block.
+    pub validator: PublicKey,
+    /// Transactions included in this block.
+    pub transactions: Box<[Transaction]>,
+}
+
 /// Immutable block containing header and transactions.
 ///
 /// Blocks are validated once upon receipt and never modified.
-///
-/// The `header_hash` is pre-computed at construction for O(1) lookups during
-/// chain traversal and validation.
+/// The header hash is lazily computed and cached for O(1) subsequent lookups.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Block {
     pub header: Header,
-    pub header_hash: Hash,
     pub validator: PublicKey,
     pub signature: SerializableSignature,
     pub transactions: Box<[Transaction]>,
+
+    /// Lazily computed header hash, cached after first computation, do not use directly.
+    cached_header_hash: OnceLock<Hash>,
 }
 
 impl Encode for Block {
@@ -56,44 +94,71 @@ impl Encode for Block {
 
 impl Decode for Block {
     fn decode(input: &mut &[u8]) -> Result<Self, DecodeError> {
-        let header = Header::decode(input)?;
-        let validator = PublicKey::decode(input)?;
-        let signature = SerializableSignature::decode(input)?;
-        let transactions: Vec<Transaction> = Decode::decode(input)?;
-        let header_hash = header.hash();
         Ok(Block {
-            header,
-            header_hash,
-            validator,
-            signature,
-            transactions: transactions.into_boxed_slice(),
+            header: Header::decode(input)?,
+            validator: PublicKey::decode(input)?,
+            signature: SerializableSignature::decode(input)?,
+            transactions: Vec::<Transaction>::decode(input)?.into_boxed_slice(),
+            cached_header_hash: OnceLock::new(),
         })
     }
 }
 
 impl Block {
-    /// Creates a new block with pre-computed header hash.
+    /// Creates a new signed block.
     ///
-    /// The header hash is computed once at construction rather than lazily,
-    /// since blocks are validated immediately upon receipt. This makes hash lookups infallible and O(1).
-    ///
-    /// # Errors
-    /// Returns an error if header encoding fails during hash computation.
+    /// Computes the data hash from the transactions, signs the block with the
+    /// validator's private key, and returns the complete block. The `chain_id`
+    /// is incorporated into both the data hash and signature to prevent
+    /// cross-chain replay attacks.
     pub fn new(
         mut header: Header,
         validator: PrivateKey,
         transactions: Vec<Transaction>,
+        chain_id: u64,
     ) -> Arc<Self> {
-        header.data_hash = transactions.hash();
-        let header_hash = header.hash();
+        header.data_hash = Block::data_hash(&transactions, chain_id);
+
+        let unsigned = UnsignedBlock {
+            header,
+            validator: validator.public_key(),
+            transactions: transactions.into_boxed_slice(),
+        };
 
         Arc::new(Block {
-            header,
-            header_hash,
-            validator: validator.public_key(),
-            signature: validator.sign(&Bytes::new(header_hash.as_slice())),
-            transactions: transactions.into_boxed_slice(),
+            header: unsigned.header,
+            validator: unsigned.validator,
+            signature: validator
+                .sign(block_sign_data(chain_id, unsigned.header.compute_hash(chain_id)).as_slice()),
+            transactions: unsigned.transactions,
+            cached_header_hash: OnceLock::new(),
         })
+    }
+
+    /// Returns the chain-specific header hash, computing and caching it on first call.
+    ///
+    /// The hash uniquely identifies this block within the given chain.
+    pub fn header_hash(&self, chain_id: u64) -> Hash {
+        *self
+            .cached_header_hash
+            .get_or_init(|| self.header.compute_hash(chain_id))
+    }
+
+    /// Computes the data hash for a set of transactions.
+    ///
+    /// The hash commits to all transaction IDs in order, prefixed with a
+    /// domain separator ("BLOCK_TXS") and chain ID for replay protection.
+    pub fn data_hash(transactions: &[Transaction], chain_id: u64) -> Hash {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"BLOCK_TXS");
+        chain_id.encode(&mut buf);
+
+        for tx in transactions {
+            let id = tx.id(chain_id);
+            id.encode(&mut buf);
+        }
+
+        Hash::sha3_from_bytes(&buf)
     }
 
     /// Verifies the block's cryptographic integrity.
@@ -108,14 +173,12 @@ impl Block {
     ///
     /// Logs warnings for any verification failures.
     pub fn verify(&self, logger: &Logger, chain_id: u64) -> bool {
+        let hash = self.header_hash(chain_id);
         if !self
             .validator
-            .verify(self.header_hash.as_slice(), self.signature)
+            .verify(block_sign_data(chain_id, hash).as_slice(), self.signature)
         {
-            logger.warn(&format!(
-                "invalid block signature: block={}",
-                self.header_hash
-            ));
+            logger.warn(&format!("invalid block signature: block={}", hash));
             return false;
         }
 
@@ -123,17 +186,14 @@ impl Block {
             if !t.verify(chain_id) {
                 logger.warn(&format!(
                     "invalid transaction signature in block: block={}",
-                    self.header_hash
+                    hash
                 ));
                 return false;
             }
         }
 
-        if self.transactions.hash() != self.header.data_hash {
-            logger.warn(&format!(
-                "invalid data hash in block: block={}",
-                self.header_hash
-            ));
+        if Block::data_hash(&self.transactions, chain_id) != self.header.data_hash {
+            logger.warn(&format!("invalid data hash in block: block={}", hash));
             return false;
         }
 
@@ -145,7 +205,6 @@ impl Block {
 mod tests {
     use super::*;
     use crate::crypto::key_pair::PrivateKey;
-    use crate::types::binary_codec::BinaryCodecHash;
     use crate::utils::test_utils::utils::random_hash;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -171,7 +230,7 @@ mod tests {
 
     fn create_block(header: Header, transactions: Vec<Transaction>) -> Arc<Block> {
         let key = PrivateKey::new();
-        Block::new(header, key, transactions)
+        Block::new(header, key, transactions, TEST_CHAIN_ID)
     }
 
     #[test]
@@ -190,8 +249,8 @@ mod tests {
     fn test_different_headers_different_hashes() {
         let header1 = create_header(5);
         let header2 = create_header(5);
-        let hash1 = header1.hash();
-        let hash2 = header2.hash();
+        let hash1 = header1.compute_hash(TEST_CHAIN_ID);
+        let hash2 = header2.compute_hash(TEST_CHAIN_ID);
         assert_ne!(
             hash1, hash2,
             "Different headers should produce different hashes"
@@ -211,7 +270,7 @@ mod tests {
         let block = create_block(genesis_header, vec![]);
         assert_eq!(block.header.height, 0);
         assert_eq!(block.header.previous_block, Hash::zero());
-        assert_ne!(block.header_hash, Hash::zero());
+        assert_ne!(block.header_hash(TEST_CHAIN_ID), Hash::zero());
     }
 
     #[test]
@@ -246,7 +305,8 @@ mod tests {
         let block1 = create_block(header, vec![]);
         let block2 = create_block(block1.header, vec![]);
         assert_eq!(
-            block1.header_hash, block2.header_hash,
+            block1.header_hash(TEST_CHAIN_ID),
+            block2.header_hash(TEST_CHAIN_ID),
             "Blocks with same header should have same hash"
         );
     }
@@ -261,13 +321,6 @@ mod tests {
     fn verify_fails_with_wrong_validator() {
         let mut block = Arc::try_unwrap(create_block(create_header(1), vec![])).unwrap();
         block.validator = PrivateKey::new().public_key();
-        assert!(!block.verify(&test_logger(), TEST_CHAIN_ID));
-    }
-
-    #[test]
-    fn verify_fails_with_tampered_header_hash() {
-        let mut block = Arc::try_unwrap(create_block(create_header(1), vec![])).unwrap();
-        block.header_hash = random_hash();
         assert!(!block.verify(&test_logger(), TEST_CHAIN_ID));
     }
 
@@ -314,7 +367,7 @@ mod tests {
 
         let header = create_header(1);
         let validator = PrivateKey::new();
-        let block = Block::new(header, validator, vec![tx]);
+        let block = Block::new(header, validator, vec![tx], TEST_CHAIN_ID);
 
         assert!(!block.verify(&test_logger(), TEST_CHAIN_ID));
     }
@@ -327,7 +380,7 @@ mod tests {
 
         let header = create_header(1);
         let validator = PrivateKey::new();
-        let block = Block::new(header, validator, vec![tx1, tx2]);
+        let block = Block::new(header, validator, vec![tx1, tx2], TEST_CHAIN_ID);
 
         assert_ne!(block.header.data_hash, Hash::zero());
         assert!(block.verify(&test_logger(), TEST_CHAIN_ID));
@@ -351,7 +404,7 @@ mod tests {
     fn empty_block_has_valid_data_hash() {
         let header = create_header(1);
         let validator = PrivateKey::new();
-        let block = Block::new(header, validator, vec![]);
+        let block = Block::new(header, validator, vec![], TEST_CHAIN_ID);
 
         assert!(block.verify(&test_logger(), TEST_CHAIN_ID));
     }

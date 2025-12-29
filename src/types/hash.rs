@@ -1,6 +1,7 @@
 //! 32-byte SHA3-256 hash type with zero-allocation operations.
 
-use crate::types::binary_codec::BinaryCodec;
+use blockchain_derive::BinaryCodec;
+use sha3::{Digest, Sha3_256};
 use std::fmt;
 
 /// SHA3-256 hash length in bytes.
@@ -22,29 +23,16 @@ impl Hash {
         Hash([0u8; HASH_LEN])
     }
 
-    /// Creates a hash from a byte slice.
-    ///
-    /// Panics if the slice length is not exactly 32 bytes.
-    pub fn from_bytes(b: &[u8]) -> Hash {
-        if b.len() != HASH_LEN {
-            panic!("expected {} bytes, got {} bytes", HASH_LEN, b.len());
-        }
-
-        let mut value = [0u8; HASH_LEN];
-        value.copy_from_slice(b);
-        Hash(value)
-    }
-
-    /// Creates a hash from a vector, consuming the vector.
-    ///
-    /// Panics if the vector length is not exactly 32 bytes.
-    pub fn from_vec(b: Vec<u8>) -> Hash {
-        Hash::from_bytes(b.as_slice())
-    }
-
     /// Returns the hash as a byte slice.
     pub fn as_slice(&self) -> &[u8] {
         &self.0
+    }
+
+    /// Computes SHA3-256 hash of the encoded representation.
+    pub fn sha3_from_bytes(data: &[u8]) -> Hash {
+        let mut hasher = Sha3_256::new();
+        hasher.update(data);
+        Hash(hasher.finalize().into())
     }
 }
 

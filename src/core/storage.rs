@@ -25,7 +25,7 @@ pub enum StorageError {
 /// concurrent access from multiple network handlers.
 pub trait Storage: Send + Sync {
     /// Creates a new storage instance initialized with the genesis block.
-    fn new(genesis: Arc<Block>) -> Self;
+    fn new(genesis: Arc<Block>, chain_id: u64) -> Self;
 
     /// Returns `true` if a block with the given hash exists.
     fn has_block(&self, hash: Hash) -> bool;
@@ -37,7 +37,7 @@ pub trait Storage: Send + Sync {
     fn get_block(&self, hash: Hash) -> Option<Arc<Block>>;
 
     /// Appends a block to storage and updates the chain tip (thread-safe).
-    fn append_block(&self, _block: Arc<Block>) -> Result<(), StorageError>;
+    fn append_block(&self, block: Arc<Block>, chain_id: u64) -> Result<(), StorageError>;
 
     /// Returns the current chain height (genesis = 0).
     fn height(&self) -> u32;
@@ -65,11 +65,11 @@ pub struct ThreadSafeMemoryStorage {
 }
 
 impl Storage for ThreadSafeMemoryStorage {
-    fn new(genesis: Arc<Block>) -> Self {
+    fn new(genesis: Arc<Block>, chain_id: u64) -> Self {
         let mut headers = HashMap::new();
         let mut blocks = HashMap::new();
 
-        let genesis_hash = genesis.header_hash;
+        let genesis_hash = genesis.header_hash(chain_id);
 
         headers.insert(genesis_hash, genesis.header);
         blocks.insert(genesis_hash, genesis);
@@ -100,7 +100,7 @@ impl Storage for ThreadSafeMemoryStorage {
         inner.blocks.get(&hash).cloned()
     }
 
-    fn append_block(&self, block: Arc<Block>) -> Result<(), StorageError> {
+    fn append_block(&self, block: Arc<Block>, chain_id: u64) -> Result<(), StorageError> {
         let mut inner = self.inner.lock().unwrap();
 
         let expected_tip = inner.tip;
@@ -111,7 +111,7 @@ impl Storage for ThreadSafeMemoryStorage {
             });
         }
 
-        let hash = block.header_hash;
+        let hash = block.header_hash(chain_id);
 
         inner.headers.insert(hash, block.header);
         inner.blocks.insert(hash, block);
@@ -147,13 +147,15 @@ pub mod tests {
     use std::sync::Arc;
     use std::thread;
 
+    const TEST_CHAIN_ID: u64 = 78909876543;
+
     pub trait StorageExtForTests {
         /// Appends a block to storage and updates the chain tip (requires mutable access).
         ///
         /// # Panics
         /// Panics if not implemented for this storage type.
         #[cfg(test)]
-        fn append_block_mut(&mut self, _block: Arc<Block>);
+        fn append_block_mut(&mut self, block: Arc<Block>, chain_id: u64);
     }
 
     /// In-memory storage for testing and development.
@@ -170,13 +172,13 @@ pub mod tests {
     }
 
     impl Storage for TestStorage {
-        fn new(genesis: Arc<Block>) -> Self {
+        fn new(genesis: Arc<Block>, chain_id: u64) -> Self {
             let mut storage = Self {
                 headers: HashMap::new(),
                 blocks: HashMap::new(),
                 tip: Hash::zero(),
             };
-            storage.append_block_mut(genesis);
+            storage.append_block_mut(genesis, chain_id);
             storage
         }
 
@@ -192,7 +194,7 @@ pub mod tests {
             self.blocks.get(&hash).cloned()
         }
 
-        fn append_block(&self, _block: Arc<Block>) -> Result<(), StorageError> {
+        fn append_block(&self, _: Arc<Block>, _: u64) -> Result<(), StorageError> {
             panic!(
                 "TestStorage::append_block is not supported. Use append_block_mut from StorageExtForTests trait instead."
             )
@@ -212,7 +214,7 @@ pub mod tests {
     }
 
     impl StorageExtForTests for TestStorage {
-        fn append_block_mut(&mut self, block: Arc<Block>) {
+        fn append_block_mut(&mut self, block: Arc<Block>, chain_id: u64) {
             if block.header.previous_block != self.tip {
                 panic!(
                     "Block does not build on current tip: {} != {}",
@@ -220,7 +222,7 @@ pub mod tests {
                 );
             }
 
-            let hash = block.header_hash;
+            let hash = block.header_hash(chain_id);
 
             self.headers.insert(hash, block.header);
             self.blocks.insert(hash, block);
@@ -238,14 +240,14 @@ pub mod tests {
             data_hash: Hash::zero(),
             merkle_root: Hash::zero(),
         };
-        Block::new(header, PrivateKey::new(), vec![])
+        Block::new(header, PrivateKey::new(), vec![], TEST_CHAIN_ID)
     }
 
     #[test]
     fn in_memory_storage_new_initializes_with_genesis() {
-        let genesis = create_genesis();
-        let hash = genesis.header_hash;
-        let storage = TestStorage::new(genesis);
+        let genesis = create_genesis(TEST_CHAIN_ID);
+        let hash = genesis.header_hash(TEST_CHAIN_ID);
+        let storage = TestStorage::new(genesis, TEST_CHAIN_ID);
 
         assert_eq!(storage.height(), 0);
         assert_eq!(storage.tip(), hash);
@@ -254,34 +256,39 @@ pub mod tests {
 
     #[test]
     fn in_memory_storage_append_and_retrieve() {
-        let genesis = create_genesis();
-        let mut storage = TestStorage::new(genesis.clone());
+        let genesis = create_genesis(TEST_CHAIN_ID);
+        let mut storage = TestStorage::new(genesis.clone(), TEST_CHAIN_ID);
 
-        let block1 = create_block_at(1, genesis.header_hash);
-        storage.append_block_mut(block1.clone());
+        let block1 = create_block_at(1, genesis.header_hash(TEST_CHAIN_ID));
+        storage.append_block_mut(block1.clone(), TEST_CHAIN_ID);
 
         assert_eq!(storage.height(), 1);
-        assert_eq!(storage.tip(), block1.header_hash);
-        assert!(storage.has_block(block1.header_hash));
+        assert_eq!(storage.tip(), block1.header_hash(TEST_CHAIN_ID));
+        assert!(storage.has_block(block1.header_hash(TEST_CHAIN_ID)));
         assert_eq!(
-            storage.get_block(block1.header_hash).unwrap().header_hash,
-            block1.header_hash
+            storage
+                .get_block(block1.header_hash(TEST_CHAIN_ID))
+                .unwrap()
+                .header_hash(TEST_CHAIN_ID),
+            block1.header_hash(TEST_CHAIN_ID)
         );
     }
 
     #[test]
     fn in_memory_storage_get_header() {
-        let genesis = create_genesis();
-        let storage = TestStorage::new(genesis.clone());
+        let genesis = create_genesis(TEST_CHAIN_ID);
+        let storage = TestStorage::new(genesis.clone(), TEST_CHAIN_ID);
 
-        let header = storage.get_header(genesis.header_hash).unwrap();
+        let header = storage
+            .get_header(genesis.header_hash(TEST_CHAIN_ID))
+            .unwrap();
         assert_eq!(header.height, 0);
     }
 
     #[test]
     fn in_memory_storage_get_nonexistent_block() {
-        let genesis = create_genesis();
-        let storage = TestStorage::new(genesis);
+        let genesis = create_genesis(TEST_CHAIN_ID);
+        let storage = TestStorage::new(genesis, TEST_CHAIN_ID);
 
         assert!(storage.get_block(random_hash()).is_none());
         assert!(storage.get_header(random_hash()).is_none());
@@ -290,18 +297,18 @@ pub mod tests {
     #[test]
     #[should_panic(expected = "Block does not build on current tip")]
     fn in_memory_storage_rejects_block_not_on_tip() {
-        let genesis = create_genesis();
-        let mut storage = TestStorage::new(genesis);
+        let genesis = create_genesis(TEST_CHAIN_ID);
+        let mut storage = TestStorage::new(genesis, TEST_CHAIN_ID);
 
         let orphan = create_block_at(1, random_hash());
-        storage.append_block_mut(orphan);
+        storage.append_block_mut(orphan, TEST_CHAIN_ID);
     }
 
     #[test]
     fn thread_safe_storage_new_initializes_with_genesis() {
-        let genesis = create_genesis();
-        let hash = genesis.header_hash;
-        let storage = ThreadSafeMemoryStorage::new(genesis);
+        let genesis = create_genesis(TEST_CHAIN_ID);
+        let hash = genesis.header_hash(TEST_CHAIN_ID);
+        let storage = ThreadSafeMemoryStorage::new(genesis, TEST_CHAIN_ID);
 
         assert_eq!(storage.height(), 0);
         assert_eq!(storage.tip(), hash);
@@ -310,22 +317,22 @@ pub mod tests {
 
     #[test]
     fn thread_safe_storage_append_and_retrieve() {
-        let genesis = create_genesis();
-        let storage = ThreadSafeMemoryStorage::new(genesis.clone());
+        let genesis = create_genesis(TEST_CHAIN_ID);
+        let storage = ThreadSafeMemoryStorage::new(genesis.clone(), TEST_CHAIN_ID);
 
-        let block1 = create_block_at(1, genesis.header_hash);
-        assert!(storage.append_block(block1.clone()).is_ok());
+        let block1 = create_block_at(1, genesis.header_hash(TEST_CHAIN_ID));
+        assert!(storage.append_block(block1.clone(), TEST_CHAIN_ID).is_ok());
 
         assert_eq!(storage.height(), 1);
-        assert_eq!(storage.tip(), block1.header_hash);
-        assert!(storage.has_block(block1.header_hash));
+        assert_eq!(storage.tip(), block1.header_hash(TEST_CHAIN_ID));
+        assert!(storage.has_block(block1.header_hash(TEST_CHAIN_ID)));
     }
 
     #[test]
     fn thread_safe_storage_concurrent_reads() {
-        let genesis = create_genesis();
-        let storage = Arc::new(ThreadSafeMemoryStorage::new(genesis.clone()));
-        let hash = genesis.header_hash;
+        let genesis = create_genesis(TEST_CHAIN_ID);
+        let storage = Arc::new(ThreadSafeMemoryStorage::new(genesis.clone(), TEST_CHAIN_ID));
+        let hash = genesis.header_hash(TEST_CHAIN_ID);
 
         let handles: Vec<_> = (0..10)
             .map(|_| {
@@ -347,23 +354,23 @@ pub mod tests {
 
     #[test]
     fn thread_safe_storage_rejects_block_not_on_tip() {
-        let genesis = create_genesis();
-        let storage = ThreadSafeMemoryStorage::new(genesis);
+        let genesis = create_genesis(TEST_CHAIN_ID);
+        let storage = ThreadSafeMemoryStorage::new(genesis, TEST_CHAIN_ID);
 
         let orphan = create_block_at(1, random_hash());
-        assert!(storage.append_block(orphan).is_err());
+        assert!(storage.append_block(orphan, TEST_CHAIN_ID).is_err());
     }
 
     #[test]
     fn thread_safe_storage_chain_of_blocks() {
-        let genesis = create_genesis();
-        let storage = ThreadSafeMemoryStorage::new(genesis.clone());
+        let genesis = create_genesis(TEST_CHAIN_ID);
+        let storage = ThreadSafeMemoryStorage::new(genesis.clone(), TEST_CHAIN_ID);
 
-        let mut prev_hash = genesis.header_hash;
+        let mut prev_hash = genesis.header_hash(TEST_CHAIN_ID);
         for i in 1..=10 {
             let block = create_block_at(i, prev_hash);
-            prev_hash = block.header_hash;
-            assert!(storage.append_block(block).is_ok());
+            prev_hash = block.header_hash(TEST_CHAIN_ID);
+            assert!(storage.append_block(block, TEST_CHAIN_ID).is_ok());
         }
 
         assert_eq!(storage.height(), 10);

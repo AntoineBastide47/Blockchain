@@ -14,10 +14,16 @@ pub mod utils {
         let mut buf = vec![0u8; HASH_LEN];
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         buf[..8].copy_from_slice(&n.to_le_bytes());
-        Hash::from_vec(buf)
+        let mut value = [0u8; HASH_LEN];
+        value.copy_from_slice(buf.as_slice());
+        Hash(value)
     }
 
-    pub fn create_genesis() -> Arc<Block> {
+    /// Creates a genesis block for testing with the given chain ID.
+    ///
+    /// Uses a random validator key and random data hash to ensure
+    /// test isolation between runs.
+    pub fn create_genesis(chain_id: u64) -> Arc<Block> {
         let header = Header {
             version: 1,
             height: 0,
@@ -26,6 +32,6 @@ pub mod utils {
             data_hash: random_hash(),
             merkle_root: Hash::zero(),
         };
-        Block::new(header, PrivateKey::new(), vec![])
+        Block::new(header, PrivateKey::new(), vec![], chain_id)
     }
 }

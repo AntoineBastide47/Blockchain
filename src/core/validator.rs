@@ -83,7 +83,7 @@ impl Validator for BlockValidator {
             return Err(BlockValidatorError::PreviousHashMismatch);
         }
 
-        if storage.has_block(block.header_hash) {
+        if storage.has_block(block.header_hash(chain_id)) {
             return Err(BlockValidatorError::BlockExists);
         }
 
@@ -120,16 +120,16 @@ mod tests {
             data_hash: random_hash(),
             merkle_root: Hash::zero(),
         };
-        Block::new(header, PrivateKey::new(), vec![])
+        Block::new(header, PrivateKey::new(), vec![], TEST_CHAIN_ID)
     }
 
     #[test]
     fn valid_block_accepted() {
-        let genesis = create_genesis();
-        let storage = TestStorage::new(genesis.clone());
+        let genesis = create_genesis(TEST_CHAIN_ID);
+        let storage = TestStorage::new(genesis.clone(), TEST_CHAIN_ID);
         let validator = BlockValidator;
 
-        let block = create_block(1, genesis.header_hash);
+        let block = create_block(1, genesis.header_hash(TEST_CHAIN_ID));
         assert!(
             validator
                 .validate_block(&block, &storage, &test_logger(), TEST_CHAIN_ID)
@@ -139,11 +139,11 @@ mod tests {
 
     #[test]
     fn wrong_height_rejected() {
-        let genesis = create_genesis();
-        let storage = TestStorage::new(genesis.clone());
+        let genesis = create_genesis(TEST_CHAIN_ID);
+        let storage = TestStorage::new(genesis.clone(), TEST_CHAIN_ID);
         let validator = BlockValidator;
 
-        let block = create_block(5, genesis.header_hash);
+        let block = create_block(5, genesis.header_hash(TEST_CHAIN_ID));
         assert!(
             validator
                 .validate_block(&block, &storage, &test_logger(), TEST_CHAIN_ID)
@@ -153,8 +153,8 @@ mod tests {
 
     #[test]
     fn wrong_previous_hash_rejected() {
-        let genesis = create_genesis();
-        let storage = TestStorage::new(genesis.clone());
+        let genesis = create_genesis(TEST_CHAIN_ID);
+        let storage = TestStorage::new(genesis.clone(), TEST_CHAIN_ID);
         let validator = BlockValidator;
 
         let block = create_block(1, random_hash());
@@ -180,7 +180,7 @@ mod tests {
 
     struct EmptyStorage;
     impl Storage for EmptyStorage {
-        fn new(_genesis: Arc<Block>) -> Self {
+        fn new(_genesis: Arc<Block>, _chain_id: u64) -> Self {
             Self
         }
 
@@ -193,7 +193,7 @@ mod tests {
         fn get_block(&self, _: Hash) -> Option<Arc<Block>> {
             None
         }
-        fn append_block(&self, _: Arc<Block>) -> Result<(), StorageError> {
+        fn append_block(&self, _: Arc<Block>, _: u64) -> Result<(), StorageError> {
             Ok(())
         }
         fn height(&self) -> u32 {

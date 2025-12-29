@@ -48,7 +48,7 @@ impl Blockchain<BlockValidator, ThreadSafeMemoryStorage> {
 
 impl<V: Validator, S: Storage> Blockchain<V, S> {
     /// Returns the height of the chain.
-    pub fn height(&self) -> u32 {
+    pub fn height(&self) -> u64 {
         self.storage.height()
     }
 
@@ -211,7 +211,7 @@ mod tests {
         }
     }
 
-    fn create_header(height: u32, previous: Hash) -> Header {
+    fn create_header(height: u64, previous: Hash) -> Header {
         Header {
             version: 1,
             height,

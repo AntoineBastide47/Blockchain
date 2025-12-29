@@ -18,7 +18,7 @@ pub struct Header {
     /// Protocol version for future upgrades
     pub version: u32,
     /// Block index in the chain (genesis = 0)
-    pub height: u32,
+    pub height: u64,
     /// Unix timestamp in nanoseconds for temporal ordering
     pub timestamp: u64,
     /// Hash of parent block, forming the chain
@@ -214,7 +214,7 @@ mod tests {
         Logger::new("test")
     }
 
-    fn create_header(height: u32) -> Header {
+    fn create_header(height: u64) -> Header {
         Header {
             version: 1,
             height,
@@ -287,7 +287,7 @@ mod tests {
     fn test_header_max_values() {
         let header = Header {
             version: u32::MAX,
-            height: u32::MAX,
+            height: u64::MAX,
             timestamp: u64::MAX,
             data_hash: random_hash(),
             previous_block: random_hash(),

@@ -50,7 +50,7 @@ pub struct BlockValidator;
 #[derive(Debug, blockchain_derive::Error)]
 pub enum BlockValidatorError {
     #[error("invalid block height: expected {expected}, got {actual}")]
-    InvalidHeight { expected: u32, actual: u32 },
+    InvalidHeight { expected: u64, actual: u64 },
 
     #[error("previous block hash mismatch")]
     PreviousHashMismatch,
@@ -111,7 +111,7 @@ mod tests {
         Logger::new("test")
     }
 
-    fn create_block(height: u32, previous: Hash) -> Arc<Block> {
+    fn create_block(height: u64, previous: Hash) -> Arc<Block> {
         let header = Header {
             version: 1,
             height,
@@ -196,7 +196,7 @@ mod tests {
         fn append_block(&self, _: Arc<Block>, _: u64) -> Result<(), StorageError> {
             Ok(())
         }
-        fn height(&self) -> u32 {
+        fn height(&self) -> u64 {
             0
         }
         fn tip(&self) -> Hash {

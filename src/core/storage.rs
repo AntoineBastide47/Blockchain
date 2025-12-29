@@ -40,7 +40,7 @@ pub trait Storage: Send + Sync {
     fn append_block(&self, block: Arc<Block>, chain_id: u64) -> Result<(), StorageError>;
 
     /// Returns the current chain height (genesis = 0).
-    fn height(&self) -> u32;
+    fn height(&self) -> u64;
 
     /// Returns the hash of the current chain tip.
     fn tip(&self) -> Hash;
@@ -120,7 +120,7 @@ impl Storage for ThreadSafeMemoryStorage {
         Ok(())
     }
 
-    fn height(&self) -> u32 {
+    fn height(&self) -> u64 {
         let inner = self.inner.lock().unwrap();
 
         inner
@@ -128,7 +128,7 @@ impl Storage for ThreadSafeMemoryStorage {
             .len()
             .saturating_sub(1)
             .try_into()
-            .expect("blockchain height exceeds u32::MAX")
+            .expect("blockchain height exceeds u64::MAX")
     }
 
     fn tip(&self) -> Hash {
@@ -200,12 +200,12 @@ pub mod tests {
             )
         }
 
-        fn height(&self) -> u32 {
+        fn height(&self) -> u64 {
             self.headers
                 .len()
                 .saturating_sub(1)
                 .try_into()
-                .expect("blockchain height exceeds u32::MAX")
+                .expect("blockchain height exceeds u64::MAX")
         }
 
         fn tip(&self) -> Hash {
@@ -231,7 +231,7 @@ pub mod tests {
         }
     }
 
-    fn create_block_at(height: u32, previous: Hash) -> Arc<Block> {
+    fn create_block_at(height: u64, previous: Hash) -> Arc<Block> {
         let header = Header {
             version: 1,
             height,

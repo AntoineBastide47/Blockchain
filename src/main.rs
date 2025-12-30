@@ -21,6 +21,7 @@ mod crypto;
 mod network;
 mod types;
 mod utils;
+mod virtual_machine;
 
 /// Errors that can occur when sending a transaction from the main loop.
 #[derive(Debug, Error)]
@@ -77,7 +78,7 @@ async fn main() {
     tokio::spawn(async move {
         let mut i: u8 = 0;
         loop {
-            if let Err(e) = send_transaction(&server_for_tx, tr_a_addr.clone(), i).await {
+            if let Err(e) = send_transaction(&server_for_tx, tr_a_addr.clone()).await {
                 logger_for_tx.error(&format!("failed to send transaction {i}: {e}"));
             }
             i += 1;
@@ -118,13 +119,11 @@ fn init_remote_servers(transports: Vec<Arc<LocalTransport>>) {
 ///
 /// Creates a new transaction with random 32-byte data, signs it with a fresh keypair,
 /// adds it to the local pool, and transmits it to the specified peer.
-async fn send_transaction(
-    server: &Server,
-    to: String,
-    index: u8,
-) -> Result<(), SendTransactionError> {
+async fn send_transaction(server: &Server, to: String) -> Result<(), SendTransactionError> {
     let key = PrivateKey::new();
-    let data = vec![index; 32];
+    let data = vec![
+        0, 0, 50, 0, 0, 0, 0, 0, 0, 0, 0, 1, 8, 0, 0, 0, 0, 0, 0, 0, 3, 2, 0, 1,
+    ];
 
     let tx = Transaction::new(data, key, DEV_CHAIN_ID);
     let msg = Message::new(MessageType::Transaction, tx.to_bytes());

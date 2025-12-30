@@ -108,3 +108,10 @@ See `checklist.md` for an idea of what still needs to be done.
 ## License
 
 See LICENSE file.
+
+## References
+The following references include a collection of articles and videos that have served as the foundation for building the
+blockchain (the list will evolve over time):
+- Core blockchain functionality: [Anthony GG - Create a modular blockchain from scratch](https://www.youtube.com/playlist?list=PL0xRBLFXXsP6-hxQmCDcl_BHJMm0mhxx7)
+> [!Important]
+> These resources are guides. They provide insights but may not result in an identical blockchain implementation.

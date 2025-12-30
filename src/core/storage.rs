@@ -12,11 +12,15 @@ use std::sync::{Arc, Mutex};
 /// Errors that can occur while interacting with storage backends.
 #[derive(Debug, blockchain_derive::Error)]
 pub enum StorageError {
+    /// Block's previous hash does not match the current chain tip.
     #[error("block does not extend current tip: expected previous hash {expected}, got {actual}")]
     NotOnTip { expected: Hash, actual: Hash },
-
+    /// Block failed validation rules.
     #[error("block validation failed: {0}")]
     ValidationFailed(String),
+    /// Virtual machine execution failed while processing transactions.
+    #[error("{0}")]
+    VMError(String),
 }
 
 /// Storage backend for blockchain data.

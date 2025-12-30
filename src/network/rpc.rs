@@ -126,6 +126,18 @@ mod tests {
     }
 
     #[test]
+    fn block_message_roundtrip() {
+        let payload = Bytes::new(vec![1u8, 2, 3, 4, 5]);
+        let msg = Message::new(MessageType::Block, payload.clone());
+
+        let encoded = msg.to_bytes();
+        let decoded = Message::from_bytes(encoded.as_slice()).expect("deserialization failed");
+
+        assert!(matches!(decoded.header, MessageType::Block));
+        assert_eq!(decoded.data, payload);
+    }
+
+    #[test]
     fn rpc_serialization_roundtrip() {
         let payload = vec![1, 2, 3, 4, 5];
         let rpc = Rpc::new("node_a", payload.clone());
@@ -135,6 +147,22 @@ mod tests {
 
         assert_eq!(decoded.from, "node_a");
         assert_eq!(decoded.payload.as_ref(), payload.as_slice());
+    }
+
+    #[test]
+    fn rpc_roundtrip_block_payload() {
+        let payload = Bytes::new(vec![9u8; 16]);
+        let msg = Message::new(MessageType::Block, payload.clone());
+        let rpc = Rpc::new("node_b", msg.to_bytes());
+
+        let encoded = rpc.to_bytes();
+        let decoded = Rpc::from_bytes(encoded.as_slice()).expect("deserialization failed");
+
+        assert_eq!(decoded.from, "node_b");
+
+        let decoded_msg = Message::from_bytes(decoded.payload.as_slice()).expect("message decode");
+        assert!(matches!(decoded_msg.header, MessageType::Block));
+        assert_eq!(decoded_msg.data, payload);
     }
 
     #[test]

@@ -16,6 +16,7 @@
 //! - [`isa`]: Instruction set architecture and bytecode encoding
 //! - [`assembler`]: Assembly source to bytecode compilation
 
-mod assembler;
+pub mod assembler;
 mod isa;
+pub mod program;
 pub mod vm;

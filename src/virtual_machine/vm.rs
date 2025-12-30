@@ -5,6 +5,7 @@
 
 use crate::types::bytes::Bytes;
 use crate::virtual_machine::isa::Instruction;
+use crate::virtual_machine::program::Program;
 use blockchain_derive::Error;
 
 /// Errors that can occur during VM execution or assembly.
@@ -28,12 +29,12 @@ pub enum VMError {
     /// Failed to parse an immediate value as i64.
     #[error("invalid i64 literal {0}")]
     InvalidI64(String),
-    /// Attempted to read from an uninitialized register.
-    #[error("stack underflow: attempting to remove a value from empty stack")]
-    StackUnderflow,
     /// Register index exceeds the register file size.
-    #[error("stack overflow: attempting to read beyond the stack size")]
-    StackOverflow,
+    #[error("register index {0} out of bounds")]
+    InvalidRegisterIndex(u8),
+    /// Bytecode ended unexpectedly while reading an instruction.
+    #[error("unexpected end of bytecode")]
+    UnexpectedEndOfBytecode,
     /// Operand type does not match expected type.
     #[error(
         "instruction {instruction} expected argument {arg_index} to be of type {expected} but got {actual}"
@@ -42,7 +43,7 @@ pub enum VMError {
         instruction: &'static str,
         arg_index: i32,
         expected: &'static str,
-        actual: &'static str,
+        actual: String,
     },
     /// Instruction pointer overflow or out of bounds.
     #[error("invalid instruction pointer")]
@@ -50,13 +51,38 @@ pub enum VMError {
     /// Division or modulo by zero.
     #[error("division by zero")]
     DivisionByZero,
+    /// Assembly error with line number context.
+    #[error("line {line}: {source}")]
+    AssemblyError { line: usize, source: String },
+    /// File I/O error during assembly.
+    #[error("io error: {0}")]
+    IoError(String),
+    #[error("invalid CALL_HOST function name {0}")]
+    InvalidCallHostFunction(String),
 }
 
 /// Runtime value stored in registers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Value {
+    Zero,
+    /// Boolean value.
+    Bool(bool),
+    /// Reference to a heap-allocated object (string pool index).
+    Ref(u32),
     /// 64-bit signed integer.
     Int(i64),
+}
+
+impl Value {
+    /// Returns the type name for error messages.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Value::Zero => "Zero",
+            Value::Bool(_) => "Bool",
+            Value::Ref(_) => "Ref",
+            Value::Int(_) => "Int",
+        }
+    }
 }
 
 /// Register file holding VM state.
@@ -64,54 +90,103 @@ enum Value {
 /// Provides 256 registers, each capable of storing a single [`Value`].
 /// Registers are lazily initialized (start as `None`).
 struct Registers {
-    regs: Vec<Option<Value>>,
+    regs: Vec<Value>,
 }
 
 impl Registers {
     /// Creates a new register file with `count` registers.
     pub fn new(count: usize) -> Self {
         Self {
-            regs: vec![None; count],
+            regs: vec![Value::Zero; count],
         }
     }
 
     /// Returns a reference to the value in register `idx`.
     ///
-    /// Returns [`VMError::StackUnderflow`] if the register is uninitialized.
+    /// Returns [`VMError::InvalidRegisterIndex`] if `idx` is out of bounds.
     pub fn get(&self, idx: u8) -> Result<&Value, VMError> {
         self.regs
             .get(idx as usize)
-            .and_then(|v| v.as_ref())
-            .ok_or(VMError::StackUnderflow)
+            .ok_or(VMError::InvalidRegisterIndex(idx))
+    }
+
+    /// Returns the boolean value in register `idx`.
+    ///
+    /// Returns [`VMError::TypeMismatch`] if the value is not a boolean.
+    pub fn get_bool(&self, idx: u8, instr: &'static str) -> Result<bool, VMError> {
+        match self.get(idx)? {
+            Value::Bool(v) => Ok(*v),
+            other => Err(VMError::TypeMismatch {
+                instruction: instr,
+                arg_index: idx as i32,
+                expected: "Bool",
+                actual: other.type_name().to_string(),
+            }),
+        }
+    }
+
+    /// Returns the reference value in register `idx`.
+    ///
+    /// Returns [`VMError::TypeMismatch`] if the value is not a reference.
+    pub fn get_ref(&self, idx: u8, instr: &'static str) -> Result<u32, VMError> {
+        match self.get(idx)? {
+            Value::Ref(v) => Ok(*v),
+            other => Err(VMError::TypeMismatch {
+                instruction: instr,
+                arg_index: idx as i32,
+                expected: "Ref",
+                actual: other.type_name().to_string(),
+            }),
+        }
     }
 
     /// Returns the integer value in register `idx`.
     ///
-    /// Returns [`VMError::StackUnderflow`] if uninitialized.
-    pub fn get_int(&self, idx: u8, _instr: &'static str) -> Result<i64, VMError> {
+    /// Returns [`VMError::TypeMismatch`] if the value is not an integer.
+    pub fn get_int(&self, idx: u8, instr: &'static str) -> Result<i64, VMError> {
         match self.get(idx)? {
             Value::Int(v) => Ok(*v),
-            /*
             other => Err(VMError::TypeMismatch {
                 instruction: instr,
                 arg_index: idx as i32,
                 expected: "Int",
-                actual: other.type_name(),
+                actual: other.type_name().to_string(),
             }),
-             */
         }
     }
 
     /// Stores a value into register `idx`.
     ///
-    /// Returns [`VMError::StackOverflow`] if `idx` is out of bounds.
+    /// Returns [`VMError::InvalidRegisterIndex`] if `idx` is out of bounds.
     pub fn set(&mut self, idx: u8, v: Value) -> Result<(), VMError> {
         let slot = self
             .regs
             .get_mut(idx as usize)
-            .ok_or(VMError::StackOverflow)?;
-        *slot = Some(v);
+            .ok_or(VMError::InvalidRegisterIndex(idx))?;
+        *slot = v;
         Ok(())
+    }
+}
+
+/// Heap storage for reference-counted objects.
+///
+/// Currently, holds only the string pool loaded from the program.
+struct Heap {
+    /// String pool (indices correspond to `Ref` values).
+    strings: Vec<String>,
+}
+
+impl Heap {
+    /// Allocates a new string on the heap, returning its reference index.
+    fn alloc_string(&mut self, s: String) -> u32 {
+        let id = self.strings.len() as u32;
+        self.strings.push(s);
+        id
+    }
+
+    /// Retrieves a string by its reference index.
+    fn get_string(&self, id: u32) -> &str {
+        &self.strings[id as usize]
     }
 }
 
@@ -126,6 +201,8 @@ pub struct VM {
     ip: usize,
     /// Register file (256 registers).
     registers: Registers,
+    /// Heap for string pool and future allocations.
+    heap: Heap,
 }
 
 macro_rules! exec_vm {
@@ -159,15 +236,29 @@ macro_rules! exec_vm {
         let bytes = $vm.read_exact(8)?;
         Ok::<i64, VMError>(i64::from_le_bytes(bytes.try_into().unwrap()))
     }};
+
+    // Decode a u32 reference (little-endian, 4 bytes)
+    (@read $vm:ident, RefU32) => {{
+        let bytes = $vm.read_exact(4)?;
+        Ok::<u32, VMError>(u32::from_le_bytes(bytes.try_into().unwrap()))
+    }};
+
+    // Decode a bool (1 byte, 0 = false, nonzero = true)
+    (@read $vm:ident, Bool) => {{
+        Ok::<bool, VMError>($vm.read_exact(1)?[0] != 0)
+    }};
 }
 
 impl VM {
     /// Creates a new VM instance with the given bytecode.
-    pub fn new(data: Bytes) -> Self {
+    pub fn new(program: Program) -> Self {
         Self {
-            data,
+            data: program.bytecode.into(),
             ip: 0,
             registers: Registers::new(256),
+            heap: Heap {
+                strings: program.strings,
+            },
         }
     }
 
@@ -192,7 +283,10 @@ impl VM {
         let start = self.ip;
         let end = self.ip.checked_add(count).ok_or(VMError::InvalidIP)?;
 
-        let slice = self.data.get(start..end).ok_or(VMError::StackOverflow)?;
+        let slice = self
+            .data
+            .get(start..end)
+            .ok_or(VMError::UnexpectedEndOfBytecode)?;
 
         self.ip = end;
         Ok(slice)
@@ -204,17 +298,38 @@ impl VM {
             vm = self,
             instr = instruction,
             {
+                // Loads
                 LoadI64 => op_load_i64(rd: Reg, imm: ImmI64),
+                LoadStr => op_load_str(rd: Reg, str_ref: RefU32),
+                LoadBool => op_load_bool(rd: Reg, b: Bool),
+                // Moves / casts
                 Move => op_move(rd: Reg, rs: Reg),
+                I64ToBool => op_i64_to_bool(rd: Reg, rs: Reg),
+                BoolToI64 => op_bool_to_i64(rd: Reg, rs: Reg),
+                // Arithmetic
                 Add => op_add(rd: Reg, rs1: Reg, rs2: Reg),
                 Sub => op_sub(rd: Reg, rs1: Reg, rs2: Reg),
                 Mul => op_mul(rd: Reg, rs1: Reg, rs2: Reg),
                 Div => op_div(rd: Reg, rs1: Reg, rs2: Reg),
                 Mod => op_mod(rd: Reg, rs1: Reg, rs2: Reg),
                 Neg => op_neg(rd: Reg, rs: Reg),
+                Abs => op_abs(rd: Reg, rs: Reg),
+                Min => op_min(rd: Reg, rs1: Reg, rs2: Reg),
+                Max => op_max(rd: Reg, rs1: Reg, rs2: Reg),
+                Shl => op_shl(rd: Reg, rs1: Reg, rs2: Reg),
+                Shr => op_shr(rd: Reg, rs1: Reg, rs2: Reg),
+                // Boolean / comparison
+                Not => op_not(rd: Reg, rs: Reg),
+                And => op_and(rd: Reg, rs1: Reg, rs2: Reg),
+                Or => op_or(rd: Reg, rs1: Reg, rs2: Reg),
+                Xor => op_xor(rd: Reg, rs1: Reg, rs2: Reg),
                 Eq => op_eq(rd: Reg, rs1: Reg, rs2: Reg),
                 Lt => op_lt(rd: Reg, rs1: Reg, rs2: Reg),
+                Le => op_le(rd: Reg, rs1: Reg, rs2: Reg),
                 Gt => op_gt(rd: Reg, rs1: Reg, rs2: Reg),
+                Ge => op_ge(rd: Reg, rs1: Reg, rs2: Reg),
+                // Control Flow
+                CallHost => op_call_host(dst: Reg, fn_id: RefU32, argc: ImmI64, argv: Reg),
             }
         }
     }
@@ -223,9 +338,27 @@ impl VM {
         self.registers.set(dst, Value::Int(imm))
     }
 
+    fn op_load_str(&mut self, dst: u8, str_ref: u32) -> Result<(), VMError> {
+        self.registers.set(dst, Value::Ref(str_ref))
+    }
+
+    fn op_load_bool(&mut self, dst: u8, b: bool) -> Result<(), VMError> {
+        self.registers.set(dst, Value::Bool(b))
+    }
+
     fn op_move(&mut self, dst: u8, src: u8) -> Result<(), VMError> {
-        let v = self.registers.get_int(src, "MOVE")?;
-        self.registers.set(dst, Value::Int(v))
+        let v = self.registers.get(src)?.clone();
+        self.registers.set(dst, v)
+    }
+
+    fn op_i64_to_bool(&mut self, dst: u8, src: u8) -> Result<(), VMError> {
+        let v = self.registers.get_int(src, "I64_TO_BOOL")?;
+        self.registers.set(dst, Value::Bool(v != 0))
+    }
+
+    fn op_bool_to_i64(&mut self, dst: u8, src: u8) -> Result<(), VMError> {
+        let v = self.registers.get_bool(src, "BOOL_TO_I64")?;
+        self.registers.set(dst, Value::Int(if v { 1 } else { 0 }))
     }
 
     fn op_add(&mut self, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
@@ -269,25 +402,101 @@ impl VM {
         self.registers.set(dst, Value::Int(v.wrapping_neg()))
     }
 
+    fn op_abs(&mut self, dst: u8, src: u8) -> Result<(), VMError> {
+        let v = self.registers.get_int(src, "ABS")?;
+        self.registers.set(dst, Value::Int(v.wrapping_abs()))
+    }
+
+    fn op_min(&mut self, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
+        let va = self.registers.get_int(a, "MIN")?;
+        let vb = self.registers.get_int(b, "MIN")?;
+        self.registers.set(dst, Value::Int(va.min(vb)))
+    }
+
+    fn op_max(&mut self, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
+        let va = self.registers.get_int(a, "MAX")?;
+        let vb = self.registers.get_int(b, "MAX")?;
+        self.registers.set(dst, Value::Int(va.max(vb)))
+    }
+
+    fn op_shl(&mut self, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
+        let va = self.registers.get_int(a, "SHL")?;
+        let vb = self.registers.get_int(b, "SHL")?;
+        self.registers
+            .set(dst, Value::Int(va.wrapping_shl(vb as u32)))
+    }
+
+    fn op_shr(&mut self, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
+        let va = self.registers.get_int(a, "SHR")?;
+        let vb = self.registers.get_int(b, "SHR")?;
+        self.registers
+            .set(dst, Value::Int(va.wrapping_shr(vb as u32)))
+    }
+
+    fn op_not(&mut self, dst: u8, src: u8) -> Result<(), VMError> {
+        let v = self.registers.get_bool(src, "NOT")?;
+        self.registers.set(dst, Value::Bool(!v))
+    }
+
+    fn op_and(&mut self, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
+        let va = self.registers.get_bool(a, "AND")?;
+        let vb = self.registers.get_bool(b, "AND")?;
+        self.registers.set(dst, Value::Bool(va && vb))
+    }
+
+    fn op_or(&mut self, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
+        let va = self.registers.get_bool(a, "OR")?;
+        let vb = self.registers.get_bool(b, "OR")?;
+        self.registers.set(dst, Value::Bool(va || vb))
+    }
+
+    fn op_xor(&mut self, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
+        let va = self.registers.get_bool(a, "XOR")?;
+        let vb = self.registers.get_bool(b, "XOR")?;
+        self.registers.set(dst, Value::Bool(va ^ vb))
+    }
+
     fn op_eq(&mut self, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
         let va = self.registers.get_int(a, "EQ")?;
         let vb = self.registers.get_int(b, "EQ")?;
-        self.registers
-            .set(dst, Value::Int(if va == vb { 1 } else { 0 }))
+        self.registers.set(dst, Value::Bool(va == vb))
     }
 
     fn op_lt(&mut self, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
         let va = self.registers.get_int(a, "LT")?;
         let vb = self.registers.get_int(b, "LT")?;
-        self.registers
-            .set(dst, Value::Int(if va < vb { 1 } else { 0 }))
+        self.registers.set(dst, Value::Bool(va < vb))
     }
 
     fn op_gt(&mut self, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
         let va = self.registers.get_int(a, "GT")?;
         let vb = self.registers.get_int(b, "GT")?;
-        self.registers
-            .set(dst, Value::Int(if va > vb { 1 } else { 0 }))
+        self.registers.set(dst, Value::Bool(va > vb))
+    }
+
+    fn op_le(&mut self, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
+        let va = self.registers.get_int(a, "LE")?;
+        let vb = self.registers.get_int(b, "LE")?;
+        self.registers.set(dst, Value::Bool(va <= vb))
+    }
+
+    fn op_ge(&mut self, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
+        let va = self.registers.get_int(a, "GE")?;
+        let vb = self.registers.get_int(b, "GE")?;
+        self.registers.set(dst, Value::Bool(va >= vb))
+    }
+
+    fn op_call_host(&mut self, _dst: u8, fn_id: u32, argc: i64, argv: u8) -> Result<(), VMError> {
+        let fn_name = self.heap.get_string(fn_id);
+        let _args: Vec<&Value> = (0..argc as u8)
+            .map(|i| self.registers.get(argv.wrapping_add(i)))
+            .collect::<Result<_, _>>()?;
+
+        // match fn_name {
+        //     _ => Err(VMError::InvalidCallHostFunction(fn_name.to_string())),
+        // }
+
+        Err(VMError::InvalidCallHostFunction(fn_name.to_string()))
     }
 }
 
@@ -296,199 +505,346 @@ mod tests {
     use super::*;
     use crate::virtual_machine::assembler::assemble_source;
 
-    fn run_and_get(source: &str, reg: u8) -> i64 {
-        let bytecode = assemble_source(source).expect("assembly failed");
-        let mut vm = VM::new(Bytes::new(bytecode));
+    fn run_vm(source: &str) -> VM {
+        let program = assemble_source(source).expect("assembly failed");
+        println!("{:?}", program);
+        let mut vm = VM::new(program);
         vm.run().expect("vm run failed");
-        vm.registers.get_int(reg, "").expect("register read failed")
+        vm
+    }
+
+    fn run_and_get_int(source: &str, reg: u8) -> i64 {
+        run_vm(source).registers.get_int(reg, "").unwrap()
+    }
+
+    fn run_and_get_bool(source: &str, reg: u8) -> bool {
+        run_vm(source).registers.get_bool(reg, "").unwrap()
     }
 
     fn run_expect_err(source: &str) -> VMError {
-        let bytecode = assemble_source(source).expect("assembly failed");
-        let mut vm = VM::new(Bytes::new(bytecode));
+        let program = assemble_source(source).expect("assembly failed");
+        let mut vm = VM::new(program);
         vm.run().expect_err("expected error")
     }
 
+    // ==================== Loads ====================
+
     #[test]
-    fn op_load_i64() {
-        assert_eq!(run_and_get("LOAD_I64 r0, 42", 0), 42);
-        assert_eq!(run_and_get("LOAD_I64 r0, -1", 0), -1);
-        assert_eq!(run_and_get("LOAD_I64 r0, 0", 0), 0);
+    fn load_i64() {
+        assert_eq!(run_and_get_int("LOAD_I64 r0, 42", 0), 42);
+        assert_eq!(run_and_get_int("LOAD_I64 r0, -1", 0), -1);
+        assert_eq!(run_and_get_int("LOAD_I64 r0, 0", 0), 0);
     }
 
     #[test]
-    fn op_move() {
-        let source = r#"
-            LOAD_I64 r0, 99
-            MOVE r1, r0
-        "#;
-        assert_eq!(run_and_get(source, 1), 99);
+    fn load_bool() {
+        assert!(run_and_get_bool("LOAD_BOOL r0, true", 0));
+        assert!(!run_and_get_bool("LOAD_BOOL r0, false", 0));
     }
 
     #[test]
-    fn op_add() {
-        let source = r#"
-            LOAD_I64 r0, 10
-            LOAD_I64 r1, 32
-            ADD r2, r0, r1
-        "#;
-        assert_eq!(run_and_get(source, 2), 42);
+    fn load_str() {
+        let vm = run_vm(r#"LOAD_STR r0, "hello""#);
+        let ref_id = vm.registers.get_ref(0, "").unwrap();
+        assert_eq!(vm.heap.get_string(ref_id), "hello");
+    }
+
+    // ==================== Moves / Casts ====================
+
+    #[test]
+    fn move_int() {
+        assert_eq!(run_and_get_int("LOAD_I64 r0, 99\nMOVE r1, r0", 1), 99);
     }
 
     #[test]
-    fn op_add_wrapping() {
-        let source = r#"
-            LOAD_I64 r0, 9223372036854775807
-            LOAD_I64 r1, 1
-            ADD r2, r0, r1
-        "#;
-        assert_eq!(run_and_get(source, 2), i64::MIN);
+    fn move_bool() {
+        assert!(run_and_get_bool("LOAD_BOOL r0, true\nMOVE r1, r0", 1));
     }
 
     #[test]
-    fn op_sub() {
-        let source = r#"
-            LOAD_I64 r0, 50
-            LOAD_I64 r1, 8
-            SUB r2, r0, r1
-        "#;
-        assert_eq!(run_and_get(source, 2), 42);
+    fn i64_to_bool() {
+        assert!(run_and_get_bool("LOAD_I64 r0, 1\nI64_TO_BOOL r1, r0", 1));
+        assert!(run_and_get_bool("LOAD_I64 r0, -5\nI64_TO_BOOL r1, r0", 1));
+        assert!(!run_and_get_bool("LOAD_I64 r0, 0\nI64_TO_BOOL r1, r0", 1));
     }
 
     #[test]
-    fn op_mul() {
-        let source = r#"
-            LOAD_I64 r0, 6
-            LOAD_I64 r1, 7
-            MUL r2, r0, r1
-        "#;
-        assert_eq!(run_and_get(source, 2), 42);
+    fn bool_to_i64() {
+        assert_eq!(
+            run_and_get_int("LOAD_BOOL r0, true\nBOOL_TO_I64 r1, r0", 1),
+            1
+        );
+        assert_eq!(
+            run_and_get_int("LOAD_BOOL r0, false\nBOOL_TO_I64 r1, r0", 1),
+            0
+        );
+    }
+
+    // ==================== Arithmetic ====================
+
+    #[test]
+    fn add() {
+        assert_eq!(
+            run_and_get_int("LOAD_I64 r0, 10\nLOAD_I64 r1, 32\nADD r2, r0, r1", 2),
+            42
+        );
     }
 
     #[test]
-    fn op_div() {
-        let source = r#"
-            LOAD_I64 r0, 84
-            LOAD_I64 r1, 2
-            DIV r2, r0, r1
-        "#;
-        assert_eq!(run_and_get(source, 2), 42);
+    fn add_wrapping() {
+        let source = "LOAD_I64 r0, 9223372036854775807\nLOAD_I64 r1, 1\nADD r2, r0, r1";
+        assert_eq!(run_and_get_int(source, 2), i64::MIN);
     }
 
     #[test]
-    fn op_div_by_zero() {
-        let source = r#"
-            LOAD_I64 r0, 1
-            LOAD_I64 r1, 0
-            DIV r2, r0, r1
-        "#;
-        assert!(matches!(run_expect_err(source), VMError::DivisionByZero));
+    fn sub() {
+        assert_eq!(
+            run_and_get_int("LOAD_I64 r0, 50\nLOAD_I64 r1, 8\nSUB r2, r0, r1", 2),
+            42
+        );
     }
 
     #[test]
-    fn op_mod() {
-        let source = r#"
-            LOAD_I64 r0, 47
-            LOAD_I64 r1, 5
-            MOD r2, r0, r1
-        "#;
-        assert_eq!(run_and_get(source, 2), 2);
+    fn mul() {
+        assert_eq!(
+            run_and_get_int("LOAD_I64 r0, 6\nLOAD_I64 r1, 7\nMUL r2, r0, r1", 2),
+            42
+        );
     }
 
     #[test]
-    fn op_mod_by_zero() {
-        let source = r#"
-            LOAD_I64 r0, 1
-            LOAD_I64 r1, 0
-            MOD r2, r0, r1
-        "#;
-        assert!(matches!(run_expect_err(source), VMError::DivisionByZero));
+    fn div() {
+        assert_eq!(
+            run_and_get_int("LOAD_I64 r0, 84\nLOAD_I64 r1, 2\nDIV r2, r0, r1", 2),
+            42
+        );
     }
 
     #[test]
-    fn op_neg() {
-        let source = r#"
-            LOAD_I64 r0, 42
-            NEG r1, r0
-        "#;
-        assert_eq!(run_and_get(source, 1), -42);
+    fn div_by_zero() {
+        assert!(matches!(
+            run_expect_err("LOAD_I64 r0, 1\nLOAD_I64 r1, 0\nDIV r2, r0, r1"),
+            VMError::DivisionByZero
+        ));
     }
 
     #[test]
-    fn op_eq_true() {
-        let source = r#"
-            LOAD_I64 r0, 5
-            LOAD_I64 r1, 5
-            EQ r2, r0, r1
-        "#;
-        assert_eq!(run_and_get(source, 2), 1);
+    fn modulo() {
+        assert_eq!(
+            run_and_get_int("LOAD_I64 r0, 47\nLOAD_I64 r1, 5\nMOD r2, r0, r1", 2),
+            2
+        );
     }
 
     #[test]
-    fn op_eq_false() {
-        let source = r#"
-            LOAD_I64 r0, 5
-            LOAD_I64 r1, 6
-            EQ r2, r0, r1
-        "#;
-        assert_eq!(run_and_get(source, 2), 0);
+    fn mod_by_zero() {
+        assert!(matches!(
+            run_expect_err("LOAD_I64 r0, 1\nLOAD_I64 r1, 0\nMOD r2, r0, r1"),
+            VMError::DivisionByZero
+        ));
     }
 
     #[test]
-    fn op_lt_true() {
-        let source = r#"
-            LOAD_I64 r0, 3
-            LOAD_I64 r1, 5
-            LT r2, r0, r1
-        "#;
-        assert_eq!(run_and_get(source, 2), 1);
+    fn neg() {
+        assert_eq!(run_and_get_int("LOAD_I64 r0, 42\nNEG r1, r0", 1), -42);
     }
 
     #[test]
-    fn op_lt_false() {
-        let source = r#"
-            LOAD_I64 r0, 5
-            LOAD_I64 r1, 3
-            LT r2, r0, r1
-        "#;
-        assert_eq!(run_and_get(source, 2), 0);
+    fn abs() {
+        assert_eq!(run_and_get_int("LOAD_I64 r0, -42\nABS r1, r0", 1), 42);
+        assert_eq!(run_and_get_int("LOAD_I64 r0, 42\nABS r1, r0", 1), 42);
     }
 
     #[test]
-    fn op_gt_true() {
-        let source = r#"
-            LOAD_I64 r0, 10
-            LOAD_I64 r1, 5
-            GT r2, r0, r1
-        "#;
-        assert_eq!(run_and_get(source, 2), 1);
+    fn min() {
+        assert_eq!(
+            run_and_get_int("LOAD_I64 r0, 10\nLOAD_I64 r1, 5\nMIN r2, r0, r1", 2),
+            5
+        );
     }
 
     #[test]
-    fn op_gt_false() {
-        let source = r#"
-            LOAD_I64 r0, 5
-            LOAD_I64 r1, 10
-            GT r2, r0, r1
-        "#;
-        assert_eq!(run_and_get(source, 2), 0);
+    fn max() {
+        assert_eq!(
+            run_and_get_int("LOAD_I64 r0, 10\nLOAD_I64 r1, 5\nMAX r2, r0, r1", 2),
+            10
+        );
     }
+
+    #[test]
+    fn shl() {
+        assert_eq!(
+            run_and_get_int("LOAD_I64 r0, 1\nLOAD_I64 r1, 4\nSHL r2, r0, r1", 2),
+            16
+        );
+    }
+
+    #[test]
+    fn shr() {
+        assert_eq!(
+            run_and_get_int("LOAD_I64 r0, 16\nLOAD_I64 r1, 2\nSHR r2, r0, r1", 2),
+            4
+        );
+        // Arithmetic shift preserves sign
+        assert_eq!(
+            run_and_get_int("LOAD_I64 r0, -16\nLOAD_I64 r1, 2\nSHR r2, r0, r1", 2),
+            -4
+        );
+    }
+
+    // ==================== Boolean ====================
+
+    #[test]
+    fn not() {
+        assert!(!run_and_get_bool("LOAD_BOOL r0, true\nNOT r1, r0", 1));
+        assert!(run_and_get_bool("LOAD_BOOL r0, false\nNOT r1, r0", 1));
+    }
+
+    #[test]
+    fn and() {
+        assert!(run_and_get_bool(
+            "LOAD_BOOL r0, true\nLOAD_BOOL r1, true\nAND r2, r0, r1",
+            2
+        ));
+        assert!(!run_and_get_bool(
+            "LOAD_BOOL r0, true\nLOAD_BOOL r1, false\nAND r2, r0, r1",
+            2
+        ));
+    }
+
+    #[test]
+    fn or() {
+        assert!(run_and_get_bool(
+            "LOAD_BOOL r0, false\nLOAD_BOOL r1, true\nOR r2, r0, r1",
+            2
+        ));
+        assert!(!run_and_get_bool(
+            "LOAD_BOOL r0, false\nLOAD_BOOL r1, false\nOR r2, r0, r1",
+            2
+        ));
+    }
+
+    #[test]
+    fn xor() {
+        assert!(run_and_get_bool(
+            "LOAD_BOOL r0, true\nLOAD_BOOL r1, false\nXOR r2, r0, r1",
+            2
+        ));
+        assert!(!run_and_get_bool(
+            "LOAD_BOOL r0, true\nLOAD_BOOL r1, true\nXOR r2, r0, r1",
+            2
+        ));
+    }
+
+    // ==================== Comparison ====================
+
+    #[test]
+    fn eq() {
+        assert!(run_and_get_bool(
+            "LOAD_I64 r0, 5\nLOAD_I64 r1, 5\nEQ r2, r0, r1",
+            2
+        ));
+        assert!(!run_and_get_bool(
+            "LOAD_I64 r0, 5\nLOAD_I64 r1, 6\nEQ r2, r0, r1",
+            2
+        ));
+    }
+
+    #[test]
+    fn lt() {
+        assert!(run_and_get_bool(
+            "LOAD_I64 r0, 3\nLOAD_I64 r1, 5\nLT r2, r0, r1",
+            2
+        ));
+        assert!(!run_and_get_bool(
+            "LOAD_I64 r0, 5\nLOAD_I64 r1, 3\nLT r2, r0, r1",
+            2
+        ));
+    }
+
+    #[test]
+    fn le() {
+        assert!(run_and_get_bool(
+            "LOAD_I64 r0, 3\nLOAD_I64 r1, 5\nLE r2, r0, r1",
+            2
+        ));
+        assert!(run_and_get_bool(
+            "LOAD_I64 r0, 5\nLOAD_I64 r1, 5\nLE r2, r0, r1",
+            2
+        ));
+        assert!(!run_and_get_bool(
+            "LOAD_I64 r0, 6\nLOAD_I64 r1, 5\nLE r2, r0, r1",
+            2
+        ));
+    }
+
+    #[test]
+    fn gt() {
+        assert!(run_and_get_bool(
+            "LOAD_I64 r0, 10\nLOAD_I64 r1, 5\nGT r2, r0, r1",
+            2
+        ));
+        assert!(!run_and_get_bool(
+            "LOAD_I64 r0, 5\nLOAD_I64 r1, 10\nGT r2, r0, r1",
+            2
+        ));
+    }
+
+    #[test]
+    fn ge() {
+        assert!(run_and_get_bool(
+            "LOAD_I64 r0, 10\nLOAD_I64 r1, 5\nGE r2, r0, r1",
+            2
+        ));
+        assert!(run_and_get_bool(
+            "LOAD_I64 r0, 5\nLOAD_I64 r1, 5\nGE r2, r0, r1",
+            2
+        ));
+        assert!(!run_and_get_bool(
+            "LOAD_I64 r0, 4\nLOAD_I64 r1, 5\nGE r2, r0, r1",
+            2
+        ));
+    }
+
+    // ==================== Type Errors ====================
+
+    #[test]
+    fn type_mismatch_int_for_bool() {
+        let source = "LOAD_I64 r0, 1\nNOT r1, r0";
+        assert!(matches!(
+            run_expect_err(source),
+            VMError::TypeMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn type_mismatch_bool_for_int() {
+        let source = "LOAD_BOOL r0, true\nLOAD_BOOL r1, true\nADD r2, r0, r1";
+        assert!(matches!(
+            run_expect_err(source),
+            VMError::TypeMismatch { .. }
+        ));
+    }
+
+    // ==================== Error Cases ====================
 
     #[test]
     fn read_uninitialized_register() {
-        let source = "ADD r2, r0, r1";
-        assert!(matches!(run_expect_err(source), VMError::StackUnderflow));
+        assert!(matches!(
+            run_expect_err("ADD r2, r0, r1"),
+            VMError::TypeMismatch { .. }
+        ));
     }
 
     #[test]
     fn invalid_opcode() {
-        let mut vm = VM::new(Bytes::new(vec![0xFF]));
+        let mut vm = VM::new(Program::new(vec![], vec![0xFF]));
         assert!(matches!(vm.run(), Err(VMError::InvalidInstruction(0xFF))));
     }
 
     #[test]
     fn truncated_bytecode() {
-        let mut vm = VM::new(Bytes::new(vec![0x00, 0x00])); // LOAD_I64 needs 10 bytes
-        assert!(matches!(vm.run(), Err(VMError::StackOverflow)));
+        let mut vm = VM::new(Program::new(vec![], vec![0x00, 0x00]));
+        assert!(matches!(vm.run(), Err(VMError::UnexpectedEndOfBytecode)));
     }
 }

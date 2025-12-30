@@ -11,18 +11,13 @@
 //! - Opcode: 1 byte
 //! - Register operand: 1 byte (register index 0-255)
 //! - Immediate i64: 8 bytes (little-endian)
+//! - Reference u32: 4 bytes (little-endian, index into string pool)
+//! - Boolean: 1 byte (0 = false, nonzero = true)
 
-use crate::virtual_machine::assembler::{parse_i64, parse_reg};
+use crate::virtual_machine::assembler::{
+    AsmContext, parse_bool, parse_i64, parse_ref_u32, parse_reg,
+};
 use crate::virtual_machine::vm::VMError;
-
-/// Operand type specifier for instruction definitions.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum Operand {
-    /// Register operand (encoded as 1 byte).
-    Reg,
-    /// 64-bit signed immediate value (encoded as 8 bytes, little-endian).
-    ImmI64,
-}
 
 macro_rules! define_instructions {
     (
@@ -45,12 +40,6 @@ macro_rules! define_instructions {
         }
 
         impl Instruction {
-            pub fn type_name(&self) -> &'static str {
-                match self {
-                    $( Instruction::$name => $mnemonic, )*
-                }
-            }
-
             pub fn from_str(name: &str) -> Result<Self, VMError> {
                 match name {
                     $( $mnemonic => Ok(Instruction::$name), )*
@@ -59,7 +48,7 @@ macro_rules! define_instructions {
             }
 
             /// Parse one instruction from tokens into `AsmInstr`
-            pub fn parse(tokens: Vec<String>) -> Result<AsmInstr, VMError> {
+            pub fn parse(ctx: &mut AsmContext, tokens: &[String]) -> Result<AsmInstr, VMError> {
                 if tokens.is_empty() {
                     return Err(VMError::ArityMismatch);
                 }
@@ -77,7 +66,9 @@ macro_rules! define_instructions {
                             let mut it = tokens.iter().skip(1);
                             Ok(AsmInstr::$name {
                                 $(
-                                    $field: define_instructions!(@parse_operand $kind, it.next().unwrap())?,
+                                    $field: define_instructions!(
+                                        @parse_operand $kind, it.next().unwrap(), ctx
+                                    )?,
                                 )*
                             })
                         }
@@ -128,10 +119,13 @@ macro_rules! define_instructions {
         }
     };
 
-    // ---------- helpers ----------
+    // ---------- types ----------
     (@ty Reg)    => { u8 };
     (@ty ImmI64) => { i64 };
+    (@ty RefU32) => { u32 };
+    (@ty Bool)   => { bool };
 
+    // ---------- encoding ----------
     (@emit $out:ident, Reg, $v:ident) => {
         $out.push(*$v);
     };
@@ -140,56 +134,119 @@ macro_rules! define_instructions {
         $out.extend_from_slice(&$v.to_le_bytes());
     };
 
+    (@emit $out:ident, RefU32, $v:ident) => {
+        $out.extend_from_slice(&$v.to_le_bytes());
+    };
+
+    (@emit $out:ident, Bool, $v:ident) => {
+        $out.push(if *$v { 1 } else { 0 });
+    };
+
+    // ---------- counting ----------
     (@count $( $x:ident ),* ) => {
         <[()]>::len(&[ $( define_instructions!(@unit $x) ),* ])
     };
 
     (@unit $x:ident) => { () };
 
-    (@parse_operand Reg, $tok:expr) => {
+    // ---------- parsing ----------
+    (@parse_operand Reg, $tok:expr, $ctx:expr) => {
         parse_reg($tok)
     };
 
-    (@parse_operand ImmI64, $tok:expr) => {
+    (@parse_operand ImmI64, $tok:expr, $ctx:expr) => {
         parse_i64($tok)
+    };
+
+    (@parse_operand RefU32, $tok:expr, $ctx:expr) => {{
+        if let Some(s) = $tok.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
+            Ok($ctx.intern_string(s.to_string()))
+        } else {
+            parse_ref_u32($tok)
+        }
+    }};
+
+
+    (@parse_operand Bool, $tok:expr, $ctx:expr) => {
+        parse_bool($tok)
     };
 }
 
 define_instructions! {
+    // =========================
+    // Loads / constants
+    // =========================
     /// LOAD_I64 rd, imm64 ; rd = imm64
     LoadI64 = 0x00, "LOAD_I64" => [rd: Reg, imm: ImmI64],
+    /// LOAD_STR rd, ref ; rd = ref
+    LoadStr = 0x01, "LOAD_STR" => [rd: Reg, str: RefU32],
+    /// LOAD_BOOL rd, true|false ; rd = true|false
+    LoadBool = 0x02, "LOAD_BOOL" => [rd: Reg, bool: Bool],
+    // =========================
+    // Moves / casts
+    // =========================
     /// MOVE rd, rs ; rd = rs
-    Move = 0x01, "MOVE" => [rd: Reg, rs: Reg],
+    Move = 0x10, "MOVE" => [rd: Reg, rs: Reg],
+    /// I64_TO_BOOL rd, rs ; rd = (rs != 0)
+    I64ToBool = 0x11, "I64_TO_BOOL" => [rd: Reg, rs: Reg],
+    /// BOOL_TO_I64 rd, rs ; rd = rs as i64 (false=0, true=1)
+    BoolToI64 = 0x12, "BOOL_TO_I64" => [rd: Reg, rs: Reg],
+    // =========================
+    // Integer arithmetic
+    // =========================
     /// ADD rd, rs1, rs2 ; rd = rs1 + rs2
-    Add = 0x02, "ADD" => [rd: Reg, rs1: Reg, rs2: Reg],
+    Add = 0x20, "ADD" => [rd: Reg, rs1: Reg, rs2: Reg],
     /// SUB rd, rs1, rs2 ; rd = rs1 - rs2
-    Sub = 0x03, "SUB" => [rd: Reg, rs1: Reg, rs2: Reg],
+    Sub = 0x21, "SUB" => [rd: Reg, rs1: Reg, rs2: Reg],
     /// MUL rd, rs1, rs2 ; rd = rs1 * rs2
-    Mul = 0x04, "MUL" => [rd: Reg, rs1: Reg, rs2: Reg],
+    Mul = 0x22, "MUL" => [rd: Reg, rs1: Reg, rs2: Reg],
     /// DIV rd, rs1, rs2 ; rd = rs1 / rs2 (trap on division by zero)
-    Div = 0x05, "DIV" => [rd: Reg, rs1: Reg, rs2: Reg],
+    Div = 0x23, "DIV" => [rd: Reg, rs1: Reg, rs2: Reg],
     /// MOD rd, rs1, rs2 ; rd = rs1 % rs2
-    Mod = 0x06, "MOD" => [rd: Reg, rs1: Reg, rs2: Reg],
+    Mod = 0x24, "MOD" => [rd: Reg, rs1: Reg, rs2: Reg],
     /// NEG rd, rs ; rd = -rs
-    Neg = 0x07, "NEG" => [rd: Reg, rs: Reg],
+    Neg = 0x25, "NEG" => [rd: Reg, rs: Reg],
+    /// ABS rd, rs ; rd = |rs|
+    Abs = 0x26, "ABS" => [rd: Reg, rs: Reg],
+    /// MIN rd, rs1, rs2 ; rd = min(rs1, rs2)
+    Min = 0x27, "MIN" => [rd: Reg, rs1: Reg, rs2: Reg],
+    /// MAX rd, rs1, rs2 ; rd = max(rs1, rs2)
+    Max = 0x28, "MAX" => [rd: Reg, rs1: Reg, rs2: Reg],
+    /// SHL rd, rs1, rs2 ; rd = rs1 << rs2
+    Shl = 0x29, "SHL" => [rd: Reg, rs1: Reg, rs2: Reg],
+    /// SHR rd, rs1, rs2 ; rd = rs1 >> rs2 (arithmetic shift)
+    Shr = 0x2A, "SHR" => [rd: Reg, rs1: Reg, rs2: Reg],
+    // =========================
+    // Boolean / comparison
+    // =========================
+    /// NOT rd, rs ; rd = !rs (logical negation)
+    Not = 0x30, "NOT" => [rd: Reg, rs: Reg],
+    /// AND rd, rs1, rs2 ; rd = rs1 & rs2 (bitwise and)
+    And = 0x31, "AND" => [rd: Reg, rs1: Reg, rs2: Reg],
+    /// OR rd, rs1, rs2 ; rd = rs1 | rs2 (bitwise or)
+    Or = 0x32, "OR" => [rd: Reg, rs1: Reg, rs2: Reg],
+    /// XOR rd, rs1, rs2 ; rd = rs1 ^ rs2 (bitwise xor)
+    Xor = 0x33, "XOR" => [rd: Reg, rs1: Reg, rs2: Reg],
     /// EQ rd, rs1, rs2 ; rd = (rs1 == rs2)
-    Eq = 0x08, "EQ" => [rd: Reg, rs1: Reg, rs2: Reg],
+    Eq = 0x34, "EQ" => [rd: Reg, rs1: Reg, rs2: Reg],
     /// LT rd, rs1, rs2 ; rd = (rs1 < rs2)
-    Lt = 0x09, "LT" => [rd: Reg, rs1: Reg, rs2: Reg],
+    Lt = 0x35, "LT" => [rd: Reg, rs1: Reg, rs2: Reg],
+    /// LE rd, rs1, rs2 ; rd = (rs1 <= rs2)
+    Le = 0x37, "LE" => [rd: Reg, rs1: Reg, rs2: Reg],
     /// GT rd, rs1, rs2 ; rd = (rs1 > rs2)
-    Gt = 0x0A, "GT" => [rd: Reg, rs1: Reg, rs2: Reg],
+    Gt = 0x38, "GT" => [rd: Reg, rs1: Reg, rs2: Reg],
+    /// GE rd, rs1, rs2 ; rd = (rs1 >= rs2)
+    Ge = 0x39, "GE" => [rd: Reg, rs1: Reg, rs2: Reg],
+    // =========================
+    // Control Flow
+    // =========================
+    /// CALL dst, fn, argc, argv ; call function fn with argc args from regs[argv..] ; return -> dst
+    CallHost = 0x40, "CALL_HOST" => [dst: Reg, fn_id: RefU32, argc: ImmI64, argv: Reg],
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn instruction_type_name() {
-        assert_eq!(Instruction::LoadI64.type_name(), "LOAD_I64");
-        assert_eq!(Instruction::Add.type_name(), "ADD");
-        assert_eq!(Instruction::Gt.type_name(), "GT");
-    }
 
     #[test]
     fn instruction_from_str_valid() {
@@ -216,8 +273,8 @@ mod tests {
     #[test]
     fn instruction_try_from_valid() {
         assert_eq!(Instruction::try_from(0x00).unwrap(), Instruction::LoadI64);
-        assert_eq!(Instruction::try_from(0x02).unwrap(), Instruction::Add);
-        assert_eq!(Instruction::try_from(0x0A).unwrap(), Instruction::Gt);
+        assert_eq!(Instruction::try_from(0x20).unwrap(), Instruction::Add);
+        assert_eq!(Instruction::try_from(0x38).unwrap(), Instruction::Gt);
     }
 
     #[test]
@@ -231,7 +288,7 @@ mod tests {
     #[test]
     fn instruction_parse_empty() {
         assert!(matches!(
-            Instruction::parse(vec![]),
+            Instruction::parse(&mut AsmContext::new(), &[]),
             Err(VMError::ArityMismatch)
         ));
     }
@@ -239,7 +296,7 @@ mod tests {
     #[test]
     fn instruction_parse_load_i64() {
         let tokens = vec!["LOAD_I64".into(), "r5".into(), "100".into()];
-        let instr = Instruction::parse(tokens).unwrap();
+        let instr = Instruction::parse(&mut AsmContext::new(), &tokens).unwrap();
         match instr {
             AsmInstr::LoadI64 { rd, imm } => {
                 assert_eq!(rd, 5);
@@ -252,7 +309,7 @@ mod tests {
     #[test]
     fn instruction_parse_three_reg() {
         let tokens = vec!["ADD".into(), "r0".into(), "r1".into(), "r2".into()];
-        let instr = Instruction::parse(tokens).unwrap();
+        let instr = Instruction::parse(&mut AsmContext::new(), &tokens).unwrap();
         match instr {
             AsmInstr::Add { rd, rs1, rs2 } => {
                 assert_eq!(rd, 0);
@@ -282,7 +339,7 @@ mod tests {
         };
         let mut out = Vec::new();
         instr.assemble(&mut out);
-        assert_eq!(out, vec![0x03, 10, 20, 30]);
+        assert_eq!(out, vec![0x21, 10, 20, 30]);
     }
 
     #[test]
@@ -290,6 +347,24 @@ mod tests {
         let instr = AsmInstr::Neg { rd: 1, rs: 2 };
         let mut out = Vec::new();
         instr.assemble(&mut out);
-        assert_eq!(out, vec![0x07, 1, 2]);
+        assert_eq!(out, vec![0x25, 1, 2]);
+    }
+
+    #[test]
+    fn asm_instr_assemble_bool() {
+        let instr = AsmInstr::LoadBool { rd: 0, bool: true };
+        let mut out = Vec::new();
+        instr.assemble(&mut out);
+        assert_eq!(out, vec![0x02, 0, 1]);
+    }
+
+    #[test]
+    fn asm_instr_assemble_ref() {
+        let instr = AsmInstr::LoadStr { rd: 1, str: 0x1234 };
+        let mut out = Vec::new();
+        instr.assemble(&mut out);
+        assert_eq!(out[0], 0x01);
+        assert_eq!(out[1], 1);
+        assert_eq!(u32::from_le_bytes(out[2..6].try_into().unwrap()), 0x1234);
     }
 }

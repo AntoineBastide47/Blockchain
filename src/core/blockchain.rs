@@ -7,6 +7,7 @@ use crate::core::validator::{BlockValidator, Validator};
 use crate::crypto::key_pair::PrivateKey;
 use crate::types::hash::Hash;
 use crate::utils::log::Logger;
+use crate::virtual_machine::program::Program;
 use crate::virtual_machine::vm::VM;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -106,16 +107,20 @@ impl<V: Validator, S: Storage> Blockchain<V, S> {
 
                 // Run VM code
                 for tx in &block.transactions {
-                    let mut vm = VM::new(tx.data.clone());
-                    if let Err(e) = vm.run() {
-                        return Err(StorageError::VMError(e.to_string()));
-                    }
+                    match Program::from_bytes(tx.data.as_slice()) {
+                        Ok(program) => {
+                            if let Err(e) = VM::new(program).run() {
+                                return Err(StorageError::VMError(e.to_string()));
+                            }
 
-                    self.logger.info(&format!(
-                        "executing code from transaction: hash={} len={}",
-                        tx.id(self.id),
-                        tx.data.len()
-                    ));
+                            self.logger.info(&format!(
+                                "executing code from transaction: hash={} len={}",
+                                tx.id(self.id),
+                                tx.data.len()
+                            ));
+                        }
+                        Err(e) => return Err(StorageError::VMError(e.to_string())),
+                    }
                 }
 
                 self.storage.append_block(block, self.id)

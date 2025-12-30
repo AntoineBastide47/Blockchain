@@ -10,6 +10,7 @@ use crate::network::server::{DEV_CHAIN_ID, Server, ServerError};
 use crate::network::transport::{Transport, TransportError};
 use crate::types::encoding::Encode;
 use crate::utils::log::{self, Logger};
+use crate::virtual_machine::assembler::assemble_source;
 use blockchain_derive::Error;
 use std::sync::Arc;
 use std::time::Duration;
@@ -115,15 +116,18 @@ fn init_remote_servers(transports: Vec<Arc<LocalTransport>>) {
     }
 }
 
-/// Sends a random transaction to a peer node via the server.
+/// Sends a transaction to a peer node via the server.
 ///
-/// Creates a new transaction with random 32-byte data, signs it with a fresh keypair,
+/// Assembles the provided source code into bytecode, signs it with a fresh keypair,
 /// adds it to the local pool, and transmits it to the specified peer.
 async fn send_transaction(server: &Server, to: String) -> Result<(), SendTransactionError> {
     let key = PrivateKey::new();
-    let data = vec![
-        0, 0, 50, 0, 0, 0, 0, 0, 0, 0, 0, 1, 8, 0, 0, 0, 0, 0, 0, 0, 3, 2, 0, 1,
-    ];
+    let source = r#"
+        LOAD_I64 r0, 10
+        LOAD_I64 r1, 32
+        ADD r2, r0, r1
+    "#;
+    let data = assemble_source(source).expect("assembly failed").to_bytes();
 
     let tx = Transaction::new(data, key, DEV_CHAIN_ID);
     let msg = Message::new(MessageType::Transaction, tx.to_bytes());

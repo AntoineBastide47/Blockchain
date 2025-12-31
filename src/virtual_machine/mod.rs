@@ -13,10 +13,11 @@
 //! # Modules
 //!
 //! - [`vm`]: Core virtual machine implementation
-//! - [`isa`]: Instruction set architecture and bytecode encoding
-//! - [`assembler`]: Assembly source to bytecode compilation
+//! - [`isa`]: Instruction set definition and opcode mappings
+//! - [`assembler`]: Assembly parsing, IR, and bytecode encoding
 
 pub mod assembler;
+mod errors;
 mod isa;
 pub mod program;
 pub mod vm;

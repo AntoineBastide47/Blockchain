@@ -1,6 +1,10 @@
 //! Assembly language parser and bytecode compiler.
 //!
 //! Converts human-readable assembly source into executable bytecode.
+//! Uses [`for_each_instruction!`](crate::for_each_instruction) to generate:
+//! - [`AsmInstr`] intermediate representation for parsed instructions
+//! - [`AsmInstr::assemble`] for bytecode encoding
+//! - `parse_instruction` for tokenized input parsing
 //!
 //! # Syntax
 //!
@@ -16,9 +20,11 @@
 //! - Comments start with `#`
 //! - Commas between operands are optional
 
+use crate::define_instructions;
+use crate::for_each_instruction;
+use crate::virtual_machine::errors::VMError;
 use crate::virtual_machine::isa::Instruction;
 use crate::virtual_machine::program::Program;
-use crate::virtual_machine::vm::VMError;
 use std::fs;
 use std::path::Path;
 
@@ -140,6 +146,112 @@ pub(crate) fn parse_bool(tok: &str) -> Result<bool, VMError> {
     }
 }
 
+macro_rules! define_parse_instruction {
+    (
+        $(
+            $(#[$doc:meta])*
+            $name:ident = $opcode:expr, $mnemonic:literal => [
+                $( $field:ident : $kind:ident ),* $(,)?
+            ]
+        ),* $(,)?
+    ) => {
+
+        // =========================
+        // Assembler IR
+        // =========================
+        #[derive(Debug, Clone)]
+        enum AsmInstr {
+            $(
+                $name {
+                    $( $field: define_instructions!(@ty $kind) ),*
+                },
+            )*
+        }
+
+        impl AsmInstr {
+            /// Encodes the assembly instruction into bytecode
+            fn assemble(&self, out: &mut Vec<u8>) {
+                match self {
+                    $(
+                        AsmInstr::$name { $( $field ),* } => {
+                            out.push($opcode);
+                            $(
+                                define_instructions!(@emit out, $kind, $field);
+                            )*
+                        }
+                    ),*
+                }
+            }
+        }
+
+        fn instruction_from_str(name: &str) -> Result<Instruction, VMError> {
+            match name {
+                $( $mnemonic => Ok(Instruction::$name), )*
+                _ => Err(VMError::InvalidInstructionName(name.to_string())),
+            }
+        }
+
+        /// Parse one instruction from tokens into [`AsmInstr`].
+        fn parse_instruction(ctx: &mut AsmContext, tokens: &[String]) -> Result<AsmInstr, VMError> {
+            if tokens.is_empty() {
+                return Err(VMError::ArityMismatch);
+            }
+
+            let instr = instruction_from_str(&tokens[0])?;
+
+            match instr {
+                $(
+                    Instruction::$name => {
+                        const EXPECTED: usize = 1 + define_parse_instruction!(@count $( $field ),*);
+                        if tokens.len() != EXPECTED {
+                            return Err(VMError::ArityMismatch);
+                        }
+
+                        let mut it = tokens.iter().skip(1);
+                        Ok(AsmInstr::$name {
+                            $(
+                                $field: define_parse_instruction!(
+                                    @parse_operand $kind, it.next().unwrap(), ctx
+                                )?,
+                            )*
+                        })
+                    }
+                ),*
+            }
+        }
+    };
+
+    // ---------- counting ----------
+    (@count $( $x:ident ),* ) => {
+        <[()]>::len(&[ $( define_parse_instruction!(@unit $x) ),* ])
+    };
+
+    (@unit $x:ident) => { () };
+
+    // ---------- parsing ----------
+    (@parse_operand Reg, $tok:expr, $ctx:expr) => {
+        parse_reg($tok)
+    };
+
+    (@parse_operand ImmI64, $tok:expr, $ctx:expr) => {
+        parse_i64($tok)
+    };
+
+    (@parse_operand RefU32, $tok:expr, $ctx:expr) => {{
+        if let Some(s) = $tok.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
+            Ok($ctx.intern_string(s.to_string()))
+        } else {
+            parse_ref_u32($tok)
+        }
+    }};
+
+    (@parse_operand Bool, $tok:expr, $ctx:expr) => {
+        parse_bool($tok)
+    };
+}
+
+for_each_instruction!(define_parse_instruction);
+
 /// Assemble a full source string into bytecode.
 pub fn assemble_source(source: impl Into<String>) -> Result<Program, VMError> {
     let mut bytecode = Vec::new();
@@ -152,7 +264,7 @@ pub fn assemble_source(source: impl Into<String>) -> Result<Program, VMError> {
         }
 
         let instr =
-            Instruction::parse(&mut asm_context, &tokens).map_err(|e| VMError::AssemblyError {
+            parse_instruction(&mut asm_context, &tokens).map_err(|e| VMError::AssemblyError {
                 line: line_no + 1,
                 source: e.to_string(),
             })?;
@@ -331,5 +443,110 @@ mod tests {
 
         let err = assemble_source("LOAD_BOOL r0, 1").unwrap_err();
         assert!(matches!(err, VMError::AssemblyError { .. }));
+    }
+
+    #[test]
+    fn instruction_parse_empty() {
+        assert!(matches!(
+            parse_instruction(&mut AsmContext::new(), &[]),
+            Err(VMError::ArityMismatch)
+        ));
+    }
+
+    #[test]
+    fn instruction_parse_load_i64() {
+        let tokens = vec!["LOAD_I64".into(), "r5".into(), "100".into()];
+        let instr = parse_instruction(&mut AsmContext::new(), &tokens).unwrap();
+        match instr {
+            AsmInstr::LoadI64 { rd, imm } => {
+                assert_eq!(rd, 5);
+                assert_eq!(imm, 100);
+            }
+            _ => panic!("wrong instruction type"),
+        }
+    }
+
+    #[test]
+    fn instruction_parse_three_reg() {
+        let tokens = vec!["ADD".into(), "r0".into(), "r1".into(), "r2".into()];
+        let instr = parse_instruction(&mut AsmContext::new(), &tokens).unwrap();
+        match instr {
+            AsmInstr::Add { rd, rs1, rs2 } => {
+                assert_eq!(rd, 0);
+                assert_eq!(rs1, 1);
+                assert_eq!(rs2, 2);
+            }
+            _ => panic!("wrong instruction type"),
+        }
+    }
+
+    #[test]
+    fn instruction_from_str_valid() {
+        assert_eq!(
+            instruction_from_str("LOAD_I64").unwrap(),
+            Instruction::LoadI64
+        );
+        assert_eq!(instruction_from_str("ADD").unwrap(), Instruction::Add);
+        assert_eq!(instruction_from_str("DIV").unwrap(), Instruction::Div);
+    }
+
+    #[test]
+    fn instruction_from_str_invalid() {
+        assert!(matches!(
+            instruction_from_str("INVALID"),
+            Err(VMError::InvalidInstructionName(_))
+        ));
+        assert!(matches!(
+            instruction_from_str("add"), // case sensitive
+            Err(VMError::InvalidInstructionName(_))
+        ));
+    }
+
+    #[test]
+    fn asm_instr_assemble_load_i64() {
+        let instr = AsmInstr::LoadI64 { rd: 3, imm: -1 };
+        let mut out = Vec::new();
+        instr.assemble(&mut out);
+        assert_eq!(out[0], 0x00);
+        assert_eq!(out[1], 3);
+        assert_eq!(i64::from_le_bytes(out[2..10].try_into().unwrap()), -1);
+    }
+
+    #[test]
+    fn asm_instr_assemble_three_reg() {
+        let instr = AsmInstr::Sub {
+            rd: 10,
+            rs1: 20,
+            rs2: 30,
+        };
+        let mut out = Vec::new();
+        instr.assemble(&mut out);
+        assert_eq!(out, vec![0x21, 10, 20, 30]);
+    }
+
+    #[test]
+    fn asm_instr_assemble_two_reg() {
+        let instr = AsmInstr::Neg { rd: 1, rs: 2 };
+        let mut out = Vec::new();
+        instr.assemble(&mut out);
+        assert_eq!(out, vec![0x25, 1, 2]);
+    }
+
+    #[test]
+    fn asm_instr_assemble_bool() {
+        let instr = AsmInstr::LoadBool { rd: 0, bool: true };
+        let mut out = Vec::new();
+        instr.assemble(&mut out);
+        assert_eq!(out, vec![0x02, 0, 1]);
+    }
+
+    #[test]
+    fn asm_instr_assemble_ref() {
+        let instr = AsmInstr::LoadStr { rd: 1, str: 0x1234 };
+        let mut out = Vec::new();
+        instr.assemble(&mut out);
+        assert_eq!(out[0], 0x01);
+        assert_eq!(out[1], 1);
+        assert_eq!(u32::from_le_bytes(out[2..6].try_into().unwrap()), 0x1234);
     }
 }

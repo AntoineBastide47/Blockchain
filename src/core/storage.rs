@@ -7,6 +7,7 @@ use crate::core::block::{Block, Header};
 use crate::types::hash::Hash;
 use std::collections::HashMap;
 
+use crate::virtual_machine::state::State;
 use std::sync::{Arc, Mutex};
 
 /// Errors that can occur while interacting with storage backends.
@@ -50,6 +51,59 @@ pub trait Storage: Send + Sync {
     fn tip(&self) -> Hash;
 }
 
+/// State storage interface for VM execution.
+///
+/// Provides key-value storage operations and state root management.
+/// Implementations must be thread-safe.
+pub trait StateStore: Send + Sync {
+    /// Retrieves a value by key from the state store.
+    fn get(&self, key: &[u8]) -> Option<Vec<u8>>;
+    /// Applies a batch of writes atomically. `None` values indicate deletions.
+    fn apply_batch(&self, writes: Vec<(Vec<u8>, Option<Vec<u8>>)>);
+    /// Returns the current state root hash.
+    fn state_root(&self) -> Hash;
+    /// Updates the stored state root hash.
+    fn set_state_root(&self, root: Hash);
+}
+
+/// Allows iteration over all key-value pairs in the state.
+///
+/// Used for computing state roots. Production implementations should use
+/// a sparse Merkle tree instead of full iteration.
+pub trait IterableState {
+    /// Returns an iterator over all key-value pairs in the state.
+    fn iter_all(&self) -> Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + '_>;
+}
+
+/// Read-only view into the state store.
+///
+/// Implements [`State`] for use with the VM while preventing writes.
+pub struct StateView<'a, S: StateStore> {
+    storage: &'a S,
+}
+
+/// Provides a read-only state view from a state store.
+pub trait StateViewProvider {
+    /// Returns a read-only view of the current state.
+    fn state_view(&self) -> StateView<'_, Self>
+    where
+        Self: Sized + StateStore;
+}
+
+impl<'a, S: StateStore> State for StateView<'a, S> {
+    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.storage.get(key)
+    }
+
+    fn push(&mut self, _key: Vec<u8>, _value: Vec<u8>) {
+        unreachable!("StateView is read-only")
+    }
+
+    fn delete(&mut self, _key: &[u8]) {
+        unreachable!("StateView is read-only")
+    }
+}
+
 struct Inner {
     /// Block headers indexed by hash.
     headers: HashMap<Hash, Header>,
@@ -57,6 +111,10 @@ struct Inner {
     blocks: HashMap<Hash, Arc<Block>>,
     /// Hash of the current chain tip.
     tip: Hash,
+    /// Key-value state storage for VM execution.
+    state: HashMap<Vec<u8>, Vec<u8>>,
+    /// Root hash of the current state.
+    state_root: Hash,
 }
 
 /// In-memory storage for development as it is thread safe
@@ -68,12 +126,20 @@ pub struct ThreadSafeMemoryStorage {
     inner: Mutex<Inner>,
 }
 
+impl ThreadSafeMemoryStorage {
+    /// Returns a read-only view of the current state for VM execution.
+    pub fn state_view(&self) -> StateView<'_, Self> {
+        StateView { storage: self }
+    }
+}
+
 impl Storage for ThreadSafeMemoryStorage {
     fn new(genesis: Arc<Block>, chain_id: u64) -> Self {
         let mut headers = HashMap::new();
         let mut blocks = HashMap::new();
 
         let genesis_hash = genesis.header_hash(chain_id);
+        let state_root = genesis.header.state_root;
 
         headers.insert(genesis_hash, genesis.header);
         blocks.insert(genesis_hash, genesis);
@@ -82,6 +148,8 @@ impl Storage for ThreadSafeMemoryStorage {
             headers,
             blocks,
             tip: genesis_hash,
+            state: HashMap::new(),
+            state_root,
         };
 
         Self {
@@ -141,6 +209,59 @@ impl Storage for ThreadSafeMemoryStorage {
     }
 }
 
+impl StateStore for ThreadSafeMemoryStorage {
+    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.inner.lock().unwrap().state.get(key).cloned()
+    }
+
+    fn apply_batch(&self, writes: Vec<(Vec<u8>, Option<Vec<u8>>)>) {
+        let mut inner = self.inner.lock().unwrap();
+
+        for (key, value_opt) in writes {
+            match value_opt {
+                Some(value) => {
+                    inner.state.insert(key, value);
+                }
+                None => {
+                    inner.state.remove(&key);
+                }
+            }
+        }
+    }
+
+    fn state_root(&self) -> Hash {
+        self.inner.lock().unwrap().state_root
+    }
+
+    fn set_state_root(&self, root: Hash) {
+        self.inner.lock().unwrap().state_root = root;
+    }
+}
+
+impl IterableState for ThreadSafeMemoryStorage {
+    fn iter_all(&self) -> Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + '_> {
+        let snapshot: Vec<(Vec<u8>, Vec<u8>)> = {
+            let inner = self.inner.lock().unwrap();
+            inner
+                .state
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        };
+
+        Box::new(snapshot.into_iter())
+    }
+}
+
+impl StateViewProvider for ThreadSafeMemoryStorage {
+    fn state_view(&self) -> StateView<'_, Self>
+    where
+        Self: Sized + StateStore,
+    {
+        StateView { storage: self }
+    }
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;
@@ -173,6 +294,8 @@ pub mod tests {
         blocks: HashMap<Hash, Arc<Block>>,
         /// Hash of the current chain tip.
         tip: Hash,
+        state: HashMap<Vec<u8>, Vec<u8>>,
+        state_root: Hash,
     }
 
     impl Storage for TestStorage {
@@ -181,6 +304,8 @@ pub mod tests {
                 headers: HashMap::new(),
                 blocks: HashMap::new(),
                 tip: Hash::zero(),
+                state: HashMap::new(),
+                state_root: Hash::zero(),
             };
             storage.append_block_mut(genesis, chain_id);
             storage
@@ -217,6 +342,30 @@ pub mod tests {
         }
     }
 
+    impl StateStore for TestStorage {
+        fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+            self.state.get(key).cloned()
+        }
+
+        fn apply_batch(&self, _writes: Vec<(Vec<u8>, Option<Vec<u8>>)>) {
+            todo!()
+        }
+
+        fn state_root(&self) -> Hash {
+            self.state_root
+        }
+
+        fn set_state_root(&self, _root: Hash) {
+            todo!()
+        }
+    }
+
+    impl IterableState for TestStorage {
+        fn iter_all(&self) -> Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + '_> {
+            Box::new(self.state.iter().map(|(k, v)| (k.clone(), v.clone())))
+        }
+    }
+
     impl StorageExtForTests for TestStorage {
         fn append_block_mut(&mut self, block: Arc<Block>, chain_id: u64) {
             if block.header.previous_block != self.tip {
@@ -235,6 +384,15 @@ pub mod tests {
         }
     }
 
+    impl StateViewProvider for TestStorage {
+        fn state_view(&self) -> StateView<'_, Self>
+        where
+            Self: Sized + StateStore,
+        {
+            StateView { storage: self }
+        }
+    }
+
     fn create_block_at(height: u64, previous: Hash) -> Arc<Block> {
         let header = Header {
             version: 1,
@@ -243,6 +401,7 @@ pub mod tests {
             previous_block: previous,
             data_hash: Hash::zero(),
             merkle_root: Hash::zero(),
+            state_root: Hash::zero(),
         };
         Block::new(header, PrivateKey::new(), vec![], TEST_CHAIN_ID)
     }
@@ -379,5 +538,60 @@ pub mod tests {
 
         assert_eq!(storage.height(), 10);
         assert_eq!(storage.tip(), prev_hash);
+    }
+
+    // ==================== StateStore Tests ====================
+
+    #[test]
+    fn state_store_get_returns_none_for_missing_key() {
+        let genesis = create_genesis(TEST_CHAIN_ID);
+        let storage = ThreadSafeMemoryStorage::new(genesis, TEST_CHAIN_ID);
+        assert_eq!(StateStore::get(&storage, b"missing"), None);
+    }
+
+    #[test]
+    fn state_store_apply_batch_inserts_and_deletes() {
+        let genesis = create_genesis(TEST_CHAIN_ID);
+        let storage = ThreadSafeMemoryStorage::new(genesis, TEST_CHAIN_ID);
+
+        storage.apply_batch(vec![
+            (b"key1".to_vec(), Some(b"value1".to_vec())),
+            (b"key2".to_vec(), Some(b"value2".to_vec())),
+        ]);
+
+        assert_eq!(StateStore::get(&storage, b"key1"), Some(b"value1".to_vec()));
+        assert_eq!(StateStore::get(&storage, b"key2"), Some(b"value2".to_vec()));
+
+        storage.apply_batch(vec![(b"key1".to_vec(), None)]);
+        assert_eq!(StateStore::get(&storage, b"key1"), None);
+        assert_eq!(StateStore::get(&storage, b"key2"), Some(b"value2".to_vec()));
+    }
+
+    #[test]
+    fn state_store_state_root_operations() {
+        let genesis = create_genesis(TEST_CHAIN_ID);
+        let storage = ThreadSafeMemoryStorage::new(genesis.clone(), TEST_CHAIN_ID);
+
+        assert_eq!(storage.state_root(), genesis.header.state_root);
+
+        let new_root = random_hash();
+        storage.set_state_root(new_root);
+        assert_eq!(storage.state_root(), new_root);
+    }
+
+    #[test]
+    fn iterable_state_iter_all() {
+        let genesis = create_genesis(TEST_CHAIN_ID);
+        let storage = ThreadSafeMemoryStorage::new(genesis, TEST_CHAIN_ID);
+
+        storage.apply_batch(vec![
+            (b"a".to_vec(), Some(b"1".to_vec())),
+            (b"b".to_vec(), Some(b"2".to_vec())),
+        ]);
+
+        let entries: Vec<_> = storage.iter_all().collect();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.contains(&(b"a".to_vec(), b"1".to_vec())));
+        assert!(entries.contains(&(b"b".to_vec(), b"2".to_vec())));
     }
 }

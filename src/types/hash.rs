@@ -28,6 +28,11 @@ impl Hash {
         &self.0
     }
 
+    /// Converts the hash into an owned byte vector.
+    pub fn to_vec(self) -> Vec<u8> {
+        Vec::<u8>::from(self.as_slice())
+    }
+
     /// Computes SHA3-256 hash of the encoded representation.
     pub fn sha3_from_bytes(data: &[u8]) -> Hash {
         let mut hasher = Sha3_256::new();
@@ -42,5 +47,25 @@ impl fmt::Display for Hash {
             write!(f, "{:02x}", byte)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn to_vec_returns_correct_bytes() {
+        let hash = Hash::sha3_from_bytes(b"test");
+        let vec = hash.to_vec();
+        assert_eq!(vec.len(), HASH_LEN);
+        assert_eq!(vec.as_slice(), hash.as_slice());
+    }
+
+    #[test]
+    fn to_vec_zero_hash() {
+        let hash = Hash::zero();
+        let vec = hash.to_vec();
+        assert!(vec.iter().all(|&b| b == 0));
     }
 }

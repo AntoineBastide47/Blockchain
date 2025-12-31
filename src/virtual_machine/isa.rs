@@ -32,7 +32,7 @@ macro_rules! for_each_instruction {
     ($callback:ident) => {
         $callback! {
             // =========================
-            // Loads / constants
+            // Store and Load
             // =========================
             /// LOAD_I64 rd, imm64 ; rd = imm64
             LoadI64 = 0x00, "LOAD_I64" => [rd: Reg, imm: ImmI64],
@@ -40,6 +40,12 @@ macro_rules! for_each_instruction {
             LoadStr = 0x01, "LOAD_STR" => [rd: Reg, str: RefU32],
             /// LOAD_BOOL rd, true|false ; rd = true|false
             LoadBool = 0x02, "LOAD_BOOL" => [rd: Reg, bool: Bool],
+            /// STORE_I64 key, value ; store i64 value at key in storage
+            StoreI64 = 0x09, "STORE_I64" => [key: Reg, value: Reg],
+            /// STORE_STR key, value ; store string value at key in storage
+            StoreStr = 0x0A, "STORE_STR" => [key: Reg, value: Reg],
+            /// STORE_BOOL key, value ; store bool value at key in storage
+            StoreBool = 0x0B, "STORE_BOOL" => [key: Reg, value: Reg],
             // =========================
             // Moves / casts
             // =========================
@@ -139,9 +145,9 @@ macro_rules! define_instructions {
 
     // ---------- types ----------
     (@ty Reg)    => { u8 };
-    (@ty ImmI64) => { i64 };
-    (@ty RefU32) => { u32 };
     (@ty Bool)   => { bool };
+    (@ty RefU32) => { u32 };
+    (@ty ImmI64) => { i64 };
 
     // ---------- encoding ----------
     (@emit $out:ident, Reg, $v:ident) => {

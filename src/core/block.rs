@@ -27,6 +27,8 @@ pub struct Header {
     pub data_hash: Hash,
     /// Root of merkle tree of transactions, enables SPV proofs
     pub merkle_root: Hash,
+    /// Root hash of the VM state after executing all transactions in this block
+    pub state_root: Hash,
 }
 
 impl Header {
@@ -225,6 +227,7 @@ mod tests {
             previous_block: random_hash(),
             data_hash: random_hash(),
             merkle_root: random_hash(),
+            state_root: random_hash(),
         }
     }
 
@@ -266,6 +269,7 @@ mod tests {
             previous_block: Hash::zero(),
             data_hash: Hash::zero(),
             merkle_root: Hash::zero(),
+            state_root: Hash::zero(),
         };
         let block = create_block(genesis_header, vec![]);
         assert_eq!(block.header.height, 0);
@@ -292,6 +296,7 @@ mod tests {
             data_hash: random_hash(),
             previous_block: random_hash(),
             merkle_root: random_hash(),
+            state_root: random_hash(),
         };
 
         let buf = header.to_bytes();

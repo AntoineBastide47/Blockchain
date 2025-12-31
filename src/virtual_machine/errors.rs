@@ -49,6 +49,10 @@ pub enum VMError {
     /// File I/O error during assembly.
     #[error("io error: {0}")]
     IoError(String),
+    /// Unknown host function called via CALL_HOST instruction.
     #[error("invalid CALL_HOST function name {0}")]
     InvalidCallHostFunction(String),
+    /// Failed to decode program bytecode.
+    #[error("decoding error: {0}")]
+    DecodeError(String),
 }

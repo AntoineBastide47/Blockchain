@@ -112,6 +112,9 @@ See LICENSE file.
 ## References
 The following references include a collection of articles and videos that have served as the foundation for building the
 blockchain (the list will evolve over time):
-- Core blockchain functionality: [Anthony GG - Create a modular blockchain from scratch](https://www.youtube.com/playlist?list=PL0xRBLFXXsP6-hxQmCDcl_BHJMm0mhxx7)
+- Core blockchain functionality: [Create a modular blockchain from scratch](https://www.youtube.com/playlist?list=PL0xRBLFXXsP6-hxQmCDcl_BHJMm0mhxx7) (by [Anthony GG](https://www.youtube.com/@anthonygg_))
+
 > [!Important]
 > These resources are guides. They provide insights but may not result in an identical blockchain implementation.
+> 
+> Concrete Example: [Create a modular blockchain from scratch](https://www.youtube.com/playlist?list=PL0xRBLFXXsP6-hxQmCDcl_BHJMm0mhxx7) is written in go and uses a stack based VM whereas the project is in rust and uses a register based VM. 

@@ -91,6 +91,7 @@ impl Server {
             previous_block: Hash::zero(),
             data_hash: Hash::zero(),
             merkle_root: Hash::zero(),
+            state_root: Hash::zero(),
         };
 
         let genesis_key = PrivateKey::from_bytes(&GENESIS_PRIVATE_KEY_BYTES)
@@ -204,19 +205,23 @@ impl Server {
             self.private_key.clone().unwrap(),
             self.tx_pool.transactions(),
         );
-        match self.chain.add_block(block.clone()) {
-            Ok(_) => {
-                self.tx_pool.flush();
-                if let Err(e) = self
-                    .broadcast_block(self.logger.id.to_string(), block)
-                    .await
-                {
-                    self.logger.warn(&format!("could not broadcast block: {e}"));
+
+        match block {
+            Ok(built_block) => match self.chain.add_block(built_block.clone()) {
+                Ok(_) => {
+                    self.tx_pool.flush();
+                    if let Err(e) = self
+                        .broadcast_block(self.logger.id.to_string(), built_block)
+                        .await
+                    {
+                        self.logger.warn(&format!("could not broadcast block: {e}"));
+                    }
                 }
-            }
-            Err(err) => self
-                .logger
-                .warn(&format!("could not add newly built block: {err}")),
+                Err(err) => self
+                    .logger
+                    .warn(&format!("could not add newly built block: {err}")),
+            },
+            Err(e) => self.logger.warn(&format!("build block failed: {e}")),
         }
     }
 
@@ -447,6 +452,7 @@ mod tests {
             previous_block: Hash::zero(),
             data_hash: Hash::zero(),
             merkle_root: Hash::zero(),
+            state_root: Hash::zero(),
         };
         Block::new(header, PrivateKey::new(), transactions, TEST_CHAIN_ID)
     }

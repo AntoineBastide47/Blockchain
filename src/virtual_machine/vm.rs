@@ -4,9 +4,11 @@
 //! registers. All arithmetic uses wrapping semantics to prevent overflow panics.
 
 use crate::types::bytes::Bytes;
+use crate::types::hash::Hash;
 use crate::virtual_machine::errors::VMError;
 use crate::virtual_machine::isa::Instruction;
 use crate::virtual_machine::program::Program;
+use crate::virtual_machine::state::State;
 
 /// Runtime value stored in registers.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -130,40 +132,34 @@ impl Heap {
     }
 }
 
-/// Bytecode virtual machine.
-///
-/// Executes compiled bytecode sequentially, reading instructions from the
-/// instruction pointer until the end of the bytecode is reached.
-pub struct VM {
-    /// Bytecode to execute.
-    data: Bytes,
-    /// Instruction pointer (current position in bytecode).
-    ip: usize,
-    /// Register file (256 registers).
-    registers: Registers,
-    /// Heap for string pool and future allocations.
-    heap: Heap,
-}
-
 macro_rules! exec_vm {
-    // Entry: list instructions and map to handler method names
+    // Entry point
     (
         vm = $vm:ident,
+        state = $state:ident,
+        ctx = $ctx:ident,
         instr = $instr:ident,
-        {
-            $(
-                $variant:ident => $handler:ident ( $( $field:ident : $kind:ident ),* $(,)? )
-            ),* $(,)?
-        }
+        { $( $variant:ident => $handler:ident $args:tt ),* $(,)? }
     ) => {{
         match $instr {
-            $(
-                Instruction::$variant => {
-                    $( let $field = exec_vm!(@read $vm, $kind)?; )*
-                    $vm.$handler( $( $field ),* )
-                }
-            ),*
+            $( Instruction::$variant => exec_vm!(@call $vm, $state, $ctx, $handler, $args) ),*
         }
+    }};
+
+    // Handler with state and chain_id (semicolon separator)
+    (@call $vm:ident, $state:ident, $ctx:ident, $handler:ident,
+        (state, ctx; $( $field:ident : $kind:ident ),* $(,)? )
+    ) => {{
+        $( let $field = exec_vm!(@read $vm, $kind)?; )*
+        $vm.$handler($state, $ctx, $( $field ),*)
+    }};
+
+    // Handler without state (no semicolon)
+    (@call $vm:ident, $state:ident, $ctx:ident, $handler:ident,
+        ( $( $field:ident : $kind:ident ),* $(,)? )
+    ) => {{
+        $( let $field = exec_vm!(@read $vm, $kind)?; )*
+        $vm.$handler($( $field ),*)
     }};
 
     // Decode a u8 register index
@@ -189,6 +185,31 @@ macro_rules! exec_vm {
     }};
 }
 
+/// Execution context passed to the VM during contract execution.
+///
+/// Contains chain and contract identifiers used to namespace state keys.
+pub struct ExecContext<'a> {
+    /// Chain identifier for state key derivation.
+    pub chain_id: u64,
+    /// Contract identifier for state key derivation.
+    pub contract_id: &'a [u8],
+}
+
+/// Bytecode virtual machine.
+///
+/// Executes compiled bytecode sequentially, reading instructions from the
+/// instruction pointer until the end of the bytecode is reached.
+pub struct VM {
+    /// Bytecode to execute.
+    data: Bytes,
+    /// Instruction pointer (current position in bytecode).
+    ip: usize,
+    /// Register file (256 registers).
+    registers: Registers,
+    /// Heap for string pool and future allocations.
+    heap: Heap,
+}
+
 impl VM {
     /// Creates a new VM instance with the given bytecode.
     pub fn new(program: Program) -> Self {
@@ -206,12 +227,12 @@ impl VM {
     ///
     /// Runs instructions sequentially until the instruction pointer reaches
     /// the end of the bytecode buffer.
-    pub fn run(&mut self) -> Result<(), VMError> {
+    pub fn run(&mut self, state: &mut dyn State, ctx: &ExecContext) -> Result<(), VMError> {
         while self.ip < self.data.len() {
             let opcode = self.data[self.ip];
             self.ip += 1;
             let instr = Instruction::try_from(opcode)?;
-            self.exec(instr)?;
+            self.exec(instr, state, ctx)?;
         }
         Ok(())
     }
@@ -233,15 +254,26 @@ impl VM {
     }
 
     /// Executes a single instruction.
-    pub fn exec(&mut self, instruction: Instruction) -> Result<(), VMError> {
+    fn exec(
+        &mut self,
+        instruction: Instruction,
+        state: &mut dyn State,
+        ctx: &ExecContext,
+    ) -> Result<(), VMError> {
         exec_vm! {
             vm = self,
+            state = state,
+            ctx = ctx,
             instr = instruction,
             {
                 // Loads
                 LoadI64 => op_load_i64(rd: Reg, imm: ImmI64),
                 LoadStr => op_load_str(rd: Reg, str_ref: RefU32),
                 LoadBool => op_load_bool(rd: Reg, b: Bool),
+                // Stores
+                StoreI64 => op_store_i64(state, ctx; key: Reg, value: Reg),
+                StoreStr => op_store_str(state, ctx; key: Reg, value: Reg),
+                StoreBool => op_store_bool(state, ctx; key: Reg, value: Reg),
                 // Moves / casts
                 Move => op_move(rd: Reg, rs: Reg),
                 I64ToBool => op_i64_to_bool(rd: Reg, rs: Reg),
@@ -274,6 +306,19 @@ impl VM {
         }
     }
 
+    /// Derives a unique state key from chain ID, contract ID, and user-provided key.
+    ///
+    /// The key is hashed to ensure uniform distribution and prevent collisions
+    /// between different contracts or chains.
+    fn make_state_key(chain_id: u64, contract_id: &[u8], user_key: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"STATE");
+        buf.extend_from_slice(&chain_id.to_le_bytes());
+        buf.extend_from_slice(contract_id);
+        buf.extend_from_slice(user_key);
+        Hash::sha3_from_bytes(buf.as_slice()).to_vec()
+    }
+
     fn op_load_i64(&mut self, dst: u8, imm: i64) -> Result<(), VMError> {
         self.registers.set(dst, Value::Int(imm))
     }
@@ -284,6 +329,55 @@ impl VM {
 
     fn op_load_bool(&mut self, dst: u8, b: bool) -> Result<(), VMError> {
         self.registers.set(dst, Value::Bool(b))
+    }
+
+    /// Stores a 64-bit integer to state.
+    fn op_store_i64(
+        &mut self,
+        state: &mut dyn State,
+        ctx: &ExecContext,
+        key: u8,
+        value: u8,
+    ) -> Result<(), VMError> {
+        let key_ref = self.registers.get_ref(key, "STORE_I64")?;
+        let key_str = self.heap.get_string(key_ref).to_owned();
+        let val = self.registers.get_int(value, "STORE_I64")?;
+        let key = Self::make_state_key(ctx.chain_id, ctx.contract_id, key_str.as_bytes());
+        state.push(key, val.to_le_bytes().to_vec());
+        Ok(())
+    }
+
+    /// Stores a string to state.
+    fn op_store_str(
+        &mut self,
+        state: &mut dyn State,
+        ctx: &ExecContext,
+        key: u8,
+        value: u8,
+    ) -> Result<(), VMError> {
+        let key_ref = self.registers.get_ref(key, "STORE_STR")?;
+        let key_str = self.heap.get_string(key_ref).to_owned();
+        let val_ref = self.registers.get_ref(value, "STORE_STR")?;
+        let val_str = self.heap.get_string(val_ref);
+        let key = Self::make_state_key(ctx.chain_id, ctx.contract_id, key_str.as_bytes());
+        state.push(key, val_str.as_bytes().into());
+        Ok(())
+    }
+
+    /// Stores a boolean to state.
+    fn op_store_bool(
+        &mut self,
+        state: &mut dyn State,
+        ctx: &ExecContext,
+        key: u8,
+        value: u8,
+    ) -> Result<(), VMError> {
+        let key_ref = self.registers.get_ref(key, "STORE_BOOL")?;
+        let key_str = self.heap.get_string(key_ref).to_owned();
+        let val = self.registers.get_bool(value, "STORE_BOOL")?;
+        let key = Self::make_state_key(ctx.chain_id, ctx.contract_id, key_str.as_bytes());
+        state.push(key, [val as u8].into());
+        Ok(())
     }
 
     fn op_move(&mut self, dst: u8, src: u8) -> Result<(), VMError> {
@@ -444,12 +538,18 @@ impl VM {
 mod tests {
     use super::*;
     use crate::virtual_machine::assembler::assemble_source;
+    use crate::virtual_machine::state::tests::TestState;
+
+    const EXECUTION_CONTEXT: &ExecContext = &ExecContext {
+        chain_id: 62845383663927,
+        contract_id: &[3, 5, 2, 3, 9, 1],
+    };
 
     fn run_vm(source: &str) -> VM {
         let program = assemble_source(source).expect("assembly failed");
-        println!("{:?}", program);
         let mut vm = VM::new(program);
-        vm.run().expect("vm run failed");
+        vm.run(&mut TestState::new(), EXECUTION_CONTEXT)
+            .expect("vm run failed");
         vm
     }
 
@@ -464,7 +564,17 @@ mod tests {
     fn run_expect_err(source: &str) -> VMError {
         let program = assemble_source(source).expect("assembly failed");
         let mut vm = VM::new(program);
-        vm.run().expect_err("expected error")
+        vm.run(&mut TestState::new(), EXECUTION_CONTEXT)
+            .expect_err("expected error")
+    }
+
+    fn run_vm_with_state(source: &str) -> TestState {
+        let program = assemble_source(source).expect("assembly failed");
+        let mut vm = VM::new(program);
+        let mut state = TestState::new();
+        vm.run(&mut state, EXECUTION_CONTEXT)
+            .expect("vm run failed");
+        state
     }
 
     // ==================== Loads ====================
@@ -779,12 +889,78 @@ mod tests {
     #[test]
     fn invalid_opcode() {
         let mut vm = VM::new(Program::new(vec![], vec![0xFF]));
-        assert!(matches!(vm.run(), Err(VMError::InvalidInstruction(0xFF))));
+        assert!(matches!(
+            vm.run(&mut TestState::new(), EXECUTION_CONTEXT),
+            Err(VMError::InvalidInstruction(0xFF))
+        ));
     }
 
     #[test]
     fn truncated_bytecode() {
         let mut vm = VM::new(Program::new(vec![], vec![0x00, 0x00]));
-        assert!(matches!(vm.run(), Err(VMError::UnexpectedEndOfBytecode)));
+        assert!(matches!(
+            vm.run(&mut TestState::new(), EXECUTION_CONTEXT),
+            Err(VMError::UnexpectedEndOfBytecode)
+        ));
+    }
+
+    // ==================== Stores ====================
+
+    fn make_test_key(user_key: &[u8]) -> Vec<u8> {
+        VM::make_state_key(
+            EXECUTION_CONTEXT.chain_id,
+            EXECUTION_CONTEXT.contract_id,
+            user_key,
+        )
+    }
+
+    #[test]
+    fn store_i64() {
+        let state = run_vm_with_state(
+            r#"LOAD_STR r0, "counter"
+LOAD_I64 r1, 42
+STORE_I64 r0, r1"#,
+        );
+        let key = make_test_key(b"counter");
+        let value = state.get(&key).expect("key not found");
+        assert_eq!(i64::from_le_bytes(value.try_into().unwrap()), 42);
+    }
+
+    #[test]
+    fn store_str() {
+        let state = run_vm_with_state(
+            r#"LOAD_STR r0, "name"
+LOAD_STR r1, "alice"
+STORE_STR r0, r1"#,
+        );
+        let key = make_test_key(b"name");
+        let value = state.get(&key).expect("key not found");
+        assert_eq!(value, b"alice");
+    }
+
+    #[test]
+    fn store_bool() {
+        let state = run_vm_with_state(
+            r#"LOAD_STR r0, "flag"
+LOAD_BOOL r1, true
+STORE_BOOL r0, r1"#,
+        );
+        let key = make_test_key(b"flag");
+        let value = state.get(&key).expect("key not found");
+        assert_eq!(value, &[1u8]);
+    }
+
+    #[test]
+    fn store_overwrites_previous_value() {
+        let state = run_vm_with_state(
+            r#"LOAD_STR r0, "x"
+LOAD_I64 r1, 100
+STORE_I64 r0, r1
+LOAD_I64 r2, 200
+STORE_I64 r0, r2"#,
+        );
+        let key = make_test_key(b"x");
+        let value = state.get(&key).expect("key not found");
+        assert_eq!(i64::from_le_bytes(value.try_into().unwrap()), 200);
     }
 }

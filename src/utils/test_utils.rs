@@ -31,6 +31,7 @@ pub mod utils {
             previous_block: Hash::zero(),
             data_hash: random_hash(),
             merkle_root: Hash::zero(),
+            state_root: Hash::zero(),
         };
         Block::new(header, PrivateKey::new(), vec![], chain_id)
     }

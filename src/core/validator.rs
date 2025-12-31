@@ -119,6 +119,7 @@ mod tests {
             previous_block: previous,
             data_hash: random_hash(),
             merkle_root: Hash::zero(),
+            state_root: random_hash(),
         };
         Block::new(header, PrivateKey::new(), vec![], TEST_CHAIN_ID)
     }

@@ -17,7 +17,8 @@
 //! - [`assembler`]: Assembly parsing, IR, and bytecode encoding
 
 pub mod assembler;
-mod errors;
-mod isa;
+pub mod errors;
+pub mod isa;
 pub mod program;
+pub mod state;
 pub mod vm;

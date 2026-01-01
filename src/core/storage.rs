@@ -57,9 +57,9 @@ pub trait Storage: Send + Sync {
 /// Implementations must be thread-safe.
 pub trait StateStore: Send + Sync {
     /// Retrieves a value by key from the state store.
-    fn get(&self, key: &[u8]) -> Option<Vec<u8>>;
+    fn get(&self, key: Hash) -> Option<Vec<u8>>;
     /// Applies a batch of writes atomically. `None` values indicate deletions.
-    fn apply_batch(&self, writes: Vec<(Vec<u8>, Option<Vec<u8>>)>);
+    fn apply_batch(&self, writes: Vec<(Hash, Option<Vec<u8>>)>);
     /// Returns the current state root hash.
     fn state_root(&self) -> Hash;
     /// Updates the stored state root hash.
@@ -72,7 +72,7 @@ pub trait StateStore: Send + Sync {
 /// a sparse Merkle tree instead of full iteration.
 pub trait IterableState {
     /// Returns an iterator over all key-value pairs in the state.
-    fn iter_all(&self) -> Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + '_>;
+    fn iter_all(&self) -> Box<dyn Iterator<Item = (Hash, Vec<u8>)> + '_>;
 }
 
 /// Read-only view into the state store.
@@ -91,15 +91,15 @@ pub trait StateViewProvider {
 }
 
 impl<'a, S: StateStore> State for StateView<'a, S> {
-    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+    fn get(&self, key: Hash) -> Option<Vec<u8>> {
         self.storage.get(key)
     }
 
-    fn push(&mut self, _key: Vec<u8>, _value: Vec<u8>) {
+    fn push(&mut self, _key: Hash, _value: Vec<u8>) {
         unreachable!("StateView is read-only")
     }
 
-    fn delete(&mut self, _key: &[u8]) {
+    fn delete(&mut self, _key: Hash) {
         unreachable!("StateView is read-only")
     }
 }
@@ -112,7 +112,7 @@ struct Inner {
     /// Hash of the current chain tip.
     tip: Hash,
     /// Key-value state storage for VM execution.
-    state: HashMap<Vec<u8>, Vec<u8>>,
+    state: HashMap<Hash, Vec<u8>>,
     /// Root hash of the current state.
     state_root: Hash,
 }
@@ -159,7 +159,7 @@ impl Storage for ThreadSafeMemoryStorage {
 
     fn has_block(&self, hash: Hash) -> bool {
         let inner = self.inner.lock().unwrap();
-        inner.blocks.contains_key(&hash)
+        inner.headers.contains_key(&hash)
     }
 
     fn get_header(&self, hash: Hash) -> Option<Header> {
@@ -210,11 +210,11 @@ impl Storage for ThreadSafeMemoryStorage {
 }
 
 impl StateStore for ThreadSafeMemoryStorage {
-    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.inner.lock().unwrap().state.get(key).cloned()
+    fn get(&self, key: Hash) -> Option<Vec<u8>> {
+        self.inner.lock().unwrap().state.get(&key).cloned()
     }
 
-    fn apply_batch(&self, writes: Vec<(Vec<u8>, Option<Vec<u8>>)>) {
+    fn apply_batch(&self, writes: Vec<(Hash, Option<Vec<u8>>)>) {
         let mut inner = self.inner.lock().unwrap();
 
         for (key, value_opt) in writes {
@@ -239,14 +239,10 @@ impl StateStore for ThreadSafeMemoryStorage {
 }
 
 impl IterableState for ThreadSafeMemoryStorage {
-    fn iter_all(&self) -> Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + '_> {
-        let snapshot: Vec<(Vec<u8>, Vec<u8>)> = {
+    fn iter_all(&self) -> Box<dyn Iterator<Item = (Hash, Vec<u8>)> + '_> {
+        let snapshot: Vec<(Hash, Vec<u8>)> = {
             let inner = self.inner.lock().unwrap();
-            inner
-                .state
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect()
+            inner.state.iter().map(|(k, v)| (*k, v.clone())).collect()
         };
 
         Box::new(snapshot.into_iter())
@@ -294,7 +290,7 @@ pub mod tests {
         blocks: HashMap<Hash, Arc<Block>>,
         /// Hash of the current chain tip.
         tip: Hash,
-        state: HashMap<Vec<u8>, Vec<u8>>,
+        state: HashMap<Hash, Vec<u8>>,
         state_root: Hash,
     }
 
@@ -343,11 +339,11 @@ pub mod tests {
     }
 
     impl StateStore for TestStorage {
-        fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-            self.state.get(key).cloned()
+        fn get(&self, key: Hash) -> Option<Vec<u8>> {
+            self.state.get(&key).cloned()
         }
 
-        fn apply_batch(&self, _writes: Vec<(Vec<u8>, Option<Vec<u8>>)>) {
+        fn apply_batch(&self, _writes: Vec<(Hash, Option<Vec<u8>>)>) {
             todo!()
         }
 
@@ -361,8 +357,8 @@ pub mod tests {
     }
 
     impl IterableState for TestStorage {
-        fn iter_all(&self) -> Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + '_> {
-            Box::new(self.state.iter().map(|(k, v)| (k.clone(), v.clone())))
+        fn iter_all(&self) -> Box<dyn Iterator<Item = (Hash, Vec<u8>)> + '_> {
+            Box::new(self.state.iter().map(|(k, v)| (*k, v.clone())))
         }
     }
 
@@ -542,11 +538,15 @@ pub mod tests {
 
     // ==================== StateStore Tests ====================
 
+    fn h(s: &[u8]) -> Hash {
+        Hash::sha3_from_bytes(s)
+    }
+
     #[test]
     fn state_store_get_returns_none_for_missing_key() {
         let genesis = create_genesis(TEST_CHAIN_ID);
         let storage = ThreadSafeMemoryStorage::new(genesis, TEST_CHAIN_ID);
-        assert_eq!(StateStore::get(&storage, b"missing"), None);
+        assert_eq!(StateStore::get(&storage, h(b"missing")), None);
     }
 
     #[test]
@@ -554,17 +554,20 @@ pub mod tests {
         let genesis = create_genesis(TEST_CHAIN_ID);
         let storage = ThreadSafeMemoryStorage::new(genesis, TEST_CHAIN_ID);
 
+        let key1 = h(b"key1");
+        let key2 = h(b"key2");
+
         storage.apply_batch(vec![
-            (b"key1".to_vec(), Some(b"value1".to_vec())),
-            (b"key2".to_vec(), Some(b"value2".to_vec())),
+            (key1, Some(b"value1".to_vec())),
+            (key2, Some(b"value2".to_vec())),
         ]);
 
-        assert_eq!(StateStore::get(&storage, b"key1"), Some(b"value1".to_vec()));
-        assert_eq!(StateStore::get(&storage, b"key2"), Some(b"value2".to_vec()));
+        assert_eq!(StateStore::get(&storage, key1), Some(b"value1".to_vec()));
+        assert_eq!(StateStore::get(&storage, key2), Some(b"value2".to_vec()));
 
-        storage.apply_batch(vec![(b"key1".to_vec(), None)]);
-        assert_eq!(StateStore::get(&storage, b"key1"), None);
-        assert_eq!(StateStore::get(&storage, b"key2"), Some(b"value2".to_vec()));
+        storage.apply_batch(vec![(key1, None)]);
+        assert_eq!(StateStore::get(&storage, key1), None);
+        assert_eq!(StateStore::get(&storage, key2), Some(b"value2".to_vec()));
     }
 
     #[test]
@@ -584,14 +587,17 @@ pub mod tests {
         let genesis = create_genesis(TEST_CHAIN_ID);
         let storage = ThreadSafeMemoryStorage::new(genesis, TEST_CHAIN_ID);
 
+        let key_a = h(b"a");
+        let key_b = h(b"b");
+
         storage.apply_batch(vec![
-            (b"a".to_vec(), Some(b"1".to_vec())),
-            (b"b".to_vec(), Some(b"2".to_vec())),
+            (key_a, Some(b"1".to_vec())),
+            (key_b, Some(b"2".to_vec())),
         ]);
 
         let entries: Vec<_> = storage.iter_all().collect();
         assert_eq!(entries.len(), 2);
-        assert!(entries.contains(&(b"a".to_vec(), b"1".to_vec())));
-        assert!(entries.contains(&(b"b".to_vec(), b"2".to_vec())));
+        assert!(entries.contains(&(key_a, b"1".to_vec())));
+        assert!(entries.contains(&(key_b, b"2".to_vec())));
     }
 }

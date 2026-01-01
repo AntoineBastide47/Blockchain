@@ -36,16 +36,22 @@ macro_rules! for_each_instruction {
             // =========================
             /// LOAD_I64 rd, imm64 ; rd = imm64
             LoadI64 = 0x00, "LOAD_I64" => [rd: Reg, imm: ImmI64],
-            /// LOAD_STR rd, ref ; rd = ref
-            LoadStr = 0x01, "LOAD_STR" => [rd: Reg, str: RefU32],
-            /// LOAD_BOOL rd, true|false ; rd = true|false
-            LoadBool = 0x02, "LOAD_BOOL" => [rd: Reg, bool: Bool],
             /// STORE_I64 key, value ; store i64 value at key in storage
-            StoreI64 = 0x09, "STORE_I64" => [key: Reg, value: Reg],
-            /// STORE_STR key, value ; store string value at key in storage
-            StoreStr = 0x0A, "STORE_STR" => [key: Reg, value: Reg],
+            StoreI64 = 0x01, "STORE_I64" => [key: Reg, value: Reg],
+            /// LOAD_I64_STATE dst, key ; loads the i64 stored as key from storage
+            LoadI64State = 0x02, "LOAD_I64_STATE" => [rd: Reg, key: Reg],
+            /// LOAD_BOOL rd, true|false ; rd = true|false
+            LoadBool = 0x03, "LOAD_BOOL" => [rd: Reg, bool: Bool],
             /// STORE_BOOL key, value ; store bool value at key in storage
-            StoreBool = 0x0B, "STORE_BOOL" => [key: Reg, value: Reg],
+            StoreBool = 0x04, "STORE_BOOL" => [key: Reg, value: Reg],
+            /// LOAD_BOOL_STATE dst, key ; loads the boolean stored as key from storage
+            LoadBoolState = 0x05, "LOAD_BOOL_STATE" => [rd: Reg, key: Reg],
+            /// LOAD_STR rd, ref ; rd = ref
+            LoadStr = 0x06, "LOAD_STR" => [rd: Reg, str: RefU32],
+            /// STORE_STR key, value ; store string value at key in storage
+            StoreStr = 0x07, "STORE_STR" => [key: Reg, value: Reg],
+            /// LOAD_STR_STATE dst, key ; loads the string stored as key from storage
+            LoadStrState = 0x08, "LOAD_STR_STATE" => [rd: Reg, key: Reg],
             // =========================
             // Moves / casts
             // =========================

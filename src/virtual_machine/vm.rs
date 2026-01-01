@@ -266,19 +266,21 @@ impl VM {
             ctx = ctx,
             instr = instruction,
             {
-                // Loads
+                // Store and Load
                 LoadI64 => op_load_i64(rd: Reg, imm: ImmI64),
-                LoadStr => op_load_str(rd: Reg, str_ref: RefU32),
-                LoadBool => op_load_bool(rd: Reg, b: Bool),
-                // Stores
                 StoreI64 => op_store_i64(state, ctx; key: Reg, value: Reg),
-                StoreStr => op_store_str(state, ctx; key: Reg, value: Reg),
+                LoadI64State => op_load_i64_state(state, ctx; rd: Reg, key: Reg),
+                LoadBool => op_load_bool(rd: Reg, b: Bool),
                 StoreBool => op_store_bool(state, ctx; key: Reg, value: Reg),
+                LoadBoolState => op_load_bool_state(state, ctx; rd: Reg, key: Reg),
+                LoadStr => op_load_str(rd: Reg, str_ref: RefU32),
+                StoreStr => op_store_str(state, ctx; key: Reg, value: Reg),
+                LoadStrState => op_load_str_state(state, ctx; rd: Reg, key: Reg),
                 // Moves / casts
                 Move => op_move(rd: Reg, rs: Reg),
                 I64ToBool => op_i64_to_bool(rd: Reg, rs: Reg),
                 BoolToI64 => op_bool_to_i64(rd: Reg, rs: Reg),
-                // Arithmetic
+                // Integer arithmetic
                 Add => op_add(rd: Reg, rs1: Reg, rs2: Reg),
                 Sub => op_sub(rd: Reg, rs1: Reg, rs2: Reg),
                 Mul => op_mul(rd: Reg, rs1: Reg, rs2: Reg),
@@ -310,28 +312,19 @@ impl VM {
     ///
     /// The key is hashed to ensure uniform distribution and prevent collisions
     /// between different contracts or chains.
-    fn make_state_key(chain_id: u64, contract_id: &[u8], user_key: &[u8]) -> Vec<u8> {
+    fn make_state_key(chain_id: u64, contract_id: &[u8], user_key: &[u8]) -> Hash {
         let mut buf = Vec::new();
         buf.extend_from_slice(b"STATE");
         buf.extend_from_slice(&chain_id.to_le_bytes());
         buf.extend_from_slice(contract_id);
         buf.extend_from_slice(user_key);
-        Hash::sha3_from_bytes(buf.as_slice()).to_vec()
+        Hash::sha3_from_bytes(buf.as_slice())
     }
 
     fn op_load_i64(&mut self, dst: u8, imm: i64) -> Result<(), VMError> {
         self.registers.set(dst, Value::Int(imm))
     }
 
-    fn op_load_str(&mut self, dst: u8, str_ref: u32) -> Result<(), VMError> {
-        self.registers.set(dst, Value::Ref(str_ref))
-    }
-
-    fn op_load_bool(&mut self, dst: u8, b: bool) -> Result<(), VMError> {
-        self.registers.set(dst, Value::Bool(b))
-    }
-
-    /// Stores a 64-bit integer to state.
     fn op_store_i64(
         &mut self,
         state: &mut dyn State,
@@ -347,7 +340,66 @@ impl VM {
         Ok(())
     }
 
-    /// Stores a string to state.
+    fn op_load_i64_state(
+        &mut self,
+        state: &mut dyn State,
+        ctx: &ExecContext,
+        dst: u8,
+        key: u8,
+    ) -> Result<(), VMError> {
+        let key_ref = self.registers.get_ref(key, "LOAD_I64_STATE")?;
+        let key_str = self.heap.get_string(key_ref);
+        let state_key = Self::make_state_key(ctx.chain_id, ctx.contract_id, key_str.as_bytes());
+        let value = state
+            .get(state_key)
+            .ok_or_else(|| VMError::KeyNotFound(key_str.to_string()))?;
+        let bytes: [u8; 8] = value.try_into().map_err(|_| VMError::InvalidStateValue)?;
+        self.registers
+            .set(dst, Value::Int(i64::from_le_bytes(bytes)))
+    }
+
+    fn op_load_bool(&mut self, dst: u8, b: bool) -> Result<(), VMError> {
+        self.registers.set(dst, Value::Bool(b))
+    }
+
+    fn op_store_bool(
+        &mut self,
+        state: &mut dyn State,
+        ctx: &ExecContext,
+        key: u8,
+        value: u8,
+    ) -> Result<(), VMError> {
+        let key_ref = self.registers.get_ref(key, "STORE_BOOL")?;
+        let key_str = self.heap.get_string(key_ref).to_owned();
+        let val = self.registers.get_bool(value, "STORE_BOOL")?;
+        let key = Self::make_state_key(ctx.chain_id, ctx.contract_id, key_str.as_bytes());
+        state.push(key, [val as u8].into());
+        Ok(())
+    }
+
+    fn op_load_bool_state(
+        &mut self,
+        state: &mut dyn State,
+        ctx: &ExecContext,
+        dst: u8,
+        key: u8,
+    ) -> Result<(), VMError> {
+        let key_ref = self.registers.get_ref(key, "LOAD_BOOL_STATE")?;
+        let key_str = self.heap.get_string(key_ref);
+        let state_key = Self::make_state_key(ctx.chain_id, ctx.contract_id, key_str.as_bytes());
+        let value = state
+            .get(state_key)
+            .ok_or_else(|| VMError::KeyNotFound(key_str.to_string()))?;
+        if value.len() != 1 {
+            return Err(VMError::InvalidStateValue);
+        }
+        self.registers.set(dst, Value::Bool(value[0] != 0))
+    }
+
+    fn op_load_str(&mut self, dst: u8, str_ref: u32) -> Result<(), VMError> {
+        self.registers.set(dst, Value::Ref(str_ref))
+    }
+
     fn op_store_str(
         &mut self,
         state: &mut dyn State,
@@ -364,20 +416,23 @@ impl VM {
         Ok(())
     }
 
-    /// Stores a boolean to state.
-    fn op_store_bool(
+    fn op_load_str_state(
         &mut self,
         state: &mut dyn State,
         ctx: &ExecContext,
+        dst: u8,
         key: u8,
-        value: u8,
     ) -> Result<(), VMError> {
-        let key_ref = self.registers.get_ref(key, "STORE_BOOL")?;
-        let key_str = self.heap.get_string(key_ref).to_owned();
-        let val = self.registers.get_bool(value, "STORE_BOOL")?;
-        let key = Self::make_state_key(ctx.chain_id, ctx.contract_id, key_str.as_bytes());
-        state.push(key, [val as u8].into());
-        Ok(())
+        let key_ref = self.registers.get_ref(key, "LOAD_STR_STATE")?;
+        let key_str = self.heap.get_string(key_ref);
+        let state_key = Self::make_state_key(ctx.chain_id, ctx.contract_id, key_str.as_bytes());
+        let value = state
+            .get(state_key)
+            .ok_or_else(|| VMError::KeyNotFound(key_str.to_string()))?;
+        let str_val = String::from_utf8(value).map_err(|_| VMError::InvalidStateValue)?;
+        let str_idx = self.heap.strings.len() as u32;
+        self.heap.strings.push(str_val);
+        self.registers.set(dst, Value::Ref(str_idx))
     }
 
     fn op_move(&mut self, dst: u8, src: u8) -> Result<(), VMError> {
@@ -906,7 +961,7 @@ mod tests {
 
     // ==================== Stores ====================
 
-    fn make_test_key(user_key: &[u8]) -> Vec<u8> {
+    fn make_test_key(user_key: &[u8]) -> Hash {
         VM::make_state_key(
             EXECUTION_CONTEXT.chain_id,
             EXECUTION_CONTEXT.contract_id,
@@ -922,7 +977,7 @@ LOAD_I64 r1, 42
 STORE_I64 r0, r1"#,
         );
         let key = make_test_key(b"counter");
-        let value = state.get(&key).expect("key not found");
+        let value = state.get(key).expect("key not found");
         assert_eq!(i64::from_le_bytes(value.try_into().unwrap()), 42);
     }
 
@@ -934,7 +989,7 @@ LOAD_STR r1, "alice"
 STORE_STR r0, r1"#,
         );
         let key = make_test_key(b"name");
-        let value = state.get(&key).expect("key not found");
+        let value = state.get(key).expect("key not found");
         assert_eq!(value, b"alice");
     }
 
@@ -946,7 +1001,7 @@ LOAD_BOOL r1, true
 STORE_BOOL r0, r1"#,
         );
         let key = make_test_key(b"flag");
-        let value = state.get(&key).expect("key not found");
+        let value = state.get(key).expect("key not found");
         assert_eq!(value, &[1u8]);
     }
 
@@ -960,7 +1015,166 @@ LOAD_I64 r2, 200
 STORE_I64 r0, r2"#,
         );
         let key = make_test_key(b"x");
-        let value = state.get(&key).expect("key not found");
+        let value = state.get(key).expect("key not found");
         assert_eq!(i64::from_le_bytes(value.try_into().unwrap()), 200);
+    }
+
+    // ==================== State Loads ====================
+
+    fn run_vm_on_state(source: &str, state: &mut TestState) -> VM {
+        let program = assemble_source(source).expect("assembly failed");
+        let mut vm = VM::new(program);
+        vm.run(state, EXECUTION_CONTEXT).expect("vm run failed");
+        vm
+    }
+
+    #[test]
+    fn load_i64_state() {
+        let key = make_test_key(b"counter");
+        let mut state = TestState::with_data(vec![(key, 42i64.to_le_bytes().to_vec())]);
+        let vm = run_vm_on_state(
+            r#"LOAD_STR r0, "counter"
+LOAD_I64_STATE r1, r0"#,
+            &mut state,
+        );
+        assert_eq!(vm.registers.get_int(1, "").unwrap(), 42);
+    }
+
+    #[test]
+    fn load_i64_state_negative() {
+        let key = make_test_key(b"neg");
+        let mut state = TestState::with_data(vec![(key, (-999i64).to_le_bytes().to_vec())]);
+        let vm = run_vm_on_state(
+            r#"LOAD_STR r0, "neg"
+LOAD_I64_STATE r1, r0"#,
+            &mut state,
+        );
+        assert_eq!(vm.registers.get_int(1, "").unwrap(), -999);
+    }
+
+    #[test]
+    fn load_i64_state_key_not_found() {
+        let program = assemble_source(
+            r#"LOAD_STR r0, "missing"
+LOAD_I64_STATE r1, r0"#,
+        )
+        .expect("assembly failed");
+        let mut vm = VM::new(program);
+        let err = vm
+            .run(&mut TestState::new(), EXECUTION_CONTEXT)
+            .expect_err("expected error");
+        assert!(matches!(err, VMError::KeyNotFound(_)));
+    }
+
+    #[test]
+    fn load_bool_state_true() {
+        let key = make_test_key(b"flag");
+        let mut state = TestState::with_data(vec![(key, vec![1u8])]);
+        let vm = run_vm_on_state(
+            r#"LOAD_STR r0, "flag"
+LOAD_BOOL_STATE r1, r0"#,
+            &mut state,
+        );
+        assert!(vm.registers.get_bool(1, "").unwrap());
+    }
+
+    #[test]
+    fn load_bool_state_false() {
+        let key = make_test_key(b"flag");
+        let mut state = TestState::with_data(vec![(key, vec![0u8])]);
+        let vm = run_vm_on_state(
+            r#"LOAD_STR r0, "flag"
+LOAD_BOOL_STATE r1, r0"#,
+            &mut state,
+        );
+        assert!(!vm.registers.get_bool(1, "").unwrap());
+    }
+
+    #[test]
+    fn load_bool_state_key_not_found() {
+        let program = assemble_source(
+            r#"LOAD_STR r0, "missing"
+LOAD_BOOL_STATE r1, r0"#,
+        )
+        .expect("assembly failed");
+        let mut vm = VM::new(program);
+        let err = vm
+            .run(&mut TestState::new(), EXECUTION_CONTEXT)
+            .expect_err("expected error");
+        assert!(matches!(err, VMError::KeyNotFound(_)));
+    }
+
+    #[test]
+    fn load_str_state() {
+        let key = make_test_key(b"name");
+        let mut state = TestState::with_data(vec![(key, b"alice".to_vec())]);
+        let vm = run_vm_on_state(
+            r#"LOAD_STR r0, "name"
+LOAD_STR_STATE r1, r0"#,
+            &mut state,
+        );
+        let ref_id = vm.registers.get_ref(1, "").unwrap();
+        assert_eq!(vm.heap.get_string(ref_id), "alice");
+    }
+
+    #[test]
+    fn load_str_state_empty() {
+        let key = make_test_key(b"empty");
+        let mut state = TestState::with_data(vec![(key, vec![])]);
+        let vm = run_vm_on_state(
+            r#"LOAD_STR r0, "empty"
+LOAD_STR_STATE r1, r0"#,
+            &mut state,
+        );
+        let ref_id = vm.registers.get_ref(1, "").unwrap();
+        assert_eq!(vm.heap.get_string(ref_id), "");
+    }
+
+    #[test]
+    fn load_str_state_key_not_found() {
+        let program = assemble_source(
+            r#"LOAD_STR r0, "missing"
+LOAD_STR_STATE r1, r0"#,
+        )
+        .expect("assembly failed");
+        let mut vm = VM::new(program);
+        let err = vm
+            .run(&mut TestState::new(), EXECUTION_CONTEXT)
+            .expect_err("expected error");
+        assert!(matches!(err, VMError::KeyNotFound(_)));
+    }
+
+    #[test]
+    fn store_then_load_i64() {
+        let vm = run_vm(
+            r#"LOAD_STR r0, "x"
+LOAD_I64 r1, 123
+STORE_I64 r0, r1
+LOAD_I64_STATE r2, r0"#,
+        );
+        assert_eq!(vm.registers.get_int(2, "").unwrap(), 123);
+    }
+
+    #[test]
+    fn store_then_load_bool() {
+        let vm = run_vm(
+            r#"LOAD_STR r0, "b"
+LOAD_BOOL r1, true
+STORE_BOOL r0, r1
+LOAD_BOOL_STATE r2, r0"#,
+        );
+        assert!(vm.registers.get_bool(2, "").unwrap());
+    }
+
+    #[test]
+    fn store_then_load_str() {
+        let vm = run_vm(
+            r#"LOAD_STR r0, "s"
+LOAD_STR r1, "hello"
+STORE_STR r0, r1
+LOAD_STR_STATE r2, r0"#,
+        );
+        let ref_id = vm.registers.get_ref(2, "").unwrap();
+        assert_eq!(vm.heap.get_string(ref_id), "hello");
     }
 }

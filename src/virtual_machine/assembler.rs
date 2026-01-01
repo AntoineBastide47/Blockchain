@@ -418,7 +418,7 @@ mod tests {
     fn assemble_string_literal() {
         let program = assemble_source(r#"LOAD_STR r0, "hello""#).unwrap();
         assert_eq!(program.strings, vec!["hello"]);
-        assert_eq!(program.bytecode[0], 0x01); // LOAD_STR opcode
+        assert_eq!(program.bytecode[0], 0x06); // LOAD_STR opcode
     }
 
     #[test]
@@ -434,11 +434,11 @@ mod tests {
     #[test]
     fn assemble_bool_literal() {
         let program = assemble_source("LOAD_BOOL r0, true").unwrap();
-        assert_eq!(program.bytecode[0], 0x02); // LOAD_BOOL opcode
+        assert_eq!(program.bytecode[0], 0x03); // LOAD_BOOL opcode
         assert_eq!(program.bytecode[2], 1); // true = 1
 
         let program = assemble_source("LOAD_BOOL r0, false").unwrap();
-        assert_eq!(program.bytecode[0], 0x02); // LOAD_BOOL opcode
+        assert_eq!(program.bytecode[0], 0x03); // LOAD_BOOL opcode
         assert_eq!(program.bytecode[2], 0); // false = 0
 
         let err = assemble_source("LOAD_BOOL r0, 1").unwrap_err();
@@ -537,7 +537,7 @@ mod tests {
         let instr = AsmInstr::LoadBool { rd: 0, bool: true };
         let mut out = Vec::new();
         instr.assemble(&mut out);
-        assert_eq!(out, vec![0x02, 0, 1]);
+        assert_eq!(out, vec![0x03, 0, 1]);
     }
 
     #[test]
@@ -545,7 +545,7 @@ mod tests {
         let instr = AsmInstr::LoadStr { rd: 1, str: 0x1234 };
         let mut out = Vec::new();
         instr.assemble(&mut out);
-        assert_eq!(out[0], 0x01);
+        assert_eq!(out[0], 0x06);
         assert_eq!(out[1], 1);
         assert_eq!(u32::from_le_bytes(out[2..6].try_into().unwrap()), 0x1234);
     }

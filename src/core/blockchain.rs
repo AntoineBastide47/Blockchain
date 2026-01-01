@@ -113,6 +113,13 @@ impl<V: Validator, S: Storage + StateStore + IterableState + StateViewProvider> 
     ///
     /// Returns an error if validation or storage persistence fails.
     pub fn add_block(&self, block: Arc<Block>) -> Result<(), StorageError> {
+        let hash = block.header_hash(self.id);
+        if self.has_block(hash) {
+            return Err(StorageError::ValidationFailed(
+                "block already exists".into(),
+            ));
+        }
+
         self.validator
             .validate_block(&block, &self.storage, &self.logger, self.id)
             .map_err(|e| StorageError::ValidationFailed(e.to_string()))?;
@@ -147,7 +154,7 @@ impl<V: Validator, S: Storage + StateStore + IterableState + StateViewProvider> 
             for (k, v) in tx_overlay.into_writes() {
                 match v {
                     Some(val) => block_overlay.push(k, val),
-                    None => block_overlay.delete(&k),
+                    None => block_overlay.delete(k),
                 }
             }
         }
@@ -169,7 +176,7 @@ impl<V: Validator, S: Storage + StateStore + IterableState + StateViewProvider> 
         use std::collections::BTreeMap;
 
         // Materialize into deterministic map
-        let mut m: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        let mut m: BTreeMap<Hash, Vec<u8>> = BTreeMap::new();
 
         // Dev-only: you need an iterator for base state.
         // In memory you can expose it; for production you replace this with an SMT.
@@ -181,7 +188,7 @@ impl<V: Validator, S: Storage + StateStore + IterableState + StateViewProvider> 
         for (k, opt_v) in overlay.writes.iter() {
             match opt_v {
                 Some(v) => {
-                    m.insert(k.clone(), v.clone());
+                    m.insert(*k, v.clone());
                 }
                 None => {
                     m.remove(k);

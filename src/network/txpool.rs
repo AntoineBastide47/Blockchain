@@ -72,12 +72,6 @@ impl TxPool {
         self.transactions.len()
     }
 
-    /// Removes all transactions from the pool.
-    pub fn flush(&self) {
-        self.transactions.clear();
-        self.order.write().unwrap().clear();
-    }
-
     /// Removes transactions with the given hashes from the pool.
     pub fn remove_batch(&self, hashes: &[Hash]) {
         let removals: HashSet<Hash> = hashes.iter().copied().collect();
@@ -91,15 +85,16 @@ impl TxPool {
     }
 
     /// Returns all transactions in insertion order.
+    /// The caller now owns the transactions
     ///
     /// TODO: replace with size or gas algorithm
     pub fn transactions(&self) -> Vec<Transaction> {
-        let order = self.order.read().unwrap();
+        let mut order = self.order.write().unwrap();
+        let take_count = order.len().min(MAX_TRANSACTION_PER_BLOCK);
 
         order
-            .iter()
-            .take(MAX_TRANSACTION_PER_BLOCK)
-            .filter_map(|h| self.transactions.get(h).map(|e| e.clone()))
+            .drain(..take_count)
+            .filter_map(|h| self.transactions.remove(&h).map(|(_, tx)| tx))
             .collect()
     }
 }
@@ -111,6 +106,10 @@ mod tests {
     use crate::network::txpool::TxPool;
 
     const TEST_CHAIN_ID: u64 = 284528;
+
+    fn flush(pool: &TxPool) {
+        let _ = pool.transactions();
+    }
 
     #[test]
     fn text_tx_pool() {
@@ -126,7 +125,7 @@ mod tests {
         pool.append(tx, TEST_CHAIN_ID);
         assert_eq!(pool.length(), 1);
 
-        pool.flush();
+        flush(&pool);
         assert_eq!(pool.length(), 0);
     }
 
@@ -152,7 +151,7 @@ mod tests {
             );
         }
 
-        pool.flush();
+        flush(&pool);
         assert_eq!(pool.length(), 0);
     }
 
@@ -192,7 +191,7 @@ mod tests {
         }
 
         assert_eq!(pool.length(), 5);
-        pool.flush();
+        flush(&pool);
         assert_eq!(pool.length(), 0);
 
         assert!(pool.transactions().is_empty());

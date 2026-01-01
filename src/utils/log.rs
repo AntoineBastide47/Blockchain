@@ -1,7 +1,7 @@
 //! Simple logging module.
 
-use std::fmt::Display;
-use std::sync::Arc;
+use blockchain_derive::BinaryCodec;
+use std::fmt::{self, Display};
 use std::sync::atomic::{AtomicU8, Ordering};
 
 /// Log level for filtering messages.
@@ -14,12 +14,71 @@ pub enum Level {
 }
 
 impl Display for Level {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Level::Info => write!(f, "INFO"),
             Level::Warn => write!(f, "WARN"),
             Level::Error => write!(f, "ERROR"),
         }
+    }
+}
+
+/// Maximum length for logger identifiers.
+pub const LOG_ID_MAX_LEN: usize = 32;
+
+/// Fixed-size logger identifier (max 32 bytes).
+///
+/// Stores UTF-8 data inline without heap allocation. Inputs longer than
+/// 32 bytes are truncated at the nearest valid UTF-8 boundary.
+#[derive(Clone, Copy, BinaryCodec, Debug)]
+pub struct LogId {
+    data: [u8; LOG_ID_MAX_LEN],
+    len: u8,
+}
+
+impl LogId {
+    /// Creates a new LogId from a string slice, truncating if necessary.
+    pub fn new(s: &str) -> Self {
+        let bytes = s.as_bytes();
+        let mut len = bytes.len().min(LOG_ID_MAX_LEN);
+
+        // Truncate at UTF-8 boundary
+        while len > 0 && !s.is_char_boundary(len) {
+            len -= 1;
+        }
+
+        let mut data = [0u8; LOG_ID_MAX_LEN];
+        data[..len].copy_from_slice(&bytes[..len]);
+
+        Self {
+            data,
+            len: len as u8,
+        }
+    }
+
+    /// Returns the identifier as a string slice.
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.data[..self.len as usize])
+            .expect("LogId invariant violated: invalid UTF-8")
+    }
+}
+
+impl Display for LogId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<&str> for LogId {
+    fn from(s: &str) -> Self {
+        Self::new(s)
+    }
+}
+
+impl From<String> for LogId {
+    fn from(s: String) -> Self {
+        Self::new(&s)
     }
 }
 
@@ -82,30 +141,30 @@ fn log_with_id(level: Level, id: Option<&str>, message: &str) {
 ///
 /// Each logger instance carries an ID that is prepended to all log messages,
 /// allowing differentiation between multiple components (e.g., server instances).
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct Logger {
-    pub id: Arc<str>,
+    pub id: LogId,
 }
 
 impl Logger {
     /// Creates a new logger with the given identifier.
-    pub fn new(id: impl Into<Arc<str>>) -> Self {
+    pub fn new(id: impl Into<LogId>) -> Self {
         Self { id: id.into() }
     }
 
     /// Logs an info-level message.
     pub fn info(&self, message: &str) {
-        log_with_id(Level::Info, Some(&self.id), message);
+        log_with_id(Level::Info, Some(self.id.as_str()), message);
     }
 
     /// Logs a warning-level message.
     pub fn warn(&self, message: &str) {
-        log_with_id(Level::Warn, Some(&self.id), message);
+        log_with_id(Level::Warn, Some(self.id.as_str()), message);
     }
 
     /// Logs an error-level message.
     pub fn error(&self, message: &str) {
-        log_with_id(Level::Error, Some(&self.id), message);
+        log_with_id(Level::Error, Some(self.id.as_str()), message);
     }
 }
 
@@ -127,27 +186,44 @@ mod tests {
     }
 
     #[test]
-    fn logger_new_with_string() {
+    fn logger_new_with_str() {
         let logger = Logger::new("test-id");
-        // Logger should be created without panic
         logger.info("test message");
+        assert_eq!(logger.id.as_str(), "test-id");
     }
 
     #[test]
-    fn logger_new_with_arc_str() {
-        let id: Arc<str> = "arc-id".into();
+    fn logger_new_with_string() {
+        let id = String::from("string-id");
         let logger = Logger::new(id);
         logger.info("test message");
+        assert_eq!(logger.id.as_str(), "string-id");
     }
 
     #[test]
     fn logger_clone() {
         let logger1 = Logger::new("clone-test");
-        let logger2 = logger1.clone();
+        let logger2 = logger1;
 
-        // Both loggers should work independently
         logger1.info("from logger1");
         logger2.info("from logger2");
+    }
+
+    #[test]
+    fn log_id_truncates_long_input() {
+        let long = "a".repeat(50);
+        let id = LogId::new(&long);
+        assert_eq!(id.as_str().len(), LOG_ID_MAX_LEN);
+    }
+
+    #[test]
+    fn log_id_truncates_at_utf8_boundary() {
+        // 3-byte UTF-8 char repeated, then truncated mid-char
+        let s = "\u{1234}".repeat(12); // 36 bytes total
+        let id = LogId::new(&s);
+        // Should truncate to 30 bytes (10 complete chars)
+        assert_eq!(id.as_str().len(), 30);
+        assert_eq!(id.as_str().chars().count(), 10);
     }
 
     #[test]

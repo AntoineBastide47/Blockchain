@@ -108,6 +108,10 @@ impl Transport for LocalTransport {
     fn addr(self: &Arc<Self>) -> String {
         self.address.clone()
     }
+
+    fn peers(self: &Arc<Self>) -> Vec<Arc<Self>> {
+        self.peers.iter().map(|e| e.value().clone()).collect()
+    }
 }
 
 #[cfg(test)]
@@ -264,5 +268,46 @@ mod tests {
         // A cannot send directly to C (not connected)
         let result = tr_a.send_message(tr_c.addr(), Bytes::from("test")).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn peers_returns_empty_when_no_connections() {
+        let tr = LocalTransport::new("Isolated");
+        assert!(tr.peers().is_empty());
+    }
+
+    #[tokio::test]
+    async fn peers_returns_connected_transports() {
+        let tr_a = LocalTransport::new("A");
+        let tr_b = LocalTransport::new("B");
+        let tr_c = LocalTransport::new("C");
+
+        tr_a.connect(&tr_b).await;
+        tr_a.connect(&tr_c).await;
+
+        let peers = tr_a.peers();
+        assert_eq!(peers.len(), 2);
+
+        let addrs: Vec<String> = peers.iter().map(|p| p.addr()).collect();
+        assert!(addrs.contains(&"B".to_string()));
+        assert!(addrs.contains(&"C".to_string()));
+    }
+
+    #[tokio::test]
+    async fn peers_reflects_bidirectional_connections() {
+        let tr_a = LocalTransport::new("A");
+        let tr_b = LocalTransport::new("B");
+
+        tr_a.connect(&tr_b).await;
+
+        // Both should see each other as peers
+        let a_peers = tr_a.peers();
+        let b_peers = tr_b.peers();
+
+        assert_eq!(a_peers.len(), 1);
+        assert_eq!(a_peers[0].addr(), "B");
+
+        assert_eq!(b_peers.len(), 1);
+        assert_eq!(b_peers[0].addr(), "A");
     }
 }

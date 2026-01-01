@@ -59,6 +59,11 @@ impl<V: Validator, S: Storage + StateStore + IterableState + StateViewProvider> 
         self.storage.height()
     }
 
+    /// Returns the hash of the current chain tip block.
+    pub fn storage_tip(&self) -> Hash {
+        self.storage.tip()
+    }
+
     /// Returns true if a block with the given hash exists.
     pub fn has_block(&self, hash: Hash) -> bool {
         self.storage.has_block(hash)

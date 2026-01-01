@@ -48,38 +48,57 @@ impl From<TransportError> for SendTransactionError {
 
 #[tokio::main]
 async fn main() {
-    // The local node running on our machine
+    log::init(log::Level::Info);
+
+    // Create transports
     let tr_local = LocalTransport::new("Local");
     let tr_a = LocalTransport::new("A");
     let tr_b = LocalTransport::new("B");
     let tr_c = LocalTransport::new("C");
 
-    tr_local.connect(&tr_a).await;
-    tr_a.connect(&tr_b).await;
-    tr_b.connect(&tr_c).await;
+    // Create servers
+    let main_server = make_server(tr_local, Some(PrivateKey::new())).await;
+    let server_a = make_server(tr_a, None).await;
+    let server_b = make_server(tr_b, None).await;
+    let server_c = make_server(tr_c, None).await;
 
-    // let connect_tr = tr_c.clone();
-    // tokio::spawn(async move {
-    //     sleep(Duration::new(7, 0)).await;
-    //     let tr_late = LocalTransport::new("Late");
-    //     let server_late = make_server(tr_late.clone(), None);
-    //     tr_late.connect(&connect_tr).await;
-    //     let (sx, rx) = channel::<Rpc>(1024);
-    //     server_late.start(sx, rx).await
-    // });
+    // Connect servers (establishes transport connections and initiates handshake)
+    main_server.connect(&server_a).await.unwrap();
+    server_a.connect(&server_b).await.unwrap();
+    server_b.connect(&server_c).await.unwrap();
 
-    log::init(log::Level::Info);
+    // Start remote servers
+    let server_a_addr = server_a.transport().addr();
+    let server_c_for_late = server_c.clone();
+    for server in [server_a, server_b, server_c] {
+        tokio::spawn(async move {
+            let (sx, rx) = channel::<Rpc>(1024);
+            server.start(sx, rx).await;
+        });
+    }
 
-    let main_server = make_server(tr_local, Some(PrivateKey::new()));
-    init_remote_servers(vec![tr_a.clone(), tr_b, tr_c]);
+    // Spawn late-joining server after 12 seconds
+    tokio::spawn(async move {
+        sleep(Duration::from_secs(12)).await;
 
+        let tr_late = LocalTransport::new("Late");
+        let server_late = make_server(tr_late, None).await;
+        if let Err(e) = server_late.connect(&server_c_for_late).await {
+            eprintln!("Failed to connect late server: {}", e);
+            return;
+        }
+
+        let (sx, rx) = channel::<Rpc>(1024);
+        server_late.start(sx, rx).await;
+    });
+
+    // Spawn transaction sender
     let server_for_tx = main_server.clone();
-    let tr_a_addr = tr_a.addr();
     let logger_for_tx = Logger::new("main");
     tokio::spawn(async move {
         let mut i: u8 = 0;
         loop {
-            if let Err(e) = send_transaction(&server_for_tx, tr_a_addr.clone()).await {
+            if let Err(e) = send_transaction(&server_for_tx, server_a_addr.clone()).await {
                 logger_for_tx.error(&format!("failed to send transaction {i}: {e}"));
             }
             i += 1;
@@ -94,25 +113,15 @@ async fn main() {
 /// Creates a server instance with the given transport and optional validator key.
 ///
 /// If a private key is provided, the server becomes a validator node.
-fn make_server(tr: Arc<LocalTransport>, key: Option<PrivateKey>) -> Arc<Server> {
+async fn make_server(tr: Arc<LocalTransport>, key: Option<PrivateKey>) -> Arc<Server> {
     let duration = Duration::new(5, 0);
     let id = tr.addr();
 
     // Server creation for easy testing
     if key.is_some() {
-        Server::new(id, tr, duration, key, None, None)
+        Server::new(id, tr, duration, key, None, None).await
     } else {
-        Server::default(id, tr, duration)
-    }
-}
-
-/// Spawns non-validator server instances for each transport in the background.
-fn init_remote_servers(transports: Vec<Arc<LocalTransport>>) {
-    for tr in transports {
-        tokio::spawn(async move {
-            let (sx, rx) = channel::<Rpc>(1024);
-            make_server(tr, None).start(sx, rx).await
-        });
+        Server::default(id, tr, duration).await
     }
 }
 
@@ -130,8 +139,9 @@ async fn send_transaction(server: &Server, to: String) -> Result<(), SendTransac
     let data = assemble_source(source).expect("assembly failed").to_bytes();
 
     let tx = Transaction::new(data, key, DEV_CHAIN_ID);
-    let msg = Message::new(MessageType::Transaction, tx.to_bytes());
-    server.add_to_pool(&tx)?;
+    let bytes = tx.to_bytes();
+    let msg = Message::new(MessageType::Transaction, bytes);
+    server.add_to_pool(tx)?;
 
     server.transport().send_message(to, msg.to_bytes()).await?;
 

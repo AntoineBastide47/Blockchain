@@ -74,7 +74,7 @@ struct UnsignedBlock {
 ///
 /// Blocks are validated once upon receipt and never modified.
 /// The header hash is lazily computed and cached for O(1) subsequent lookups.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Block {
     pub header: Header,
     pub validator: PublicKey,

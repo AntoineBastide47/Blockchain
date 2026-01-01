@@ -64,15 +64,15 @@ Only items that are complete or partially complete in this codebase are marked.
    - ❌ Block limits (gas/bytes): TODO
 
 10. **Implement networking**
-    - 🟡 Message types limited to tx/block; no handshake/version/getheaders/etc.  
+    - 🟡 Message types now include tx/block plus basic sync (status and block range); no full handshake/version/getheaders/etc.  
     - 🟡 DoS bounds: vector-length cap only; no max message size per type, rate limits, or timeouts.  
     - 🟡 Validate before storing: decode + basic stateless checks; minimal.  
     - ❌ Networking state is coupled with consensus/state logic.
 
 11. **Implement sync**
-    - ❌ No header-first sync.  
-    - ❌ No block fetch/apply sync pipeline.  
-    - ❌ No reorg handling during sync.
+    - 🟡 Basic block sync via GetStatus/GetBlocks/SendBlocks messages.  
+    - ❌ Header-first sync missing.  
+    - ❌ Reorg handling during sync missing.
 
 12. **Implement observability and safety**
     - 🟡 Errors and logging present.  
@@ -89,7 +89,8 @@ Only items that are complete or partially complete in this codebase are marked.
     - ❌ Spam/mempool pressure tests missing.
 
 14. **Only then: implement the VM**
+    - ✅ Minimal register-based bytecode VM with string handling.  
+    - ✅ Simple persistent contract storage and state retrieval in the VM.  
     - ❌ Gas schedule/op semantics not defined.  
-    - ❌ Interpreter not implemented.  
     - ❌ Metering/limits not integrated.  
-    - ❌ State access model not defined.
+    - ❌ State access model not fully defined beyond basic contract storage.

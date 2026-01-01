@@ -66,4 +66,7 @@ pub trait Transport: Send + Sync {
 
     /// Returns the local address of this transport.
     fn addr(self: &Arc<Self>) -> String;
+
+    /// Returns all connected peer transports.
+    fn peers(self: &Arc<Self>) -> Vec<Arc<Self>>;
 }

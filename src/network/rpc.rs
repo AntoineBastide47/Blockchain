@@ -5,6 +5,7 @@
 
 use crate::core::block::Block;
 use crate::core::transaction::Transaction;
+use crate::network::message::{GetBlocksMessage, SendBlocksMessage, SendStatusMessage};
 use crate::types::bytes::Bytes;
 use crate::types::wrapper_types::BoxFuture;
 use blockchain_derive::BinaryCodec;
@@ -18,9 +19,17 @@ use std::sync::Arc;
 #[derive(BinaryCodec)]
 pub enum MessageType {
     /// Payload contains a serialized transaction.
-    Transaction = 0,
+    Transaction,
     /// Payload contains a serialized block.
     Block,
+    /// Request for peer's chain status (empty payload).
+    GetStatus,
+    /// Response containing peer's chain status.
+    SendStatus,
+    /// Request for a range of blocks.
+    GetBlocks,
+    /// Response containing requested blocks.
+    SendBlocks,
 }
 
 /// Framed message with type header and serialized payload.
@@ -68,6 +77,14 @@ pub enum DecodedMessageData {
     Transaction(Transaction),
     /// A deserialized block.
     Block(Block),
+    /// Status request from a peer.
+    GetStatus,
+    /// Status response containing peer's chain info.
+    SendStatus(SendStatusMessage),
+    /// Block range request from a peer.
+    GetBlocks(GetBlocksMessage),
+    /// Block range response.
+    SendBlocks(SendBlocksMessage),
 }
 
 /// A fully decoded RPC message with sender and typed payload.
@@ -90,6 +107,9 @@ pub enum RpcError {
 
     #[error("failed to decode block: {0}")]
     Block(String),
+
+    #[error("failed to decode status: {0}")]
+    Status(String),
 }
 
 /// Function signature for custom RPC handlers.
@@ -169,12 +189,73 @@ mod tests {
     fn message_type_discriminants() {
         let tx_msg = Message::new(MessageType::Transaction, vec![]);
         let block_msg = Message::new(MessageType::Block, vec![]);
+        let get_status_msg = Message::new(MessageType::GetStatus, vec![]);
+        let send_status_msg = Message::new(MessageType::SendStatus, vec![]);
+        let get_blocks_msg = Message::new(MessageType::GetBlocks, vec![]);
+        let send_blocks_msg = Message::new(MessageType::SendBlocks, vec![]);
 
         let tx_bytes = tx_msg.to_bytes();
         let block_bytes = block_msg.to_bytes();
+        let get_status_bytes = get_status_msg.to_bytes();
+        let send_status_bytes = send_status_msg.to_bytes();
+        let get_blocks_bytes = get_blocks_msg.to_bytes();
+        let send_blocks_bytes = send_blocks_msg.to_bytes();
 
         // First byte is the discriminant
         assert_eq!(tx_bytes[0], 0, "Transaction discriminant should be 0");
         assert_eq!(block_bytes[0], 1, "Block discriminant should be 1");
+        assert_eq!(get_status_bytes[0], 2, "GetStatus discriminant should be 2");
+        assert_eq!(
+            send_status_bytes[0], 3,
+            "SendStatus discriminant should be 3"
+        );
+        assert_eq!(get_blocks_bytes[0], 4, "GetBlocks discriminant should be 4");
+        assert_eq!(
+            send_blocks_bytes[0], 5,
+            "SendBlocks discriminant should be 5"
+        );
+    }
+
+    #[test]
+    fn get_status_message_roundtrip() {
+        let msg = Message::new(MessageType::GetStatus, vec![0x08]);
+        let encoded = msg.to_bytes();
+        let decoded = Message::from_bytes(&encoded).expect("decode failed");
+
+        assert!(matches!(decoded.header, MessageType::GetStatus));
+        assert_eq!(decoded.data.as_ref(), &[0x08]);
+    }
+
+    #[test]
+    fn send_status_message_roundtrip() {
+        let payload = vec![1, 2, 3, 4, 5];
+        let msg = Message::new(MessageType::SendStatus, payload.clone());
+        let encoded = msg.to_bytes();
+        let decoded = Message::from_bytes(&encoded).expect("decode failed");
+
+        assert!(matches!(decoded.header, MessageType::SendStatus));
+        assert_eq!(decoded.data.as_ref(), payload.as_slice());
+    }
+
+    #[test]
+    fn get_blocks_message_roundtrip() {
+        let payload = vec![10, 20, 30];
+        let msg = Message::new(MessageType::GetBlocks, payload.clone());
+        let encoded = msg.to_bytes();
+        let decoded = Message::from_bytes(&encoded).expect("decode failed");
+
+        assert!(matches!(decoded.header, MessageType::GetBlocks));
+        assert_eq!(decoded.data.as_ref(), payload.as_slice());
+    }
+
+    #[test]
+    fn send_blocks_message_roundtrip() {
+        let payload = vec![100, 200];
+        let msg = Message::new(MessageType::SendBlocks, payload.clone());
+        let encoded = msg.to_bytes();
+        let decoded = Message::from_bytes(&encoded).expect("decode failed");
+
+        assert!(matches!(decoded.header, MessageType::SendBlocks));
+        assert_eq!(decoded.data.as_ref(), payload.as_slice());
     }
 }

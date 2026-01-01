@@ -1,7 +1,7 @@
 //! Assembly language parser and bytecode compiler.
 //!
 //! Converts human-readable assembly source into executable bytecode.
-//! Uses [`for_each_instruction!`](crate::for_each_instruction) to generate:
+//! Uses [`for_each_instruction!`](for_each_instruction) to generate:
 //! - [`AsmInstr`] intermediate representation for parsed instructions
 //! - [`AsmInstr::assemble`] for bytecode encoding
 //! - `parse_instruction` for tokenized input parsing

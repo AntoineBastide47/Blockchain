@@ -199,6 +199,14 @@ pub struct ExecContext<'a> {
 ///
 /// Executes compiled bytecode sequentially, reading instructions from the
 /// instruction pointer until the end of the bytecode is reached.
+///
+/// # TODO:
+/// 1) Add full string, hash, list and map support
+/// 2) Add full control flow for function support
+/// 3) Add a smart contract language to not require assembly written smart contracts
+/// 4) Add a deterministic compiler to convert the language to assembly
+/// 5) Add a deterministic optimizer do make the assembly code more performant
+/// 6) Add an LSP for smoother smart contract writing experience
 pub struct VM {
     /// Bytecode to execute.
     data: Bytes,

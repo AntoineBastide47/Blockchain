@@ -4,8 +4,9 @@
 //! exchanging messages between blockchain nodes.
 
 pub mod local_transport;
-mod message;
+pub mod message;
 pub mod rpc;
 pub mod server;
+pub mod tcp_transport;
 pub mod transport;
 pub mod txpool;

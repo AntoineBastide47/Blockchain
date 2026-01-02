@@ -6,6 +6,7 @@
 use crate::core::block::Block;
 use crate::core::storage::Storage;
 use crate::utils::log::Logger;
+use blockchain_derive::Error;
 use std::error::Error;
 use std::fmt::Debug;
 
@@ -47,17 +48,14 @@ pub trait Validator: Send + Sync {
 pub struct BlockValidator;
 
 /// Errors that can occur during block validation operations.
-#[derive(Debug, blockchain_derive::Error)]
+#[derive(Debug, Error)]
 pub enum BlockValidatorError {
     #[error("invalid block height: expected {expected}, got {actual}")]
     InvalidHeight { expected: u64, actual: u64 },
-
     #[error("previous block hash mismatch")]
     PreviousHashMismatch,
-
     #[error("block already exists")]
     BlockExists,
-
     #[error("invalid block signature")]
     InvalidSignature,
 }

@@ -4,8 +4,47 @@
 //! during peer synchronization.
 
 use crate::core::block::Block;
+use crate::types::bytes::Bytes;
 use crate::utils::log::LogId;
 use blockchain_derive::BinaryCodec;
+
+/// Discriminant for message payload types.
+///
+/// Used as a header to identify how to deserialize the message body.
+#[derive(BinaryCodec)]
+pub enum MessageType {
+    /// Payload contains a serialized transaction.
+    Transaction,
+    /// Payload contains a serialized block.
+    Block,
+    /// Request for peer's chain status (empty payload).
+    GetStatus,
+    /// Response containing peer's chain status.
+    SendStatus,
+    /// Request for a range of blocks.
+    GetBlocks,
+    /// Response containing requested blocks.
+    SendBlocks,
+}
+
+/// Framed message with type header and serialized payload.
+#[derive(BinaryCodec)]
+pub struct Message {
+    /// Type discriminant for payload deserialization.
+    pub(crate) header: MessageType,
+    /// Serialized payload data.
+    pub(crate) data: Bytes,
+}
+
+impl Message {
+    /// Creates a new message with the given type and payload.
+    pub fn new(header: MessageType, data: impl Into<Bytes>) -> Self {
+        Self {
+            header,
+            data: data.into(),
+        }
+    }
+}
 
 /// Response message containing a node's current chain status.
 ///
@@ -46,6 +85,60 @@ mod tests {
     use crate::types::hash::Hash;
 
     const TEST_CHAIN_ID: u64 = 10;
+
+    #[test]
+    fn message_serialization_roundtrip() {
+        let payload = Bytes::new(vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        let msg = Message::new(MessageType::Transaction, payload.clone());
+
+        let encoded = msg.to_bytes();
+        let decoded = Message::from_bytes(encoded.as_slice()).expect("deserialization failed");
+
+        assert_eq!(decoded.data, payload);
+    }
+
+    #[test]
+    fn block_message_roundtrip() {
+        let payload = Bytes::new(vec![1u8, 2, 3, 4, 5]);
+        let msg = Message::new(MessageType::Block, payload.clone());
+
+        let encoded = msg.to_bytes();
+        let decoded = Message::from_bytes(encoded.as_slice()).expect("deserialization failed");
+
+        assert!(matches!(decoded.header, MessageType::Block));
+        assert_eq!(decoded.data, payload);
+    }
+
+    #[test]
+    fn message_type_discriminants() {
+        let tx_msg = Message::new(MessageType::Transaction, vec![]);
+        let block_msg = Message::new(MessageType::Block, vec![]);
+        let get_status_msg = Message::new(MessageType::GetStatus, vec![]);
+        let send_status_msg = Message::new(MessageType::SendStatus, vec![]);
+        let get_blocks_msg = Message::new(MessageType::GetBlocks, vec![]);
+        let send_blocks_msg = Message::new(MessageType::SendBlocks, vec![]);
+
+        let tx_bytes = tx_msg.to_bytes();
+        let block_bytes = block_msg.to_bytes();
+        let get_status_bytes = get_status_msg.to_bytes();
+        let send_status_bytes = send_status_msg.to_bytes();
+        let get_blocks_bytes = get_blocks_msg.to_bytes();
+        let send_blocks_bytes = send_blocks_msg.to_bytes();
+
+        // First byte is the discriminant
+        assert_eq!(tx_bytes[0], 0, "Transaction discriminant should be 0");
+        assert_eq!(block_bytes[0], 1, "Block discriminant should be 1");
+        assert_eq!(get_status_bytes[0], 2, "GetStatus discriminant should be 2");
+        assert_eq!(
+            send_status_bytes[0], 3,
+            "SendStatus discriminant should be 3"
+        );
+        assert_eq!(get_blocks_bytes[0], 4, "GetBlocks discriminant should be 4");
+        assert_eq!(
+            send_blocks_bytes[0], 5,
+            "SendBlocks discriminant should be 5"
+        );
+    }
 
     #[test]
     fn send_status_message_roundtrip() {

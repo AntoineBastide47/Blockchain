@@ -2,6 +2,7 @@
 
 use blockchain_derive::BinaryCodec;
 use std::fmt::{self, Display};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 /// Log level for filtering messages.
@@ -79,6 +80,12 @@ impl From<&str> for LogId {
 impl From<String> for LogId {
     fn from(s: String) -> Self {
         Self::new(&s)
+    }
+}
+
+impl From<SocketAddr> for LogId {
+    fn from(value: SocketAddr) -> Self {
+        Self::new(&value.to_string())
     }
 }
 

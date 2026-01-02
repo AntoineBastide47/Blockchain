@@ -4,14 +4,17 @@
 
 use crate::core::transaction::Transaction;
 use crate::crypto::key_pair::PrivateKey;
-use crate::network::local_transport::LocalTransport;
-use crate::network::rpc::{Message, MessageType, Rpc};
+use crate::network::message::{Message, MessageType};
+use crate::network::rpc::Rpc;
 use crate::network::server::{DEV_CHAIN_ID, Server, ServerError};
+use crate::network::tcp_transport::TcpTransport;
 use crate::network::transport::{Transport, TransportError};
 use crate::types::encoding::Encode;
-use crate::utils::log::{self, Logger};
+use crate::utils::log;
+use crate::utils::log::Logger;
 use crate::virtual_machine::assembler::assemble_source;
 use blockchain_derive::Error;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::channel;
@@ -50,46 +53,56 @@ impl From<TransportError> for SendTransactionError {
 async fn main() {
     log::init(log::Level::Info);
 
-    // Create transports
-    let tr_local = LocalTransport::new("Local");
-    let tr_a = LocalTransport::new("A");
-    let tr_b = LocalTransport::new("B");
-    let tr_c = LocalTransport::new("C");
+    // Create TCP transports with different ports
+    let tr_main = TcpTransport::new("127.0.0.1:3000".parse().unwrap());
+    let tr_a = TcpTransport::new("127.0.0.1:3001".parse().unwrap());
+    let tr_b = TcpTransport::new("127.0.0.1:3002".parse().unwrap());
+    let tr_c = TcpTransport::new("127.0.0.1:3003".parse().unwrap());
 
     // Create servers
-    let main_server = make_server(tr_local, Some(PrivateKey::new())).await;
+    let main_server = make_server(tr_main, Some(PrivateKey::new())).await;
     let server_a = make_server(tr_a, None).await;
     let server_b = make_server(tr_b, None).await;
     let server_c = make_server(tr_c, None).await;
 
-    // Connect servers (establishes transport connections and initiates handshake)
-    main_server.connect(&server_a).await.unwrap();
-    server_a.connect(&server_b).await.unwrap();
-    server_b.connect(&server_c).await.unwrap();
-
-    // Start remote servers
+    // Start other servers (delayed so main server starts first)
     let server_a_addr = server_a.transport().addr();
     let server_c_for_late = server_c.clone();
-    for server in [server_a, server_b, server_c] {
+
+    for server in [server_a.clone(), server_b.clone(), server_c.clone()] {
+        let (sx, rx) = channel::<Rpc>(1024);
         tokio::spawn(async move {
-            let (sx, rx) = channel::<Rpc>(1024);
             server.start(sx, rx).await;
         });
     }
+
+    // Wait for servers to bind
+    sleep(Duration::from_millis(1100)).await;
+
+    // Connect servers (establishes TCP connections and initiates handshake)
+    main_server.connect(&server_a).await.unwrap();
+    server_a.connect(&server_b).await.unwrap();
+    server_b.connect(&server_c).await.unwrap();
 
     // Spawn late-joining server after 12 seconds
     tokio::spawn(async move {
         sleep(Duration::from_secs(12)).await;
 
-        let tr_late = LocalTransport::new("Late");
+        let tr_late = TcpTransport::new("127.0.0.1:3004".parse().unwrap());
         let server_late = make_server(tr_late, None).await;
-        if let Err(e) = server_late.connect(&server_c_for_late).await {
-            eprintln!("Failed to connect late server: {}", e);
-            return;
-        }
 
+        // Start the late server first
+        let server_late_clone = server_late.clone();
         let (sx, rx) = channel::<Rpc>(1024);
-        server_late.start(sx, rx).await;
+        tokio::spawn(async move {
+            server_late_clone.start(sx, rx).await;
+        });
+
+        sleep(Duration::from_millis(100)).await;
+
+        if let Err(e) = server_late.connect(&server_c_for_late).await {
+            eprintln!("Failed to connect late server: {e}");
+        }
     });
 
     // Spawn transaction sender
@@ -98,7 +111,7 @@ async fn main() {
     tokio::spawn(async move {
         let mut i: u8 = 0;
         loop {
-            if let Err(e) = send_transaction(&server_for_tx, server_a_addr.clone()).await {
+            if let Err(e) = send_transaction(&server_for_tx, server_a_addr).await {
                 logger_for_tx.error(&format!("failed to send transaction {i}: {e}"));
             }
             i += 1;
@@ -113,13 +126,13 @@ async fn main() {
 /// Creates a server instance with the given transport and optional validator key.
 ///
 /// If a private key is provided, the server becomes a validator node.
-async fn make_server(tr: Arc<LocalTransport>, key: Option<PrivateKey>) -> Arc<Server> {
+async fn make_server<T: Transport>(tr: Arc<T>, key: Option<PrivateKey>) -> Arc<Server<T>> {
     let duration = Duration::new(5, 0);
     let id = tr.addr();
 
     // Server creation for easy testing
     if key.is_some() {
-        Server::new(id, tr, duration, key, None, None).await
+        Server::new(id, tr, duration, key, None).await
     } else {
         Server::default(id, tr, duration).await
     }
@@ -129,7 +142,10 @@ async fn make_server(tr: Arc<LocalTransport>, key: Option<PrivateKey>) -> Arc<Se
 ///
 /// Assembles the provided source code into bytecode, signs it with a fresh keypair,
 /// adds it to the local pool, and transmits it to the specified peer.
-async fn send_transaction(server: &Server, to: String) -> Result<(), SendTransactionError> {
+async fn send_transaction<T: Transport>(
+    server: &Server<T>,
+    to: SocketAddr,
+) -> Result<(), SendTransactionError> {
     let key = PrivateKey::new();
     let source = r#"
         LOAD_I64 r0, 10

@@ -3,11 +3,13 @@
 //! Enables direct message passing between nodes without network I/O,
 //! ideal for unit tests and single-process simulations.
 
+use crate::impl_transport_consume;
 use crate::network::rpc::Rpc;
-use crate::network::transport::{Transport, TransportError};
+use crate::network::transport::{Transport, TransportError, spawn_rpc_forwarder};
 use crate::types::bytes::Bytes;
 use crate::types::wrapper_types::BoxFuture;
 use dashmap::DashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
@@ -17,56 +19,50 @@ use tokio::sync::mpsc::{Receiver, Sender, channel};
 /// Maintains a peer registry and routes messages directly through memory
 /// without network overhead. Thread-safe and suitable for concurrent use.
 pub struct LocalTransport {
-    peers: DashMap<String, Arc<LocalTransport>>,
+    peers: DashMap<SocketAddr, Arc<LocalTransport>>,
     tx: Sender<Rpc>,
     rx: Arc<Mutex<Option<Receiver<Rpc>>>>,
-    address: String,
+    address: SocketAddr,
 }
 
 impl LocalTransport {
     /// Creates a new LocalTransport instance with the given address.
     ///
     /// The transport is wrapped in an Arc for shared ownership across async tasks.
-    pub fn new(address: &str) -> Arc<LocalTransport> {
+    pub fn new(address: SocketAddr) -> Arc<LocalTransport> {
         let (tx, rx) = channel(1024);
 
         Arc::new(LocalTransport {
-            address: address.to_string(),
+            address,
             peers: DashMap::new(),
             tx,
             rx: Arc::new(Mutex::new(Some(rx))),
         })
     }
-
-    /// Establishes a bidirectional connection to another transport node.
-    ///
-    /// Both transports are added to each other's routing tables.
-    pub async fn connect(self: &Arc<LocalTransport>, other: &Arc<LocalTransport>) {
-        self.peers.insert(other.addr(), other.clone());
-        other.peers.insert(self.addr(), self.clone());
-    }
 }
 
 impl Transport for LocalTransport {
-    fn consume(self: &Arc<Self>) -> BoxFuture<'static, Receiver<Rpc>> {
-        let rx = self.rx.clone();
-
-        Box::pin(async move {
-            let mut guard = rx.lock().await;
-            guard.take().expect("receiver already taken")
-        })
+    fn connect(self: &Arc<Self>, other: &Arc<Self>) {
+        self.peers.insert(other.addr(), other.clone());
+        other.peers.insert(self.addr(), self.clone());
     }
+
+    fn start(self: &Arc<Self>, sx: Sender<Rpc>) {
+        spawn_rpc_forwarder(self.clone(), sx);
+    }
+
+    impl_transport_consume!();
 
     fn send_message(
         self: &Arc<Self>,
-        to: String,
+        to: SocketAddr,
         payload: Bytes,
     ) -> BoxFuture<'static, Result<(), TransportError>> {
         let peers = self.peers.clone();
-        let address = self.address.clone();
+        let address = self.address;
 
         Box::pin(async move {
-            let peer = match peers.get(to.trim()) {
+            let peer = match peers.get(&to) {
                 Some(r) => r.value().clone(),
                 None => return Err(TransportError::PeerNotFound(to)),
             };
@@ -78,39 +74,12 @@ impl Transport for LocalTransport {
         })
     }
 
-    fn broadcast(
-        self: &Arc<Self>,
-        from: String,
-        data: Bytes,
-    ) -> BoxFuture<'static, Result<(), TransportError>> {
-        let peers = self.peers.clone();
-        let this = self.clone();
-
-        Box::pin(async move {
-            let mut errors = Vec::new();
-            for peer in peers.iter() {
-                if from == peer.addr() {
-                    continue;
-                }
-
-                if let Err(e) = this.send_message(peer.addr(), data.clone()).await {
-                    errors.push(e.to_string());
-                }
-            }
-            if errors.is_empty() {
-                Ok(())
-            } else {
-                Err(TransportError::BroadcastFailed(errors.join("; ")))
-            }
-        })
+    fn addr(self: &Arc<Self>) -> SocketAddr {
+        self.address
     }
 
-    fn addr(self: &Arc<Self>) -> String {
-        self.address.clone()
-    }
-
-    fn peers(self: &Arc<Self>) -> Vec<Arc<Self>> {
-        self.peers.iter().map(|e| e.value().clone()).collect()
+    fn peer_addrs(self: &Arc<Self>) -> Vec<SocketAddr> {
+        self.peers.iter().map(|e| *e.key()).collect()
     }
 }
 
@@ -120,26 +89,28 @@ mod tests {
 
     #[tokio::test]
     async fn test_connect() {
-        let tr_a = LocalTransport::new("A");
-        let tr_b = LocalTransport::new("B");
+        let addr_a: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let addr_b: SocketAddr = "127.0.0.1:3001".parse().unwrap();
+        let tr_a = LocalTransport::new(addr_a);
+        let tr_b = LocalTransport::new(addr_b);
 
-        tr_a.connect(&tr_b).await;
-        tr_b.connect(&tr_a).await;
+        tr_a.connect(&tr_b);
+        tr_b.connect(&tr_a);
 
-        assert!(tr_a.peers.contains_key("B"));
-        assert_eq!(tr_a.peers.get("B").unwrap().addr(), tr_b.addr());
+        assert!(tr_a.peers.contains_key(&addr_b));
+        assert_eq!(tr_a.peers.get(&addr_b).unwrap().addr(), tr_b.addr());
 
-        assert!(tr_b.peers.contains_key("A"));
-        assert_eq!(tr_b.peers.get("A").unwrap().addr(), tr_a.addr());
+        assert!(tr_b.peers.contains_key(&addr_a));
+        assert_eq!(tr_b.peers.get(&addr_a).unwrap().addr(), tr_a.addr());
     }
 
     #[tokio::test]
     async fn test_send_message() {
-        let tr_a = LocalTransport::new("A");
-        let tr_b = LocalTransport::new("B");
+        let tr_a = LocalTransport::new("127.0.0.1:3000".parse().unwrap());
+        let tr_b = LocalTransport::new("127.0.0.1:3001".parse().unwrap());
 
-        tr_a.connect(&tr_b).await;
-        tr_b.connect(&tr_a).await;
+        tr_a.connect(&tr_b);
+        tr_b.connect(&tr_a);
 
         let mut rx = tr_b.consume().await;
 
@@ -155,12 +126,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_broadcast() {
-        let tr_a = LocalTransport::new("A");
-        let tr_b = LocalTransport::new("B");
-        let tr_c = LocalTransport::new("C");
+        let tr_a = LocalTransport::new("127.0.0.1:3000".parse().unwrap());
+        let tr_b = LocalTransport::new("127.0.0.1:3001".parse().unwrap());
+        let tr_c = LocalTransport::new("127.0.0.1:3002".parse().unwrap());
 
-        tr_a.connect(&tr_b).await;
-        tr_a.connect(&tr_c).await;
+        tr_a.connect(&tr_b);
+        tr_a.connect(&tr_c);
 
         let mut rx_b = tr_b.consume().await;
         let mut rx_c = tr_c.consume().await;
@@ -179,28 +150,33 @@ mod tests {
 
     #[tokio::test]
     async fn connect_is_bidirectional() {
-        let tr_a = LocalTransport::new("A");
-        let tr_b = LocalTransport::new("B");
+        let addr_a: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let addr_b: SocketAddr = "127.0.0.1:3001".parse().unwrap();
+        let tr_a = LocalTransport::new(addr_a);
+        let tr_b = LocalTransport::new(addr_b);
 
         // Single connect call should add both directions
-        tr_a.connect(&tr_b).await;
+        tr_a.connect(&tr_b);
 
-        assert!(tr_a.peers.contains_key("B"));
-        assert!(tr_b.peers.contains_key("A"));
+        assert!(tr_a.peers.contains_key(&addr_b));
+        assert!(tr_b.peers.contains_key(&addr_a));
     }
 
     #[tokio::test]
     async fn connect_multiple_peers() {
-        let tr_a = LocalTransport::new("A");
-        let tr_b = LocalTransport::new("B");
-        let tr_c = LocalTransport::new("C");
+        let addr_a: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let addr_b: SocketAddr = "127.0.0.1:3001".parse().unwrap();
+        let addr_c: SocketAddr = "127.0.0.1:3002".parse().unwrap();
+        let tr_a = LocalTransport::new(addr_a);
+        let tr_b = LocalTransport::new(addr_b);
+        let tr_c = LocalTransport::new(addr_c);
 
-        tr_a.connect(&tr_b).await;
-        tr_a.connect(&tr_c).await;
+        tr_a.connect(&tr_b);
+        tr_a.connect(&tr_c);
 
         assert_eq!(tr_a.peers.len(), 2);
-        assert!(tr_a.peers.contains_key("B"));
-        assert!(tr_a.peers.contains_key("C"));
+        assert!(tr_a.peers.contains_key(&addr_b));
+        assert!(tr_a.peers.contains_key(&addr_c));
 
         // B and C should only have A as peer
         assert_eq!(tr_b.peers.len(), 1);
@@ -209,12 +185,12 @@ mod tests {
 
     #[tokio::test]
     async fn broadcast_excludes_sender() {
-        let tr_a = LocalTransport::new("A");
-        let tr_b = LocalTransport::new("B");
-        let tr_c = LocalTransport::new("C");
+        let tr_a = LocalTransport::new("127.0.0.1:3000".parse().unwrap());
+        let tr_b = LocalTransport::new("127.0.0.1:3001".parse().unwrap());
+        let tr_c = LocalTransport::new("127.0.0.1:3002".parse().unwrap());
 
-        tr_a.connect(&tr_b).await;
-        tr_b.connect(&tr_c).await;
+        tr_a.connect(&tr_b);
+        tr_b.connect(&tr_c);
 
         let mut rx_a = tr_a.consume().await;
         let mut rx_c = tr_c.consume().await;
@@ -232,29 +208,33 @@ mod tests {
 
     #[tokio::test]
     async fn send_to_nonexistent_peer_fails() {
-        let tr_a = LocalTransport::new("A");
+        let tr_a = LocalTransport::new("127.0.0.1:3000".parse().unwrap());
 
         let result = tr_a
-            .send_message("NonExistent".to_string(), Bytes::from("test"))
+            .send_message("127.0.0.1:2982".parse().unwrap(), Bytes::from("test"))
             .await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn addr_returns_correct_address() {
-        let tr = LocalTransport::new("TestAddr");
-        assert_eq!(tr.addr(), "TestAddr");
+        let addr: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let tr = LocalTransport::new(addr);
+        assert_eq!(tr.addr(), addr);
     }
 
     #[tokio::test]
     async fn chain_topology_message_passing() {
         // A -> B -> C topology
-        let tr_a = LocalTransport::new("A");
-        let tr_b = LocalTransport::new("B");
-        let tr_c = LocalTransport::new("C");
+        let addr_a: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let addr_b: SocketAddr = "127.0.0.1:3001".parse().unwrap();
+        let addr_c: SocketAddr = "127.0.0.1:3002".parse().unwrap();
+        let tr_a = LocalTransport::new(addr_a);
+        let tr_b = LocalTransport::new(addr_b);
+        let tr_c = LocalTransport::new(addr_c);
 
-        tr_a.connect(&tr_b).await;
-        tr_b.connect(&tr_c).await;
+        tr_a.connect(&tr_b);
+        tr_b.connect(&tr_c);
 
         let mut rx_b = tr_b.consume().await;
 
@@ -263,7 +243,7 @@ mod tests {
             .await
             .unwrap();
         let msg = rx_b.recv().await.unwrap();
-        assert_eq!(msg.from, "A");
+        assert_eq!(msg.from, addr_a);
 
         // A cannot send directly to C (not connected)
         let result = tr_a.send_message(tr_c.addr(), Bytes::from("test")).await;
@@ -271,43 +251,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn peers_returns_empty_when_no_connections() {
-        let tr = LocalTransport::new("Isolated");
-        assert!(tr.peers().is_empty());
+    async fn peer_addrs_returns_empty_when_no_connections() {
+        let tr = LocalTransport::new("127.0.0.1:3000".parse().unwrap());
+        assert!(tr.peer_addrs().is_empty());
     }
 
     #[tokio::test]
-    async fn peers_returns_connected_transports() {
-        let tr_a = LocalTransport::new("A");
-        let tr_b = LocalTransport::new("B");
-        let tr_c = LocalTransport::new("C");
+    async fn peer_addrs_returns_connected_addresses() {
+        let addr_a: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let addr_b: SocketAddr = "127.0.0.1:3001".parse().unwrap();
+        let addr_c: SocketAddr = "127.0.0.1:3002".parse().unwrap();
+        let tr_a = LocalTransport::new(addr_a);
+        let tr_b = LocalTransport::new(addr_b);
+        let tr_c = LocalTransport::new(addr_c);
 
-        tr_a.connect(&tr_b).await;
-        tr_a.connect(&tr_c).await;
+        tr_a.connect(&tr_b);
+        tr_a.connect(&tr_c);
 
-        let peers = tr_a.peers();
-        assert_eq!(peers.len(), 2);
-
-        let addrs: Vec<String> = peers.iter().map(|p| p.addr()).collect();
-        assert!(addrs.contains(&"B".to_string()));
-        assert!(addrs.contains(&"C".to_string()));
+        let addrs = tr_a.peer_addrs();
+        assert_eq!(addrs.len(), 2);
+        assert!(addrs.contains(&addr_b));
+        assert!(addrs.contains(&addr_c));
     }
 
     #[tokio::test]
-    async fn peers_reflects_bidirectional_connections() {
-        let tr_a = LocalTransport::new("A");
-        let tr_b = LocalTransport::new("B");
+    async fn peer_addrs_reflects_bidirectional_connections() {
+        let addr_a: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let addr_b: SocketAddr = "127.0.0.1:3001".parse().unwrap();
+        let tr_a = LocalTransport::new(addr_a);
+        let tr_b = LocalTransport::new(addr_b);
 
-        tr_a.connect(&tr_b).await;
+        tr_a.connect(&tr_b);
 
-        // Both should see each other as peers
-        let a_peers = tr_a.peers();
-        let b_peers = tr_b.peers();
+        let a_peers = tr_a.peer_addrs();
+        let b_peers = tr_b.peer_addrs();
 
         assert_eq!(a_peers.len(), 1);
-        assert_eq!(a_peers[0].addr(), "B");
+        assert_eq!(a_peers[0], addr_b);
 
         assert_eq!(b_peers.len(), 1);
-        assert_eq!(b_peers[0].addr(), "A");
+        assert_eq!(b_peers[0], addr_a);
     }
 }

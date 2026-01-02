@@ -5,13 +5,13 @@
 
 use crate::core::block::{Block, Header};
 use crate::types::hash::Hash;
-use std::collections::HashMap;
-
 use crate::virtual_machine::state::State;
+use blockchain_derive::Error;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 /// Errors that can occur while interacting with storage backends.
-#[derive(Debug, blockchain_derive::Error)]
+#[derive(Debug, Error)]
 pub enum StorageError {
     /// Block's previous hash does not match the current chain tip.
     #[error("block does not extend current tip: expected previous hash {expected}, got {actual}")]

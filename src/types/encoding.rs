@@ -116,6 +116,8 @@ pub enum DecodeError {
         actual: String,
         type_name: String,
     },
+    #[error("invalid ip address format: {0}")]
+    InvalidIpAddr(String),
 }
 
 /// Trait for types that can be deserialized from binary format.

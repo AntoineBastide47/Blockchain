@@ -8,12 +8,10 @@ use crate::core::storage::{StorageError, ThreadSafeMemoryStorage};
 use crate::core::transaction::Transaction;
 use crate::core::validator::BlockValidator;
 use crate::crypto::key_pair::PrivateKey;
-use crate::network::local_transport::LocalTransport;
-use crate::network::message::{GetBlocksMessage, SendBlocksMessage, SendStatusMessage};
-use crate::network::rpc::{
-    DecodedMessage, DecodedMessageData, HandleRpcFn, Message, MessageType, Rpc, RpcError,
-    RpcProcessor,
+use crate::network::message::{
+    GetBlocksMessage, Message, MessageType, SendBlocksMessage, SendStatusMessage,
 };
+use crate::network::rpc::{DecodedMessage, DecodedMessageData, Rpc, RpcError, RpcProcessor};
 use crate::network::transport::{Transport, TransportError};
 use crate::network::txpool::TxPool;
 use crate::types::bytes::Bytes;
@@ -22,6 +20,7 @@ use crate::types::hash::Hash;
 use crate::types::wrapper_types::BoxFuture;
 use crate::utils::log::{LogId, Logger};
 use std::collections::VecDeque;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -74,13 +73,11 @@ impl From<TransportError> for ServerError {
 ///
 /// Processes RPC messages from the transport in an event loop,
 /// handling transactions and block creation.
-pub struct Server {
+pub struct Server<T: Transport> {
     /// Logger instance for this server.
     logger: Logger,
-    /// Optional custom handler for incoming RPC messages. Uses default handler if `None`.
-    rpc_handler: Option<HandleRpcFn>,
     /// This server's transport layer (its network identity).
-    transport: Arc<LocalTransport>,
+    transport: Arc<T>,
     /// If set, this node becomes a validator node.
     private_key: Option<PrivateKey>,
     /// How often new blocks are created.
@@ -93,7 +90,7 @@ pub struct Server {
     chain: Blockchain<BlockValidator, ThreadSafeMemoryStorage>,
 }
 
-impl Server {
+impl<T: Transport> Server<T> {
     /// The genesis block, lazily initialized once and shared across all server instances.
     pub fn genesis_block(chain_id: u64) -> Arc<Block> {
         let header = Header {
@@ -117,11 +114,10 @@ impl Server {
     /// Sets `is_validator` to true if `private_key` is provided.
     pub async fn new(
         id: impl Into<LogId>,
-        transport: Arc<LocalTransport>,
+        transport: Arc<T>,
         block_time: Duration,
         private_key: Option<PrivateKey>,
         transaction_pool_capacity: Option<usize>,
-        rpc_handler: Option<HandleRpcFn>,
     ) -> Arc<Self> {
         let is_validator = private_key.is_some();
         let logger = Logger::new(id);
@@ -129,7 +125,6 @@ impl Server {
 
         Arc::new(Self {
             logger,
-            rpc_handler,
             transport,
             private_key,
             is_validator,
@@ -142,10 +137,10 @@ impl Server {
     /// Creates a new server with sensible defaults for a non-validator node.
     pub async fn default(
         id: impl Into<LogId>,
-        transport: Arc<LocalTransport>,
+        transport: Arc<T>,
         block_time: Duration,
     ) -> Arc<Self> {
-        Self::new(id, transport, block_time, None, None, None).await
+        Self::new(id, transport, block_time, None, None).await
     }
 
     /// Starts the server and begins processing incoming messages.
@@ -153,7 +148,8 @@ impl Server {
     /// Initializes the transport and enters the main event loop.
     /// Blocks until the transport channel closes.
     pub async fn start(self: Arc<Self>, sx: Sender<Rpc>, mut rx: Receiver<Rpc>) {
-        self.init_transport(sx).await;
+        self.logger.info("Server starting");
+        self.transport.start(sx);
 
         if self.is_validator {
             let server_thread = self.clone();
@@ -163,12 +159,7 @@ impl Server {
         loop {
             tokio::select! {
                 Some(rpc) = rx.recv() => {
-                    let result = match &self.rpc_handler {
-                        Some(handler) => handler(rpc),
-                        None => handle_rpc(rpc),
-                    };
-
-                    match result {
+                    match handle_rpc(rpc) {
                         Ok(msg) => {
                             if let Err(e) = &self.clone().process_message(msg).await {
                                 self.logger.error(&format!("failed to process rpc: {}", e));
@@ -203,32 +194,18 @@ impl Server {
         }
     }
 
-    /// Spawns an async task to forward messages from the transport to the main channel.
-    async fn init_transport(&self, sx: Sender<Rpc>) {
-        let tr = self.transport.clone();
-        tokio::spawn(async move {
-            let mut rx = tr.consume().await;
-            while let Some(rpc) = rx.recv().await {
-                let _ = sx.send(rpc).await;
-            }
-        });
-    }
-
     /// Connects to another server and initiates the handshake protocol.
     ///
     /// Establishes bidirectional transport-level connection, then sends
     /// a GetStatus message to synchronize chain state if needed.
-    pub async fn connect(self: &Arc<Self>, other: &Arc<Server>) -> Result<(), ServerError> {
-        self.transport.connect(&other.transport).await;
+    pub async fn connect(self: &Arc<Self>, other: &Arc<Server<T>>) -> Result<(), ServerError> {
+        self.transport.connect_async(&other.transport).await;
         self.send_get_status_message(&other.transport).await?;
         Ok(())
     }
 
     /// Sends a status request to the specified peer transport.
-    async fn send_get_status_message(
-        &self,
-        transport: &Arc<LocalTransport>,
-    ) -> Result<(), TransportError> {
+    async fn send_get_status_message(&self, transport: &Arc<T>) -> Result<(), TransportError> {
         let rpc = Message::new(MessageType::GetStatus, 0x8.to_bytes());
         self.transport
             .send_message(transport.addr(), rpc.to_bytes())
@@ -269,7 +246,7 @@ impl Server {
     }
 
     /// Returns a reference to the server's transport.
-    pub fn transport(&self) -> &Arc<LocalTransport> {
+    pub fn transport(&self) -> &Arc<T> {
         &self.transport
     }
 
@@ -279,7 +256,7 @@ impl Server {
     /// their own broadcast.
     async fn broadcast(
         &self,
-        from: String,
+        from: SocketAddr,
         payload: Bytes,
         msg_type: MessageType,
     ) -> Result<(), TransportError> {
@@ -292,7 +269,7 @@ impl Server {
     /// Skips duplicate transactions. Returns an error if verification fails.
     async fn process_transaction(
         self: Arc<Self>,
-        from: String,
+        from: SocketAddr,
         transaction: Transaction,
     ) -> Result<(), ServerError> {
         if self.tx_pool.contains(transaction.id(self.chain.id)) {
@@ -328,7 +305,11 @@ impl Server {
     ///
     /// Returns `Ok` if the block was successfully added, or an error if
     /// validation failed or the block was already present.
-    async fn process_block(self: Arc<Self>, from: String, block: Block) -> Result<(), ServerError> {
+    async fn process_block(
+        self: Arc<Self>,
+        from: SocketAddr,
+        block: Block,
+    ) -> Result<(), ServerError> {
         let arc_block = Arc::new(block);
         self.chain
             .add_block(arc_block.clone())
@@ -351,7 +332,10 @@ impl Server {
     }
 
     /// Handles an incoming status request by responding with our chain info.
-    async fn process_get_status_message(self: Arc<Self>, from: String) -> Result<(), ServerError> {
+    async fn process_get_status_message(
+        self: Arc<Self>,
+        from: SocketAddr,
+    ) -> Result<(), ServerError> {
         let status = SendStatusMessage {
             id: self.logger.id,
             version: 1,
@@ -370,7 +354,7 @@ impl Server {
     /// If the peer's chain is ahead, requests missing blocks to sync.
     async fn process_send_status_message(
         self: Arc<Self>,
-        from: String,
+        from: SocketAddr,
         status: SendStatusMessage,
     ) -> Result<(), ServerError> {
         // Skip for 2 new nodes
@@ -401,7 +385,7 @@ impl Server {
     /// Handles a block range request by walking the chain and sending requested blocks.
     async fn process_get_blocks_message(
         self: Arc<Self>,
-        from: String,
+        from: SocketAddr,
         req: GetBlocksMessage,
     ) -> Result<(), ServerError> {
         // Check if all the available blocks were requested
@@ -457,7 +441,7 @@ impl Server {
     /// Handles a blocks response by adding each block to the local chain.
     async fn process_send_blocks_message(
         self: Arc<Self>,
-        _from: String,
+        _from: SocketAddr,
         response: SendBlocksMessage,
     ) -> Result<(), ServerError> {
         for block in response.blocks {
@@ -470,7 +454,7 @@ impl Server {
     }
 }
 
-impl RpcProcessor for Server {
+impl<T: Transport> RpcProcessor for Server<T> {
     type Error = ServerError;
     fn process_message(
         self: Arc<Self>,
@@ -507,7 +491,7 @@ impl RpcProcessor for Server {
 /// Default RPC handler that deserializes messages based on their type header.
 fn handle_rpc(rpc: Rpc) -> Result<DecodedMessage, RpcError> {
     let msg = Message::from_bytes(rpc.payload.as_ref()).map_err(|e| RpcError::Message {
-        from: rpc.from.clone(),
+        from: rpc.from,
         details: format!("{e:?}"),
     })?;
 
@@ -516,7 +500,7 @@ fn handle_rpc(rpc: Rpc) -> Result<DecodedMessage, RpcError> {
             let tx = Transaction::from_bytes(msg.data.as_ref())
                 .map_err(|e| RpcError::Transaction(format!("{e:?}")))?;
             Ok(DecodedMessage {
-                from: rpc.from.clone(),
+                from: rpc.from,
                 data: DecodedMessageData::Transaction(tx),
             })
         }
@@ -524,7 +508,7 @@ fn handle_rpc(rpc: Rpc) -> Result<DecodedMessage, RpcError> {
             let block = Block::from_bytes(msg.data.as_ref())
                 .map_err(|e| RpcError::Block(format!("{e:?}")))?;
             Ok(DecodedMessage {
-                from: rpc.from.clone(),
+                from: rpc.from,
                 data: DecodedMessageData::Block(block),
             })
         }
@@ -532,19 +516,19 @@ fn handle_rpc(rpc: Rpc) -> Result<DecodedMessage, RpcError> {
             let status = SendStatusMessage::from_bytes(msg.data.as_ref())
                 .map_err(|e| RpcError::Status(format!("{e:?}")))?;
             Ok(DecodedMessage {
-                from: rpc.from.clone(),
+                from: rpc.from,
                 data: DecodedMessageData::SendStatus(status),
             })
         }
         MessageType::GetStatus => Ok(DecodedMessage {
-            from: rpc.from.clone(),
+            from: rpc.from,
             data: DecodedMessageData::GetStatus,
         }),
         MessageType::SendBlocks => {
             let send_blocks_msg = SendBlocksMessage::from_bytes(msg.data.as_ref())
                 .map_err(|e| RpcError::Status(format!("{e:?}")))?;
             Ok(DecodedMessage {
-                from: rpc.from.clone(),
+                from: rpc.from,
                 data: DecodedMessageData::SendBlocks(send_blocks_msg),
             })
         }
@@ -552,7 +536,7 @@ fn handle_rpc(rpc: Rpc) -> Result<DecodedMessage, RpcError> {
             let get_blocks_msg = GetBlocksMessage::from_bytes(msg.data.as_ref())
                 .map_err(|e| RpcError::Status(format!("{e:?}")))?;
             Ok(DecodedMessage {
-                from: rpc.from.clone(),
+                from: rpc.from,
                 data: DecodedMessageData::GetBlocks(get_blocks_msg),
             })
         }
@@ -563,18 +547,22 @@ fn handle_rpc(rpc: Rpc) -> Result<DecodedMessage, RpcError> {
 mod tests {
     use super::*;
     use crate::crypto::key_pair::PrivateKey;
+    use crate::network::local_transport::LocalTransport;
 
     const TEST_CHAIN_ID: u64 = 10;
 
+    fn addr(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
     #[tokio::test]
     async fn server_is_validator_when_private_key_set() {
-        let transport = LocalTransport::new("validator");
+        let transport = LocalTransport::new(addr(3000));
         let server = Server::new(
             "test-validator",
             transport,
             Duration::from_secs(10),
             Some(PrivateKey::new()),
-            None,
             None,
         )
         .await;
@@ -583,13 +571,14 @@ mod tests {
 
     #[tokio::test]
     async fn server_is_not_validator_without_private_key() {
-        let transport = LocalTransport::new("node");
+        let transport = LocalTransport::new(addr(3001));
         let server = Server::default("test-node", transport, Duration::from_secs(10)).await;
         assert!(!server.is_validator);
     }
 
     #[test]
     fn handle_rpc_decodes_valid_transaction() {
+        let sender = addr(3000);
         let key = PrivateKey::new();
         let tx = Transaction::new(b"test data".as_slice(), key, TEST_CHAIN_ID);
         let tx_bytes = tx.to_bytes();
@@ -597,10 +586,10 @@ mod tests {
         let msg = Message::new(MessageType::Transaction, tx_bytes);
         let msg_bytes = msg.to_bytes();
 
-        let rpc = Rpc::new("sender", msg_bytes);
+        let rpc = Rpc::new(sender, msg_bytes);
         let result = handle_rpc(rpc).expect("should decode successfully");
 
-        assert_eq!(result.from, "sender");
+        assert_eq!(result.from, sender);
         match result.data {
             DecodedMessageData::Transaction(decoded_tx) => {
                 assert_eq!(decoded_tx.id(TEST_CHAIN_ID), tx.id(TEST_CHAIN_ID));
@@ -611,7 +600,7 @@ mod tests {
 
     #[test]
     fn handle_rpc_rejects_malformed_payload() {
-        let rpc = Rpc::new("bad_sender", vec![0xFF, 0xFF, 0xFF]);
+        let rpc = Rpc::new(addr(3000), vec![0xFF, 0xFF, 0xFF]);
         let result = handle_rpc(rpc);
 
         assert!(matches!(result, Err(RpcError::Message { .. })));
@@ -622,7 +611,7 @@ mod tests {
         let msg = Message::new(MessageType::Transaction, vec![0x00, 0x01, 0x02]);
         let msg_bytes = msg.to_bytes();
 
-        let rpc = Rpc::new("sender", msg_bytes);
+        let rpc = Rpc::new(addr(3000), msg_bytes);
         let result = handle_rpc(rpc);
 
         assert!(matches!(result, Err(RpcError::Transaction { .. })));
@@ -643,16 +632,17 @@ mod tests {
 
     #[test]
     fn handle_rpc_decodes_valid_block() {
+        let sender = addr(3000);
         let block = create_test_block(vec![]);
         let block_bytes = block.to_bytes();
 
         let msg = Message::new(MessageType::Block, block_bytes);
         let msg_bytes = msg.to_bytes();
 
-        let rpc = Rpc::new("block_sender", msg_bytes);
+        let rpc = Rpc::new(sender, msg_bytes);
         let result = handle_rpc(rpc).expect("should decode successfully");
 
-        assert_eq!(result.from, "block_sender");
+        assert_eq!(result.from, sender);
         match result.data {
             DecodedMessageData::Block(decoded_block) => {
                 assert_eq!(
@@ -670,7 +660,7 @@ mod tests {
         let msg = Message::new(MessageType::Block, vec![0x00, 0x01, 0x02]);
         let msg_bytes = msg.to_bytes();
 
-        let rpc = Rpc::new("sender", msg_bytes);
+        let rpc = Rpc::new(addr(3000), msg_bytes);
         let result = handle_rpc(rpc);
 
         assert!(matches!(result, Err(RpcError::Block { .. })));
@@ -690,7 +680,7 @@ mod tests {
         let msg = Message::new(MessageType::Block, block_bytes);
         let msg_bytes = msg.to_bytes();
 
-        let rpc = Rpc::new("sender", msg_bytes);
+        let rpc = Rpc::new(addr(3000), msg_bytes);
         let result = handle_rpc(rpc).expect("should decode successfully");
 
         match result.data {
@@ -714,7 +704,7 @@ mod tests {
         let msg = Message::new(MessageType::Block, block_bytes);
         let msg_bytes = msg.to_bytes();
 
-        let rpc = Rpc::new("sender", msg_bytes);
+        let rpc = Rpc::new(addr(3000), msg_bytes);
         let result = handle_rpc(rpc);
 
         assert!(matches!(result, Err(RpcError::Block { .. })));
@@ -722,11 +712,12 @@ mod tests {
 
     #[test]
     fn handle_rpc_decodes_get_status() {
+        let peer = addr(3000);
         let msg = Message::new(MessageType::GetStatus, 0x8u8.to_bytes());
-        let rpc = Rpc::new("peer", msg.to_bytes());
+        let rpc = Rpc::new(peer, msg.to_bytes());
         let result = handle_rpc(rpc).expect("should decode");
 
-        assert_eq!(result.from, "peer");
+        assert_eq!(result.from, peer);
         assert!(matches!(result.data, DecodedMessageData::GetStatus));
     }
 
@@ -734,16 +725,17 @@ mod tests {
     fn handle_rpc_decodes_send_status() {
         use crate::utils::log::LogId;
 
+        let peer = addr(3000);
         let status = SendStatusMessage {
             id: LogId::new("node-a"),
             version: 1,
             current_height: 100,
         };
         let msg = Message::new(MessageType::SendStatus, status.to_bytes());
-        let rpc = Rpc::new("peer", msg.to_bytes());
+        let rpc = Rpc::new(peer, msg.to_bytes());
         let result = handle_rpc(rpc).expect("should decode");
 
-        assert_eq!(result.from, "peer");
+        assert_eq!(result.from, peer);
         match result.data {
             DecodedMessageData::SendStatus(s) => {
                 assert_eq!(s.id.as_str(), "node-a");
@@ -756,12 +748,13 @@ mod tests {
 
     #[test]
     fn handle_rpc_decodes_get_blocks() {
+        let peer = addr(3000);
         let get_blocks = GetBlocksMessage { start: 5, end: 10 };
         let msg = Message::new(MessageType::GetBlocks, get_blocks.to_bytes());
-        let rpc = Rpc::new("peer", msg.to_bytes());
+        let rpc = Rpc::new(peer, msg.to_bytes());
         let result = handle_rpc(rpc).expect("should decode");
 
-        assert_eq!(result.from, "peer");
+        assert_eq!(result.from, peer);
         match result.data {
             DecodedMessageData::GetBlocks(req) => {
                 assert_eq!(req.start, 5);
@@ -773,12 +766,13 @@ mod tests {
 
     #[test]
     fn handle_rpc_decodes_send_blocks_empty() {
+        let peer = addr(3000);
         let send_blocks = SendBlocksMessage { blocks: vec![] };
         let msg = Message::new(MessageType::SendBlocks, send_blocks.to_bytes());
-        let rpc = Rpc::new("peer", msg.to_bytes());
+        let rpc = Rpc::new(peer, msg.to_bytes());
         let result = handle_rpc(rpc).expect("should decode");
 
-        assert_eq!(result.from, "peer");
+        assert_eq!(result.from, peer);
         match result.data {
             DecodedMessageData::SendBlocks(resp) => {
                 assert!(resp.blocks.is_empty());
@@ -789,8 +783,10 @@ mod tests {
 
     #[tokio::test]
     async fn server_connect_establishes_bidirectional_transport() {
-        let tr_a = LocalTransport::new("A");
-        let tr_b = LocalTransport::new("B");
+        let addr_a = addr(3000);
+        let addr_b = addr(3001);
+        let tr_a = LocalTransport::new(addr_a);
+        let tr_b = LocalTransport::new(addr_b);
 
         let server_a = Server::default("server-a", tr_a.clone(), Duration::from_secs(10)).await;
         let server_b = Server::default("server-b", tr_b.clone(), Duration::from_secs(10)).await;
@@ -798,16 +794,18 @@ mod tests {
         server_a.connect(&server_b).await.unwrap();
 
         // Transport-level connection should be bidirectional
-        let a_peers: Vec<String> = tr_a.peers().iter().map(|p| p.addr()).collect();
-        let b_peers: Vec<String> = tr_b.peers().iter().map(|p| p.addr()).collect();
-        assert!(a_peers.contains(&"B".to_string()));
-        assert!(b_peers.contains(&"A".to_string()));
+        let a_peers = tr_a.peer_addrs();
+        let b_peers = tr_b.peer_addrs();
+        assert!(a_peers.contains(&addr_b));
+        assert!(b_peers.contains(&addr_a));
     }
 
     #[tokio::test]
     async fn server_connect_sends_get_status_message() {
-        let tr_a = LocalTransport::new("A");
-        let tr_b = LocalTransport::new("B");
+        let addr_a = addr(3000);
+        let addr_b = addr(3001);
+        let tr_a = LocalTransport::new(addr_a);
+        let tr_b = LocalTransport::new(addr_b);
 
         let server_a = Server::default("server-a", tr_a.clone(), Duration::from_secs(10)).await;
         let server_b = Server::default("server-b", tr_b.clone(), Duration::from_secs(10)).await;
@@ -818,7 +816,7 @@ mod tests {
 
         // B should receive a GetStatus message from A
         let rpc = rx_b.recv().await.expect("should receive message");
-        assert_eq!(rpc.from, "A");
+        assert_eq!(rpc.from, addr_a);
 
         let msg = Message::from_bytes(&rpc.payload).expect("should decode message");
         assert!(matches!(msg.header, MessageType::GetStatus));
@@ -826,9 +824,11 @@ mod tests {
 
     #[tokio::test]
     async fn process_get_status_responds_with_send_status() {
-        let tr_a = LocalTransport::new("A");
-        let tr_b = LocalTransport::new("B");
-        tr_a.connect(&tr_b).await;
+        let addr_a = addr(3000);
+        let addr_b = addr(3001);
+        let tr_a = LocalTransport::new(addr_a);
+        let tr_b = LocalTransport::new(addr_b);
+        tr_a.connect(&tr_b);
 
         let server_a = Server::default("server-a", tr_a.clone(), Duration::from_secs(10)).await;
 
@@ -837,13 +837,13 @@ mod tests {
         // Process a GetStatus message from B
         server_a
             .clone()
-            .process_get_status_message("B".to_string())
+            .process_get_status_message(addr_b)
             .await
             .unwrap();
 
         // B should receive a SendStatus response
         let rpc = rx_b.recv().await.expect("should receive response");
-        assert_eq!(rpc.from, "A");
+        assert_eq!(rpc.from, addr_a);
 
         let msg = Message::from_bytes(&rpc.payload).expect("decode message");
         assert!(matches!(msg.header, MessageType::SendStatus));
@@ -854,7 +854,7 @@ mod tests {
 
     #[tokio::test]
     async fn process_send_status_skips_sync_when_both_new_nodes() {
-        let tr_a = LocalTransport::new("A");
+        let tr_a = LocalTransport::new(addr(3000));
         let server_a = Server::default("server-a", tr_a, Duration::from_secs(10)).await;
 
         // Both nodes at height 0 (new nodes) - sync is skipped
@@ -866,7 +866,7 @@ mod tests {
 
         let result = server_a
             .clone()
-            .process_send_status_message("B".to_string(), status)
+            .process_send_status_message(addr(3001), status)
             .await;
 
         assert!(result.is_ok());
@@ -874,13 +874,12 @@ mod tests {
 
     #[tokio::test]
     async fn process_send_status_errors_when_peer_behind() {
-        let tr_a = LocalTransport::new("A");
+        let tr_a = LocalTransport::new(addr(3000));
         let server_a = Server::new(
             "server-a",
             tr_a.clone(),
             Duration::from_secs(10),
             Some(PrivateKey::new()),
-            None,
             None,
         )
         .await;
@@ -901,7 +900,7 @@ mod tests {
 
         let result = server_a
             .clone()
-            .process_send_status_message("B".to_string(), status)
+            .process_send_status_message(addr(3001), status)
             .await;
 
         assert!(matches!(result, Err(ServerError::BlockHeightToLow(0, 1))));
@@ -909,9 +908,11 @@ mod tests {
 
     #[tokio::test]
     async fn process_send_status_requests_blocks_when_peer_ahead() {
-        let tr_a = LocalTransport::new("A");
-        let tr_b = LocalTransport::new("B");
-        tr_a.connect(&tr_b).await;
+        let addr_a = addr(3000);
+        let addr_b = addr(3001);
+        let tr_a = LocalTransport::new(addr_a);
+        let tr_b = LocalTransport::new(addr_b);
+        tr_a.connect(&tr_b);
 
         let server_a = Server::default("server-a", tr_a.clone(), Duration::from_secs(10)).await;
 
@@ -926,7 +927,7 @@ mod tests {
 
         server_a
             .clone()
-            .process_send_status_message("B".to_string(), status)
+            .process_send_status_message(addr_b, status)
             .await
             .unwrap();
 
@@ -942,9 +943,11 @@ mod tests {
 
     #[tokio::test]
     async fn process_get_blocks_returns_empty_for_invalid_range() {
-        let tr_a = LocalTransport::new("A");
-        let tr_b = LocalTransport::new("B");
-        tr_a.connect(&tr_b).await;
+        let addr_a = addr(3000);
+        let addr_b = addr(3001);
+        let tr_a = LocalTransport::new(addr_a);
+        let tr_b = LocalTransport::new(addr_b);
+        tr_a.connect(&tr_b);
 
         let server_a = Server::default("server-a", tr_a.clone(), Duration::from_secs(10)).await;
 
@@ -954,7 +957,7 @@ mod tests {
         let req = GetBlocksMessage { start: 10, end: 20 };
         server_a
             .clone()
-            .process_get_blocks_message("B".to_string(), req)
+            .process_get_blocks_message(addr_b, req)
             .await
             .unwrap();
 
@@ -967,9 +970,11 @@ mod tests {
 
     #[tokio::test]
     async fn process_get_blocks_returns_empty_for_start_greater_than_end() {
-        let tr_a = LocalTransport::new("A");
-        let tr_b = LocalTransport::new("B");
-        tr_a.connect(&tr_b).await;
+        let addr_a = addr(3000);
+        let addr_b = addr(3001);
+        let tr_a = LocalTransport::new(addr_a);
+        let tr_b = LocalTransport::new(addr_b);
+        tr_a.connect(&tr_b);
 
         let server_a = Server::default("server-a", tr_a.clone(), Duration::from_secs(10)).await;
 
@@ -979,7 +984,7 @@ mod tests {
         let req = GetBlocksMessage { start: 5, end: 2 };
         server_a
             .clone()
-            .process_get_blocks_message("B".to_string(), req)
+            .process_get_blocks_message(addr_b, req)
             .await
             .unwrap();
 
@@ -992,8 +997,8 @@ mod tests {
 
     #[tokio::test]
     async fn process_send_blocks_adds_blocks_to_chain() {
-        let tr_a = LocalTransport::new("A");
-        let tr_b = LocalTransport::new("B");
+        let tr_a = LocalTransport::new(addr(3000));
+        let tr_b = LocalTransport::new(addr(3001));
         let server_a = Server::default("server-a", tr_a, Duration::from_secs(10)).await;
 
         // Use a builder server to create valid blocks with correct state_root
@@ -1002,7 +1007,6 @@ mod tests {
             tr_b,
             Duration::from_secs(10),
             Some(PrivateKey::new()),
-            None,
             None,
         )
         .await;
@@ -1021,7 +1025,7 @@ mod tests {
 
         server_a
             .clone()
-            .process_send_blocks_message("B".to_string(), response)
+            .process_send_blocks_message(addr(3001), response)
             .await
             .unwrap();
 
@@ -1030,8 +1034,8 @@ mod tests {
 
     #[tokio::test]
     async fn process_send_blocks_adds_multiple_blocks_in_order() {
-        let tr_a = LocalTransport::new("A");
-        let tr_b = LocalTransport::new("B");
+        let tr_a = LocalTransport::new(addr(3000));
+        let tr_b = LocalTransport::new(addr(3001));
         let server_a = Server::default("server-a", tr_a, Duration::from_secs(10)).await;
 
         // Use a builder server to create valid blocks with correct state_root
@@ -1040,7 +1044,6 @@ mod tests {
             tr_b,
             Duration::from_secs(10),
             Some(PrivateKey::new()),
-            None,
             None,
         )
         .await;
@@ -1065,7 +1068,7 @@ mod tests {
 
         server_a
             .clone()
-            .process_send_blocks_message("B".to_string(), response)
+            .process_send_blocks_message(addr(3001), response)
             .await
             .unwrap();
 
@@ -1074,15 +1077,17 @@ mod tests {
 
     #[tokio::test]
     async fn late_server_syncs_with_established_chain() {
+        let addr_established = addr(3000);
+        let addr_late = addr(3001);
+
         // Create an established server with blocks
-        let tr_established = LocalTransport::new("Established");
+        let tr_established = LocalTransport::new(addr_established);
         let validator_key = PrivateKey::new();
         let server_established = Server::new(
             "established",
             tr_established.clone(),
             Duration::from_secs(10),
             Some(validator_key.clone()),
-            None,
             None,
         )
         .await;
@@ -1098,7 +1103,7 @@ mod tests {
         assert_eq!(server_established.chain.height(), 3);
 
         // Create a late-joining server
-        let tr_late = LocalTransport::new("Late");
+        let tr_late = LocalTransport::new(addr_late);
         let server_late = Server::default("late", tr_late.clone(), Duration::from_secs(10)).await;
         assert_eq!(server_late.chain.height(), 0);
 
@@ -1111,7 +1116,7 @@ mod tests {
             .recv()
             .await
             .expect("should receive GetStatus");
-        assert_eq!(rpc.from, "Late");
+        assert_eq!(rpc.from, addr_late);
         let msg = Message::from_bytes(&rpc.payload).expect("decode");
         assert!(matches!(msg.header, MessageType::GetStatus));
 
@@ -1119,7 +1124,7 @@ mod tests {
         let mut rx_late = tr_late.consume().await;
         server_established
             .clone()
-            .process_get_status_message("Late".to_string())
+            .process_get_status_message(addr_late)
             .await
             .unwrap();
 
@@ -1133,7 +1138,7 @@ mod tests {
         // Late processes SendStatus and sends GetBlocks
         server_late
             .clone()
-            .process_send_status_message("Established".to_string(), status)
+            .process_send_status_message(addr_established, status)
             .await
             .unwrap();
 
@@ -1151,7 +1156,7 @@ mod tests {
         // Established processes GetBlocks and sends SendBlocks
         server_established
             .clone()
-            .process_get_blocks_message("Late".to_string(), get_blocks)
+            .process_get_blocks_message(addr_late, get_blocks)
             .await
             .unwrap();
 
@@ -1165,7 +1170,7 @@ mod tests {
         // Late processes SendBlocks - this should sync all 3 blocks
         server_late
             .clone()
-            .process_send_blocks_message("Established".to_string(), send_blocks)
+            .process_send_blocks_message(addr_established, send_blocks)
             .await
             .unwrap();
 
@@ -1179,9 +1184,11 @@ mod tests {
 
     #[tokio::test]
     async fn process_get_blocks_handles_start_zero() {
-        let tr_a = LocalTransport::new("A");
-        let tr_b = LocalTransport::new("B");
-        tr_a.connect(&tr_b).await;
+        let addr_a = addr(3000);
+        let addr_b = addr(3001);
+        let tr_a = LocalTransport::new(addr_a);
+        let tr_b = LocalTransport::new(addr_b);
+        tr_a.connect(&tr_b);
 
         let server_a = Server::default("server-a", tr_a.clone(), Duration::from_secs(10)).await;
 
@@ -1191,7 +1198,7 @@ mod tests {
         let req = GetBlocksMessage { start: 0, end: 0 };
         server_a
             .clone()
-            .process_get_blocks_message("B".to_string(), req)
+            .process_get_blocks_message(addr_b, req)
             .await
             .unwrap();
 
@@ -1206,9 +1213,11 @@ mod tests {
 
     #[tokio::test]
     async fn process_get_blocks_handles_max_start() {
-        let tr_a = LocalTransport::new("A");
-        let tr_b = LocalTransport::new("B");
-        tr_a.connect(&tr_b).await;
+        let addr_a = addr(3000);
+        let addr_b = addr(3001);
+        let tr_a = LocalTransport::new(addr_a);
+        let tr_b = LocalTransport::new(addr_b);
+        tr_a.connect(&tr_b);
 
         let server_a = Server::default("server-a", tr_a.clone(), Duration::from_secs(10)).await;
 
@@ -1221,7 +1230,7 @@ mod tests {
         };
         server_a
             .clone()
-            .process_get_blocks_message("B".to_string(), req)
+            .process_get_blocks_message(addr_b, req)
             .await
             .unwrap();
 
@@ -1235,9 +1244,11 @@ mod tests {
 
     #[tokio::test]
     async fn process_get_blocks_handles_max_end() {
-        let tr_a = LocalTransport::new("A");
-        let tr_b = LocalTransport::new("B");
-        tr_a.connect(&tr_b).await;
+        let addr_a = addr(3000);
+        let addr_b = addr(3001);
+        let tr_a = LocalTransport::new(addr_a);
+        let tr_b = LocalTransport::new(addr_b);
+        tr_a.connect(&tr_b);
 
         let server_a = Server::default("server-a", tr_a.clone(), Duration::from_secs(10)).await;
 
@@ -1250,7 +1261,7 @@ mod tests {
         };
         server_a
             .clone()
-            .process_get_blocks_message("B".to_string(), req)
+            .process_get_blocks_message(addr_b, req)
             .await
             .unwrap();
 
@@ -1264,9 +1275,11 @@ mod tests {
 
     #[tokio::test]
     async fn process_get_blocks_handles_start_equals_end() {
-        let tr_a = LocalTransport::new("A");
-        let tr_b = LocalTransport::new("B");
-        tr_a.connect(&tr_b).await;
+        let addr_a = addr(3000);
+        let addr_b = addr(3001);
+        let tr_a = LocalTransport::new(addr_a);
+        let tr_b = LocalTransport::new(addr_b);
+        tr_a.connect(&tr_b);
 
         let validator_key = PrivateKey::new();
         let server_a = Server::new(
@@ -1274,7 +1287,6 @@ mod tests {
             tr_a.clone(),
             Duration::from_secs(10),
             Some(validator_key.clone()),
-            None,
             None,
         )
         .await;
@@ -1294,7 +1306,7 @@ mod tests {
         let req = GetBlocksMessage { start: 1, end: 1 };
         server_a
             .clone()
-            .process_get_blocks_message("B".to_string(), req)
+            .process_get_blocks_message(addr_b, req)
             .await
             .unwrap();
 
@@ -1308,9 +1320,11 @@ mod tests {
 
     #[tokio::test]
     async fn process_get_blocks_handles_end_less_than_start() {
-        let tr_a = LocalTransport::new("A");
-        let tr_b = LocalTransport::new("B");
-        tr_a.connect(&tr_b).await;
+        let addr_a = addr(3000);
+        let addr_b = addr(3001);
+        let tr_a = LocalTransport::new(addr_a);
+        let tr_b = LocalTransport::new(addr_b);
+        tr_a.connect(&tr_b);
 
         let server_a = Server::default("server-a", tr_a.clone(), Duration::from_secs(10)).await;
 
@@ -1320,7 +1334,7 @@ mod tests {
         let req = GetBlocksMessage { start: 10, end: 5 };
         server_a
             .clone()
-            .process_get_blocks_message("B".to_string(), req)
+            .process_get_blocks_message(addr_b, req)
             .await
             .unwrap();
 
@@ -1334,9 +1348,11 @@ mod tests {
 
     #[tokio::test]
     async fn process_get_blocks_handles_start_one_end_zero() {
-        let tr_a = LocalTransport::new("A");
-        let tr_b = LocalTransport::new("B");
-        tr_a.connect(&tr_b).await;
+        let addr_a = addr(3000);
+        let addr_b = addr(3001);
+        let tr_a = LocalTransport::new(addr_a);
+        let tr_b = LocalTransport::new(addr_b);
+        tr_a.connect(&tr_b);
 
         let validator_key = PrivateKey::new();
         let server_a = Server::new(
@@ -1344,7 +1360,6 @@ mod tests {
             tr_a.clone(),
             Duration::from_secs(10),
             Some(validator_key.clone()),
-            None,
             None,
         )
         .await;
@@ -1364,7 +1379,7 @@ mod tests {
         let req = GetBlocksMessage { start: 1, end: 0 };
         server_a
             .clone()
-            .process_get_blocks_message("B".to_string(), req)
+            .process_get_blocks_message(addr_b, req)
             .await
             .unwrap();
 

@@ -383,6 +383,7 @@ impl<T: Transport> Server<T> {
     const EMPTY_BLOCKS: SendBlocksMessage = SendBlocksMessage { blocks: Vec::new() };
 
     /// Handles a block range request by walking the chain and sending requested blocks.
+    /// TODO: add a block send limit (ex: 500) to not overload the other node
     async fn process_get_blocks_message(
         self: Arc<Self>,
         from: SocketAddr,

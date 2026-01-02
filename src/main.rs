@@ -53,11 +53,12 @@ impl From<TransportError> for SendTransactionError {
 async fn main() {
     log::init(log::Level::Info);
 
-    // Create TCP transports with different ports
+    // Create TCP transports with different ports (mixed IPv4/IPv6)
+    // Each transport has its own cryptographic identity for authenticated handshakes
     let tr_main = TcpTransport::new("127.0.0.1:3000".parse().unwrap());
     let tr_a = TcpTransport::new("127.0.0.1:3001".parse().unwrap());
-    let tr_b = TcpTransport::new("127.0.0.1:3002".parse().unwrap());
-    let tr_c = TcpTransport::new("127.0.0.1:3003".parse().unwrap());
+    let tr_b = TcpTransport::new("[::1]:3002".parse().unwrap());
+    let tr_c = TcpTransport::new("[::1]:3003".parse().unwrap());
 
     // Create servers
     let main_server = make_server(tr_main, Some(PrivateKey::new())).await;

@@ -3,7 +3,6 @@
 use blockchain_derive::BinaryCodec;
 use std::fmt::{self, Display};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU8, Ordering};
 
 /// Log level for filtering messages.
 #[repr(u8)]
@@ -89,19 +88,6 @@ impl From<SocketAddr> for LogId {
     }
 }
 
-static LOG_LEVEL: AtomicU8 = AtomicU8::new(Level::Info as u8);
-
-/// Initialize the logger with the given level.
-pub fn init(level: Level) {
-    LOG_LEVEL.store(level as u8, Ordering::Relaxed);
-}
-
-/// Returns true if the given level should be logged.
-#[inline]
-fn enabled(level: Level) -> bool {
-    level as u8 >= LOG_LEVEL.load(Ordering::Relaxed)
-}
-
 /// Converts days since Unix epoch to (year, month, day).
 fn days_to_date(days: u64) -> (u32, u32, u32) {
     // Algorithm based on Howard Hinnant's date algorithms
@@ -120,27 +106,21 @@ fn days_to_date(days: u64) -> (u32, u32, u32) {
 
 /// Internal logging function with optional identifier prefix.
 fn log_with_id(level: Level, id: Option<&str>, message: &str) {
-    if enabled(level) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
-        let secs = now.as_secs();
-        let days = secs / 86400;
-        let (year, month, day) = days_to_date(days);
-        let hours = (secs / 3600) % 24;
-        let mins = (secs / 60) % 60;
-        let s = secs % 60;
-        let millis = now.subsec_millis();
-        match id {
-            Some(id) => eprintln!(
-                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03} [{:5}] [{}] {}",
-                year, month, day, hours, mins, s, millis, level, id, message
-            ),
-            None => eprintln!(
-                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03} [{:5}] {}",
-                year, month, day, hours, mins, s, millis, level, message
-            ),
-        }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs();
+    let days = secs / 86400;
+    let (year, month, day) = days_to_date(days);
+    let hours = (secs / 3600) % 24;
+    let mins = (secs / 60) % 60;
+    let s = secs % 60;
+    let millis = now.subsec_millis();
+    if let Some(id) = id {
+        eprintln!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03} [{:5}] [{}] {}",
+            year, month, day, hours, mins, s, millis, level, id, message
+        )
     }
 }
 
@@ -258,28 +238,5 @@ mod tests {
         assert_eq!(year, 2024);
         assert_eq!(month, 2);
         assert_eq!(day, 29);
-    }
-
-    #[test]
-    fn enabled_respects_level() {
-        init(Level::Warn);
-
-        assert!(!enabled(Level::Info));
-        assert!(enabled(Level::Warn));
-        assert!(enabled(Level::Error));
-
-        // Reset to default for other tests
-        init(Level::Info);
-    }
-
-    #[test]
-    fn init_sets_log_level() {
-        init(Level::Error);
-        assert!(!enabled(Level::Info));
-        assert!(!enabled(Level::Warn));
-        assert!(enabled(Level::Error));
-
-        init(Level::Info);
-        assert!(enabled(Level::Info));
     }
 }

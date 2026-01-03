@@ -321,12 +321,12 @@ impl VM {
     /// The key is hashed to ensure uniform distribution and prevent collisions
     /// between different contracts or chains.
     fn make_state_key(chain_id: u64, contract_id: &[u8], user_key: &[u8]) -> Hash {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(b"STATE");
-        buf.extend_from_slice(&chain_id.to_le_bytes());
-        buf.extend_from_slice(contract_id);
-        buf.extend_from_slice(user_key);
-        Hash::sha3_from_bytes(buf.as_slice())
+        let mut h = Hash::sha3();
+        h.update(b"STATE");
+        h.update(&chain_id.to_le_bytes());
+        h.update(contract_id);
+        h.update(user_key);
+        h.finalize()
     }
 
     fn op_load_i64(&mut self, dst: u8, imm: i64) -> Result<(), VMError> {

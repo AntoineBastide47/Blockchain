@@ -4,12 +4,19 @@
 pub mod utils {
     use crate::core::block::{Block, Header};
     use crate::crypto::key_pair::PrivateKey;
+    use crate::network::rpc::Rpc;
+    use crate::types::bytes::Bytes;
     use crate::types::hash::{HASH_LEN, Hash};
+    use std::net::SocketAddr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
+    /// Generates a unique deterministic hash for testing.
+    ///
+    /// Each call returns a different hash based on an incrementing counter,
+    /// ensuring test reproducibility while avoiding collisions.
     pub fn random_hash() -> Hash {
         let mut buf = vec![0u8; HASH_LEN];
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -34,5 +41,17 @@ pub mod utils {
             state_root: Hash::zero(),
         };
         Block::new(header, PrivateKey::new(), vec![], chain_id)
+    }
+
+    /// Creates an RPC message for testing with a zeroed peer ID.
+    ///
+    /// Bypasses the authenticated peer ID that would normally come from
+    /// the Noise handshake, using [`Hash::zero()`] as a placeholder.
+    pub fn test_rpc(from: SocketAddr, payload: impl Into<Bytes>) -> Rpc {
+        Rpc {
+            from,
+            payload: payload.into(),
+            peer_id: Hash::zero(),
+        }
     }
 }

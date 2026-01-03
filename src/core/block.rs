@@ -37,11 +37,11 @@ impl Header {
     /// The hash includes a domain separator ("BLOCK_HEADER"), the chain ID,
     /// and all header fields to prevent cross-chain replay attacks.
     fn compute_hash(&self, chain_id: u64) -> Hash {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(b"BLOCK_HEADER");
-        chain_id.encode(&mut buf);
-        self.encode(&mut buf);
-        Hash::sha3_from_bytes(&buf)
+        let mut h = Hash::sha3();
+        h.update(b"BLOCK_HEADER");
+        chain_id.encode(&mut h);
+        self.encode(&mut h);
+        h.finalize()
     }
 }
 
@@ -151,16 +151,16 @@ impl Block {
     /// The hash commits to all transaction IDs in order, prefixed with a
     /// domain separator ("BLOCK_TXS") and chain ID for replay protection.
     pub fn data_hash(transactions: &[Transaction], chain_id: u64) -> Hash {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(b"BLOCK_TXS");
-        chain_id.encode(&mut buf);
+        let mut h = Hash::sha3();
+        h.update(b"BLOCK_TXS");
+        chain_id.encode(&mut h);
 
         for tx in transactions {
             let id = tx.id(chain_id);
-            id.encode(&mut buf);
+            id.encode(&mut h);
         }
 
-        Hash::sha3_from_bytes(&buf)
+        h.finalize()
     }
 
     /// Verifies the block's cryptographic integrity.

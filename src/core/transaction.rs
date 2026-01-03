@@ -24,12 +24,12 @@ impl UnsignedTransaction {
     ///
     /// Includes a domain separator prefix and chain ID to prevent replay attacks
     /// across different chains.
-    pub fn signing_bytes(&self, chain_id: u64) -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(b"TX");
+    pub fn signing_bytes(&self, chain_id: u64) -> Hash {
+        let mut buf = Hash::sha3();
+        buf.update(b"TX");
         chain_id.encode(&mut buf);
         self.encode(&mut buf);
-        buf
+        buf.finalize()
     }
 }
 
@@ -61,7 +61,7 @@ impl Transaction {
             from: key.public_key(),
             data: data.clone(),
         };
-        let signature = Hash::sha3_from_bytes(&unsigned.signing_bytes(chain_id));
+        let signature = &unsigned.signing_bytes(chain_id);
 
         Transaction {
             from: unsigned.from,
@@ -74,7 +74,7 @@ impl Transaction {
     /// Returns the bytes that were signed to produce this transaction's signature.
     ///
     /// Used during verification to reconstruct the signed message.
-    pub fn signing_bytes(&self, chain_id: u64) -> Vec<u8> {
+    pub fn signing_bytes(&self, chain_id: u64) -> Hash {
         UnsignedTransaction {
             from: self.from,
             data: self.data.clone(),
@@ -88,11 +88,11 @@ impl Transaction {
     /// even for identical payloads signed by different keys. Result is cached.
     pub fn id(&self, chain_id: u64) -> Hash {
         *self.cached_id.get_or_init(|| {
-            let mut buf = Vec::<u8>::new();
-            buf.extend_from_slice(b"TXID");
-            chain_id.encode(&mut buf);
-            self.encode(&mut buf);
-            Hash::sha3_from_bytes(&buf)
+            let mut h = Hash::sha3();
+            h.update(b"TXID");
+            chain_id.encode(&mut h);
+            self.encode(&mut h);
+            h.finalize()
         })
     }
 
@@ -100,7 +100,7 @@ impl Transaction {
     ///
     /// Returns `true` if the signature is valid for the given chain ID.
     pub fn verify(&self, chain_id: u64) -> bool {
-        let hash = Hash::sha3_from_bytes(&self.signing_bytes(chain_id));
+        let hash = self.signing_bytes(chain_id);
         self.from.verify(hash.as_slice(), self.signature)
     }
 }

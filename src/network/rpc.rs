@@ -6,18 +6,55 @@
 use crate::core::block::Block;
 use crate::core::transaction::Transaction;
 use crate::network::message::{GetBlocksMessage, SendBlocksMessage, SendStatusMessage};
+use crate::network::tcp_transport::{decode_socket_addr, encode_socket_addr};
 use crate::types::bytes::Bytes;
+use crate::types::encoding::{Decode, DecodeError, Encode, EncodeSink};
+use crate::types::hash::Hash;
 use crate::types::wrapper_types::BoxFuture;
-use blockchain_derive::{BinaryCodec, Error};
+use blockchain_derive::Error;
 use std::error::Error;
 use std::fmt::Debug;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-/// Remote procedure call message containing sender address and payload data.
-#[derive(BinaryCodec)]
+/// Wire-format RPC message for network serialization.
+///
+/// Contains only the sender's socket address and payload bytes. Unlike [`Rpc`],
+/// this does not include the authenticated peer ID since that information is
+/// added after the Noise handshake verifies the sender's identity.
+pub struct RawRpc {
+    /// Listen address of the sender.
+    pub(crate) from: SocketAddr,
+    /// Raw message payload.
+    pub(crate) payload: Bytes,
+}
+
+impl Encode for RawRpc {
+    fn encode<S: EncodeSink>(&self, out: &mut S) {
+        encode_socket_addr(self.from).encode(out);
+        self.payload.encode(out);
+    }
+}
+
+impl Decode for RawRpc {
+    fn decode(input: &mut &[u8]) -> Result<Self, DecodeError> {
+        let vec = Vec::<u8>::decode(input)?;
+        Ok(RawRpc {
+            from: decode_socket_addr(&vec)
+                .map_err(|e| DecodeError::InvalidValueWithMessage(e.to_string()))?,
+            payload: Bytes::decode(input)?,
+        })
+    }
+}
+
+/// Authenticated RPC message with verified sender identity.
+///
+/// Contains the cryptographic peer ID derived from the sender's Noise static key,
+/// providing authenticated origin for all messages after handshake completion.
 pub struct Rpc {
-    /// Address of the sender.
+    /// Cryptographic identity of the sender, derived from their Noise static key.
+    pub(crate) peer_id: Hash,
+    /// Listen address of the sender.
     pub(crate) from: SocketAddr,
     /// Raw message payload.
     pub(crate) payload: Bytes,
@@ -25,10 +62,33 @@ pub struct Rpc {
 
 impl Rpc {
     /// Creates a new RPC message from the given sender and payload.
-    pub fn new(from: SocketAddr, payload: impl Into<Bytes>) -> Self {
+    pub fn new(peer_id: Hash, from: SocketAddr, payload: impl Into<Bytes>) -> Self {
         Self {
             from,
             payload: payload.into(),
+            peer_id,
+        }
+    }
+
+    /// Converts to wire format for network transmission.
+    ///
+    /// Strips the peer ID since it's re-derived from the authenticated session.
+    pub fn to_raw(&self) -> RawRpc {
+        RawRpc {
+            from: self.from,
+            payload: self.payload.clone(),
+        }
+    }
+
+    /// Reconstructs an authenticated RPC from wire format.
+    ///
+    /// The `peer_id` is provided by the transport layer after verifying the
+    /// sender's identity through the Noise handshake.
+    pub fn from_raw(raw: RawRpc, peer_id: Hash) -> Self {
+        Self {
+            peer_id,
+            from: raw.from,
+            payload: raw.payload,
         }
     }
 }
@@ -89,15 +149,16 @@ mod tests {
     use super::*;
     use crate::network::message::{Message, MessageType};
     use crate::types::encoding::{Decode, Encode};
+    use crate::utils::test_utils::utils::test_rpc;
 
     #[test]
     fn rpc_serialization_roundtrip() {
         let addr: SocketAddr = "127.0.0.1:3000".parse().unwrap();
         let payload = vec![1, 2, 3, 4, 5];
-        let rpc = Rpc::new(addr, payload.clone());
+        let rpc = test_rpc(addr, payload.clone());
 
-        let encoded = rpc.to_bytes();
-        let decoded = Rpc::from_bytes(encoded.as_slice()).expect("deserialization failed");
+        let encoded = rpc.to_raw().to_bytes();
+        let decoded = RawRpc::from_bytes(encoded.as_slice()).expect("deserialization failed");
 
         assert_eq!(decoded.from, addr);
         assert_eq!(decoded.payload.as_ref(), payload.as_slice());
@@ -108,10 +169,10 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:3001".parse().unwrap();
         let payload = Bytes::new(vec![9u8; 16]);
         let msg = Message::new(MessageType::Block, payload.clone());
-        let rpc = Rpc::new(addr, msg.to_bytes());
+        let rpc = test_rpc(addr, msg.to_bytes());
 
-        let encoded = rpc.to_bytes();
-        let decoded = Rpc::from_bytes(encoded.as_slice()).expect("deserialization failed");
+        let encoded = rpc.to_raw().to_bytes();
+        let decoded = RawRpc::from_bytes(encoded.as_slice()).expect("deserialization failed");
 
         assert_eq!(decoded.from, addr);
 

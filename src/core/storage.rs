@@ -539,7 +539,9 @@ pub mod tests {
     // ==================== StateStore Tests ====================
 
     fn h(s: &[u8]) -> Hash {
-        Hash::sha3_from_bytes(s)
+        let mut h = Hash::sha3();
+        h.update(s);
+        h.finalize()
     }
 
     #[test]

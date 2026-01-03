@@ -5,7 +5,6 @@
 
 use crate::network::rpc::Rpc;
 use crate::types::bytes::Bytes;
-use crate::types::encoding::{Decode, DecodeError, Encode, EncodeSink};
 use crate::types::wrapper_types::BoxFuture;
 use blockchain_derive::Error;
 use std::net::SocketAddr;
@@ -48,21 +47,6 @@ pub enum TransportError {
     /// Failed to send message to the specified address.
     #[error("failed to broadcast: {0}")]
     BroadcastFailed(String),
-}
-
-impl Encode for SocketAddr {
-    fn encode<S: EncodeSink>(&self, out: &mut S) {
-        self.to_string().encode(out);
-    }
-}
-
-impl Decode for SocketAddr {
-    fn decode(input: &mut &[u8]) -> Result<Self, DecodeError> {
-        let address = String::decode(input)?;
-        address
-            .parse()
-            .map_err(|_| DecodeError::InvalidIpAddr(address))
-    }
 }
 
 /// Async transport layer for network communication between nodes.

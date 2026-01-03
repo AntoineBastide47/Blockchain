@@ -202,13 +202,13 @@ impl<V: Validator, S: Storage + StateStore + IterableState + StateViewProvider> 
         }
 
         // Hash the sorted key-value list
-        let mut buf = Vec::new();
-        buf.extend_from_slice(b"STATE_ROOT");
+        let mut h = Hash::sha3();
+        h.update(b"STATE_ROOT");
         for (k, v) in m {
-            k.encode(&mut buf);
-            v.encode(&mut buf);
+            k.encode(&mut h);
+            v.encode(&mut h);
         }
-        Hash::sha3_from_bytes(buf.as_slice())
+        h.finalize()
     }
 }
 

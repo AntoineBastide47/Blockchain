@@ -548,7 +548,8 @@ fn handle_rpc(rpc: Rpc) -> Result<DecodedMessage, RpcError> {
 mod tests {
     use super::*;
     use crate::crypto::key_pair::PrivateKey;
-    use crate::network::local_transport::LocalTransport;
+    use crate::network::local_transport::tests::LocalTransport;
+    use crate::utils::test_utils::utils::test_rpc;
 
     const TEST_CHAIN_ID: u64 = 10;
 
@@ -587,7 +588,7 @@ mod tests {
         let msg = Message::new(MessageType::Transaction, tx_bytes);
         let msg_bytes = msg.to_bytes();
 
-        let rpc = Rpc::new(sender, msg_bytes);
+        let rpc = test_rpc(sender, msg_bytes);
         let result = handle_rpc(rpc).expect("should decode successfully");
 
         assert_eq!(result.from, sender);
@@ -601,7 +602,7 @@ mod tests {
 
     #[test]
     fn handle_rpc_rejects_malformed_payload() {
-        let rpc = Rpc::new(addr(3000), vec![0xFF, 0xFF, 0xFF]);
+        let rpc = test_rpc(addr(3000), vec![0xFF, 0xFF, 0xFF]);
         let result = handle_rpc(rpc);
 
         assert!(matches!(result, Err(RpcError::Message { .. })));
@@ -612,7 +613,7 @@ mod tests {
         let msg = Message::new(MessageType::Transaction, vec![0x00, 0x01, 0x02]);
         let msg_bytes = msg.to_bytes();
 
-        let rpc = Rpc::new(addr(3000), msg_bytes);
+        let rpc = test_rpc(addr(3000), msg_bytes);
         let result = handle_rpc(rpc);
 
         assert!(matches!(result, Err(RpcError::Transaction { .. })));
@@ -640,7 +641,7 @@ mod tests {
         let msg = Message::new(MessageType::Block, block_bytes);
         let msg_bytes = msg.to_bytes();
 
-        let rpc = Rpc::new(sender, msg_bytes);
+        let rpc = test_rpc(sender, msg_bytes);
         let result = handle_rpc(rpc).expect("should decode successfully");
 
         assert_eq!(result.from, sender);
@@ -661,7 +662,7 @@ mod tests {
         let msg = Message::new(MessageType::Block, vec![0x00, 0x01, 0x02]);
         let msg_bytes = msg.to_bytes();
 
-        let rpc = Rpc::new(addr(3000), msg_bytes);
+        let rpc = test_rpc(addr(3000), msg_bytes);
         let result = handle_rpc(rpc);
 
         assert!(matches!(result, Err(RpcError::Block { .. })));
@@ -681,7 +682,7 @@ mod tests {
         let msg = Message::new(MessageType::Block, block_bytes);
         let msg_bytes = msg.to_bytes();
 
-        let rpc = Rpc::new(addr(3000), msg_bytes);
+        let rpc = test_rpc(addr(3000), msg_bytes);
         let result = handle_rpc(rpc).expect("should decode successfully");
 
         match result.data {
@@ -705,7 +706,7 @@ mod tests {
         let msg = Message::new(MessageType::Block, block_bytes);
         let msg_bytes = msg.to_bytes();
 
-        let rpc = Rpc::new(addr(3000), msg_bytes);
+        let rpc = test_rpc(addr(3000), msg_bytes);
         let result = handle_rpc(rpc);
 
         assert!(matches!(result, Err(RpcError::Block { .. })));
@@ -715,7 +716,7 @@ mod tests {
     fn handle_rpc_decodes_get_status() {
         let peer = addr(3000);
         let msg = Message::new(MessageType::GetStatus, 0x8u8.to_bytes());
-        let rpc = Rpc::new(peer, msg.to_bytes());
+        let rpc = test_rpc(peer, msg.to_bytes());
         let result = handle_rpc(rpc).expect("should decode");
 
         assert_eq!(result.from, peer);
@@ -733,7 +734,7 @@ mod tests {
             current_height: 100,
         };
         let msg = Message::new(MessageType::SendStatus, status.to_bytes());
-        let rpc = Rpc::new(peer, msg.to_bytes());
+        let rpc = test_rpc(peer, msg.to_bytes());
         let result = handle_rpc(rpc).expect("should decode");
 
         assert_eq!(result.from, peer);
@@ -752,7 +753,7 @@ mod tests {
         let peer = addr(3000);
         let get_blocks = GetBlocksMessage { start: 5, end: 10 };
         let msg = Message::new(MessageType::GetBlocks, get_blocks.to_bytes());
-        let rpc = Rpc::new(peer, msg.to_bytes());
+        let rpc = test_rpc(peer, msg.to_bytes());
         let result = handle_rpc(rpc).expect("should decode");
 
         assert_eq!(result.from, peer);
@@ -770,7 +771,7 @@ mod tests {
         let peer = addr(3000);
         let send_blocks = SendBlocksMessage { blocks: vec![] };
         let msg = Message::new(MessageType::SendBlocks, send_blocks.to_bytes());
-        let rpc = Rpc::new(peer, msg.to_bytes());
+        let rpc = test_rpc(peer, msg.to_bytes());
         let result = handle_rpc(rpc).expect("should decode");
 
         assert_eq!(result.from, peer);

@@ -3,89 +3,88 @@
 //! Enables direct message passing between nodes without network I/O,
 //! ideal for unit tests and single-process simulations.
 
-use crate::impl_transport_consume;
-use crate::network::rpc::Rpc;
-use crate::network::transport::{Transport, TransportError, spawn_rpc_forwarder};
-use crate::types::bytes::Bytes;
-use crate::types::wrapper_types::BoxFuture;
-use dashmap::DashMap;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio::sync::Mutex;
-use tokio::sync::mpsc::{Receiver, Sender, channel};
-
-/// In-memory transport using async channels for local message passing.
-///
-/// Maintains a peer registry and routes messages directly through memory
-/// without network overhead. Thread-safe and suitable for concurrent use.
-pub struct LocalTransport {
-    peers: DashMap<SocketAddr, Arc<LocalTransport>>,
-    tx: Sender<Rpc>,
-    rx: Arc<Mutex<Option<Receiver<Rpc>>>>,
-    address: SocketAddr,
-}
-
-impl LocalTransport {
-    /// Creates a new LocalTransport instance with the given address.
-    ///
-    /// The transport is wrapped in an Arc for shared ownership across async tasks.
-    pub fn new(address: SocketAddr) -> Arc<LocalTransport> {
-        let (tx, rx) = channel(1024);
-
-        Arc::new(LocalTransport {
-            address,
-            peers: DashMap::new(),
-            tx,
-            rx: Arc::new(Mutex::new(Some(rx))),
-        })
-    }
-}
-
-impl Transport for LocalTransport {
-    fn connect(self: &Arc<Self>, other: &Arc<Self>) {
-        self.peers.insert(other.addr(), other.clone());
-        other.peers.insert(self.addr(), self.clone());
-    }
-
-    fn start(self: &Arc<Self>, sx: Sender<Rpc>) {
-        spawn_rpc_forwarder(self.clone(), sx);
-    }
-
-    impl_transport_consume!();
-
-    fn send_message(
-        self: &Arc<Self>,
-        to: SocketAddr,
-        payload: Bytes,
-    ) -> BoxFuture<'static, Result<(), TransportError>> {
-        let peers = self.peers.clone();
-        let address = self.address;
-
-        Box::pin(async move {
-            let peer = match peers.get(&to) {
-                Some(r) => r.value().clone(),
-                None => return Err(TransportError::PeerNotFound(to)),
-            };
-
-            peer.tx
-                .send(Rpc::new(address, payload))
-                .await
-                .map_err(|_| TransportError::SendFailed(to))
-        })
-    }
-
-    fn addr(self: &Arc<Self>) -> SocketAddr {
-        self.address
-    }
-
-    fn peer_addrs(self: &Arc<Self>) -> Vec<SocketAddr> {
-        self.peers.iter().map(|e| *e.key()).collect()
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub mod tests {
+    use crate::impl_transport_consume;
+    use crate::network::rpc::Rpc;
+    use crate::network::transport::{Transport, TransportError, spawn_rpc_forwarder};
+    use crate::types::bytes::Bytes;
+    use crate::types::wrapper_types::BoxFuture;
+    use crate::utils::test_utils::utils::test_rpc;
+    use dashmap::DashMap;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+    use tokio::sync::mpsc::{Receiver, Sender, channel};
+
+    /// In-memory transport using async channels for local message passing.
+    ///
+    /// Maintains a peer registry and routes messages directly through memory
+    /// without network overhead. Thread-safe and suitable for concurrent use.
+    pub struct LocalTransport {
+        peers: DashMap<SocketAddr, Arc<LocalTransport>>,
+        tx: Sender<Rpc>,
+        rx: Arc<Mutex<Option<Receiver<Rpc>>>>,
+        address: SocketAddr,
+    }
+
+    impl LocalTransport {
+        /// Creates a new LocalTransport instance with the given address.
+        ///
+        /// The transport is wrapped in an Arc for shared ownership across async tasks.
+        pub fn new(address: SocketAddr) -> Arc<LocalTransport> {
+            let (tx, rx) = channel(1024);
+
+            Arc::new(LocalTransport {
+                address,
+                peers: DashMap::new(),
+                tx,
+                rx: Arc::new(Mutex::new(Some(rx))),
+            })
+        }
+    }
+
+    impl Transport for LocalTransport {
+        fn connect(self: &Arc<Self>, other: &Arc<Self>) {
+            self.peers.insert(other.addr(), other.clone());
+            other.peers.insert(self.addr(), self.clone());
+        }
+
+        fn start(self: &Arc<Self>, sx: Sender<Rpc>) {
+            spawn_rpc_forwarder(self.clone(), sx);
+        }
+
+        impl_transport_consume!();
+
+        fn send_message(
+            self: &Arc<Self>,
+            to: SocketAddr,
+            payload: Bytes,
+        ) -> BoxFuture<'static, Result<(), TransportError>> {
+            let peers = self.peers.clone();
+            let address = self.address;
+
+            Box::pin(async move {
+                let peer = match peers.get(&to) {
+                    Some(r) => r.value().clone(),
+                    None => return Err(TransportError::PeerNotFound(to)),
+                };
+
+                peer.tx
+                    .send(test_rpc(address, payload))
+                    .await
+                    .map_err(|_| TransportError::SendFailed(to))
+            })
+        }
+
+        fn addr(self: &Arc<Self>) -> SocketAddr {
+            self.address
+        }
+
+        fn peer_addrs(self: &Arc<Self>) -> Vec<SocketAddr> {
+            self.peers.iter().map(|e| *e.key()).collect()
+        }
+    }
 
     #[tokio::test]
     async fn test_connect() {

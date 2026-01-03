@@ -1,6 +1,6 @@
 [package]
 name = "Blockchain"
-version = "0.10.3"
+version = "0.10.4"
 edition = "2024"
 
 [dependencies]
@@ -10,3 +10,4 @@ k256 = "=0.13.4"
 rand_core = "=0.6.4"
 blockchain_derive = { path = "blockchain_derive" }
 dashmap = "6.1.0"
+snow = { version = "0.10", features = ["ring-accelerated"] }

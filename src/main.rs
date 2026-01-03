@@ -10,7 +10,6 @@ use crate::network::server::{DEV_CHAIN_ID, Server, ServerError};
 use crate::network::tcp_transport::TcpTransport;
 use crate::network::transport::{Transport, TransportError};
 use crate::types::encoding::Encode;
-use crate::utils::log;
 use crate::utils::log::Logger;
 use crate::virtual_machine::assembler::assemble_source;
 use blockchain_derive::Error;
@@ -51,14 +50,12 @@ impl From<TransportError> for SendTransactionError {
 
 #[tokio::main]
 async fn main() {
-    log::init(log::Level::Info);
-
     // Create TCP transports with different ports (mixed IPv4/IPv6)
     // Each transport has its own cryptographic identity for authenticated handshakes
-    let tr_main = TcpTransport::new("127.0.0.1:3000".parse().unwrap());
-    let tr_a = TcpTransport::new("127.0.0.1:3001".parse().unwrap());
-    let tr_b = TcpTransport::new("[::1]:3002".parse().unwrap());
-    let tr_c = TcpTransport::new("[::1]:3003".parse().unwrap());
+    let tr_main = TcpTransport::new("127.0.0.1:3000".parse().unwrap(), DEV_CHAIN_ID);
+    let tr_a = TcpTransport::new("127.0.0.1:3001".parse().unwrap(), DEV_CHAIN_ID);
+    let tr_b = TcpTransport::new("[::1]:3002".parse().unwrap(), DEV_CHAIN_ID);
+    let tr_c = TcpTransport::new("[::1]:3003".parse().unwrap(), DEV_CHAIN_ID);
 
     // Create servers
     let main_server = make_server(tr_main, Some(PrivateKey::new())).await;
@@ -85,11 +82,10 @@ async fn main() {
     server_a.connect(&server_b).await.unwrap();
     server_b.connect(&server_c).await.unwrap();
 
-    // Spawn late-joining server after 12 seconds
     tokio::spawn(async move {
-        sleep(Duration::from_secs(12)).await;
+        sleep(Duration::from_secs(7)).await;
 
-        let tr_late = TcpTransport::new("127.0.0.1:3004".parse().unwrap());
+        let tr_late = TcpTransport::new("127.0.0.1:3004".parse().unwrap(), DEV_CHAIN_ID);
         let server_late = make_server(tr_late, None).await;
 
         // Start the late server first

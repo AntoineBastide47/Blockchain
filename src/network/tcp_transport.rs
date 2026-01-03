@@ -1,37 +1,89 @@
 //! TCP-based transport implementation for real network communication.
 //!
-//! Provides length-prefixed framing over TCP with per-peer connection management.
-//! Uses split read/write halves for concurrent IO on each connection.
+//! Provides encrypted, authenticated communication over TCP using the Noise Protocol
+//! Framework (XX pattern with X25519, ChaChaPoly, SHA256). All messages are
+//! length-prefixed and encrypted after the initial handshake.
 //!
-//! # Connection model
+//! # Connection Model
 //!
-//! - **Outbound connections** store writers keyed by target listen address.
-//! - **Inbound connections** only use the read half; writers are dropped.
-//!   This prevents duplicate entries when both peers connect to each other.
-//! - When accepting an inbound connection, if no outbound connection exists to that
-//!   peer, one is established automatically using the claimed listen address.
-//! - Writers are removed when the read loop terminates (connection cleanup).
-//! - Handshake has a 3-second timeout to prevent resource exhaustion.
-//!
-//! # Handshake format
-//!
-//! The handshake is authenticated with Schnorr signatures:
 //! ```text
-//! [type: u8][addr][port: u16 LE][pubkey: 32][nonce: 32][sig: 64]
+//!     ┌─────────────────────────────────────────────────────────────────┐
+//!     │                      Connection Lifecycle                       │
+//!     └─────────────────────────────────────────────────────────────────┘
+//!
+//!     Node A (initiator)                         Node B (responder)
+//!          │                                           │
+//!          │  TCP connect ──────────────────────────►  │
+//!          │                                           │
+//!          │  ◄──────────── Noise XX Handshake ──────► │
+//!          │                                           │
+//!          │  stores writer for B                      │  stores writer for A
+//!          │  spawns read loop                         │  spawns read loop
+//!          │                                           │
+//!          │  ◄═══════════ Encrypted RPCs ═══════════► │
+//!          │                                           │
 //! ```
-//! - type=4: IPv4 (4 bytes addr)
-//! - type=6: IPv6 (16 bytes addr)
-//! - The signature signs the nonce, proving ownership of the public key.
+//!
+//! - **Outbound connections** store writers keyed by the peer's listen address.
+//! - **Inbound connections** trigger a connect-back if no outbound exists.
+//! - Writers are removed automatically when the read loop terminates.
+//! - All handshakes have a 3-second timeout to prevent resource exhaustion.
+//!
+//! # Noise XX Handshake
+//!
+//! Uses the Noise XX pattern for mutual authentication with ephemeral and static keys.
+//! The chain ID is bound into the handshake via prologue to prevent cross-chain attacks.
+//!
+//! ```text
+//!     Initiator                                      Responder
+//!          │                                              │
+//!          │  ── msg1: e, payload(listen_addr) ────────►  │
+//!          │                                              │
+//!          │  ◄─ msg2: e, ee, s, es, payload(listen_addr) │
+//!          │                                              │
+//!          │  ── msg3: s, se ──────────────────────────►  │
+//!          │                                              │
+//!          │         [handshake complete]                 │
+//!          │                                              │
+//!          │  ◄═══════ encrypted transport msgs ════════► │
+//!          │                                              │
+//! ```
+//!
+//! - `e` = ephemeral public key
+//! - `s` = static public key
+//! - `ee`, `es`, `se` = DH operations between ephemeral/static keys
+//! - Payload in msg1/msg2 contains the sender's listen address
+//!
+//! # Wire Format
+//!
+//! All messages (handshake and transport) use length-prefixed framing:
+//!
+//! ```text
+//!     ┌──────────────┬─────────────────────────────────┐
+//!     │  length (4B) │  payload (up to 65535 bytes)    │
+//!     │   u32 LE     │  [encrypted after handshake]    │
+//!     └──────────────┴─────────────────────────────────┘
+//! ```
+//!
+//! Listen address encoding within handshake payloads:
+//!
+//! ```text
+//!     IPv4: [0x04][addr: 4 bytes][port: u16 LE]  (7 bytes total)
+//!     IPv6: [0x06][addr: 16 bytes][port: u16 LE] (19 bytes total)
+//! ```
 
-use crate::crypto::key_pair::{PrivateKey, PublicKey};
 use crate::impl_transport_consume;
-use crate::network::rpc::Rpc;
+use crate::network::rpc::{RawRpc, Rpc};
 use crate::network::transport::{Transport, TransportError, spawn_rpc_forwarder};
+use crate::types::array::Array;
 use crate::types::bytes::Bytes;
 use crate::types::encoding::{Decode, Encode};
+use crate::types::hash::Hash;
 use crate::types::wrapper_types::BoxFuture;
 use dashmap::DashMap;
-use rand_core::{OsRng, RngCore};
+use dashmap::try_result::TryResult;
+use snow::params::NoiseParams;
+use snow::{Builder, Keypair, TransportState};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
@@ -41,194 +93,217 @@ use tokio::sync::Mutex;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::time::{Duration, timeout};
 
+/// Address type marker for IPv4 in handshake encoding.
 const ADDR_TYPE_V4: u8 = 4;
+/// Address type marker for IPv6 in handshake encoding.
 const ADDR_TYPE_V6: u8 = 6;
 
-/// Handshake data received from a peer.
-struct Handshake {
-    addr: SocketAddr,
-    pubkey: PublicKey,
+/// Noise protocol pattern: XX with X25519 DH, ChaChaPoly AEAD, SHA256 hash.
+const NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_SHA256";
+/// Maximum Noise message size (65535 bytes per spec).
+const NOISE_MAX_MSG: usize = 65_535;
+
+/// Parses the Noise protocol parameters from the pattern string.
+fn noise_params() -> NoiseParams {
+    NOISE_PATTERN.parse().expect("invalid noise params")
 }
 
-impl Handshake {
-    /// Encodes a handshake message: `[type][addr][port][pubkey:32][nonce:32][sig:64]`
-    fn encode(addr: SocketAddr, identity: &PrivateKey) -> Vec<u8> {
-        let port = addr.port().to_le_bytes();
-        let pubkey = identity.public_key();
+/// Constructs the Noise prologue for chain-specific domain separation.
+///
+/// The prologue is hashed into the handshake transcript, binding the session
+/// to a specific chain ID and preventing cross-chain replay attacks.
+fn noise_prologue(chain_id: u64) -> Vec<u8> {
+    let mut p = Vec::with_capacity(16);
+    p.extend_from_slice(b"MYCHAIN\0NOISE\0");
+    p.extend_from_slice(&chain_id.to_le_bytes());
+    p
+}
 
-        // Generate random nonce
-        let mut nonce = [0u8; 32];
-        OsRng.fill_bytes(&mut nonce);
-
-        // Sign the nonce
-        let sig = identity.sign(&nonce);
-        let sig_bytes = sig.to_bytes();
-
-        let mut buf = match addr.ip() {
-            IpAddr::V4(v4) => {
-                let octets = v4.octets();
-                let mut b = Vec::with_capacity(7 + 32 + 32 + 64);
-                b.push(ADDR_TYPE_V4);
-                b.extend_from_slice(&octets);
-                b.extend_from_slice(&port);
-                b
-            }
-            IpAddr::V6(v6) => {
-                let octets = v6.octets();
-                let mut b = Vec::with_capacity(19 + 32 + 32 + 64);
-                b.push(ADDR_TYPE_V6);
-                b.extend_from_slice(&octets);
-                b.extend_from_slice(&port);
-                b
-            }
-        };
-
-        // Append pubkey, nonce, signature
-        buf.extend_from_slice(&pubkey.to_bytes());
-        buf.extend_from_slice(&nonce);
-        buf.extend_from_slice(&sig_bytes);
-
-        buf
+/// Writes a length-prefixed frame to the stream.
+///
+/// Frame format: `[len: u32 LE][data: len bytes]`.
+/// Returns an error if data exceeds [`NOISE_MAX_MSG`].
+async fn write_frame<W: AsyncWriteExt + Unpin>(w: &mut W, data: &[u8]) -> io::Result<()> {
+    if data.len() > NOISE_MAX_MSG {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "noise msg too large",
+        ));
     }
+    let len = (data.len() as u32).to_le_bytes();
+    w.write_all(&len).await?;
+    w.write_all(data).await?;
+    w.flush().await
+}
 
-    /// Reads and verifies a handshake message from a peer.
-    ///
-    /// Returns the peer's address and verified public key, or an error if
-    /// the handshake is malformed or the signature is invalid.
-    async fn read(reader: &mut OwnedReadHalf) -> io::Result<Handshake> {
-        // Read address type
-        let mut type_buf = [0u8; 1];
-        reader.read_exact(&mut type_buf).await?;
+/// Reads a length-prefixed frame from the stream.
+///
+/// Rejects frames with zero length or exceeding [`NOISE_MAX_MSG`].
+async fn read_frame<R: AsyncReadExt + Unpin>(r: &mut R) -> io::Result<Vec<u8>> {
+    let mut len_buf = [0u8; 4];
+    r.read_exact(&mut len_buf).await?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+    if len == 0 || len > NOISE_MAX_MSG {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad frame len"));
+    }
+    let mut buf = vec![0u8; len];
+    r.read_exact(&mut buf).await?;
+    Ok(buf)
+}
 
-        // Read address based on type
-        let addr = match type_buf[0] {
-            ADDR_TYPE_V4 => {
-                let mut buf = [0u8; 6];
-                reader.read_exact(&mut buf).await?;
-                let ip = Ipv4Addr::new(buf[0], buf[1], buf[2], buf[3]);
-                let port = u16::from_le_bytes([buf[4], buf[5]]);
-                SocketAddr::from((ip, port))
-            }
-            ADDR_TYPE_V6 => {
-                let mut buf = [0u8; 18];
-                reader.read_exact(&mut buf).await?;
-                let ip = Ipv6Addr::from(<[u8; 16]>::try_from(&buf[..16]).unwrap());
-                let port = u16::from_le_bytes([buf[16], buf[17]]);
-                SocketAddr::from((ip, port))
-            }
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid address type",
-                ));
-            }
-        };
-
-        // Read pubkey (32 bytes)
-        let mut pubkey_bytes = [0u8; 32];
-        reader.read_exact(&mut pubkey_bytes).await?;
-        let mut pubkey_slice: &[u8] = &pubkey_bytes;
-        let pubkey = PublicKey::decode(&mut pubkey_slice)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid public key"))?;
-
-        // Read nonce (32 bytes)
-        let mut nonce = [0u8; 32];
-        reader.read_exact(&mut nonce).await?;
-
-        // Read signature (64 bytes)
-        let mut sig_bytes = [0u8; 64];
-        reader.read_exact(&mut sig_bytes).await?;
-        let mut sig_slice: &[u8] = &sig_bytes;
-        let sig = Decode::decode(&mut sig_slice)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid signature"))?;
-
-        // Verify signature
-        if !pubkey.verify(&nonce, sig) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "handshake signature verification failed",
-            ));
+/// Encodes a socket address for handshake payload.
+///
+/// # Wire Format
+///
+/// ```text
+/// IPv4: [0x04][addr: 4 bytes][port: u16 LE]  = 7 bytes
+/// IPv6: [0x06][addr: 16 bytes][port: u16 LE] = 19 bytes
+/// ```
+pub fn encode_socket_addr(addr: SocketAddr) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 16 + 2);
+    match addr.ip() {
+        IpAddr::V4(v4) => {
+            out.push(ADDR_TYPE_V4);
+            out.extend_from_slice(&v4.octets());
         }
-
-        Ok(Handshake { addr, pubkey })
+        IpAddr::V6(v6) => {
+            out.push(ADDR_TYPE_V6);
+            out.extend_from_slice(&v6.octets());
+        }
     }
+    out.extend_from_slice(&addr.port().to_le_bytes());
+    out
+}
+
+/// Decodes a socket address from handshake payload bytes.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The address type byte is not 0x04 (IPv4) or 0x06 (IPv6)
+/// - The byte slice length doesn't match the expected format
+pub fn decode_socket_addr(bytes: &[u8]) -> io::Result<SocketAddr> {
+    let (ip_len, min_len) = match bytes.first() {
+        Some(&ADDR_TYPE_V4) => (4, 1 + 4 + 2),
+        Some(&ADDR_TYPE_V6) => (16, 1 + 16 + 2),
+        _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "addr type")),
+    };
+
+    if bytes.len() != min_len {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "addr length"));
+    }
+
+    let ip_bytes = &bytes[1..1 + ip_len];
+    let port_bytes = &bytes[1 + ip_len..];
+
+    let ip = match ip_len {
+        4 => IpAddr::V4(Ipv4Addr::new(
+            ip_bytes[0],
+            ip_bytes[1],
+            ip_bytes[2],
+            ip_bytes[3],
+        )),
+        16 => IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(ip_bytes).unwrap())),
+        _ => unreachable!(),
+    };
+
+    let port = u16::from_le_bytes([port_bytes[0], port_bytes[1]]);
+    Ok(SocketAddr::new(ip, port))
+}
+
+/// Holds the write-side state for an established peer connection.
+struct PeerSession {
+    /// TCP write half, protected for concurrent access.
+    writer: Mutex<OwnedWriteHalf>,
+    /// Noise transport state for encrypting outbound messages.
+    noise: Arc<Mutex<TransportState>>,
+    /// Remote peer's cryptographic identity derived from their static Noise key.
+    peer_id: Hash,
 }
 
 /// TCP transport for blockchain network communication.
 ///
-/// Manages TCP connections to peers with length-prefixed message framing.
-/// Each peer connection is stored as a write half keyed by address.
+/// Provides encrypted peer-to-peer messaging over TCP with Noise Protocol
+/// authentication. Each peer is identified by its static Noise public key.
 pub struct TcpTransport {
-    /// Address this transport listens on.
+    /// Local address this transport listens on for incoming connections.
     listen_address: SocketAddr,
-    /// Cryptographic identity for handshake authentication.
-    identity: PrivateKey,
-    /// Write halves of peer connections, keyed by peer address.
-    writers: DashMap<SocketAddr, Arc<Mutex<OwnedWriteHalf>>>,
-    /// Channel sender for incoming RPCs.
+    /// Noise static keypair for identity and authentication.
+    noise_static: Keypair,
+    /// Active peer sessions, keyed by peer's listen address.
+    writers: DashMap<SocketAddr, Arc<PeerSession>>,
+    /// Channel sender for forwarding incoming RPCs to the server.
     tx: Sender<Rpc>,
-    /// Channel receiver for incoming RPCs (taken once by consume).
+    /// Channel receiver for incoming RPCs (taken once by [`Transport::consume`]).
     rx: Arc<Mutex<Option<Receiver<Rpc>>>>,
+    /// Chain ID bound into handshake prologue for network isolation.
+    chain_id: u64,
+    /// Maps peer IDs to their socket addresses (IPv4 at index 0, IPv6 at index 1).
+    peer_to_socket: DashMap<Hash, Array<SocketAddr, 2>>,
 }
 
 impl TcpTransport {
-    /// Creates a new TCP transport bound to the given address with the specified identity.
+    /// Creates a new TCP transport for the given listen address.
     ///
-    /// The identity is used for cryptographic authentication during handshakes.
-    /// The transport must be started with `start()` before it can accept connections.
-    pub fn new(address: SocketAddr) -> Arc<Self> {
+    /// Generates a fresh Noise static keypair for identity. The transport does not
+    /// begin accepting connections until [`Transport::start`] is called.
+    pub fn new(address: SocketAddr, chain_id: u64) -> Arc<Self> {
         let (tx, rx) = channel(1024);
+        let b = Builder::new(noise_params());
+        let noise_static = b
+            .generate_keypair()
+            .expect("noise keypair generation failed");
 
         Arc::new(Self {
             listen_address: address,
-            identity: PrivateKey::new(),
+            noise_static,
             writers: DashMap::new(),
             tx,
             rx: Arc::new(Mutex::new(Some(rx))),
+            chain_id,
+            peer_to_socket: DashMap::new(),
         })
     }
 
-    /// Returns the public key of this transport's identity.
-    pub fn public_key(&self) -> PublicKey {
-        self.identity.public_key()
-    }
-
-    /// Connects to a remote peer by socket address.
+    /// Initiates an outbound connection to a peer at the given address.
     ///
-    /// This is the production API for connecting to peers. The test-oriented
-    /// `connect(&Arc<Self>)` method internally calls this.
+    /// Performs TCP connect with exponential backoff, executes Noise XX handshake
+    /// as initiator, stores the session, and spawns a read loop. Returns `true`
+    /// on success, `false` after all retries exhausted.
     pub fn connect_addr(self: &Arc<Self>, addr: SocketAddr) -> BoxFuture<'static, bool> {
         let transport = self.clone();
         let tx = self.tx.clone();
         Box::pin(async move { Self::establish_outbound_connection(transport, addr, tx).await })
     }
 
-    async fn read_loop(mut reader: OwnedReadHalf, tx: Sender<Rpc>) {
+    /// Reads encrypted messages from a peer and forwards decoded RPCs.
+    ///
+    /// Runs until the connection closes or the RPC channel is dropped.
+    /// Each frame is decrypted using the Noise transport state before parsing.
+    async fn read_loop(
+        mut reader: OwnedReadHalf,
+        noise: Arc<Mutex<TransportState>>,
+        peer_id: Hash,
+        tx: Sender<Rpc>,
+    ) {
+        let mut plain = vec![0u8; NOISE_MAX_MSG];
+
         loop {
-            let mut len_buf = [0u8; 4];
+            let frame = match read_frame(&mut reader).await {
+                Ok(f) => f,
+                Err(_) => return,
+            };
 
-            match reader.read_exact(&mut len_buf).await {
-                Ok(_) => {}
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                    return;
-                }
-                Err(_) => {
-                    return;
-                }
+            let n = {
+                let mut st = noise.lock().await;
+                st.read_message(&frame, &mut plain).unwrap_or(0)
+            };
+            if n == 0 {
+                continue;
             }
 
-            let len = u32::from_le_bytes(len_buf) as usize;
-            if len == 0 || len > 16 * 1024 * 1024 {
-                return;
-            }
-
-            let mut msg = vec![0u8; len];
-            if reader.read_exact(&mut msg).await.is_err() {
-                return;
-            }
-
-            let rpc = match Rpc::from_bytes(&msg) {
-                Ok(rpc) => rpc,
+            let rpc = match RawRpc::from_bytes(&plain[..n]) {
+                Ok(r) => Rpc::from_raw(r, peer_id),
                 Err(_) => continue,
             };
 
@@ -238,6 +313,10 @@ impl TcpTransport {
         }
     }
 
+    /// Accepts incoming TCP connections on the listen address.
+    ///
+    /// Each connection is handled in a spawned task that performs the Noise
+    /// handshake as responder, then enters the read loop.
     async fn accept_loop(self: Arc<Self>, tx: Sender<Rpc>) {
         let listener = match TcpListener::bind(self.listen_address).await {
             Ok(l) => l,
@@ -258,69 +337,359 @@ impl TcpTransport {
         }
     }
 
-    async fn handle_inbound(self: Arc<Self>, stream: TcpStream, tx: Sender<Rpc>) {
-        let (mut reader, _writer) = stream.into_split();
+    /// Executes the Noise XX handshake as initiator (outbound connection).
+    ///
+    /// Sends msg1 with local listen address, receives msg2 with peer's listen
+    /// address, sends msg3 to complete. Returns the transport state, peer's
+    /// listen address, and peer's static public key.
+    async fn noise_handshake_initiator(
+        transport: &TcpTransport,
+        reader: &mut OwnedReadHalf,
+        writer: &mut OwnedWriteHalf,
+    ) -> io::Result<(TransportState, SocketAddr, Vec<u8>, Vec<u8>)> {
+        let prologue = noise_prologue(transport.chain_id);
+        let mut hs = Builder::new(noise_params())
+            .local_private_key(&transport.noise_static.private)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
+            .prologue(&prologue)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
+            .build_initiator()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
-        // Read and verify peer's authenticated handshake with timeout
-        let handshake = match timeout(Duration::from_secs(3), Handshake::read(&mut reader)).await {
-            Ok(Ok(hs)) => hs,
-            _ => return, // Invalid handshake or timeout - reject connection
-        };
+        let mut out = vec![0u8; NOISE_MAX_MSG];
+        let mut payload = vec![0u8; NOISE_MAX_MSG];
 
-        // Connect back to peer if we don't have an outbound connection yet
-        // Must complete before read loop to ensure we can respond to messages
-        if !self.writers.contains_key(&handshake.addr) {
-            Self::establish_outbound_connection(self.clone(), handshake.addr, tx.clone()).await;
+        // msg1: send my listen addr (it may be unencrypted in XX; integrity is enforced by the handshake)
+        let p1 = encode_socket_addr(transport.listen_address);
+        let n1 = hs
+            .write_message(&p1, &mut out)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        write_frame(writer, &out[..n1]).await?;
+
+        // msg2: receive peer listen addr
+        let m2 = read_frame(reader).await?;
+        let p2n = hs
+            .read_message(&m2, &mut payload)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let peer_listen = decode_socket_addr(&payload[..p2n])?;
+
+        // msg3: finish
+        let n3 = hs
+            .write_message(&[], &mut out)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        write_frame(writer, &out[..n3]).await?;
+
+        if !hs.is_handshake_finished() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "handshake incomplete",
+            ));
         }
 
-        Self::read_loop(reader, tx).await;
+        let handshake_hash = hs.get_handshake_hash().to_vec();
+        let remote_static = hs.get_remote_static().unwrap_or(&[]).to_vec();
+        let ts = hs
+            .into_transport_mode()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+
+        Ok((ts, peer_listen, remote_static, handshake_hash))
     }
 
-    async fn send_framed(writer: &Mutex<OwnedWriteHalf>, data: &[u8]) -> io::Result<()> {
-        let mut guard = writer.lock().await;
-        let len = (data.len() as u32).to_le_bytes();
-        guard.write_all(&len).await?;
-        guard.write_all(data).await?;
-        guard.flush().await
+    /// Executes the Noise XX handshake as responder (inbound connection).
+    ///
+    /// Receives msg1 with peer's listen address, sends msg2 with local listen
+    /// address, receives msg3 to complete. Returns the transport state, peer's
+    /// listen address, and peer's static public key.
+    async fn noise_handshake_responder(
+        transport: &TcpTransport,
+        reader: &mut OwnedReadHalf,
+        writer: &mut OwnedWriteHalf,
+    ) -> io::Result<(TransportState, SocketAddr, Vec<u8>, Vec<u8>)> {
+        let prologue = noise_prologue(transport.chain_id);
+        let mut hs = Builder::new(noise_params())
+            .local_private_key(&transport.noise_static.private)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
+            .prologue(&prologue)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
+            .build_responder()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+
+        let mut out = vec![0u8; NOISE_MAX_MSG];
+        let mut payload = vec![0u8; NOISE_MAX_MSG];
+
+        // msg1: receive peer listen addr
+        let m1 = read_frame(reader).await?;
+        let p1n = hs
+            .read_message(&m1, &mut payload)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let peer_listen = decode_socket_addr(&payload[..p1n])?;
+        // msg2: send my listen addr
+        let p2 = encode_socket_addr(transport.listen_address);
+        let n2 = hs
+            .write_message(&p2, &mut out)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        write_frame(writer, &out[..n2]).await?;
+
+        // msg3: receive finish
+        let m3 = read_frame(reader).await?;
+        hs.read_message(&m3, &mut payload)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+
+        if !hs.is_handshake_finished() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "handshake incomplete",
+            ));
+        }
+
+        let handshake_hash = hs.get_handshake_hash().to_vec();
+        let remote_static = hs.get_remote_static().unwrap_or(&[]).to_vec();
+        let ts = hs
+            .into_transport_mode()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+
+        Ok((ts, peer_listen, remote_static, handshake_hash))
     }
 
-    async fn establish_outbound_connection(
-        transport: Arc<Self>,
-        target_addr: SocketAddr,
-        tx: Sender<Rpc>,
-    ) -> bool {
-        // Retry connection with exponential backoff (100ms, 200ms, 400ms, 800ms, 1600ms)
-        let mut delay = Duration::from_millis(100);
-        for _ in 0..5 {
-            match TcpStream::connect(target_addr).await {
-                Ok(stream) => {
-                    let (reader, mut writer) = stream.into_split();
+    /// Derives a stable peer ID from the peer's static Noise public key.
+    ///
+    /// The peer ID is a SHA3 hash of the domain-separated static key,
+    /// providing a consistent identity across sessions.
+    fn peer_id(peer_static: &[u8]) -> Hash {
+        let mut hash = Hash::sha3();
+        hash.update(b"PEER_ID");
+        hash.update(peer_static);
+        hash.finalize()
+    }
 
-                    // Send authenticated handshake
-                    let handshake_buf =
-                        Handshake::encode(transport.listen_address, &transport.identity);
-                    if writer.write_all(&handshake_buf).await.is_err() {
-                        return false;
-                    }
+    /// Derives a unique session ID from the peer's static key and handshake hash.
+    ///
+    /// The session ID binds to both the peer identity and the specific handshake,
+    /// ensuring each connection has a cryptographically unique identifier.
+    fn session_id(peer_static: &[u8], handshake_hash: &[u8]) -> Hash {
+        let mut hash = Hash::sha3();
+        hash.update(b"SESSION");
+        hash.update(peer_static);
+        hash.update(handshake_hash);
+        hash.finalize()
+    }
 
-                    transport
-                        .writers
-                        .insert(target_addr, Arc::new(Mutex::new(writer)));
+    /// Looks up the peer ID associated with a socket address.
+    ///
+    /// Returns `None` if no peer is known at that address.
+    fn socket_to_peer(&self, address: SocketAddr) -> Option<Hash> {
+        self.peer_to_socket
+            .iter()
+            .find(|entry| entry.value().contains(address))
+            .map(|entry| *entry.key())
+    }
 
-                    // Spawn read loop with cleanup on disconnect
-                    let writers = transport.writers.clone();
-                    tokio::spawn(async move {
-                        Self::read_loop(reader, tx).await;
-                        writers.remove(&target_addr);
-                    });
-                    return true;
-                }
-                Err(_) => {
-                    tokio::time::sleep(delay).await;
-                    delay *= 2;
+    /// Handles an accepted inbound TCP connection.
+    ///
+    /// Performs the Noise handshake as responder (3-second timeout), then initiates
+    /// a connect-back to the peer if no outbound session exists. Enters read loop
+    /// after setup. The inbound writer is not stored to avoid duplicate sessions.
+    async fn handle_inbound(self: Arc<Self>, stream: TcpStream, tx: Sender<Rpc>) {
+        let peer_ip = match stream.peer_addr() {
+            Ok(a) => a.ip(),
+            Err(_) => return,
+        };
+
+        let (mut reader, mut writer) = stream.into_split();
+
+        let hs_res = timeout(Duration::from_secs(3), async {
+            Self::noise_handshake_responder(&self, &mut reader, &mut writer).await
+        })
+        .await;
+
+        let (ts, claimed_listen, peer_static, handshake_hash) = match hs_res {
+            Ok(Ok(v)) => v,
+            _ => return,
+        };
+
+        let peer_static: [u8; 32] = match peer_static.try_into() {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+
+        let normalized = SocketAddr::new(peer_ip, claimed_listen.port());
+        let peer_id = Self::peer_id(&peer_static);
+        let mut ok = false;
+        for _ in 0..3 {
+            match self.peer_to_socket.try_get(&peer_id) {
+                TryResult::Present(pair) if !pair.value().contains(normalized) => return,
+                TryResult::Locked => tokio::task::yield_now().await,
+                _ => {
+                    ok = true;
+                    break;
                 }
             }
         }
+        if !ok {
+            return;
+        }
+        match self.socket_to_peer(normalized) {
+            Some(peer) if peer != peer_id => return,
+            _ => {}
+        }
+
+        self.peer_to_socket
+            .entry(peer_id)
+            .and_modify(|arr| {
+                arr.insert_at(normalized.is_ipv6() as usize, normalized);
+            })
+            .or_insert_with(|| {
+                let mut arr = Array::<SocketAddr, 2>::new();
+                arr.insert_at(normalized.is_ipv6() as usize, normalized);
+                arr
+            });
+
+        let _session_id = Self::session_id(&peer_static, &handshake_hash);
+
+        // 1) reject obvious spoofing unless it's loopback-v4/v6 equivalence
+        let claimed_ip = claimed_listen.ip();
+        let ok = if peer_ip == claimed_ip {
+            true
+        } else if peer_ip.is_loopback() && claimed_ip.is_loopback() {
+            // allow 127.0.0.1 <-> ::1 in local dev
+            true
+        } else {
+            false
+        };
+
+        if !ok {
+            return;
+        }
+
+        // 2) use claimed listen address as canonical key + dial target
+        let peer_addr = claimed_listen;
+
+        // If no outbound exists, try to establish it to the claimed listen addr.
+        // If it fails, promote the inbound writer under the *same* claimed addr.
+        let outbound_ok = if self.writers.contains_key(&peer_addr) {
+            true
+        } else {
+            Self::establish_outbound_connection(self.clone(), peer_addr, tx.clone()).await
+        };
+
+        if !outbound_ok {
+            let noise = Arc::new(Mutex::new(ts));
+            self.writers.entry(peer_addr).or_insert_with(|| {
+                Arc::new(PeerSession {
+                    writer: Mutex::new(writer),
+                    noise,
+                    peer_id,
+                })
+            });
+            Self::read_loop(
+                reader,
+                self.writers.get(&peer_addr).unwrap().noise.clone(),
+                peer_id,
+                tx,
+            )
+            .await;
+            return;
+        }
+
+        // if outbound_ok, drop inbound writer and just read
+        let noise = Arc::new(Mutex::new(ts));
+        Self::read_loop(reader, noise, peer_id, tx).await;
+
+        // Clean up peer_to_socket when the inbound connection closes
+        if let Some(mut entry) = self.peer_to_socket.get_mut(&peer_id) {
+            entry.value_mut().remove_value(&normalized);
+        }
+    }
+
+    /// Establishes an outbound TCP connection with retry logic.
+    ///
+    /// Retries up to 5 times with exponential backoff (100ms, 200ms, 400ms, ...).
+    /// On success, completes Noise handshake as initiator, stores the session,
+    /// and spawns a read loop. Session is removed when the read loop exits.
+    async fn establish_outbound_connection(
+        transport: Arc<Self>,
+        target: SocketAddr,
+        tx: Sender<Rpc>,
+    ) -> bool {
+        let mut delay = Duration::from_millis(100);
+
+        for _ in 0..5 {
+            let stream = match TcpStream::connect(target).await {
+                Ok(s) => s,
+                Err(_) => {
+                    tokio::time::sleep(delay).await;
+                    delay *= 2;
+                    continue;
+                }
+            };
+
+            let (mut reader, mut writer) = stream.into_split();
+
+            let hs_res = timeout(Duration::from_secs(3), async {
+                Self::noise_handshake_initiator(&transport, &mut reader, &mut writer).await
+            })
+            .await;
+
+            let (ts, peer_listen, peer_static, handshake_hash) = match hs_res {
+                Ok(Ok(v)) => v,
+                _ => {
+                    tokio::time::sleep(delay).await;
+                    delay *= 2;
+                    continue;
+                }
+            };
+
+            let peer_static: [u8; 32] = match peer_static.try_into() {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            let peer_id = Self::peer_id(&peer_static);
+
+            let normalized = SocketAddr::new(target.ip(), peer_listen.port());
+            match transport.peer_to_socket.get(&peer_id) {
+                Some(existing) if !existing.contains(normalized) => return false,
+                _ => {}
+            }
+            if let Some(other_peer) = transport.socket_to_peer(normalized)
+                && other_peer != peer_id
+            {
+                return false;
+            }
+
+            transport
+                .peer_to_socket
+                .entry(peer_id)
+                .and_modify(|arr| {
+                    arr.insert_at(normalized.is_ipv6() as usize, normalized);
+                })
+                .or_insert_with(|| {
+                    let mut arr = Array::<SocketAddr, 2>::new();
+                    arr.insert_at(normalized.is_ipv6() as usize, normalized);
+                    arr
+                });
+
+            let _session_id = Self::session_id(&peer_static, &handshake_hash);
+
+            let noise = Arc::new(Mutex::new(ts));
+            let session = Arc::new(PeerSession {
+                writer: Mutex::new(writer),
+                noise: noise.clone(),
+                peer_id,
+            });
+            transport.writers.insert(peer_listen, session.clone());
+
+            let transport_ref = transport.clone();
+            tokio::spawn(async move {
+                Self::read_loop(reader, noise.clone(), peer_id, tx).await;
+                transport_ref.writers.remove(&peer_listen);
+                if let Some(mut entry) = transport_ref.peer_to_socket.get_mut(&peer_id) {
+                    entry.value_mut().remove_value(&peer_listen);
+                }
+            });
+
+            return true;
+        }
+
         false
     }
 }
@@ -355,18 +724,30 @@ impl Transport for TcpTransport {
         payload: Bytes,
     ) -> BoxFuture<'static, Result<(), TransportError>> {
         let writers = self.writers.clone();
-        let address = self.listen_address;
+        let from = self.listen_address;
 
         Box::pin(async move {
-            let writer = match writers.get(&to) {
-                Some(w) => w.value().clone(),
+            let session = match writers.get(&to) {
+                Some(s) => s.value().clone(),
                 None => return Err(TransportError::PeerNotFound(to)),
             };
 
-            let rpc = Rpc::new(address, payload);
-            let data = rpc.to_bytes();
+            let rpc = Rpc::new(session.peer_id, from, payload);
+            let plain = rpc.to_raw().to_bytes();
 
-            Self::send_framed(&writer, &data)
+            if plain.len() + 16 > NOISE_MAX_MSG {
+                return Err(TransportError::SendFailed(to));
+            }
+
+            let mut msg = vec![0u8; plain.len() + 16];
+            let msg_len = {
+                let mut st = session.noise.lock().await;
+                st.write_message(&plain, &mut msg)
+                    .map_err(|_| TransportError::SendFailed(to))?
+            };
+
+            let mut w = session.writer.lock().await;
+            write_frame(&mut *w, &msg[..msg_len])
                 .await
                 .map_err(|_| TransportError::SendFailed(to))
         })

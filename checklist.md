@@ -29,13 +29,13 @@ Only items that are complete or partially complete in this codebase are marked.
 
 4. **Define block rules**
    - ✅ Header fields and hashing rule defined.  
-   - 🟡 Block validity: parent tip/height/+1/uniqueness/signatures/data hash checked and chain-id bound; no timestamp bounds; merkle root unused.  
+   - 🟡 Block validity: parent tip/height/+1/uniqueness/signatures/data hash checked and chain-id bound; state_root re-computed during add_block; no timestamp bounds; merkle root unused.  
    - ❌ Block size/gas constraints (`max_txs`, `max_bytes`, `block_gas_limit`) not defined/enforced.  
    - ✅ Deterministic block hash.
 
 5. **Implement the state transition function**
    - ❌ `apply_tx` not implemented.  
-   - ❌ `apply_block` (stateful) not implemented.  
+   - 🟡 `apply_block` effectively executed inside `Blockchain::add_block` via VM overlays with state_root check; still no standalone API, gas/fee rules, or partial failure handling.  
    - ❌ No-state/IO/clock/rand constraints unaddressed.  
    - ❌ No fixed-vector unit tests for state transitions.
 
@@ -58,16 +58,16 @@ Only items that are complete or partially complete in this codebase are marked.
 
 9. **Implement block production**
    - 🟡 Block template assembly: takes mempool insertion order; no fee/gas-based selection; no size/gas limits.  
-   - ❌ Execute `apply_block` (stateful) not present; invalid txs not state-checked.  
+   - 🟡 Blocks execute VM during build to set state_root, but mempool admission is still stateless and lacks gas/fee checks.  
    - ✅ Blocks are signed (validator key).  
    - ✅ Blocks broadcast.  
    - ❌ Block limits (gas/bytes): TODO
 
 10. **Implement networking**
-    - 🟡 Message types now include tx/block plus basic sync (status and block range); no full handshake/version/getheaders/etc.  
-    - 🟡 DoS bounds: vector-length cap only; no max message size per type, rate limits, or timeouts.  
-    - 🟡 Validate before storing: decode + basic stateless checks; minimal.  
-    - ❌ Networking state is coupled with consensus/state logic.
+   - 🟡 Message types now include tx/block plus basic sync (status and block range); no full handshake/version/getheaders/etc.  
+   - 🟡 DoS bounds: vector-length cap plus 16 MiB RPC limit and 30s request timeout; still no per-type limits or rate limits.  
+   - 🟡 Validate before storing: decode + basic stateless checks; minimal.  
+   - ❌ Networking state is coupled with consensus/state logic.
 
 11. **Implement sync**
     - 🟡 Basic block sync via GetStatus/GetBlocks/SendBlocks messages.  

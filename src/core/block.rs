@@ -5,7 +5,7 @@ use crate::crypto::key_pair::{PrivateKey, PublicKey};
 use crate::types::encoding::{Decode, DecodeError, Encode, EncodeSink};
 use crate::types::hash::Hash;
 use crate::types::serializable_signature::SerializableSignature;
-use crate::utils::log::Logger;
+use crate::warn;
 use blockchain_derive::BinaryCodec;
 use std::sync::{Arc, OnceLock};
 
@@ -174,28 +174,25 @@ impl Block {
     /// correct chain, preventing cross-chain replay attacks.
     ///
     /// Logs warnings for any verification failures.
-    pub fn verify(&self, logger: &Logger, chain_id: u64) -> bool {
+    pub fn verify(&self, chain_id: u64) -> bool {
         let hash = self.header_hash(chain_id);
         if !self
             .validator
             .verify(block_sign_data(chain_id, hash).as_slice(), self.signature)
         {
-            logger.warn(&format!("invalid block signature: block={}", hash));
+            warn!("invalid block signature: block={}", hash);
             return false;
         }
 
         for t in &self.transactions {
             if !t.verify(chain_id) {
-                logger.warn(&format!(
-                    "invalid transaction signature in block: block={}",
-                    hash
-                ));
+                warn!("invalid transaction signature in block: block={}", hash);
                 return false;
             }
         }
 
         if Block::data_hash(&self.transactions, chain_id) != self.header.data_hash {
-            logger.warn(&format!("invalid data hash in block: block={}", hash));
+            warn!("invalid data hash in block: block={}", hash);
             return false;
         }
 
@@ -211,10 +208,6 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     const TEST_CHAIN_ID: u64 = 832489;
-
-    fn test_logger() -> Logger {
-        Logger::new("test")
-    }
 
     fn create_header(height: u64) -> Header {
         Header {
@@ -319,14 +312,14 @@ mod tests {
     #[test]
     fn new_creates_verifiable_block() {
         let block = create_block(create_header(1), vec![]);
-        assert!(block.verify(&test_logger(), TEST_CHAIN_ID));
+        assert!(block.verify(TEST_CHAIN_ID));
     }
 
     #[test]
     fn verify_fails_with_wrong_validator() {
         let mut block = Arc::try_unwrap(create_block(create_header(1), vec![])).unwrap();
         block.validator = PrivateKey::new().public_key();
-        assert!(!block.verify(&test_logger(), TEST_CHAIN_ID));
+        assert!(!block.verify(TEST_CHAIN_ID));
     }
 
     #[test]
@@ -336,7 +329,7 @@ mod tests {
 
         let block = create_block(create_header(1), vec![tx]);
         assert_eq!(block.transactions.len(), 1);
-        assert!(block.verify(&test_logger(), TEST_CHAIN_ID));
+        assert!(block.verify(TEST_CHAIN_ID));
     }
 
     #[test]
@@ -346,7 +339,7 @@ mod tests {
 
         let mut block = Arc::try_unwrap(create_block(create_header(1), vec![tx])).unwrap();
         block.header.data_hash = random_hash();
-        assert!(!block.verify(&test_logger(), TEST_CHAIN_ID));
+        assert!(!block.verify(TEST_CHAIN_ID));
     }
 
     #[test]
@@ -359,7 +352,7 @@ mod tests {
         let tampered_tx = Transaction::new(b"tampered".as_slice(), key, TEST_CHAIN_ID);
         block.transactions = vec![tampered_tx].into_boxed_slice();
 
-        assert!(!block.verify(&test_logger(), TEST_CHAIN_ID));
+        assert!(!block.verify(TEST_CHAIN_ID));
     }
 
     #[test]
@@ -374,7 +367,7 @@ mod tests {
         let validator = PrivateKey::new();
         let block = Block::new(header, validator, vec![tx], TEST_CHAIN_ID);
 
-        assert!(!block.verify(&test_logger(), TEST_CHAIN_ID));
+        assert!(!block.verify(TEST_CHAIN_ID));
     }
 
     #[test]
@@ -388,7 +381,7 @@ mod tests {
         let block = Block::new(header, validator, vec![tx1, tx2], TEST_CHAIN_ID);
 
         assert_ne!(block.header.data_hash, Hash::zero());
-        assert!(block.verify(&test_logger(), TEST_CHAIN_ID));
+        assert!(block.verify(TEST_CHAIN_ID));
     }
 
     #[test]
@@ -402,7 +395,7 @@ mod tests {
 
         let block = create_block(create_header(1), txs);
         assert_eq!(block.transactions.len(), 10);
-        assert!(block.verify(&test_logger(), TEST_CHAIN_ID));
+        assert!(block.verify(TEST_CHAIN_ID));
     }
 
     #[test]
@@ -411,6 +404,6 @@ mod tests {
         let validator = PrivateKey::new();
         let block = Block::new(header, validator, vec![], TEST_CHAIN_ID);
 
-        assert!(block.verify(&test_logger(), TEST_CHAIN_ID));
+        assert!(block.verify(TEST_CHAIN_ID));
     }
 }

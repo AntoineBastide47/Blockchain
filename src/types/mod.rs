@@ -8,7 +8,6 @@
 //! and efficient memory layouts.
 
 pub mod address;
-pub mod array;
 pub mod bytes;
 pub mod encoding;
 pub mod hash;

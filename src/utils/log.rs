@@ -1,8 +1,8 @@
-//! Simple logging module.
+//! Simple logging module with macros.
 
-use blockchain_derive::BinaryCodec;
-use std::fmt::{self, Display};
-use std::net::SocketAddr;
+use std::fmt::Display;
+use std::io::Write;
+use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 
 /// Log level for filtering messages.
 #[repr(u8)]
@@ -10,81 +10,16 @@ use std::net::SocketAddr;
 pub enum Level {
     Info = 1,
     Warn = 2,
-    Error = 34,
+    Error = 3,
 }
 
 impl Display for Level {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Level::Info => write!(f, "INFO"),
             Level::Warn => write!(f, "WARN"),
             Level::Error => write!(f, "ERROR"),
         }
-    }
-}
-
-/// Maximum length for logger identifiers.
-pub const LOG_ID_MAX_LEN: usize = 32;
-
-/// Fixed-size logger identifier (max 32 bytes).
-///
-/// Stores UTF-8 data inline without heap allocation. Inputs longer than
-/// 32 bytes are truncated at the nearest valid UTF-8 boundary.
-#[derive(Clone, Copy, BinaryCodec, Debug)]
-pub struct LogId {
-    data: [u8; LOG_ID_MAX_LEN],
-    len: u8,
-}
-
-impl LogId {
-    /// Creates a new LogId from a string slice, truncating if necessary.
-    pub fn new(s: &str) -> Self {
-        let bytes = s.as_bytes();
-        let mut len = bytes.len().min(LOG_ID_MAX_LEN);
-
-        // Truncate at UTF-8 boundary
-        while len > 0 && !s.is_char_boundary(len) {
-            len -= 1;
-        }
-
-        let mut data = [0u8; LOG_ID_MAX_LEN];
-        data[..len].copy_from_slice(&bytes[..len]);
-
-        Self {
-            data,
-            len: len as u8,
-        }
-    }
-
-    /// Returns the identifier as a string slice.
-    #[inline]
-    pub fn as_str(&self) -> &str {
-        std::str::from_utf8(&self.data[..self.len as usize])
-            .expect("LogId invariant violated: invalid UTF-8")
-    }
-}
-
-impl Display for LogId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl From<&str> for LogId {
-    fn from(s: &str) -> Self {
-        Self::new(s)
-    }
-}
-
-impl From<String> for LogId {
-    fn from(s: String) -> Self {
-        Self::new(&s)
-    }
-}
-
-impl From<SocketAddr> for LogId {
-    fn from(value: SocketAddr) -> Self {
-        Self::new(&value.to_string())
     }
 }
 
@@ -104,8 +39,9 @@ fn days_to_date(days: u64) -> (u32, u32, u32) {
     (y as u32, m, d)
 }
 
-/// Internal logging function with optional identifier prefix.
-fn log_with_id(level: Level, id: Option<&str>, message: &str) {
+/// Internal logging function. Use the `info!`, `warn!`, or `error!` macros instead.
+#[doc(hidden)]
+pub fn log(level: Level, message: &str) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
@@ -116,43 +52,57 @@ fn log_with_id(level: Level, id: Option<&str>, message: &str) {
     let mins = (secs / 60) % 60;
     let s = secs % 60;
     let millis = now.subsec_millis();
-    if let Some(id) = id {
-        eprintln!(
-            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03} [{:5}] [{}] {}",
-            year, month, day, hours, mins, s, millis, level, id, message
-        )
+
+    let mut stderr = StandardStream::stderr(ColorChoice::Auto);
+    let mut spec = ColorSpec::new();
+    match level {
+        Level::Warn => {
+            spec.set_fg(Some(Color::Yellow)).set_bold(true);
+        }
+        Level::Error => {
+            spec.set_fg(Some(Color::Red)).set_bold(true);
+        }
+        Level::Info => {
+            spec.clear();
+        }
     }
+    let _ = stderr.set_color(&spec);
+    let _ = writeln!(
+        stderr,
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03} [{:5}] {}",
+        year, month, day, hours, mins, s, millis, level, message
+    );
+    let _ = stderr.reset();
 }
 
-/// Thread-safe logger instance with an identifier prefix.
-///
-/// Each logger instance carries an ID that is prepended to all log messages,
-/// allowing differentiation between multiple components (e.g., server instances).
-#[derive(Clone, Copy)]
-pub struct Logger {
-    pub id: LogId,
+/// Logs an info-level message.
+#[macro_export]
+macro_rules! info {
+    ($($arg:tt)*) => {{
+        if cfg!(not(test)) {
+            $crate::utils::log::log($crate::utils::log::Level::Info, &format!($($arg)*), );
+        }
+    }};
 }
 
-impl Logger {
-    /// Creates a new logger with the given identifier.
-    pub fn new(id: impl Into<LogId>) -> Self {
-        Self { id: id.into() }
-    }
+/// Logs a warning-level message.
+#[macro_export]
+macro_rules! warn {
+    ($($arg:tt)*) => {{
+        if cfg!(not(test)) {
+            $crate::utils::log::log($crate::utils::log::Level::Warn, &format!($($arg)*))
+        }
+    }};
+}
 
-    /// Logs an info-level message.
-    pub fn info(&self, message: &str) {
-        log_with_id(Level::Info, Some(self.id.as_str()), message);
-    }
-
-    /// Logs a warning-level message.
-    pub fn warn(&self, message: &str) {
-        log_with_id(Level::Warn, Some(self.id.as_str()), message);
-    }
-
-    /// Logs an error-level message.
-    pub fn error(&self, message: &str) {
-        log_with_id(Level::Error, Some(self.id.as_str()), message);
-    }
+/// Logs an error-level message.
+#[macro_export]
+macro_rules! error {
+    ($($arg:tt)*) => {{
+        if cfg!(not(test)) {
+            $crate::utils::log::log($crate::utils::log::Level::Error, &format!($($arg)*))
+        }
+    }};
 }
 
 #[cfg(test)]
@@ -170,47 +120,6 @@ mod tests {
         assert_eq!(format!("{}", Level::Info), "INFO");
         assert_eq!(format!("{}", Level::Warn), "WARN");
         assert_eq!(format!("{}", Level::Error), "ERROR");
-    }
-
-    #[test]
-    fn logger_new_with_str() {
-        let logger = Logger::new("test-id");
-        logger.info("test message");
-        assert_eq!(logger.id.as_str(), "test-id");
-    }
-
-    #[test]
-    fn logger_new_with_string() {
-        let id = String::from("string-id");
-        let logger = Logger::new(id);
-        logger.info("test message");
-        assert_eq!(logger.id.as_str(), "string-id");
-    }
-
-    #[test]
-    fn logger_clone() {
-        let logger1 = Logger::new("clone-test");
-        let logger2 = logger1;
-
-        logger1.info("from logger1");
-        logger2.info("from logger2");
-    }
-
-    #[test]
-    fn log_id_truncates_long_input() {
-        let long = "a".repeat(50);
-        let id = LogId::new(&long);
-        assert_eq!(id.as_str().len(), LOG_ID_MAX_LEN);
-    }
-
-    #[test]
-    fn log_id_truncates_at_utf8_boundary() {
-        // 3-byte UTF-8 char repeated, then truncated mid-char
-        let s = "\u{1234}".repeat(12); // 36 bytes total
-        let id = LogId::new(&s);
-        // Should truncate to 30 bytes (10 complete chars)
-        assert_eq!(id.as_str().len(), 30);
-        assert_eq!(id.as_str().chars().count(), 10);
     }
 
     #[test]

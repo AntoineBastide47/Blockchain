@@ -5,17 +5,21 @@
 
 use crate::network::rpc::Rpc;
 use crate::types::bytes::Bytes;
+use crate::types::hash::Hash;
 use crate::types::wrapper_types::BoxFuture;
 use blockchain_derive::Error;
-use std::net::SocketAddr;
+pub use libp2p::Multiaddr;
 use std::sync::Arc;
 use tokio::sync::mpsc::{Receiver, Sender};
+
+/// Stable peer identifier used across transports.
+pub type PeerId = Hash;
 
 /// Implements the `consume` method for transports with a standard rx field.
 #[macro_export]
 macro_rules! impl_transport_consume {
     () => {
-        fn consume(self: &Arc<Self>) -> BoxFuture<'static, Receiver<Rpc>> {
+        fn consume(self: &Arc<Self>) -> BoxFuture<Receiver<Rpc>> {
             let rx = self.rx.clone();
             Box::pin(async move {
                 let mut guard = rx.lock().await;
@@ -38,13 +42,13 @@ pub fn spawn_rpc_forwarder<T: Transport>(transport: Arc<T>, sx: Sender<Rpc>) {
 /// Errors that can occur during transport operations.
 #[derive(Debug, Error)]
 pub enum TransportError {
-    /// Peer with the specified address was not found.
+    /// Peer with the specified identifier was not found.
     #[error("peer not found: {0}")]
-    PeerNotFound(SocketAddr),
-    /// Failed to send message to the specified address.
+    PeerNotFound(PeerId),
+    /// Failed to send message to the specified peer.
     #[error("failed to send message to {0}")]
-    SendFailed(SocketAddr),
-    /// Failed to send message to the specified address.
+    SendFailed(PeerId),
+    /// Failed to send message to the specified peers.
     #[error("failed to broadcast: {0}")]
     BroadcastFailed(String),
 }
@@ -54,55 +58,61 @@ pub enum TransportError {
 /// Implementors provide the underlying mechanism for sending and receiving messages
 /// between network peers in a blockchain network.
 pub trait Transport: Send + Sync + 'static {
-    /// Establishes a bidirectional connection with another in-process transport.
+    /// Initiates a connection to a peer at the given multiaddr.
     ///
-    /// This is a test-only convenience for connecting two transports running
-    /// in the same process. Production code should use address-based connection.
-    fn connect(self: &Arc<Self>, other: &Arc<Self>);
-
-    /// Async version of connect that waits for connection to be established.
-    fn connect_async(self: &Arc<Self>, other: &Arc<Self>) -> BoxFuture<'static, bool> {
-        self.connect(other);
-        Box::pin(async { true })
-    }
+    /// Returns the peer's identifier if connection was established successfully,
+    /// None otherwise.
+    fn connect(self: &Arc<Self>, addr: Multiaddr) -> BoxFuture<Option<PeerId>>;
 
     /// Starts the transport, enabling it to accept connections and forward RPCs.
     fn start(self: &Arc<Self>, sx: Sender<Rpc>);
 
     /// Returns a receiver for incoming RPC messages.
-    fn consume(self: &Arc<Self>) -> BoxFuture<'static, Receiver<Rpc>>;
+    fn consume(self: &Arc<Self>) -> BoxFuture<Receiver<Rpc>>;
 
-    /// Sends a message to a specific address.
+    /// Resolves when the transport is ready to accept inbound connections.
+    fn wait_until_listening(self: &Arc<Self>) -> BoxFuture<()>;
+
+    /// Sends a message to a specific peer.
+    ///
+    /// The `origin` parameter specifies the original sender's peer ID, which is
+    /// encoded in the wire format for proper broadcast loop prevention. When
+    /// originating a message, pass `self.peer_id()`. When re-broadcasting, pass
+    /// the original sender's ID from the received message.
     ///
     /// # Errors
     /// Returns `TransportError::PeerNotFound` if the peer is not connected.
     /// Returns `TransportError::SendFailed` if the send operation fails.
     fn send_message(
         self: &Arc<Self>,
-        to: SocketAddr,
+        to: PeerId,
+        origin: PeerId,
         payload: Bytes,
-    ) -> BoxFuture<'static, Result<(), TransportError>>;
+    ) -> BoxFuture<Result<(), TransportError>>;
 
-    /// Broadcasts data to all connected peers except the sender.
+    /// Broadcasts data to all connected peers except the original sender.
+    ///
+    /// The `origin` peer ID is both excluded from recipients and encoded in the
+    /// wire format so downstream nodes can continue excluding it when re-broadcasting.
     ///
     /// # Errors
     /// Returns a `TransportError` if any peer transmission fails.
     fn broadcast(
         self: &Arc<Self>,
-        from: SocketAddr,
+        origin: PeerId,
         data: Bytes,
-    ) -> BoxFuture<'static, Result<(), TransportError>> {
-        let peers = self.peer_addrs();
+    ) -> BoxFuture<Result<(), TransportError>> {
+        let peers = self.peer_ids();
         let this = self.clone();
 
         Box::pin(async move {
             let mut errors = Vec::new();
-            for addr in peers.iter() {
-                if from == *addr {
+            for peer in peers.iter() {
+                if origin == *peer {
                     continue;
                 }
 
-                if let Err(e) = this.send_message(*addr, data.clone()).await {
+                if let Err(e) = this.send_message(*peer, origin, data.clone()).await {
                     errors.push(e.to_string());
                 }
             }
@@ -114,9 +124,15 @@ pub trait Transport: Send + Sync + 'static {
         })
     }
 
-    /// Returns the local address of this transport.
-    fn addr(self: &Arc<Self>) -> SocketAddr;
+    /// Returns the stable peer identifier for this transport.
+    fn peer_id(self: &Arc<Self>) -> PeerId;
 
-    /// Returns addresses of all connected peers.
-    fn peer_addrs(self: &Arc<Self>) -> Vec<SocketAddr>;
+    /// Returns peer identifiers of all connected peers.
+    fn peer_ids(self: &Arc<Self>) -> Vec<PeerId>;
+
+    /// Returns the local listen address of this transport.
+    fn addr(self: &Arc<Self>) -> Multiaddr;
+
+    /// Disconnects from all connected peers.
+    fn stop(self: &Arc<Self>) -> BoxFuture<()>;
 }

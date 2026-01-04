@@ -7,4 +7,4 @@ use std::pin::Pin;
 ///
 /// Used for trait objects that return futures, enabling async trait methods
 /// without the `async-trait` crate overhead.
-pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;

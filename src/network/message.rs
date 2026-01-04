@@ -5,7 +5,6 @@
 
 use crate::core::block::Block;
 use crate::types::bytes::Bytes;
-use crate::utils::log::LogId;
 use blockchain_derive::BinaryCodec;
 
 /// Discriminant for message payload types.
@@ -52,8 +51,6 @@ impl Message {
 /// of this node's protocol version and chain height.
 #[derive(BinaryCodec, Debug)]
 pub struct SendStatusMessage {
-    /// Node identifier.
-    pub id: LogId,
     /// Protocol version number.
     pub version: u32,
     /// Current blockchain height.
@@ -143,7 +140,6 @@ mod tests {
     #[test]
     fn send_status_message_roundtrip() {
         let msg = SendStatusMessage {
-            id: LogId::new("test-node"),
             version: 42,
             current_height: 1000,
         };
@@ -151,7 +147,6 @@ mod tests {
         let bytes = msg.to_bytes();
         let decoded = SendStatusMessage::from_bytes(&bytes).expect("decode failed");
 
-        assert_eq!(decoded.id.as_str(), "test-node");
         assert_eq!(decoded.version, 42);
         assert_eq!(decoded.current_height, 1000);
     }

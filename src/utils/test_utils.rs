@@ -37,7 +37,6 @@ pub mod utils {
             height: 0,
             timestamp: 0,
             previous_block: Hash::zero(),
-            data_hash: random_hash(),
             merkle_root: Hash::zero(),
             state_root: Hash::zero(),
         };

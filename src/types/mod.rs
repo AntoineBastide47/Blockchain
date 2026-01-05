@@ -11,5 +11,6 @@ pub mod address;
 pub mod bytes;
 pub mod encoding;
 pub mod hash;
+pub mod merkle_tree;
 pub mod serializable_signature;
 pub mod wrapper_types;

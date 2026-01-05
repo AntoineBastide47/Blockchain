@@ -45,12 +45,12 @@ blockchain_derive/  # Procedural macros (BinaryCodec, Error)
 
 ### Data Structures
 
-| Type | Size | Notes |
-| --- | --- | --- |
-| Header | 152 bytes | Version, height, timestamp, previous/data/merkle/state hashes |
-| Hash | 32 bytes | SHA3-256 output |
-| Address | 20 bytes | Derived from public key |
-| PublicKey | 52 bytes | secp256k1 verifying key + cached address |
+| Type | Size      | Notes |
+| --- |-----------| --- |
+| Header | 120 bytes | Version, height, timestamp, previous/merkle/state hashes |
+| Hash | 32 bytes  | SHA3-256 output |
+| Address | 20 bytes  | Derived from public key |
+| PublicKey | 52 bytes  | secp256k1 verifying key + cached address |
 
 > [!WARNING]
 > Sizes and layouts may evolve as the consensus/state model firms up.

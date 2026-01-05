@@ -108,7 +108,6 @@ mod tests {
             height,
             timestamp: 0,
             previous_block: previous,
-            data_hash: random_hash(),
             merkle_root: Hash::zero(),
             state_root: random_hash(),
         };

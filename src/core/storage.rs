@@ -141,7 +141,7 @@ impl Storage for ThreadSafeMemoryStorage {
         let genesis_hash = genesis.header_hash(chain_id);
         let state_root = genesis.header.state_root;
 
-        headers.insert(genesis_hash, genesis.header);
+        headers.insert(genesis_hash, genesis.header.clone());
         blocks.insert(genesis_hash, genesis);
 
         let inner = Inner {
@@ -185,7 +185,7 @@ impl Storage for ThreadSafeMemoryStorage {
 
         let hash = block.header_hash(chain_id);
 
-        inner.headers.insert(hash, block.header);
+        inner.headers.insert(hash, block.header.clone());
         inner.blocks.insert(hash, block);
         inner.tip = hash;
 
@@ -312,7 +312,7 @@ pub mod tests {
         }
 
         fn get_header(&self, hash: Hash) -> Option<Header> {
-            self.headers.get(&hash).copied()
+            self.headers.get(&hash).cloned()
         }
 
         fn get_block(&self, hash: Hash) -> Option<Arc<Block>> {
@@ -373,7 +373,7 @@ pub mod tests {
 
             let hash = block.header_hash(chain_id);
 
-            self.headers.insert(hash, block.header);
+            self.headers.insert(hash, block.header.clone());
             self.blocks.insert(hash, block);
 
             self.tip = hash;
@@ -395,7 +395,6 @@ pub mod tests {
             height,
             timestamp: 0,
             previous_block: previous,
-            data_hash: Hash::zero(),
             merkle_root: Hash::zero(),
             state_root: Hash::zero(),
         };

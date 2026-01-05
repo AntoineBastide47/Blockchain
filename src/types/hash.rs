@@ -20,12 +20,12 @@ impl Hash {
     /// Creates a zero-valued hash (all bytes are 0x00).
     ///
     /// Used as a sentinel value for genesis blocks or uninitialized state.
-    pub fn zero() -> Hash {
+    pub const fn zero() -> Hash {
         Hash([0u8; HASH_LEN])
     }
 
     /// Returns the hash as a byte slice.
-    pub fn as_slice(&self) -> &[u8] {
+    pub const fn as_slice(&self) -> &[u8] {
         &self.0
     }
 

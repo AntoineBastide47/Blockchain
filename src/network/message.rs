@@ -189,7 +189,6 @@ mod tests {
             height,
             timestamp: 1234567890,
             previous_block: previous,
-            data_hash: Hash::zero(),
             merkle_root: Hash::zero(),
             state_root: Hash::zero(),
         };

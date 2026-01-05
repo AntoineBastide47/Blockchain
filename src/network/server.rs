@@ -96,7 +96,6 @@ impl<T: Transport> Server<T> {
             height: 0,
             timestamp: 0,
             previous_block: Hash::zero(),
-            data_hash: Hash::zero(),
             merkle_root: Hash::zero(),
             state_root: Hash::zero(),
         };
@@ -667,7 +666,6 @@ mod tests {
             height: 1,
             timestamp: 1234567890,
             previous_block: Hash::zero(),
-            data_hash: Hash::zero(),
             merkle_root: Hash::zero(),
             state_root: Hash::zero(),
         };

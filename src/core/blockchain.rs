@@ -10,6 +10,7 @@ use crate::crypto::key_pair::PrivateKey;
 use crate::info;
 use crate::types::encoding::Encode;
 use crate::types::hash::Hash;
+use crate::types::merkle_tree::MerkleTree;
 use crate::virtual_machine::errors::VMError;
 use crate::virtual_machine::program::Program;
 use crate::virtual_machine::state::{OverlayState, State};
@@ -103,8 +104,7 @@ impl<V: Validator, S: Storage + StateStore + IterableState + StateViewProvider> 
                 .map(|d| d.as_nanos() as u64)
                 .unwrap_or(0),
             previous_block: self.storage.tip(),
-            data_hash: Hash::zero(),
-            merkle_root: Hash::zero(),
+            merkle_root: MerkleTree::from_transactions(&transactions, self.id),
             state_root: Self::compute_state_root(&self.storage, &overlay),
         };
 
@@ -309,7 +309,6 @@ mod tests {
             height,
             timestamp: 0,
             previous_block: previous,
-            data_hash: random_hash(),
             merkle_root: Hash::zero(),
             state_root: random_hash(),
         }

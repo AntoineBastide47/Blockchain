@@ -97,11 +97,6 @@ impl PublicKey {
         }
     }
 
-    /// Returns the blockchain address derived from this public key.
-    pub fn address(&self) -> Address {
-        self.address
-    }
-
     /// Verifies a Schnorr signature against the given data.
     ///
     /// Returns `true` if the signature is valid, `false` otherwise.
@@ -346,7 +341,7 @@ mod tests {
         let public1 = private1.public_key();
         let public2 = private2.public_key();
 
-        assert_ne!(public1.address(), public2.address());
+        assert_ne!(public1.address, public2.address);
     }
 
     #[test]
@@ -355,7 +350,7 @@ mod tests {
         let public1 = private.public_key();
         let public2 = private.public_key();
 
-        assert_eq!(public1.address(), public2.address());
+        assert_eq!(public1.address, public2.address);
     }
 
     #[test]
@@ -396,7 +391,7 @@ mod tests {
         let key1 = PrivateKey::from_bytes(&bytes).unwrap();
         let key2 = PrivateKey::from_bytes(&bytes).unwrap();
 
-        assert_eq!(key1.public_key().address(), key2.public_key().address());
+        assert_eq!(key1.public_key().address, key2.public_key().address);
     }
 
     #[test]
@@ -422,7 +417,7 @@ mod tests {
         let key1 = PrivateKey::from_bytes(&bytes1).unwrap();
         let key2 = PrivateKey::from_bytes(&bytes2).unwrap();
 
-        assert_ne!(key1.public_key().address(), key2.public_key().address());
+        assert_ne!(key1.public_key().address, key2.public_key().address);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -476,13 +471,13 @@ mod tests {
         let passphrase = b"secure_passphrase_123";
 
         let original_key = PrivateKey::new();
-        let original_address = original_key.public_key().address();
+        let original_address = original_key.public_key().address;
 
         save_encrypted_validator_key(&original_key, &path, passphrase).unwrap();
         assert!(path.exists());
 
         let loaded_key = load_encrypted_validator_key(&path, passphrase).unwrap();
-        let loaded_address = loaded_key.public_key().address();
+        let loaded_address = loaded_key.public_key().address;
 
         assert_eq!(original_address, loaded_address);
     }
@@ -533,8 +528,8 @@ mod tests {
 
         let loaded_key = load_encrypted_validator_key(&path, passphrase).unwrap();
         assert_eq!(
-            original_key.public_key().address(),
-            loaded_key.public_key().address()
+            original_key.public_key().address,
+            loaded_key.public_key().address
         );
     }
 
@@ -549,8 +544,8 @@ mod tests {
 
         let loaded_key = load_encrypted_validator_key(&path, passphrase).unwrap();
         assert_eq!(
-            original_key.public_key().address(),
-            loaded_key.public_key().address()
+            original_key.public_key().address,
+            loaded_key.public_key().address
         );
     }
 
@@ -720,7 +715,7 @@ mod tests {
 
         // Should load key2 with pass2
         let loaded = load_encrypted_validator_key(&path, b"pass2").unwrap();
-        assert_eq!(key2.public_key().address(), loaded.public_key().address());
+        assert_eq!(key2.public_key().address, loaded.public_key().address);
 
         // pass1 should no longer work
         let result = load_encrypted_validator_key(&path, b"pass1");
@@ -785,10 +780,7 @@ mod tests {
         // But both should decrypt to the same key
         let loaded1 = load_encrypted_validator_key(&path1, b"same_passphrase").unwrap();
         let loaded2 = load_encrypted_validator_key(&path2, b"same_passphrase").unwrap();
-        assert_eq!(
-            loaded1.public_key().address(),
-            loaded2.public_key().address()
-        );
+        assert_eq!(loaded1.public_key().address, loaded2.public_key().address);
     }
 
     #[test]
@@ -802,8 +794,8 @@ mod tests {
 
         let loaded_key = load_encrypted_validator_key(&path, &passphrase).unwrap();
         assert_eq!(
-            original_key.public_key().address(),
-            loaded_key.public_key().address()
+            original_key.public_key().address,
+            loaded_key.public_key().address
         );
     }
 
@@ -818,8 +810,8 @@ mod tests {
 
         let loaded_key = load_encrypted_validator_key(&path, &passphrase).unwrap();
         assert_eq!(
-            original_key.public_key().address(),
-            loaded_key.public_key().address()
+            original_key.public_key().address,
+            loaded_key.public_key().address
         );
     }
 }

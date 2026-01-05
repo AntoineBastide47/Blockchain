@@ -738,11 +738,12 @@ mod tests {
     fn handle_rpc_decodes_block_with_truncated_data() {
         let block = create_test_block(vec![]);
         let mut block_bytes = block.to_bytes();
+        let len = block_bytes.len() / 2;
 
         // Truncate the block data
-        block_bytes.truncate(block_bytes.len() / 2);
+        block_bytes.make_mut().truncate(len);
 
-        let msg = Message::new(MessageType::Block, block_bytes);
+        let msg = Message::new(MessageType::Block, block_bytes.to_bytes());
         let msg_bytes = msg.to_bytes();
 
         let rpc = test_rpc(addr(), msg_bytes);

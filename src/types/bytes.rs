@@ -12,11 +12,6 @@ use std::sync::Arc;
 pub struct Bytes(Arc<Vec<u8>>);
 
 impl Bytes {
-    /// Creates an empty byte buffer.
-    pub fn empty() -> Self {
-        Self(Arc::new(Vec::new()))
-    }
-
     /// Creates a new buffer from any type convertible to `Vec<u8>`.
     pub fn new(data: impl Into<Vec<u8>>) -> Self {
         Self(Arc::new(data.into()))
@@ -35,16 +30,6 @@ impl Bytes {
     /// Returns the number of bytes in the buffer.
     pub fn len(&self) -> usize {
         self.0.len()
-    }
-
-    /// Returns the capacity of the underlying vector (allocated byte count)..
-    pub fn capacity(&self) -> usize {
-        self.0.capacity()
-    }
-
-    /// Returns `true` if the buffer contains no bytes.
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
     }
 
     /// Returns the buffer contents as a byte slice.
@@ -67,11 +52,6 @@ impl Bytes {
     /// Appends bytes to the buffer, cloning if necessary.
     pub fn extend_from_slice(&mut self, s: &[u8]) {
         self.make_mut().extend_from_slice(s);
-    }
-
-    /// Truncates the buffer to the specified length, cloning if necessary.
-    pub fn truncate(&mut self, len: usize) {
-        self.make_mut().truncate(len);
     }
 }
 

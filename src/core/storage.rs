@@ -126,13 +126,6 @@ pub struct ThreadSafeMemoryStorage {
     inner: Mutex<Inner>,
 }
 
-impl ThreadSafeMemoryStorage {
-    /// Returns a read-only view of the current state for VM execution.
-    pub fn state_view(&self) -> StateView<'_, Self> {
-        StateView { storage: self }
-    }
-}
-
 impl Storage for ThreadSafeMemoryStorage {
     fn new(genesis: Arc<Block>, chain_id: u64) -> Self {
         let mut headers = HashMap::new();

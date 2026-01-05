@@ -131,6 +131,7 @@ pub trait Transport: Send + Sync + 'static {
     fn peer_ids(self: &Arc<Self>) -> Vec<PeerId>;
 
     /// Returns the local listen address of this transport.
+    #[cfg(test)]
     fn addr(self: &Arc<Self>) -> Multiaddr;
 
     /// Disconnects from all connected peers.

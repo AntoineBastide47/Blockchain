@@ -45,13 +45,6 @@ pub struct Program {
 }
 
 impl Program {
-    /// Creates a new program from pre-assembled components.
-    pub(crate) fn new(strings: Vec<String>, bytecode: Vec<u8>) -> Program {
-        Self { strings, bytecode }
-    }
-}
-
-impl Program {
     /// Serializes the program to a portable binary format.
     ///
     /// The output includes a magic header and version for compatibility checking.
@@ -97,8 +90,15 @@ impl Program {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
+
+    impl Program {
+        /// Creates a new program from pre-assembled components.
+        pub(crate) fn new(strings: Vec<String>, bytecode: Vec<u8>) -> Program {
+            Self { strings, bytecode }
+        }
+    }
 
     #[test]
     fn roundtrip_empty_program() {

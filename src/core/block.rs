@@ -253,7 +253,7 @@ mod tests {
     fn test_header_decode_insufficient_data() {
         let header = create_header(3, &[]);
         let mut buf = header.to_bytes();
-        buf.truncate(50);
+        buf.make_mut().truncate(50);
 
         let result = Header::from_bytes(buf.as_slice());
         assert!(result.is_err(), "Should fail with insufficient data");

@@ -5,12 +5,6 @@ use k256::schnorr::Signature;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SerializableSignature(pub Signature);
 
-impl SerializableSignature {
-    pub fn new(sig: Signature) -> Self {
-        SerializableSignature(sig)
-    }
-}
-
 impl From<Signature> for SerializableSignature {
     fn from(sig: Signature) -> Self {
         SerializableSignature(sig)

@@ -1079,6 +1079,7 @@ impl BlockchainTransport for Libp2pTransport {
             .collect()
     }
 
+    #[cfg(test)]
     fn addr(self: &Arc<Self>) -> Multiaddr {
         self.listen_address.clone()
     }

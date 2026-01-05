@@ -427,7 +427,6 @@ mod tests {
         let bytes = data.to_bytes();
         // Vec encodes as: 8-byte length + elements
         assert_eq!(bytes.len(), 8 + 5);
-        assert_eq!(bytes.capacity(), bytes.len());
     }
 
     // ========== Integer Tests ==========

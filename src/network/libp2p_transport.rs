@@ -3,35 +3,17 @@
 //! Provides encrypted, authenticated peer-to-peer messaging using libp2p's
 //! modular networking stack with Noise protocol authentication and Yamux multiplexing.
 //!
-//! # Architecture
-//!
-//! ```text
-//!     ┌─────────────────────────────────────────────────────────────────┐
-//!     │                     Libp2pTransport                             │
-//!     └─────────────────────────────────────────────────────────────────┘
-//!                                    │
-//!                                    ▼
-//!     ┌─────────────────────────────────────────────────────────────────┐
-//!     │                      libp2p Swarm                               │
-//!     │  ┌──────────────────────────────────────────────────────────┐   │
-//!     │  │                  RpcBehaviour                            │   │
-//!     │  │  ┌─────────────────┐  ┌─────────────────────────────┐    │   │
-//!     │  │  │ request_response│  │        identify             │    │   │
-//!     │  │  └─────────────────┘  └─────────────────────────────┘    │   │
-//!     │  └──────────────────────────────────────────────────────────┘   │
-//!     │                           │                                     │
-//!     │  ┌────────────────────────┴────────────────────────────────┐    │
-//!     │  │              Transport Layer                            │    │
-//!     │  │  TCP + Noise XX + Yamux                                 │    │
-//!     │  └─────────────────────────────────────────────────────────┘    │
-//!     └─────────────────────────────────────────────────────────────────┘
-//! ```
-//!
 //! # Peer Identity
 //!
 //! Peer IDs are derived from the libp2p identity keypair using SHA3, matching
 //! the existing `Hash` type used throughout the codebase. The mapping between
 //! `libp2p::PeerId` and `SocketAddr` is maintained bidirectionally.
+//!
+//! # Persistence and Testing
+//!
+//! Node keys and locks are stored under `~/.blockchain/{chain_id}/{node_name}` in
+//! production. Tests redirect this storage to a shared `tempfile::TempDir`, keeping
+//! test runs isolated from the real home directory and cleaning up automatically.
 
 use crate::impl_transport_consume;
 use crate::network::rpc::{RawRpc, Rpc};
@@ -101,6 +83,7 @@ const DERIVED_KEY_LEN: usize = 32;
 ///
 /// The path is `~/.blockchain/{chain_id}/{node_name}/`.
 /// Creates the directory if it doesn't exist.
+#[cfg(not(test))]
 fn node_data_dir(chain_id: u64, node_name: &str) -> io::Result<PathBuf> {
     let home = dirs::home_dir()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory not found"))?;
@@ -108,6 +91,25 @@ fn node_data_dir(chain_id: u64, node_name: &str) -> io::Result<PathBuf> {
         .join(".blockchain")
         .join(chain_id.to_string())
         .join(node_name);
+    fs::create_dir_all(&node_dir)?;
+    Ok(node_dir)
+}
+
+/// Test-only variant that isolates filesystem writes to a temporary directory.
+#[cfg(test)]
+fn node_data_dir(chain_id: u64, node_name: &str) -> io::Result<PathBuf> {
+    use std::sync::{Mutex as StdMutex, OnceLock};
+    use tempfile::TempDir;
+
+    static TEST_DATA_DIR: OnceLock<StdMutex<TempDir>> = OnceLock::new();
+
+    let temp_dir = TEST_DATA_DIR
+        .get_or_init(|| StdMutex::new(tempfile::tempdir().expect("create test data dir")))
+        .lock()
+        .expect("test data dir mutex poisoned");
+
+    let base = temp_dir.path().join(".blockchain");
+    let node_dir = base.join(chain_id.to_string()).join(node_name);
     fs::create_dir_all(&node_dir)?;
     Ok(node_dir)
 }

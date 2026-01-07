@@ -4,7 +4,6 @@
 
 use crate::core::block::{Block, Header};
 use crate::core::blockchain::Blockchain;
-use crate::core::storage::{StorageError, ThreadSafeMemoryStorage};
 use crate::core::transaction::Transaction;
 use crate::core::validator::BlockValidator;
 use crate::crypto::key_pair::PrivateKey;
@@ -13,7 +12,9 @@ use crate::network::message::{
 };
 use crate::network::rpc::{DecodedMessage, DecodedMessageData, Rpc, RpcError, RpcProcessor};
 use crate::network::transport::{Multiaddr, PeerId, Transport, TransportError};
-use crate::network::txpool::TxPool;
+use crate::storage::main_storage::MainStorage;
+use crate::storage::storage_trait::StorageError;
+use crate::storage::txpool::TxPool;
 use crate::types::bytes::Bytes;
 use crate::types::encoding::{Decode, Encode};
 use crate::types::hash::Hash;
@@ -40,7 +41,7 @@ const GENESIS_PRIVATE_KEY_BYTES: [u8; 32] = [
     0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
 ];
 
-/// Errors produced by the server while handling RPCs and state updates.
+/// Errors produced by the server while handling RPCs and storage updates.
 #[derive(Debug, blockchain_derive::Error)]
 pub enum ServerError {
     /// Transaction signature or format failed verification.
@@ -84,8 +85,8 @@ pub struct Server<T: Transport> {
     is_validator: bool,
     /// Pool of pending transactions awaiting inclusion in a block.
     tx_pool: TxPool,
-    /// The local blockchain state with block validation and persistent storage.
-    chain: Blockchain<BlockValidator, ThreadSafeMemoryStorage>,
+    /// The local blockchain storage with block validation and persistent storage.
+    chain: Blockchain<BlockValidator, MainStorage>,
 }
 
 impl<T: Transport> Server<T> {
@@ -189,7 +190,7 @@ impl<T: Transport> Server<T> {
             self.block_time.as_secs()
         );
 
-        // Consume the initial ticker state to force a wait period on startup
+        // Consume the initial ticker storage to force a wait period on startup
         ticker.tick().await;
 
         loop {
@@ -201,7 +202,7 @@ impl<T: Transport> Server<T> {
     /// Connects to a peer at the given address and initiates the handshake protocol.
     ///
     /// Establishes transport-level connection, then sends a GetStatus message
-    /// to synchronize chain state if needed. Returns the peer's identifier.
+    /// to synchronize chain storage if needed. Returns the peer's identifier.
     pub async fn connect(self: &Arc<Self>, addr: Multiaddr) -> Result<PeerId, ServerError> {
         let peer_id = self.transport.connect(addr).await.ok_or_else(|| {
             ServerError::Transport(TransportError::BroadcastFailed("connection failed".into()))

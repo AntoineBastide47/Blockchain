@@ -34,7 +34,7 @@ impl Value {
     }
 }
 
-/// Register file holding VM state.
+/// Register file holding VM storage.
 ///
 /// Provides 256 registers, each capable of storing a single [`Value`].
 /// Registers are lazily initialized (start as `None`).
@@ -146,7 +146,7 @@ macro_rules! exec_vm {
         }
     }};
 
-    // Handler with state and chain_id (semicolon separator)
+    // Handler with storage and chain_id (semicolon separator)
     (@call $vm:ident, $state:ident, $ctx:ident, $handler:ident,
         (state, ctx; $( $field:ident : $kind:ident ),* $(,)? )
     ) => {{
@@ -154,7 +154,7 @@ macro_rules! exec_vm {
         $vm.$handler($state, $ctx, $( $field ),*)
     }};
 
-    // Handler without state (no semicolon)
+    // Handler without storage (no semicolon)
     (@call $vm:ident, $state:ident, $ctx:ident, $handler:ident,
         ( $( $field:ident : $kind:ident ),* $(,)? )
     ) => {{
@@ -187,11 +187,11 @@ macro_rules! exec_vm {
 
 /// Execution context passed to the VM during contract execution.
 ///
-/// Contains chain and contract identifiers used to namespace state keys.
+/// Contains chain and contract identifiers used to namespace storage keys.
 pub struct ExecContext<'a> {
-    /// Chain identifier for state key derivation.
+    /// Chain identifier for storage key derivation.
     pub chain_id: u64,
-    /// Contract identifier for state key derivation.
+    /// Contract identifier for storage key derivation.
     pub contract_id: &'a [u8],
 }
 
@@ -316,7 +316,7 @@ impl VM {
         }
     }
 
-    /// Derives a unique state key from chain ID, contract ID, and user-provided key.
+    /// Derives a unique storage key from chain ID, contract ID, and user-provided key.
     ///
     /// The key is hashed to ensure uniform distribution and prevent collisions
     /// between different contracts or chains.

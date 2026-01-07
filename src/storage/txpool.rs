@@ -101,9 +101,8 @@ impl TxPool {
 
 #[cfg(test)]
 mod tests {
-    use crate::core::transaction::Transaction;
+    use super::*;
     use crate::crypto::key_pair::PrivateKey;
-    use crate::network::txpool::TxPool;
 
     const TEST_CHAIN_ID: u64 = 284528;
 

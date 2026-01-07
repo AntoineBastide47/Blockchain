@@ -43,6 +43,7 @@ use zeroize::Zeroizing;
 mod core;
 mod crypto;
 mod network;
+mod storage;
 mod types;
 mod utils;
 mod virtual_machine;

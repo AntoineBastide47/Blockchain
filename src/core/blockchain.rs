@@ -1,13 +1,13 @@
 //! Core blockchain data structure and block management.
 
 use crate::core::block::{Block, Header};
-use crate::core::storage::{
-    IterableState, StateStore, StateViewProvider, Storage, StorageError, ThreadSafeMemoryStorage,
-};
 use crate::core::transaction::Transaction;
 use crate::core::validator::{BlockValidator, Validator};
 use crate::crypto::key_pair::PrivateKey;
 use crate::info;
+use crate::storage::main_storage::MainStorage;
+use crate::storage::state::{IterableState, StateStore, StateViewProvider};
+use crate::storage::storage_trait::{Storage, StorageError};
 use crate::types::encoding::Encode;
 use crate::types::hash::Hash;
 use crate::types::merkle_tree::MerkleTree;
@@ -30,7 +30,7 @@ pub struct Blockchain<V: Validator, S: Storage + StateStore + IterableState + St
     storage: S,
 }
 
-impl Blockchain<BlockValidator, ThreadSafeMemoryStorage> {
+impl Blockchain<BlockValidator, MainStorage> {
     /// Creates a new blockchain with default validator and in-memory storage.
     ///
     /// The `id` parameter is the chain identifier used for transaction signing
@@ -45,7 +45,7 @@ impl Blockchain<BlockValidator, ThreadSafeMemoryStorage> {
 
         Self {
             id,
-            storage: ThreadSafeMemoryStorage::new(genesis, id),
+            storage: MainStorage::new(genesis, id),
             validator: BlockValidator,
         }
     }
@@ -161,13 +161,13 @@ impl<V: Validator, S: Storage + StateStore + IterableState + StateViewProvider> 
             }
         }
 
-        // Compute expected post-state root deterministically
+        // Compute expected post-storage root deterministically
         let computed_root = Self::compute_state_root(&self.storage, &block_overlay);
         if computed_root != block.header.state_root {
             return Err(StorageError::ValidationFailed("state_root mismatch".into()));
         }
 
-        // Commit writes to canonical state store
+        // Commit writes to canonical storage store
         self.storage.apply_batch(block_overlay.into_writes());
         self.storage.set_state_root(computed_root);
 
@@ -180,10 +180,10 @@ impl<V: Validator, S: Storage + StateStore + IterableState + StateViewProvider> 
         // Materialize into deterministic map
         let mut m: BTreeMap<Hash, Vec<u8>> = BTreeMap::new();
 
-        // Dev-only: you need an iterator for base state.
+        // Dev-only: you need an iterator for base storage.
         // In memory you can expose it; for production you replace this with an SMT.
         for (k, v) in base.iter_all() {
-            // add iter_all only to dev state
+            // add iter_all only to dev storage
             m.insert(k, v);
         }
 
@@ -213,8 +213,8 @@ impl<V: Validator, S: Storage + StateStore + IterableState + StateViewProvider> 
 mod tests {
     use super::*;
     use crate::core::block::Header;
-    use crate::core::storage::tests::{StorageExtForTests, TestStorage};
     use crate::crypto::key_pair::PrivateKey;
+    use crate::storage::test_storage::test::{StorageExtForTests, TestStorage};
     use crate::types::hash::Hash;
     use crate::utils::test_utils::utils::{create_genesis, random_hash};
     use crate::warn;

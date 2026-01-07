@@ -19,7 +19,7 @@ pub struct Hash(pub [u8; HASH_LEN]);
 impl Hash {
     /// Creates a zero-valued hash (all bytes are 0x00).
     ///
-    /// Used as a sentinel value for genesis blocks or uninitialized state.
+    /// Used as a sentinel value for genesis blocks or uninitialized storage.
     pub const fn zero() -> Hash {
         Hash([0u8; HASH_LEN])
     }
@@ -57,7 +57,7 @@ pub struct HashBuilder {
 }
 
 impl HashBuilder {
-    /// Creates a new hash builder with empty state.
+    /// Creates a new hash builder with empty storage.
     pub fn new() -> Self {
         Self {
             hasher: Sha3_256::new(),

@@ -4,7 +4,7 @@
 //! and [`BlockValidator`] as the default implementation.
 
 use crate::core::block::Block;
-use crate::core::storage::Storage;
+use crate::storage::storage_trait::Storage;
 use blockchain_derive::Error;
 use std::error::Error;
 use std::fmt::Debug;
@@ -15,12 +15,12 @@ use std::fmt::Debug;
 pub trait Validator: Send + Sync {
     type Error: Debug + Error;
 
-    /// Validates a block against the current chain state.
+    /// Validates a block against the current chain storage.
     ///
     /// # Arguments
     ///
     /// * `block` - The block to validate.
-    /// * `storage` - Current chain state for context.
+    /// * `storage` - Current chain storage for context.
     /// * `logger` - Logger for validation messages.
     /// * `chain_id` - Chain identifier for transaction signature verification.
     ///
@@ -94,8 +94,9 @@ impl Validator for BlockValidator {
 mod tests {
     use super::*;
     use crate::core::block::{Block, Header};
-    use crate::core::storage::{StorageError, tests::TestStorage};
     use crate::crypto::key_pair::PrivateKey;
+    use crate::storage::storage_trait::StorageError;
+    use crate::storage::test_storage::test::TestStorage;
     use crate::types::hash::Hash;
     use crate::utils::test_utils::utils::{create_genesis, random_hash};
     use std::sync::Arc;

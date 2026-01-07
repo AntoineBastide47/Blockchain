@@ -26,7 +26,7 @@ pub struct Header {
     pub previous_block: Hash,
     /// Root of merkle tree of transactions
     pub merkle_root: Hash,
-    /// Root hash of the VM state after executing all transactions in this block
+    /// Root hash of the VM storage after executing all transactions in this block
     pub state_root: Hash,
 }
 
@@ -56,7 +56,7 @@ fn block_sign_data(chain_id: u64, hash: &Hash) -> Vec<u8> {
     buf
 }
 
-/// Intermediate block state before signing.
+/// Intermediate block storage before signing.
 ///
 /// Used during block construction to hold all block data before
 /// the validator signature is computed and attached.

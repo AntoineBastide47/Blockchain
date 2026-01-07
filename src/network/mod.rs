@@ -9,4 +9,3 @@ pub mod message;
 pub mod rpc;
 pub mod server;
 pub mod transport;
-pub mod txpool;

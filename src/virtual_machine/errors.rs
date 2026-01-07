@@ -55,10 +55,10 @@ pub enum VMError {
     /// Failed to decode program bytecode.
     #[error("decoding error: {0}")]
     DecodeError(String),
-    /// Key not found in state storage.
-    #[error("key not found in state: {0}")]
+    /// Key not found in storage storage.
+    #[error("key not found in storage: {0}")]
     KeyNotFound(String),
     /// State value has invalid format for the expected type.
-    #[error("invalid state value format")]
+    #[error("invalid storage value format")]
     InvalidStateValue,
 }

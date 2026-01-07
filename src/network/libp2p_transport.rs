@@ -925,7 +925,7 @@ impl SwarmEventLoop {
     /// Executes a command received from [`Libp2pTransport`].
     ///
     /// Each command variant triggers the corresponding swarm operation and
-    /// registers any necessary tracking state for async completion.
+    /// registers any necessary tracking storage for async completion.
     async fn handle_command(&mut self, cmd: SwarmCommand) {
         match cmd {
             SwarmCommand::Dial { addr, done } => {

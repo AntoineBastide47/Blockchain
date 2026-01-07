@@ -1,13 +1,13 @@
-//! VM state management and overlay abstractions.
+//! VM storage management and overlay abstractions.
 //!
-//! Provides traits and types for managing blockchain state during VM execution.
+//! Provides traits and types for managing blockchain storage during VM execution.
 //! The [`State`] trait defines the interface for key-value storage, while
 //! [`OverlayState`] enables transactional writes that can be committed or discarded.
 
 use crate::types::hash::Hash;
 use std::collections::BTreeMap;
 
-/// Key-value state interface for VM execution.
+/// Key-value storage interface for VM execution.
 ///
 /// Implementations provide persistent storage that the VM reads from and writes to
 /// during smart contract execution. Keys are always hashes to ensure uniform
@@ -21,20 +21,20 @@ pub trait State {
     fn delete(&mut self, key: Hash);
 }
 
-/// Write-through overlay on top of a base state.
+/// Write-through overlay on top of a base storage.
 ///
-/// Buffers writes in memory while reading through to the base state for keys
+/// Buffers writes in memory while reading through to the base storage for keys
 /// not yet written. Enables transactional execution where writes can be
 /// committed atomically or discarded on error.
 pub struct OverlayState<'a> {
-    /// Underlying state for read-through on cache misses.
+    /// Underlying storage for read-through on cache misses.
     _base: &'a dyn State,
     /// Pending writes: `Some(value)` for insertions, `None` for deletions.
     pub(crate) writes: BTreeMap<Hash, Option<Vec<u8>>>,
 }
 
 impl<'a> OverlayState<'a> {
-    /// Creates a new overlay backed by the given base state.
+    /// Creates a new overlay backed by the given base storage.
     pub fn new(base: &'a dyn State) -> Self {
         Self {
             _base: base,

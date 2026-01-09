@@ -22,7 +22,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// The main blockchain structure holding headers and validation logic.
 ///
 /// Generic over validator and storage types for zero-cost abstraction.
-pub struct Blockchain<V: Validator, S: Storage + IterableState + StateViewProvider> {
+pub struct Blockchain<
+    V: Validator,
+    S: Storage + VmStorage + AccountStorage + IterableState + StateViewProvider,
+> {
     /// Chain identifier.
     pub id: u64,
     /// Block validator for consensus rules.
@@ -141,6 +144,10 @@ impl<V: Validator, S: Storage + VmStorage + AccountStorage + IterableState + Sta
 
         // Run VM code
         for tx in &block.transactions {
+            self.validator
+                .validate_tx(tx, &self.storage, self.id)
+                .map_err(|e| StorageError::ValidationFailed(e.to_string()))?;
+
             let program = Program::from_bytes(tx.data.as_slice())
                 .map_err(|e| StorageError::VMError(e.to_string()))?;
             let mut vm = VM::new(program);
@@ -218,7 +225,9 @@ mod tests {
     use crate::core::block::Header;
     use crate::crypto::key_pair::PrivateKey;
     use crate::storage::test_storage::test::{StorageExtForTests, TestStorage};
+    use crate::types::bytes::Bytes;
     use crate::types::hash::Hash;
+    use crate::types::merkle_tree::MerkleTree;
     use crate::utils::test_utils::utils::{create_genesis, random_hash};
     use crate::warn;
     use blockchain_derive::Error;
@@ -228,7 +237,7 @@ mod tests {
     /// Creates a new blockchain with custom validator and storage.
     pub fn with_validator_and_storage<
         V: Validator,
-        S: Storage + VmStorage + IterableState + StateViewProvider,
+        S: Storage + VmStorage + IterableState + StateViewProvider + AccountStorage,
     >(
         id: u64,
         validator: V,
@@ -288,6 +297,16 @@ mod tests {
     struct AcceptAllValidator;
     impl Validator for AcceptAllValidator {
         type Error = TestError;
+
+        fn validate_tx<S: AccountStorage>(
+            &self,
+            _transaction: &Transaction,
+            _storage: &S,
+            _chain_id: u64,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
         fn validate_block<S: Storage>(
             &self,
             _block: &Block,
@@ -301,6 +320,16 @@ mod tests {
     struct RejectAllValidator;
     impl Validator for RejectAllValidator {
         type Error = TestError;
+
+        fn validate_tx<S: AccountStorage>(
+            &self,
+            _transaction: &Transaction,
+            _storage: &S,
+            _chain_id: u64,
+        ) -> Result<(), Self::Error> {
+            Err(TestError::Dummy)
+        }
+
         fn validate_block<S: Storage>(
             &self,
             _block: &Block,
@@ -393,5 +422,55 @@ mod tests {
         let block = bc.build_block(PrivateKey::new(), vec![]).expect("VMError:");
         assert!(add_block_mut(&mut bc, block).is_ok());
         assert_eq!(bc.height(), block_count + 1);
+    }
+
+    #[test]
+    fn add_block_rejects_when_validator_rejects_tx() {
+        #[derive(Debug, Error)]
+        enum TxError {
+            #[error("tx rejected")]
+            Rejected,
+        }
+
+        struct RejectingTxValidator;
+        impl Validator for RejectingTxValidator {
+            type Error = TxError;
+            fn validate_tx<S: AccountStorage>(
+                &self,
+                _transaction: &Transaction,
+                _storage: &S,
+                _chain_id: u64,
+            ) -> Result<(), Self::Error> {
+                Err(TxError::Rejected)
+            }
+            fn validate_block<S: Storage>(
+                &self,
+                _block: &Block,
+                _storage: &S,
+                _chain_id: u64,
+            ) -> Result<(), Self::Error> {
+                Ok(())
+            }
+        }
+
+        let genesis = create_genesis(TEST_CHAIN_ID);
+        let storage = TestStorage::new(genesis.clone(), TEST_CHAIN_ID);
+        let bc = with_validator_and_storage(TEST_CHAIN_ID, RejectingTxValidator, storage);
+
+        let tx = Transaction::builder(Bytes::new(b"any"), PrivateKey::new(), TEST_CHAIN_ID).build();
+        let header = Header {
+            version: 1,
+            height: 1,
+            timestamp: 0,
+            previous_block: genesis.header_hash(TEST_CHAIN_ID),
+            merkle_root: MerkleTree::from_transactions(std::slice::from_ref(&tx), TEST_CHAIN_ID),
+            state_root: random_hash(),
+        };
+        let block = Block::new(header, PrivateKey::new(), vec![tx], TEST_CHAIN_ID);
+
+        assert!(matches!(
+            bc.add_block(block),
+            Err(StorageError::ValidationFailed(_))
+        ));
     }
 }

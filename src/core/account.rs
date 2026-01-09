@@ -47,10 +47,12 @@ impl Account {
         self.nonce
     }
 
+    /// Returns true if this account holds contract code.
     pub fn is_contract(&self) -> bool {
         self.code_hash != Self::EMPTY_CODE_HASH
     }
 
+    /// Computes (and caches) a chain-specific hash of the encoded account value.
     pub fn value_hash(&self, chain_id: u64) -> Hash {
         self.cached_hash.get_or_compute(chain_id, || {
             let mut h = Hash::sha3();

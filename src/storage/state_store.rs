@@ -19,8 +19,11 @@ pub trait StateStore: Send + Sync {
 }
 
 pub trait AccountStorage: StateStore {
+    /// Fetches the full account state for an address.
     fn get_account(&self, addr: Address) -> Option<Account>;
+    /// Writes or overwrites the account state for an address.
     fn set_account(&mut self, addr: Address, account: Account);
+    /// Removes an account and its state.
     fn delete_account(&mut self, addr: Address);
 }
 

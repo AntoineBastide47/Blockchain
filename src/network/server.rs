@@ -571,6 +571,10 @@ mod tests {
         SocketAddr::from(([127, 0, 0, 1], alloc_port()))
     }
 
+    fn build_tx(data: &[u8], key: PrivateKey) -> Transaction {
+        Transaction::builder(Bytes::new(data), key, TEST_CHAIN_ID).build()
+    }
+
     #[tokio::test]
     async fn server_is_validator_when_private_key_set() {
         let transport = LocalTransport::new(addr());
@@ -625,7 +629,7 @@ mod tests {
     fn handle_rpc_decodes_valid_transaction() {
         let sender = addr();
         let key = PrivateKey::new();
-        let tx = Transaction::new(b"test data".as_slice(), key, TEST_CHAIN_ID);
+        let tx = build_tx(b"test data", key);
         let tx_bytes = tx.to_bytes();
 
         let msg = Message::new(MessageType::Transaction, tx_bytes);
@@ -711,8 +715,8 @@ mod tests {
     #[test]
     fn handle_rpc_preserves_block_transactions() {
         let key = PrivateKey::new();
-        let tx1 = Transaction::new(b"tx1".as_slice(), key.clone(), TEST_CHAIN_ID);
-        let tx2 = Transaction::new(b"tx2".as_slice(), key, TEST_CHAIN_ID);
+        let tx1 = build_tx(b"tx1", key.clone());
+        let tx2 = build_tx(b"tx2", key);
         let tx1_hash = tx1.id(TEST_CHAIN_ID);
         let tx2_hash = tx2.id(TEST_CHAIN_ID);
 

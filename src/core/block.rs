@@ -163,11 +163,16 @@ impl Block {
 mod tests {
     use super::*;
     use crate::crypto::key_pair::PrivateKey;
+    use crate::types::bytes::Bytes;
     use crate::types::encoding::Decode;
     use crate::utils::test_utils::utils::random_hash;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     const TEST_CHAIN_ID: u64 = 832489;
+
+    fn build_tx(data: &[u8], key: PrivateKey) -> Transaction {
+        Transaction::builder(Bytes::new(data), key, TEST_CHAIN_ID).build()
+    }
 
     fn create_header(height: u64, transactions: &[Transaction]) -> Header {
         Header {
@@ -282,7 +287,7 @@ mod tests {
     #[test]
     fn new_with_transactions() {
         let key = PrivateKey::new();
-        let tx = Transaction::new(b"data".as_slice(), key, TEST_CHAIN_ID);
+        let tx = build_tx(b"data", key);
 
         let block = create_block(create_header(1, std::slice::from_ref(&tx)), vec![tx]);
         assert_eq!(block.transactions.len(), 1);
@@ -292,7 +297,7 @@ mod tests {
     #[test]
     fn verify_fails_with_tampered_merkle_root() {
         let key = PrivateKey::new();
-        let tx = Transaction::new(b"data".as_slice(), key, TEST_CHAIN_ID);
+        let tx = build_tx(b"data", key);
 
         let mut block = Arc::try_unwrap(create_block(
             create_header(1, std::slice::from_ref(&tx)),
@@ -306,7 +311,7 @@ mod tests {
     #[test]
     fn verify_fails_with_tampered_transaction() {
         let key = PrivateKey::new();
-        let tx = Transaction::new(b"original".as_slice(), key.clone(), TEST_CHAIN_ID);
+        let tx = build_tx(b"original", key.clone());
 
         let mut block = Arc::try_unwrap(create_block(
             create_header(1, std::slice::from_ref(&tx)),
@@ -314,7 +319,7 @@ mod tests {
         ))
         .unwrap();
 
-        let tampered_tx = Transaction::new(b"tampered".as_slice(), key, TEST_CHAIN_ID);
+        let tampered_tx = build_tx(b"tampered", key);
         block.transactions = vec![tampered_tx].into_boxed_slice();
 
         assert!(!block.verify(TEST_CHAIN_ID));
@@ -325,7 +330,7 @@ mod tests {
         let key1 = PrivateKey::new();
         let key2 = PrivateKey::new();
 
-        let mut tx = Transaction::new(b"data".as_slice(), key1, TEST_CHAIN_ID);
+        let mut tx = build_tx(b"data", key1);
         tx.from = key2.public_key();
 
         let header = create_header(1, std::slice::from_ref(&tx));
@@ -338,8 +343,8 @@ mod tests {
     #[test]
     fn new_computes_merkle_root_from_transactions() {
         let key = PrivateKey::new();
-        let tx1 = Transaction::new(b"tx1".as_slice(), key.clone(), TEST_CHAIN_ID);
-        let tx2 = Transaction::new(b"tx2".as_slice(), key, TEST_CHAIN_ID);
+        let tx1 = build_tx(b"tx1", key.clone());
+        let tx2 = build_tx(b"tx2", key);
 
         let header = create_header(1, &[tx1.clone(), tx2.clone()]);
         let validator = PrivateKey::new();
@@ -354,7 +359,7 @@ mod tests {
         let mut txs = Vec::new();
         for i in 0..10 {
             let key = PrivateKey::new();
-            let tx = Transaction::new(format!("tx{}", i).as_bytes(), key, TEST_CHAIN_ID);
+            let tx = build_tx(format!("tx{}", i).as_bytes(), key);
             txs.push(tx);
         }
 

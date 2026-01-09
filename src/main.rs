@@ -205,7 +205,15 @@ async fn main() {
                 "#;
                 let data = assemble_source(source).expect("assembly failed").to_bytes();
 
-                let tx = Transaction::new(data, PrivateKey::new(), DEV_CHAIN_ID);
+                // Build a fully populated transaction for the demo.
+                let tx = Transaction::builder(data, PrivateKey::new(), DEV_CHAIN_ID)
+                    .with_recipient(PrivateKey::new().public_key().address())
+                    .with_amount(1_000)
+                    .with_fee(10)
+                    .with_gas_price(1)
+                    .with_gas_limit(50_000)
+                    .with_nonce(counter)
+                    .build();
                 let msg = Message::new(MessageType::Transaction, tx.to_bytes());
 
                 if let Err(e) = server_for_txs.add_to_pool(tx) {

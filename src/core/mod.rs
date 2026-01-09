@@ -8,6 +8,7 @@
 //! All structures use memory-efficient representations tuned for blockchain
 //! validation and storage requirements.
 
+pub mod account;
 pub mod block;
 pub mod blockchain;
 pub mod transaction;

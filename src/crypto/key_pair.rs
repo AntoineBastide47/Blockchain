@@ -1,8 +1,11 @@
 //! Schnorr signature key pairs on secp256k1.
+//!
+//! Addresses are domain-separated SHA3-256 hashes of verifying keys and are
+//! kept as full 32-byte values (no truncation).
 
 use crate::info;
-use crate::types::address::{ADDRESS_SIZE, Address};
 use crate::types::encoding::{Decode, DecodeError, Encode, EncodeSink};
+use crate::types::hash::Hash;
 pub(crate) use crate::types::serializable_signature::SerializableSignature;
 use argon2::Argon2;
 use chacha20poly1305::{
@@ -13,49 +16,47 @@ use k256::ecdsa::signature::Signer;
 use k256::schnorr::signature::Verifier;
 use k256::schnorr::{SigningKey, VerifyingKey};
 use rand_core::{OsRng, RngCore};
-use sha3::{Digest, Sha3_256};
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use zeroize::Zeroizing;
+
+pub type Address = Hash;
 
 /// Private key for signing transactions.
 ///
 /// Generated using cryptographically secure randomness from the OS.
 /// Never serialized or transmitted over the network.
 #[derive(Clone)]
-pub struct PrivateKey {
-    key: SigningKey,
-}
+pub struct PrivateKey(SigningKey);
 
 /// Public key for signature verification and address derivation.
 ///
-/// The address is derived by hashing the verifying key with SHA3-256 and
-/// taking the last 20 bytes.
+/// The address is derived by domain-separating with the label `ADDRESS`,
+/// hashing the verifying key bytes with SHA3-256, and keeping the full
+/// 32-byte output. The value is cached on first use to avoid repeated hashing.
 ///
-/// This type is `Copy` (52 bytes total: 32 for key + 20 for address) for performance.
 /// Public keys are passed frequently during transaction validation, and stack
 /// allocation avoids heap overhead and improves cache locality.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PublicKey {
     pub key: VerifyingKey,
-    pub address: Address,
+    cached_address: OnceLock<Address>,
 }
 
 impl PrivateKey {
     /// Generates a new random private key using OS-provided entropy.
     pub fn new() -> Self {
         let mut rng = OsRng;
-        Self {
-            key: SigningKey::random(&mut rng),
-        }
+        Self(SigningKey::random(&mut rng))
     }
 
     /// Creates a private key from raw bytes.
     ///
     /// Returns `None` if the bytes do not represent a valid scalar for secp256k1.
     pub fn from_bytes(bytes: &[u8; 32]) -> Option<Self> {
-        SigningKey::from_bytes(bytes).ok().map(|key| Self { key })
+        SigningKey::from_bytes(bytes).ok().map(Self)
     }
 
     /// Returns the raw bytes of the private key.
@@ -63,7 +64,7 @@ impl PrivateKey {
     /// **Security**: Handle with care. These bytes should be zeroized after use
     /// and never logged or transmitted.
     fn to_bytes(&self) -> [u8; 32] {
-        self.key.to_bytes().into()
+        self.0.to_bytes().into()
     }
 
     /// Derives the corresponding public key.
@@ -73,27 +74,19 @@ impl PrivateKey {
 
     /// Signs arbitrary data, producing a Schnorr signature.
     pub fn sign(&self, data: &[u8]) -> SerializableSignature {
-        SerializableSignature(self.key.sign(data))
+        SerializableSignature(self.0.sign(data))
     }
 }
 
 impl PublicKey {
-    /// Derives a public key from a private key and computes its address.
+    /// Derives a public key from a private key.
     ///
-    /// Address derivation: SHA3-256(verifying_key_bytes)[12..32]
+    /// Address derivation is performed lazily via [`Self::address`] using a
+    /// domain-separated SHA3-256 hash of the verifying key bytes.
     pub(crate) fn new(private: &PrivateKey) -> Self {
-        let vk = private.key.verifying_key();
-
-        let mut hasher = Sha3_256::new();
-        hasher.update(vk.to_bytes());
-        let full: [u8; 32] = hasher.finalize().into();
-
-        let mut addr = [0u8; ADDRESS_SIZE];
-        addr.copy_from_slice(&full[12..]);
-
-        PublicKey {
-            key: *vk,
-            address: Address(addr),
+        Self {
+            key: *private.0.verifying_key(),
+            cached_address: OnceLock::new(),
         }
     }
 
@@ -102,6 +95,19 @@ impl PublicKey {
     /// Returns `true` if the signature is valid, `false` otherwise.
     pub fn verify(&self, data: &[u8], signature: SerializableSignature) -> bool {
         self.key.verify(data, &signature.0).is_ok()
+    }
+
+    /// Returns the 32-byte address derived from the verifying key.
+    ///
+    /// The address is computed once using SHA3-256 over the domain label
+    /// `ADDRESS` followed by the raw verifying key bytes, then cached.
+    pub fn address(&self) -> Address {
+        *self.cached_address.get_or_init(|| {
+            let mut h = Address::sha3();
+            h.update(b"ADDRESS");
+            h.update(&self.key.to_bytes());
+            h.finalize()
+        })
     }
 }
 
@@ -116,16 +122,9 @@ impl Decode for PublicKey {
         let key_bytes = <[u8; 32]>::decode(input)?;
         let key = VerifyingKey::from_bytes(&key_bytes).map_err(|_| DecodeError::InvalidValue)?;
 
-        // Derive address for key to maintain the invariance
-        let mut hasher = Sha3_256::new();
-        hasher.update(key.to_bytes());
-        let full: [u8; 32] = hasher.finalize().into();
-        let mut address = [0u8; ADDRESS_SIZE];
-        address.copy_from_slice(&full[12..]);
-
         Ok(PublicKey {
             key,
-            address: Address(address),
+            cached_address: OnceLock::new(),
         })
     }
 }
@@ -341,7 +340,7 @@ mod tests {
         let public1 = private1.public_key();
         let public2 = private2.public_key();
 
-        assert_ne!(public1.address, public2.address);
+        assert_ne!(public1.address(), public2.address());
     }
 
     #[test]
@@ -350,7 +349,7 @@ mod tests {
         let public1 = private.public_key();
         let public2 = private.public_key();
 
-        assert_eq!(public1.address, public2.address);
+        assert_eq!(public1.address(), public2.address());
     }
 
     #[test]
@@ -391,7 +390,7 @@ mod tests {
         let key1 = PrivateKey::from_bytes(&bytes).unwrap();
         let key2 = PrivateKey::from_bytes(&bytes).unwrap();
 
-        assert_eq!(key1.public_key().address, key2.public_key().address);
+        assert_eq!(key1.public_key().address(), key2.public_key().address());
     }
 
     #[test]
@@ -417,7 +416,7 @@ mod tests {
         let key1 = PrivateKey::from_bytes(&bytes1).unwrap();
         let key2 = PrivateKey::from_bytes(&bytes2).unwrap();
 
-        assert_ne!(key1.public_key().address, key2.public_key().address);
+        assert_ne!(key1.public_key().address(), key2.public_key().address());
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -471,13 +470,13 @@ mod tests {
         let passphrase = b"secure_passphrase_123";
 
         let original_key = PrivateKey::new();
-        let original_address = original_key.public_key().address;
+        let original_address = original_key.public_key().address();
 
         save_encrypted_validator_key(&original_key, &path, passphrase).unwrap();
         assert!(path.exists());
 
         let loaded_key = load_encrypted_validator_key(&path, passphrase).unwrap();
-        let loaded_address = loaded_key.public_key().address;
+        let loaded_address = loaded_key.public_key().address();
 
         assert_eq!(original_address, loaded_address);
     }
@@ -528,8 +527,8 @@ mod tests {
 
         let loaded_key = load_encrypted_validator_key(&path, passphrase).unwrap();
         assert_eq!(
-            original_key.public_key().address,
-            loaded_key.public_key().address
+            original_key.public_key().address(),
+            loaded_key.public_key().address()
         );
     }
 
@@ -544,8 +543,8 @@ mod tests {
 
         let loaded_key = load_encrypted_validator_key(&path, passphrase).unwrap();
         assert_eq!(
-            original_key.public_key().address,
-            loaded_key.public_key().address
+            original_key.public_key().address(),
+            loaded_key.public_key().address()
         );
     }
 
@@ -715,7 +714,7 @@ mod tests {
 
         // Should load key2 with pass2
         let loaded = load_encrypted_validator_key(&path, b"pass2").unwrap();
-        assert_eq!(key2.public_key().address, loaded.public_key().address);
+        assert_eq!(key2.public_key().address(), loaded.public_key().address());
 
         // pass1 should no longer work
         let result = load_encrypted_validator_key(&path, b"pass1");
@@ -780,7 +779,10 @@ mod tests {
         // But both should decrypt to the same key
         let loaded1 = load_encrypted_validator_key(&path1, b"same_passphrase").unwrap();
         let loaded2 = load_encrypted_validator_key(&path2, b"same_passphrase").unwrap();
-        assert_eq!(loaded1.public_key().address, loaded2.public_key().address);
+        assert_eq!(
+            loaded1.public_key().address(),
+            loaded2.public_key().address()
+        );
     }
 
     #[test]
@@ -794,8 +796,8 @@ mod tests {
 
         let loaded_key = load_encrypted_validator_key(&path, &passphrase).unwrap();
         assert_eq!(
-            original_key.public_key().address,
-            loaded_key.public_key().address
+            original_key.public_key().address(),
+            loaded_key.public_key().address()
         );
     }
 
@@ -810,8 +812,8 @@ mod tests {
 
         let loaded_key = load_encrypted_validator_key(&path, &passphrase).unwrap();
         assert_eq!(
-            original_key.public_key().address,
-            loaded_key.public_key().address
+            original_key.public_key().address(),
+            loaded_key.public_key().address()
         );
     }
 }

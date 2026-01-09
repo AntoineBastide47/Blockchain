@@ -1,13 +1,17 @@
 #[cfg(test)]
 pub mod test {
+    use crate::core::account::Account;
     use crate::core::block::{Block, Header};
-    use crate::crypto::key_pair::PrivateKey;
-    use crate::storage::state::{IterableState, StateStore, StateView, StateViewProvider};
+    use crate::crypto::key_pair::{Address, PrivateKey};
+    use crate::storage::state_store::{AccountStorage, IterableState, StateStore, VmStorage};
+    use crate::storage::state_view::{StateView, StateViewProvider};
     use crate::storage::storage_trait::{Storage, StorageError};
+    use crate::types::encoding::{Decode, Encode};
     use crate::types::hash::Hash;
     use crate::utils::test_utils::utils::{create_genesis, random_hash};
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::sync::RwLock;
 
     pub trait StorageExtForTests {
         /// Appends a block to storage and updates the chain tip (requires mutable access).
@@ -29,8 +33,8 @@ pub mod test {
         blocks: HashMap<Hash, Arc<Block>>,
         /// Hash of the current chain tip.
         tip: Hash,
-        state: HashMap<Hash, Vec<u8>>,
-        state_root: Hash,
+        state: RwLock<HashMap<Hash, Vec<u8>>>,
+        state_root: RwLock<Hash>,
     }
 
     impl Storage for TestStorage {
@@ -39,8 +43,8 @@ pub mod test {
                 headers: HashMap::new(),
                 blocks: HashMap::new(),
                 tip: Hash::zero(),
-                state: HashMap::new(),
-                state_root: Hash::zero(),
+                state: RwLock::new(HashMap::new()),
+                state_root: RwLock::new(Hash::zero()),
             };
             storage.append_block_mut(genesis, chain_id);
             storage
@@ -78,26 +82,75 @@ pub mod test {
     }
 
     impl StateStore for TestStorage {
-        fn get(&self, key: Hash) -> Option<Vec<u8>> {
-            self.state.get(&key).cloned()
-        }
+        fn apply_batch(&self, writes: Vec<(Hash, Option<Vec<u8>>)>) {
+            let mut state = self.state.write().unwrap();
+            for (key, value) in writes {
+                match value {
+                    Some(v) => {
+                        state.insert(key, v);
+                    }
+                    None => {
+                        state.remove(&key);
+                    }
+                }
+            }
 
-        fn apply_batch(&self, _writes: Vec<(Hash, Option<Vec<u8>>)>) {
-            todo!()
-        }
+            // Recompute root deterministically from sorted entries.
+            let mut sorted = std::collections::BTreeMap::new();
+            for (k, v) in state.iter() {
+                sorted.insert(*k, v.clone());
+            }
 
+            let mut h = Hash::sha3();
+            h.update(b"STATE_ROOT");
+            for (k, v) in sorted {
+                k.encode(&mut h);
+                v.encode(&mut h);
+            }
+
+            *self.state_root.write().unwrap() = h.finalize();
+        }
         fn state_root(&self) -> Hash {
-            self.state_root
+            *self.state_root.read().unwrap()
+        }
+    }
+
+    impl VmStorage for TestStorage {
+        fn get(&self, key: Hash) -> Option<Vec<u8>> {
+            self.state.read().unwrap().get(&key).cloned()
         }
 
-        fn set_state_root(&self, _root: Hash) {
-            todo!()
+        fn set_state_root(&self, root: Hash) {
+            *self.state_root.write().unwrap() = root;
+        }
+    }
+
+    impl AccountStorage for TestStorage {
+        fn get_account(&self, addr: Address) -> Option<Account> {
+            self.get(addr)
+                .and_then(|bytes| Account::decode(&mut bytes.as_slice()).ok())
+        }
+
+        fn set_account(&mut self, addr: Address, account: Account) {
+            self.apply_batch(vec![(addr, Some(account.to_vec()))]);
+        }
+
+        fn delete_account(&mut self, addr: Address) {
+            self.apply_batch(vec![(addr, None)]);
         }
     }
 
     impl IterableState for TestStorage {
         fn iter_all(&self) -> Box<dyn Iterator<Item = (Hash, Vec<u8>)> + '_> {
-            Box::new(self.state.iter().map(|(k, v)| (*k, v.clone())))
+            let snapshot: Vec<(Hash, Vec<u8>)> = self
+                .state
+                .read()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| (*k, v.clone()))
+                .collect();
+
+            Box::new(snapshot.into_iter())
         }
     }
 
@@ -122,7 +175,7 @@ pub mod test {
     impl StateViewProvider for TestStorage {
         fn state_view(&self) -> StateView<'_, Self>
         where
-            Self: Sized + StateStore,
+            Self: Sized + VmStorage,
         {
             StateView::new(self)
         }

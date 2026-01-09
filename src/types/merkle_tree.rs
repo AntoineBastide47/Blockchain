@@ -9,11 +9,20 @@ use crate::core::transaction::Transaction;
 use crate::types::hash::Hash;
 
 const EMPTY_VEC_HASH: Hash = Hash::zero();
+const MERKLE_NODE_SEPARATION: &[u8] = b"MERKLE_STATE_NODE";
 
 /// Utility functions to build Merkle roots from hashes or transactions.
 pub struct MerkleTree;
 
 impl MerkleTree {
+    fn hash_pair(left: Hash, right: Hash) -> Hash {
+        let mut h = Hash::sha3();
+        h.update(MERKLE_NODE_SEPARATION);
+        h.update(left.as_slice());
+        h.update(right.as_slice());
+        h.finalize()
+    }
+
     /// Computes a Merkle root from the provided leaf hashes.
     ///
     /// This performs an in-place reduction; when a level has an odd number
@@ -38,10 +47,7 @@ impl MerkleTree {
                     left
                 };
 
-                let mut h = Hash::sha3();
-                h.update(left.as_slice());
-                h.update(right.as_slice());
-                nodes[write] = h.finalize();
+                nodes[write] = Self::hash_pair(left, right);
 
                 write += 1;
                 read += 2;
@@ -82,13 +88,6 @@ mod tests {
         h.finalize()
     }
 
-    fn hash_pair(left: Hash, right: Hash) -> Hash {
-        let mut h = Hash::sha3();
-        h.update(left.as_slice());
-        h.update(right.as_slice());
-        h.finalize()
-    }
-
     #[test]
     fn empty_returns_zero_hash() {
         assert_eq!(MerkleTree::from_raw(Vec::new()), Hash::zero());
@@ -107,8 +106,8 @@ mod tests {
         let c = hash_leaf(b"c");
         let d = hash_leaf(b"d");
 
-        let level1 = [hash_pair(a, b), hash_pair(c, d)];
-        let expected_root = hash_pair(level1[0], level1[1]);
+        let level1 = [MerkleTree::hash_pair(a, b), MerkleTree::hash_pair(c, d)];
+        let expected_root = MerkleTree::hash_pair(level1[0], level1[1]);
 
         assert_eq!(MerkleTree::from_raw(vec![a, b, c, d]), expected_root);
     }
@@ -119,9 +118,9 @@ mod tests {
         let b = hash_leaf(b"b");
         let c = hash_leaf(b"c");
 
-        let left = hash_pair(a, b);
-        let right = hash_pair(c, c);
-        let expected_root = hash_pair(left, right);
+        let left = MerkleTree::hash_pair(a, b);
+        let right = MerkleTree::hash_pair(c, c);
+        let expected_root = MerkleTree::hash_pair(left, right);
 
         assert_eq!(MerkleTree::from_raw(vec![a, b, c]), expected_root);
     }

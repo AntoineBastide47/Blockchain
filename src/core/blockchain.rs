@@ -6,7 +6,8 @@ use crate::core::validator::{BlockValidator, Validator};
 use crate::crypto::key_pair::PrivateKey;
 use crate::info;
 use crate::storage::main_storage::MainStorage;
-use crate::storage::state::{IterableState, StateStore, StateViewProvider};
+use crate::storage::state_store::{AccountStorage, IterableState, VmStorage};
+use crate::storage::state_view::StateViewProvider;
 use crate::storage::storage_trait::{Storage, StorageError};
 use crate::types::encoding::Encode;
 use crate::types::hash::Hash;
@@ -21,7 +22,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// The main blockchain structure holding headers and validation logic.
 ///
 /// Generic over validator and storage types for zero-cost abstraction.
-pub struct Blockchain<V: Validator, S: Storage + StateStore + IterableState + StateViewProvider> {
+pub struct Blockchain<V: Validator, S: Storage + IterableState + StateViewProvider> {
     /// Chain identifier.
     pub id: u64,
     /// Block validator for consensus rules.
@@ -51,7 +52,9 @@ impl Blockchain<BlockValidator, MainStorage> {
     }
 }
 
-impl<V: Validator, S: Storage + StateStore + IterableState + StateViewProvider> Blockchain<V, S> {
+impl<V: Validator, S: Storage + VmStorage + AccountStorage + IterableState + StateViewProvider>
+    Blockchain<V, S>
+{
     /// Returns the height of the chain.
     pub fn height(&self) -> u64 {
         self.storage.height()
@@ -225,7 +228,7 @@ mod tests {
     /// Creates a new blockchain with custom validator and storage.
     pub fn with_validator_and_storage<
         V: Validator,
-        S: Storage + StateStore + IterableState + StateViewProvider,
+        S: Storage + VmStorage + IterableState + StateViewProvider,
     >(
         id: u64,
         validator: V,
@@ -240,7 +243,12 @@ mod tests {
 
     pub fn add_block_mut<
         V: Validator,
-        S: Storage + StateStore + IterableState + StorageExtForTests + StateViewProvider,
+        S: Storage
+            + VmStorage
+            + AccountStorage
+            + IterableState
+            + StorageExtForTests
+            + StateViewProvider,
     >(
         chain: &mut Blockchain<V, S>,
         block: Arc<Block>,

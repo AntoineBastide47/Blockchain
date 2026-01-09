@@ -2,10 +2,9 @@
 
 use crate::crypto::key_pair::{PrivateKey, PublicKey, SerializableSignature};
 use crate::types::bytes::Bytes;
-use crate::types::encoding::{Decode, DecodeError, Encode, EncodeSink};
-use crate::types::hash::Hash;
+use crate::types::encoding::Encode;
+use crate::types::hash::{Hash, HashCache};
 use blockchain_derive::BinaryCodec;
-use std::sync::OnceLock;
 
 /// Unsigned transaction used internally for signing and verification.
 ///
@@ -37,16 +36,16 @@ impl UnsignedTransaction {
 ///
 /// Uses `Bytes` for zero-copy sharing - transactions are immutable after creation
 /// and often referenced by multiple blocks during reorganizations.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, BinaryCodec)]
 pub struct Transaction {
     /// Sender's public key, also used for signature verification.
     pub from: PublicKey,
-    /// ECDSA signature over the transaction hash.
+    /// Schnorr signature over the transaction hash.
     pub signature: SerializableSignature,
     /// Arbitrary transaction payload.
     pub data: Bytes,
     /// Cached transaction ID, computed lazily on first access, do not use directly.
-    cached_id: OnceLock<Hash>,
+    cached_id: HashCache,
 }
 
 impl Transaction {
@@ -67,7 +66,7 @@ impl Transaction {
             from: unsigned.from,
             signature: key.sign(signature.as_slice()),
             data: unsigned.data,
-            cached_id: OnceLock::new(),
+            cached_id: HashCache::new(),
         }
     }
 
@@ -76,7 +75,7 @@ impl Transaction {
     /// Used during verification to reconstruct the signed message.
     pub fn signing_bytes(&self, chain_id: u64) -> Hash {
         UnsignedTransaction {
-            from: self.from,
+            from: self.from.clone(),
             data: self.data.clone(),
         }
         .signing_bytes(chain_id)
@@ -87,7 +86,7 @@ impl Transaction {
     /// Computed from the full transaction including signature, ensuring uniqueness
     /// even for identical payloads signed by different keys. Result is cached.
     pub fn id(&self, chain_id: u64) -> Hash {
-        *self.cached_id.get_or_init(|| {
+        self.cached_id.get_or_compute(chain_id, || {
             let mut h = Hash::sha3();
             h.update(b"TXID");
             chain_id.encode(&mut h);
@@ -105,28 +104,10 @@ impl Transaction {
     }
 }
 
-impl Encode for Transaction {
-    fn encode<S: EncodeSink>(&self, out: &mut S) {
-        self.from.encode(out);
-        self.signature.encode(out);
-        self.data.encode(out);
-    }
-}
-
-impl Decode for Transaction {
-    fn decode(input: &mut &[u8]) -> Result<Self, DecodeError> {
-        Ok(Self {
-            from: PublicKey::decode(input)?,
-            signature: SerializableSignature::decode(input)?,
-            data: Bytes::decode(input)?,
-            cached_id: OnceLock::new(),
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::encoding::Decode;
 
     const TEST_CHAIN_ID: u64 = 32;
 

@@ -24,6 +24,7 @@
 //! ```
 
 use crate::types::bytes::Bytes;
+use crate::types::hash::HashCache;
 use blockchain_derive::Error;
 
 /// Maximum number of elements allowed when decoding a vector to avoid unbounded allocations.
@@ -92,6 +93,20 @@ pub trait Encode {
 
         // Second pass: encode once, with exact capacity
         let mut out = Bytes::with_capacity(counter.len());
+        self.encode(&mut out);
+        out
+    }
+
+    /// Serializes to a new Vec<u8> buffer with exact capacity.
+    ///
+    /// Performs two passes: first to count bytes, then to encode.
+    fn to_vec(&self) -> Vec<u8> {
+        // First pass: count
+        let mut counter = SizeCounter::new();
+        self.encode(&mut counter);
+
+        // Second pass: encode once, with exact capacity
+        let mut out = Vec::<u8>::with_capacity(counter.len());
         self.encode(&mut out);
         out
     }
@@ -400,6 +415,18 @@ impl<A: Encode, B: Encode, C: Encode> Encode for (A, B, C) {
 impl<A: Decode, B: Decode, C: Decode> Decode for (A, B, C) {
     fn decode(input: &mut &[u8]) -> Result<Self, DecodeError> {
         Ok((A::decode(input)?, B::decode(input)?, C::decode(input)?))
+    }
+}
+
+/// Empty encoding and decoding for HashCache this allows types that require
+/// internal hash caching to derive from BinaryCodec and not need explicit impl blocks
+impl Encode for HashCache {
+    fn encode<S: EncodeSink>(&self, _: &mut S) {}
+}
+
+impl Decode for HashCache {
+    fn decode(_: &mut &[u8]) -> Result<Self, DecodeError> {
+        Ok(HashCache::new())
     }
 }
 
@@ -755,5 +782,41 @@ mod tests {
         let bytes = original.to_bytes();
         let decoded = Option::<Vec<u8>>::from_bytes(&bytes).unwrap();
         assert_eq!(original, decoded);
+    }
+
+    // ========== HashCache Tests ==========
+
+    #[test]
+    fn hash_cache_encoding_is_empty() {
+        use crate::types::hash::Hash;
+
+        let empty_cache: HashCache = HashCache::new();
+        assert!(empty_cache.to_bytes().is_empty());
+
+        let filled_cache = HashCache::new();
+        let _ = filled_cache.get_or_compute(1, Hash::zero);
+        assert!(filled_cache.to_bytes().is_empty());
+    }
+
+    #[test]
+    fn hash_cache_decode_from_empty_is_uninitialized() {
+        let decoded = HashCache::from_bytes(&[]).unwrap();
+        assert!(decoded.get(0).is_none());
+        assert!(decoded.get(1).is_none());
+    }
+
+    #[test]
+    fn hash_cache_decode_rejects_trailing_bytes() {
+        let bytes = vec![0xAA, 0xBB, 0xCC];
+        let result = HashCache::from_bytes(&bytes);
+        assert!(matches!(result, Err(DecodeError::InvalidValue)));
+    }
+
+    #[test]
+    fn hash_cache_decode_leaves_input_intact() {
+        let mut input: &[u8] = &[1, 2, 3];
+        let cache = HashCache::decode(&mut input).unwrap();
+        assert!(cache.get(0).is_none());
+        assert_eq!(input, &[1, 2, 3]);
     }
 }

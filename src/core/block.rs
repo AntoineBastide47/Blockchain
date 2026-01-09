@@ -2,13 +2,13 @@
 
 use crate::core::transaction::Transaction;
 use crate::crypto::key_pair::{PrivateKey, PublicKey};
-use crate::types::encoding::{Decode, DecodeError, Encode, EncodeSink};
-use crate::types::hash::Hash;
+use crate::types::encoding::Encode;
+use crate::types::hash::{Hash, HashCache};
 use crate::types::merkle_tree::MerkleTree;
 use crate::types::serializable_signature::SerializableSignature;
 use crate::warn;
 use blockchain_derive::BinaryCodec;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 /// Block header containing metadata and cryptographic commitments.
 ///
@@ -73,7 +73,7 @@ struct UnsignedBlock {
 ///
 /// Blocks are validated once upon receipt and never modified.
 /// The header hash is lazily computed and cached for O(1) subsequent lookups.
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, BinaryCodec)]
 pub struct Block {
     pub header: Header,
     pub validator: PublicKey,
@@ -81,28 +81,7 @@ pub struct Block {
     pub transactions: Box<[Transaction]>,
 
     /// Lazily computed header hash, cached after first computation, do not use directly.
-    cached_header_hash: OnceLock<Hash>,
-}
-
-impl Encode for Block {
-    fn encode<S: EncodeSink>(&self, out: &mut S) {
-        self.header.encode(out);
-        self.validator.encode(out);
-        self.signature.encode(out);
-        self.transactions.encode(out);
-    }
-}
-
-impl Decode for Block {
-    fn decode(input: &mut &[u8]) -> Result<Self, DecodeError> {
-        Ok(Block {
-            header: Header::decode(input)?,
-            validator: PublicKey::decode(input)?,
-            signature: SerializableSignature::decode(input)?,
-            transactions: Vec::<Transaction>::decode(input)?.into_boxed_slice(),
-            cached_header_hash: OnceLock::new(),
-        })
-    }
+    cached_header_hash: HashCache,
 }
 
 impl Block {
@@ -131,7 +110,7 @@ impl Block {
                 block_sign_data(chain_id, &unsigned.header.compute_hash(chain_id)).as_slice(),
             ),
             transactions: unsigned.transactions,
-            cached_header_hash: OnceLock::new(),
+            cached_header_hash: HashCache::new(),
         })
     }
 
@@ -139,9 +118,8 @@ impl Block {
     ///
     /// The hash uniquely identifies this block within the given chain.
     pub fn header_hash(&self, chain_id: u64) -> Hash {
-        *self
-            .cached_header_hash
-            .get_or_init(|| self.header.compute_hash(chain_id))
+        self.cached_header_hash
+            .get_or_compute(chain_id, || self.header.compute_hash(chain_id))
     }
 
     /// Verifies the block's cryptographic integrity.
@@ -185,6 +163,7 @@ impl Block {
 mod tests {
     use super::*;
     use crate::crypto::key_pair::PrivateKey;
+    use crate::types::encoding::Decode;
     use crate::utils::test_utils::utils::random_hash;
     use std::time::{SystemTime, UNIX_EPOCH};
 

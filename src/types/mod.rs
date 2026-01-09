@@ -7,7 +7,6 @@
 //! All types are optimized for blockchain workloads with minimal allocations
 //! and efficient memory layouts.
 
-pub mod address;
 pub mod bytes;
 pub mod encoding;
 pub mod hash;

@@ -116,11 +116,51 @@ impl<V: Validator, S: Storage + VmStorage + AccountStorage + IterableState + Sta
 
         Ok(Block::new(header, validator, transactions, self.id))
     }
-
-    /// Attempts to add a block to the chain.
+    /// Validates and executes a single transaction into the provided block overlay.
     ///
-    /// Returns an error if validation or storage persistence fails.
-    pub fn add_block(&self, block: Arc<Block>) -> Result<(), StorageError> {
+    /// Runs validator checks (signature, nonce, balance, gas) before decoding the
+    /// program bytes and executing them in a per-tx overlay. The per-tx writes are
+    /// merged into `block_overlay` only after successful execution.
+    fn apply_tx(
+        &self,
+        transaction: &Transaction,
+        block_overlay: &mut OverlayState,
+    ) -> Result<(), StorageError> {
+        self.validator
+            .validate_tx(transaction, &self.storage, self.id)
+            .map_err(|e| StorageError::ValidationFailed(e.to_string()))?;
+
+        let program = Program::from_bytes(transaction.data.as_slice())
+            .map_err(|e| StorageError::VMError(e.to_string()))?;
+        let mut vm = VM::new(program);
+        let contract_bytes = transaction.from.to_bytes();
+        let ctx = ExecContext {
+            chain_id: self.id,
+            contract_id: contract_bytes.as_slice(), // TODO: use real smart contract id
+        };
+
+        // Execute tx in its own overlay, reading from current block overlay
+        let mut tx_overlay = OverlayState::new(block_overlay);
+        vm.run(&mut tx_overlay, &ctx)
+            .map_err(|e| StorageError::VMError(e.to_string()))?;
+
+        // Merge tx writes into block overlay
+        for (k, v) in tx_overlay.into_writes() {
+            match v {
+                Some(val) => block_overlay.push(k, val),
+                None => block_overlay.delete(k),
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validates and applies an entire block to the chain state.
+    ///
+    /// Performs block-level validation, executes each transaction into a block
+    /// overlay (after per-tx validation), checks the resulting state_root, then
+    /// commits the writes and appends the block.
+    pub fn apply_block(&self, block: Arc<Block>) -> Result<(), StorageError> {
         let hash = block.header_hash(self.id);
         if self.has_block(hash) {
             return Err(StorageError::ValidationFailed(
@@ -144,31 +184,7 @@ impl<V: Validator, S: Storage + VmStorage + AccountStorage + IterableState + Sta
 
         // Run VM code
         for tx in &block.transactions {
-            self.validator
-                .validate_tx(tx, &self.storage, self.id)
-                .map_err(|e| StorageError::ValidationFailed(e.to_string()))?;
-
-            let program = Program::from_bytes(tx.data.as_slice())
-                .map_err(|e| StorageError::VMError(e.to_string()))?;
-            let mut vm = VM::new(program);
-            let contract_bytes = tx.from.to_bytes();
-            let ctx = ExecContext {
-                chain_id: self.id,
-                contract_id: contract_bytes.as_slice(), // TODO: use real smart contract id
-            };
-
-            // Execute tx in its own overlay, reading from current block overlay
-            let mut tx_overlay = OverlayState::new(&block_overlay);
-            vm.run(&mut tx_overlay, &ctx)
-                .map_err(|e| StorageError::VMError(e.to_string()))?;
-
-            // Merge tx writes into block overlay
-            for (k, v) in tx_overlay.into_writes() {
-                match v {
-                    Some(val) => block_overlay.push(k, val),
-                    None => block_overlay.delete(k),
-                }
-            }
+            self.apply_tx(tx, &mut block_overlay)?
         }
 
         // Compute expected post-storage root deterministically
@@ -469,7 +485,7 @@ mod tests {
         let block = Block::new(header, PrivateKey::new(), vec![tx], TEST_CHAIN_ID);
 
         assert!(matches!(
-            bc.add_block(block),
+            bc.apply_block(block),
             Err(StorageError::ValidationFailed(_))
         ));
     }

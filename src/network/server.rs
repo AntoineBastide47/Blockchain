@@ -224,7 +224,7 @@ impl<T: Transport> Server<T> {
             self.private_key.clone().unwrap(),
             self.tx_pool.transactions(),
         ) {
-            Ok(block) => match self.chain.add_block(block.clone()) {
+            Ok(block) => match self.chain.apply_block(block.clone()) {
                 Ok(_) => {
                     if let Err(e) = self
                         .broadcast(
@@ -307,7 +307,7 @@ impl<T: Transport> Server<T> {
     async fn process_block(self: Arc<Self>, from: PeerId, block: Block) -> Result<(), ServerError> {
         let arc_block = Arc::new(block);
         self.chain
-            .add_block(arc_block.clone())
+            .apply_block(arc_block.clone())
             .map_err(|e| ServerError::BlockRejected {
                 hash: arc_block.header_hash(self.chain.id),
                 source: e,
@@ -440,7 +440,7 @@ impl<T: Transport> Server<T> {
     ) -> Result<(), ServerError> {
         for block in response.blocks {
             self.chain
-                .add_block(Arc::new(block))
+                .apply_block(Arc::new(block))
                 .map_err(ServerError::Storage)?;
         }
 
@@ -922,7 +922,7 @@ mod tests {
             .chain
             .build_block(PrivateKey::new(), vec![])
             .expect("build_block failed");
-        server_a.chain.add_block(block).unwrap();
+        server_a.chain.apply_block(block).unwrap();
 
         // Peer reports height 0, behind our chain (height 1)
         let status = SendStatusMessage {
@@ -1041,7 +1041,7 @@ mod tests {
             .chain
             .build_block(PrivateKey::new(), vec![])
             .expect("build_block failed");
-        server_builder.chain.add_block(block.clone()).unwrap();
+        server_builder.chain.apply_block(block.clone()).unwrap();
 
         assert_eq!(server_a.chain.height(), 0);
 
@@ -1074,14 +1074,14 @@ mod tests {
             .chain
             .build_block(PrivateKey::new(), vec![])
             .expect("build_block 1 failed");
-        server_builder.chain.add_block(block1.clone()).unwrap();
+        server_builder.chain.apply_block(block1.clone()).unwrap();
 
         // Build block 2
         let block2 = server_builder
             .chain
             .build_block(PrivateKey::new(), vec![])
             .expect("build_block 2 failed");
-        server_builder.chain.add_block(block2.clone()).unwrap();
+        server_builder.chain.apply_block(block2.clone()).unwrap();
 
         let response = SendBlocksMessage {
             blocks: vec![(*block1).clone(), (*block2).clone()],
@@ -1118,7 +1118,7 @@ mod tests {
                 .chain
                 .build_block(validator_key.clone(), vec![])
                 .expect("build_block failed");
-            server_established.chain.add_block(block).unwrap();
+            server_established.chain.apply_block(block).unwrap();
         }
         assert_eq!(server_established.chain.height(), 3);
 
@@ -1315,7 +1315,7 @@ mod tests {
                 .chain
                 .build_block(validator_key.clone(), vec![])
                 .expect("build_block failed");
-            server_a.chain.add_block(block).unwrap();
+            server_a.chain.apply_block(block).unwrap();
         }
 
         let mut rx_b = tr_b.consume().await;
@@ -1387,7 +1387,7 @@ mod tests {
                 .chain
                 .build_block(validator_key.clone(), vec![])
                 .expect("build_block failed");
-            server_a.chain.add_block(block).unwrap();
+            server_a.chain.apply_block(block).unwrap();
         }
 
         let mut rx_b = tr_b.consume().await;

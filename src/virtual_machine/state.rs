@@ -26,16 +26,16 @@ pub trait State {
 /// Buffers writes in memory while reading through to the base storage for keys
 /// not yet written. Enables transactional execution where writes can be
 /// committed atomically or discarded on error.
-pub struct OverlayState<'a> {
+pub struct OverlayState<'a, S: State> {
     /// Underlying storage for read-through on cache misses.
-    _base: &'a dyn State,
+    _base: &'a S,
     /// Pending writes: `Some(value)` for insertions, `None` for deletions.
     pub(crate) writes: BTreeMap<Hash, Option<Vec<u8>>>,
 }
 
-impl<'a> OverlayState<'a> {
+impl<'a, S: State> OverlayState<'a, S> {
     /// Creates a new overlay backed by the given base storage.
-    pub fn new(base: &'a dyn State) -> Self {
+    pub fn new(base: &'a S) -> Self {
         Self {
             _base: base,
             writes: BTreeMap::new(),
@@ -48,7 +48,7 @@ impl<'a> OverlayState<'a> {
     }
 }
 
-impl<'a> State for OverlayState<'a> {
+impl<'a, S: State> State for OverlayState<'a, S> {
     fn get(&self, key: Hash) -> Option<Vec<u8>> {
         if let Some(v) = self.writes.get(&key) {
             return v.clone();

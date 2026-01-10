@@ -9,6 +9,7 @@ use crate::virtual_machine::errors::VMError;
 use crate::virtual_machine::isa::Instruction;
 use crate::virtual_machine::program::Program;
 use crate::virtual_machine::state::State;
+use std::collections::HashMap;
 
 /// Runtime value stored in registers.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -195,18 +196,31 @@ pub struct ExecContext<'a> {
     pub contract_id: &'a [u8],
 }
 
+/// Call stack frame storing return address and destination register.
+#[derive(Clone, Debug)]
+struct CallFrame {
+    /// Return address (bytecode offset to resume after call).
+    return_addr: usize,
+    /// Destination register for return value.
+    dst_reg: u8,
+}
+
 /// Bytecode virtual machine.
 ///
 /// Executes compiled bytecode sequentially, reading instructions from the
 /// instruction pointer until the end of the bytecode is reached.
 ///
-/// # TODO:
-/// 1) Add full string, hash, list and map support
-/// 2) Add full control flow for function support
-/// 3) Add a smart contract language to not require assembly written smart contracts
-/// 4) Add a deterministic compiler to convert the language to assembly
-/// 5) Add a deterministic optimizer do make the assembly code more performant
-/// 6) Add an LSP for smoother smart contract writing experience
+/// # TODO for 0.14.0:
+/// 1) 🟢 Add full control flow for function support
+/// 2) 🔴 Add full string and hash support
+/// 3) 🔴 Add full list and map support
+///
+/// # TODO after 1.0.0:
+/// 4) 🔴 Add a smart contract language to not require assembly written smart contracts
+/// 5) 🔴 Add a deterministic compiler to convert the language to assembly
+/// 6) 🔴 Add arithmetic op codes that take in immediate instead of register
+/// 7) 🔴 Add a deterministic optimizer do make the assembly code more performant
+/// 8) 🔴 Add an LSP for smoother smart contract writing experience
 pub struct VM {
     /// Bytecode to execute.
     data: Bytes,
@@ -216,10 +230,14 @@ pub struct VM {
     registers: Registers,
     /// Heap for string pool and future allocations.
     heap: Heap,
+    /// Function labels mapping names to bytecode offsets.
+    labels: HashMap<String, usize>,
+    /// Call stack for function calls.
+    call_stack: Vec<CallFrame>,
 }
 
 impl VM {
-    /// Creates a new VM instance with the given bytecode.
+    /// Creates a new VM instance with the given program.
     pub fn new(program: Program) -> Self {
         Self {
             data: program.bytecode.into(),
@@ -228,6 +246,8 @@ impl VM {
             heap: Heap {
                 strings: program.strings,
             },
+            labels: program.labels,
+            call_stack: Vec::new(),
         }
     }
 
@@ -235,7 +255,7 @@ impl VM {
     ///
     /// Runs instructions sequentially until the instruction pointer reaches
     /// the end of the bytecode buffer.
-    pub fn run(&mut self, state: &mut dyn State, ctx: &ExecContext) -> Result<(), VMError> {
+    pub fn run<S: State>(&mut self, state: &mut S, ctx: &ExecContext) -> Result<(), VMError> {
         while self.ip < self.data.len() {
             let opcode = self.data[self.ip];
             self.ip += 1;
@@ -262,10 +282,10 @@ impl VM {
     }
 
     /// Executes a single instruction.
-    fn exec(
+    fn exec<S: State>(
         &mut self,
         instruction: Instruction,
-        state: &mut dyn State,
+        state: &mut S,
         ctx: &ExecContext,
     ) -> Result<(), VMError> {
         exec_vm! {
@@ -275,6 +295,7 @@ impl VM {
             instr = instruction,
             {
                 // Store and Load
+                DeleteState => op_delete(state, ctx; rd: Reg),
                 LoadI64 => op_load_i64(rd: Reg, imm: ImmI64),
                 StoreI64 => op_store_i64(state, ctx; key: Reg, value: Reg),
                 LoadI64State => op_load_i64_state(state, ctx; rd: Reg, key: Reg),
@@ -312,6 +333,16 @@ impl VM {
                 Ge => op_ge(rd: Reg, rs1: Reg, rs2: Reg),
                 // Control Flow
                 CallHost => op_call_host(dst: Reg, fn_id: RefU32, argc: ImmI64, argv: Reg),
+                Call => op_call(dst: Reg, fn_id: RefU32, argc: ImmI64, argv: Reg),
+                Jal => op_jal(rd: Reg, offset: ImmI64),
+                Jalr => op_jalr(rd: Reg, rs: Reg, offset: ImmI64),
+                Beq => op_beq(rs1: Reg, rs2: Reg, offset: ImmI64),
+                Bne => op_bne(rs1: Reg, rs2: Reg, offset: ImmI64),
+                Blt => op_blt(rs1: Reg, rs2: Reg, offset: ImmI64),
+                Bge => op_bge(rs1: Reg, rs2: Reg, offset: ImmI64),
+                Bltu => op_bltu(rs1: Reg, rs2: Reg, offset: ImmI64),
+                Bgeu => op_bgeu(rs1: Reg, rs2: Reg, offset: ImmI64),
+                Ret => op_ret(rs: Reg),
             }
         }
     }
@@ -329,13 +360,26 @@ impl VM {
         h.finalize()
     }
 
+    fn op_delete<S: State>(
+        &mut self,
+        state: &mut S,
+        ctx: &ExecContext,
+        key: u8,
+    ) -> Result<(), VMError> {
+        let key_ref = self.registers.get_ref(key, "STORE_I64")?;
+        let key_str = self.heap.get_string(key_ref).to_owned();
+        let key = Self::make_state_key(ctx.chain_id, ctx.contract_id, key_str.as_bytes());
+        state.delete(key);
+        Ok(())
+    }
+
     fn op_load_i64(&mut self, dst: u8, imm: i64) -> Result<(), VMError> {
         self.registers.set(dst, Value::Int(imm))
     }
 
-    fn op_store_i64(
+    fn op_store_i64<S: State>(
         &mut self,
-        state: &mut dyn State,
+        state: &mut S,
         ctx: &ExecContext,
         key: u8,
         value: u8,
@@ -348,9 +392,9 @@ impl VM {
         Ok(())
     }
 
-    fn op_load_i64_state(
+    fn op_load_i64_state<S: State>(
         &mut self,
-        state: &mut dyn State,
+        state: &mut S,
         ctx: &ExecContext,
         dst: u8,
         key: u8,
@@ -370,9 +414,9 @@ impl VM {
         self.registers.set(dst, Value::Bool(b))
     }
 
-    fn op_store_bool(
+    fn op_store_bool<S: State>(
         &mut self,
-        state: &mut dyn State,
+        state: &mut S,
         ctx: &ExecContext,
         key: u8,
         value: u8,
@@ -385,9 +429,9 @@ impl VM {
         Ok(())
     }
 
-    fn op_load_bool_state(
+    fn op_load_bool_state<S: State>(
         &mut self,
-        state: &mut dyn State,
+        state: &mut S,
         ctx: &ExecContext,
         dst: u8,
         key: u8,
@@ -408,9 +452,9 @@ impl VM {
         self.registers.set(dst, Value::Ref(str_ref))
     }
 
-    fn op_store_str(
+    fn op_store_str<S: State>(
         &mut self,
-        state: &mut dyn State,
+        state: &mut S,
         ctx: &ExecContext,
         key: u8,
         value: u8,
@@ -424,9 +468,9 @@ impl VM {
         Ok(())
     }
 
-    fn op_load_str_state(
+    fn op_load_str_state<S: State>(
         &mut self,
-        state: &mut dyn State,
+        state: &mut S,
         ctx: &ExecContext,
         dst: u8,
         key: u8,
@@ -594,6 +638,98 @@ impl VM {
         // }
 
         Err(VMError::InvalidCallHostFunction(fn_name.to_string()))
+    }
+
+    fn op_call(&mut self, dst: u8, fn_id: u32, _argc: i64, _argv: u8) -> Result<(), VMError> {
+        let fn_name = self.heap.get_string(fn_id).to_owned();
+        let target = *self
+            .labels
+            .get(&fn_name)
+            .ok_or(VMError::UndefinedFunction(fn_name))?;
+
+        self.call_stack.push(CallFrame {
+            return_addr: self.ip,
+            dst_reg: dst,
+        });
+
+        self.ip = target;
+        Ok(())
+    }
+
+    fn op_jal(&mut self, rd: u8, offset: i64) -> Result<(), VMError> {
+        self.registers.set(rd, Value::Int(self.ip as i64))?;
+        self.ip = (self.ip as i64).wrapping_add(offset) as usize;
+        Ok(())
+    }
+
+    fn op_jalr(&mut self, rd: u8, rs: u8, offset: i64) -> Result<(), VMError> {
+        let base = self.registers.get_int(rs, "JALR")?;
+        self.registers.set(rd, Value::Int(self.ip as i64))?;
+        self.ip = base.wrapping_add(offset) as usize;
+        Ok(())
+    }
+
+    fn op_beq(&mut self, rs1: u8, rs2: u8, offset: i64) -> Result<(), VMError> {
+        let a = self.registers.get_int(rs1, "BEQ")?;
+        let b = self.registers.get_int(rs2, "BEQ")?;
+        if a == b {
+            self.ip = (self.ip as i64).wrapping_add(offset) as usize;
+        }
+        Ok(())
+    }
+
+    fn op_bne(&mut self, rs1: u8, rs2: u8, offset: i64) -> Result<(), VMError> {
+        let a = self.registers.get_int(rs1, "BNE")?;
+        let b = self.registers.get_int(rs2, "BNE")?;
+        if a != b {
+            self.ip = (self.ip as i64).wrapping_add(offset) as usize;
+        }
+        Ok(())
+    }
+
+    fn op_blt(&mut self, rs1: u8, rs2: u8, offset: i64) -> Result<(), VMError> {
+        let a = self.registers.get_int(rs1, "BLT")?;
+        let b = self.registers.get_int(rs2, "BLT")?;
+        if a < b {
+            self.ip = (self.ip as i64).wrapping_add(offset) as usize;
+        }
+        Ok(())
+    }
+
+    fn op_bge(&mut self, rs1: u8, rs2: u8, offset: i64) -> Result<(), VMError> {
+        let a = self.registers.get_int(rs1, "BGE")?;
+        let b = self.registers.get_int(rs2, "BGE")?;
+        if a >= b {
+            self.ip = (self.ip as i64).wrapping_add(offset) as usize;
+        }
+        Ok(())
+    }
+
+    fn op_bltu(&mut self, rs1: u8, rs2: u8, offset: i64) -> Result<(), VMError> {
+        let a = self.registers.get_int(rs1, "BLTU")? as u64;
+        let b = self.registers.get_int(rs2, "BLTU")? as u64;
+        if a < b {
+            self.ip = (self.ip as i64).wrapping_add(offset) as usize;
+        }
+        Ok(())
+    }
+
+    fn op_bgeu(&mut self, rs1: u8, rs2: u8, offset: i64) -> Result<(), VMError> {
+        let a = self.registers.get_int(rs1, "BGEU")? as u64;
+        let b = self.registers.get_int(rs2, "BGEU")? as u64;
+        if a >= b {
+            self.ip = (self.ip as i64).wrapping_add(offset) as usize;
+        }
+        Ok(())
+    }
+
+    fn op_ret(&mut self, rs: u8) -> Result<(), VMError> {
+        let frame = self.call_stack.pop().ok_or(VMError::ReturnWithoutCall)?;
+
+        let ret_val = self.registers.get(rs)?.clone();
+        self.registers.set(frame.dst_reg, ret_val)?;
+        self.ip = frame.return_addr;
+        Ok(())
     }
 }
 
@@ -960,7 +1096,7 @@ mod tests {
 
     #[test]
     fn truncated_bytecode() {
-        let mut vm = VM::new(Program::new(vec![], vec![0x00, 0x00]));
+        let mut vm = VM::new(Program::new(vec![], vec![0x01, 0x00]));
         assert!(matches!(
             vm.run(&mut TestState::new(), EXECUTION_CONTEXT),
             Err(VMError::UnexpectedEndOfBytecode)
@@ -1183,6 +1319,631 @@ STORE_STR r0, r1
 LOAD_STR_STATE r2, r0"#,
         );
         let ref_id = vm.registers.get_ref(2, "").unwrap();
+        assert_eq!(vm.heap.get_string(ref_id), "hello");
+    }
+
+    // ==================== Control Flow ====================
+
+    #[test]
+    fn jal_saves_return_address() {
+        // JAL saves the address after the instruction to rd
+        // JAL r0, 0 means jump to current position (no-op) but save return addr
+        let vm = run_vm("JAL r0, 0");
+        // After JAL (10 bytes), ip should be saved as 10
+        assert_eq!(vm.registers.get_int(0, "").unwrap(), 10);
+    }
+
+    #[test]
+    fn jal_forward_jump() {
+        // Jump over LOAD_I64 r1, 99 to reach LOAD_I64 r2, 42
+        let source = r#"
+            JAL r0, skip
+            LOAD_I64 r1, 99
+            skip: LOAD_I64 r2, 42
+        "#;
+        let vm = run_vm(source);
+        // r1 should still be zero (skipped)
+        assert_eq!(vm.registers.get(1).unwrap(), &Value::Zero);
+        // r2 should be 42
+        assert_eq!(vm.registers.get_int(2, "").unwrap(), 42);
+    }
+
+    #[test]
+    fn beq_taken() {
+        // Branch taken when equal
+        let source = r#"
+            LOAD_I64 r0, 5
+            LOAD_I64 r1, 5
+            BEQ r0, r1, skip
+            LOAD_I64 r2, 99
+            skip: LOAD_I64 r3, 42
+        "#;
+        let vm = run_vm(source);
+        assert_eq!(vm.registers.get(2).unwrap(), &Value::Zero);
+        assert_eq!(vm.registers.get_int(3, "").unwrap(), 42);
+    }
+
+    #[test]
+    fn beq_not_taken() {
+        // Branch not taken when not equal
+        let source = r#"
+            LOAD_I64 r0, 5
+            LOAD_I64 r1, 6
+            BEQ r0, r1, skip
+            LOAD_I64 r2, 99
+            skip: LOAD_I64 r3, 42
+        "#;
+        let vm = run_vm(source);
+        assert_eq!(vm.registers.get_int(2, "").unwrap(), 99);
+        assert_eq!(vm.registers.get_int(3, "").unwrap(), 42);
+    }
+
+    #[test]
+    fn bne_taken() {
+        let source = r#"
+            LOAD_I64 r0, 5
+            LOAD_I64 r1, 6
+            BNE r0, r1, skip
+            LOAD_I64 r2, 99
+            skip: LOAD_I64 r3, 42
+        "#;
+        let vm = run_vm(source);
+        assert_eq!(vm.registers.get(2).unwrap(), &Value::Zero);
+        assert_eq!(vm.registers.get_int(3, "").unwrap(), 42);
+    }
+
+    #[test]
+    fn bne_not_taken() {
+        let source = r#"
+            LOAD_I64 r0, 5
+            LOAD_I64 r1, 5
+            BNE r0, r1, skip
+            LOAD_I64 r2, 99
+            skip: LOAD_I64 r3, 42
+        "#;
+        let vm = run_vm(source);
+        assert_eq!(vm.registers.get_int(2, "").unwrap(), 99);
+    }
+
+    #[test]
+    fn blt_taken() {
+        let source = r#"
+            LOAD_I64 r0, 3
+            LOAD_I64 r1, 5
+            BLT r0, r1, skip
+            LOAD_I64 r2, 99
+            skip: LOAD_I64 r3, 42
+        "#;
+        let vm = run_vm(source);
+        assert_eq!(vm.registers.get(2).unwrap(), &Value::Zero);
+        assert_eq!(vm.registers.get_int(3, "").unwrap(), 42);
+    }
+
+    #[test]
+    fn blt_not_taken() {
+        let source = r#"
+            LOAD_I64 r0, 5
+            LOAD_I64 r1, 3
+            BLT r0, r1, skip
+            LOAD_I64 r2, 99
+            skip: LOAD_I64 r3, 42
+        "#;
+        let vm = run_vm(source);
+        assert_eq!(vm.registers.get_int(2, "").unwrap(), 99);
+    }
+
+    #[test]
+    fn blt_signed() {
+        // -1 < 1 in signed comparison
+        let source = r#"
+            LOAD_I64 r0, -1
+            LOAD_I64 r1, 1
+            BLT r0, r1, skip
+            LOAD_I64 r2, 99
+            skip: LOAD_I64 r3, 42
+        "#;
+        let vm = run_vm(source);
+        assert_eq!(vm.registers.get(2).unwrap(), &Value::Zero);
+    }
+
+    #[test]
+    fn bge_taken() {
+        let source = r#"
+            LOAD_I64 r0, 5
+            LOAD_I64 r1, 5
+            BGE r0, r1, skip
+            LOAD_I64 r2, 99
+            skip: LOAD_I64 r3, 42
+        "#;
+        let vm = run_vm(source);
+        assert_eq!(vm.registers.get(2).unwrap(), &Value::Zero);
+    }
+
+    #[test]
+    fn bge_greater() {
+        let source = r#"
+            LOAD_I64 r0, 7
+            LOAD_I64 r1, 5
+            BGE r0, r1, skip
+            LOAD_I64 r2, 99
+            skip: LOAD_I64 r3, 42
+        "#;
+        let vm = run_vm(source);
+        assert_eq!(vm.registers.get(2).unwrap(), &Value::Zero);
+    }
+
+    #[test]
+    fn bltu_unsigned() {
+        // -1 as u64 is MAX, so -1 > 1 in unsigned comparison
+        let source = r#"
+            LOAD_I64 r0, -1
+            LOAD_I64 r1, 1
+            BLTU r0, r1, skip
+            LOAD_I64 r2, 99
+            skip: LOAD_I64 r3, 42
+        "#;
+        let vm = run_vm(source);
+        // Branch NOT taken because -1 as u64 > 1
+        assert_eq!(vm.registers.get_int(2, "").unwrap(), 99);
+    }
+
+    #[test]
+    fn bgeu_unsigned() {
+        // -1 as u64 is MAX, so -1 >= 1 in unsigned comparison
+        let source = r#"
+            LOAD_I64 r0, -1
+            LOAD_I64 r1, 1
+            BGEU r0, r1, skip
+            LOAD_I64 r2, 99
+            skip: LOAD_I64 r3, 42
+        "#;
+        let vm = run_vm(source);
+        // Branch taken because -1 as u64 > 1
+        assert_eq!(vm.registers.get(2).unwrap(), &Value::Zero);
+    }
+
+    #[test]
+    fn loop_with_backward_branch() {
+        // Simple loop: count from 0 to 3
+        let source = r#"
+            LOAD_I64 r0, 0
+            LOAD_I64 r1, 1
+            LOAD_I64 r2, 3
+            loop:
+            ADD r0, r0, r1
+            BLT r0, r2, loop
+        "#;
+        let vm = run_vm(source);
+        // r0 should be 3 after loop exits
+        assert_eq!(vm.registers.get_int(0, "").unwrap(), 3);
+    }
+
+    #[test]
+    fn jalr_indirect_jump() {
+        // JALR jumps to address in register + offset
+        // LOAD_I64: 10 bytes, JALR: 11 bytes
+        // Offsets: LOAD_I64[0-9], JALR[10-20], LOAD_I64 r2[21-30], LOAD_I64 r3[31-40]
+        let source = r#"
+            LOAD_I64 r1, 30
+            JALR r0, r1, 1
+            LOAD_I64 r2, 99
+            LOAD_I64 r3, 42
+        "#;
+        let vm = run_vm(source);
+        // Should skip LOAD_I64 r2, 99 and execute LOAD_I64 r3, 42
+        assert_eq!(vm.registers.get(2).unwrap(), &Value::Zero);
+        assert_eq!(vm.registers.get_int(3, "").unwrap(), 42);
+    }
+
+    // ==================== Function Calls ====================
+
+    #[test]
+    fn call_and_ret_simple() {
+        // Call a function that returns a constant
+        let source = r#"
+            JAL r0, main
+            main:
+            CALL r1, "double", 0, r0
+            JAL r0, end
+            double:
+            LOAD_I64 r10, 42
+            RET r10
+            end:
+        "#;
+        let vm = run_vm(source);
+        assert_eq!(vm.registers.get_int(1, "").unwrap(), 42);
+    }
+
+    #[test]
+    fn call_nested() {
+        // Nested function calls
+        let source = r#"
+            JAL r0, main
+            main:
+            CALL r1, "outer", 0, r0
+            JAL r0, end
+            outer:
+            CALL r2, "inner", 0, r0
+            RET r2
+            inner:
+            LOAD_I64 r10, 99
+            RET r10
+            end:
+        "#;
+        let vm = run_vm(source);
+        assert_eq!(vm.registers.get_int(1, "").unwrap(), 99);
+    }
+
+    #[test]
+    fn call_undefined_function() {
+        let source = r#"CALL r0, "nonexistent", 0, r0"#;
+        let err = run_expect_err(source);
+        assert!(matches!(err, VMError::UndefinedFunction(_)));
+    }
+
+    #[test]
+    fn ret_without_call() {
+        let source = "LOAD_I64 r0, 1\nRET r0";
+        let err = run_expect_err(source);
+        assert!(matches!(err, VMError::ReturnWithoutCall));
+    }
+
+    #[test]
+    fn call_preserves_registers() {
+        let source = r#"
+            JAL r0, main
+            main:
+            LOAD_I64 r5, 100
+            CALL r1, "func", 0, r0
+            ADD r2, r1, r5
+            JAL r0, end
+            func:
+            LOAD_I64 r10, 50
+            RET r10
+            end:
+        "#;
+        let vm = run_vm(source);
+        // r1 = 50 (return value), r5 = 100, r2 = 150
+        assert_eq!(vm.registers.get_int(2, "").unwrap(), 150);
+    }
+
+    #[test]
+    fn counter_steps_loop() {
+        let prog = r#"
+        # increment counter N times, where N is stored under "steps"
+        main:
+            LOAD_STR r0, "counter"
+            LOAD_STR r1, "steps"
+
+            LOAD_I64_STATE r2, r0     # acc = counter
+            LOAD_I64_STATE r3, r1     # limit = steps
+            LOAD_I64 r4, 0            # i = 0
+            LOAD_I64 r5, 1            # inc = 1
+
+        loop:
+            ADD r2, r2, r5            # acc += 1
+            ADD r4, r4, r5            # i++
+            BLT r4, r3, loop          # loop while i < limit
+
+        STORE_I64 r0, r2              # update counter
+        "#;
+
+        let mut state = TestState::new();
+        let key_counter = VM::make_state_key(
+            EXECUTION_CONTEXT.chain_id,
+            EXECUTION_CONTEXT.contract_id,
+            b"counter",
+        );
+        let key_steps = VM::make_state_key(
+            EXECUTION_CONTEXT.chain_id,
+            EXECUTION_CONTEXT.contract_id,
+            b"steps",
+        );
+
+        state.push(key_counter, 5i64.to_le_bytes().to_vec());
+        state.push(key_steps, 3i64.to_le_bytes().to_vec());
+
+        let program = assemble_source(prog).expect("assembly failed");
+        let mut vm = VM::new(program);
+        vm.run(&mut state, EXECUTION_CONTEXT)
+            .expect("vm run failed");
+
+        let out = state.get(key_counter).unwrap();
+        assert_eq!(i64::from_le_bytes(out.try_into().unwrap()), 8);
+    }
+
+    // ==================== Call Stack Poisoning ====================
+
+    #[test]
+    fn deeply_nested_calls() {
+        // Chain of nested function calls to stress the call stack
+        let source = r#"
+            JAL r0, main
+            main:
+            CALL r1, "f1", 0, r0
+            JAL r0, end
+            f1:
+            CALL r2, "f2", 0, r0
+            RET r2
+            f2:
+            CALL r3, "f3", 0, r0
+            RET r3
+            f3:
+            CALL r4, "f4", 0, r0
+            RET r4
+            f4:
+            CALL r5, "f5", 0, r0
+            RET r5
+            f5:
+            LOAD_I64 r10, 777
+            RET r10
+            end:
+        "#;
+        let vm = run_vm(source);
+        assert_eq!(vm.registers.get_int(1, "").unwrap(), 777);
+    }
+
+    #[test]
+    fn call_stack_unwind_on_multiple_returns() {
+        // Each function returns, properly unwinding the stack
+        let source = r#"
+            JAL r0, main
+            main:
+            LOAD_I64 r10, 1
+            CALL r1, "add_ten", 0, r0
+            CALL r2, "add_ten", 0, r0
+            CALL r3, "add_ten", 0, r0
+            ADD r4, r1, r2
+            ADD r4, r4, r3
+            JAL r0, end
+            add_ten:
+            LOAD_I64 r20, 10
+            RET r20
+            end:
+        "#;
+        let vm = run_vm(source);
+        // Three calls each return 10, sum should be 30
+        assert_eq!(vm.registers.get_int(4, "").unwrap(), 30);
+    }
+
+    #[test]
+    fn call_overwrites_dst_register_with_return_value() {
+        // Verify that the destination register is correctly overwritten
+        let source = r#"
+            JAL r0, main
+            main:
+            LOAD_I64 r5, 999
+            CALL r5, "get_42", 0, r0
+            JAL r0, end
+            get_42:
+            LOAD_I64 r10, 42
+            RET r10
+            end:
+        "#;
+        let vm = run_vm(source);
+        // r5 should be overwritten with 42, not 999
+        assert_eq!(vm.registers.get_int(5, "").unwrap(), 42);
+    }
+
+    #[test]
+    fn return_from_recursive_call() {
+        // Simple recursion: count down from 3 to 0
+        let source = r#"
+            JAL r0, main
+            main:
+            LOAD_I64 r1, 3
+            CALL r2, "countdown", 0, r0
+            JAL r0, end
+
+            countdown:
+            LOAD_I64 r10, 0
+            LOAD_I64 r11, 1
+            BEQ r1, r10, done
+            SUB r1, r1, r11
+            CALL r12, "countdown", 0, r0
+            done:
+            RET r1
+
+            end:
+        "#;
+        let vm = run_vm(source);
+        // After countdown, r1 should be 0
+        assert_eq!(vm.registers.get_int(2, "").unwrap(), 0);
+    }
+
+    #[test]
+    fn multiple_ret_without_call_fails() {
+        // First RET succeeds, second RET should fail
+        let source = r#"
+            JAL r0, main
+            main:
+            CALL r1, "func", 0, r0
+            JAL r0, end
+            func:
+            LOAD_I64 r10, 1
+            RET r10
+            RET r10
+            end:
+        "#;
+        // This should succeed because the second RET is never reached
+        let vm = run_vm(source);
+        assert_eq!(vm.registers.get_int(1, "").unwrap(), 1);
+    }
+
+    #[test]
+    fn ret_with_empty_stack_fails() {
+        // Direct RET without any CALL
+        let source = "LOAD_I64 r0, 42\nRET r0";
+        let err = run_expect_err(source);
+        assert!(matches!(err, VMError::ReturnWithoutCall));
+    }
+
+    #[test]
+    fn call_then_jal_then_ret_fails() {
+        // CALL pushes frame, but JAL jumps away and RET finds wrong context
+        let source = r#"
+            JAL r0, main
+            main:
+            CALL r1, "func", 0, r0
+            JAL r0, end
+            func:
+            JAL r0, escape
+            escape:
+            LOAD_I64 r10, 1
+            RET r10
+            end:
+        "#;
+        // This should work because RET still finds the call frame
+        let vm = run_vm(source);
+        assert_eq!(vm.registers.get_int(1, "").unwrap(), 1);
+    }
+
+    #[test]
+    fn call_stack_isolation_between_calls() {
+        // Ensure sequential calls don't interfere with each other
+        let source = r#"
+            JAL r0, main
+            main:
+            CALL r1, "ret_10", 0, r0
+            CALL r2, "ret_20", 0, r0
+            CALL r3, "ret_30", 0, r0
+            JAL r0, end
+            ret_10:
+            LOAD_I64 r10, 10
+            RET r10
+            ret_20:
+            LOAD_I64 r10, 20
+            RET r10
+            ret_30:
+            LOAD_I64 r10, 30
+            RET r10
+            end:
+        "#;
+        let vm = run_vm(source);
+        assert_eq!(vm.registers.get_int(1, "").unwrap(), 10);
+        assert_eq!(vm.registers.get_int(2, "").unwrap(), 20);
+        assert_eq!(vm.registers.get_int(3, "").unwrap(), 30);
+    }
+
+    #[test]
+    fn call_with_same_dst_as_return_reg() {
+        // Return value goes to same register used inside function
+        let source = r#"
+            JAL r0, main
+            main:
+            CALL r10, "func", 0, r0
+            JAL r0, end
+            func:
+            LOAD_I64 r10, 42
+            RET r10
+            end:
+        "#;
+        let vm = run_vm(source);
+        // r10 should have return value 42
+        assert_eq!(vm.registers.get_int(10, "").unwrap(), 42);
+    }
+
+    #[test]
+    fn nested_call_return_value_propagation() {
+        // Return value flows through nested calls
+        let source = r#"
+            JAL r0, main
+            main:
+            CALL r1, "outer", 0, r0
+            JAL r0, end
+            outer:
+            CALL r2, "middle", 0, r0
+            LOAD_I64 r3, 1
+            ADD r2, r2, r3
+            RET r2
+            middle:
+            CALL r4, "inner", 0, r0
+            LOAD_I64 r5, 1
+            ADD r4, r4, r5
+            RET r4
+            inner:
+            LOAD_I64 r6, 1
+            RET r6
+            end:
+        "#;
+        let vm = run_vm(source);
+        // inner returns 1, middle adds 1 = 2, outer adds 1 = 3
+        assert_eq!(vm.registers.get_int(1, "").unwrap(), 3);
+    }
+
+    #[test]
+    fn call_stack_empty_after_balanced_calls() {
+        // After all returns, call stack should be empty
+        let source = r#"
+            JAL r0, main
+            main:
+            CALL r1, "a", 0, r0
+            CALL r2, "b", 0, r0
+            JAL r0, end
+            a:
+            LOAD_I64 r10, 1
+            RET r10
+            b:
+            LOAD_I64 r10, 2
+            RET r10
+            end:
+        "#;
+        let vm = run_vm(source);
+        // Call stack should be empty after execution
+        assert!(vm.call_stack.is_empty());
+    }
+
+    #[test]
+    fn return_zero_value() {
+        // Return the Zero value from an uninitialized register
+        let source = r#"
+            JAL r0, main
+            main:
+            CALL r1, "ret_zero", 0, r0
+            JAL r0, end
+            ret_zero:
+            RET r50
+            end:
+        "#;
+        let vm = run_vm(source);
+        assert_eq!(vm.registers.get(1).unwrap(), &Value::Zero);
+    }
+
+    #[test]
+    fn return_bool_value() {
+        // Return a boolean value
+        let source = r#"
+            JAL r0, main
+            main:
+            CALL r1, "ret_bool", 0, r0
+            JAL r0, end
+            ret_bool:
+            LOAD_BOOL r10, true
+            RET r10
+            end:
+        "#;
+        let vm = run_vm(source);
+        assert_eq!(vm.registers.get(1).unwrap(), &Value::Bool(true));
+    }
+
+    #[test]
+    fn return_ref_value() {
+        // Return a string reference
+        let source = r#"
+            JAL r0, main
+            main:
+            CALL r1, "ret_str", 0, r0
+            JAL r0, end
+            ret_str:
+            LOAD_STR r10, "hello"
+            RET r10
+            end:
+        "#;
+        let vm = run_vm(source);
+        let ref_id = match vm.registers.get(1).unwrap() {
+            Value::Ref(r) => *r,
+            other => panic!("expected Ref, got {:?}", other),
+        };
         assert_eq!(vm.heap.get_string(ref_id), "hello");
     }
 }

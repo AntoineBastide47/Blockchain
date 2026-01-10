@@ -7,7 +7,7 @@ use crate::crypto::key_pair::PrivateKey;
 use crate::info;
 use crate::storage::main_storage::MainStorage;
 use crate::storage::state_store::{AccountStorage, IterableState, VmStorage};
-use crate::storage::state_view::StateViewProvider;
+use crate::storage::state_view::{StateView, StateViewProvider};
 use crate::storage::storage_trait::{Storage, StorageError};
 use crate::types::encoding::Encode;
 use crate::types::hash::Hash;
@@ -124,7 +124,7 @@ impl<V: Validator, S: Storage + VmStorage + AccountStorage + IterableState + Sta
     fn apply_tx(
         &self,
         transaction: &Transaction,
-        block_overlay: &mut OverlayState,
+        block_overlay: &mut OverlayState<StateView<S>>,
     ) -> Result<(), StorageError> {
         self.validator
             .validate_tx(transaction, &self.storage, self.id)
@@ -200,7 +200,7 @@ impl<V: Validator, S: Storage + VmStorage + AccountStorage + IterableState + Sta
         self.storage.append_block(block, self.id)
     }
 
-    fn compute_state_root(base: &S, overlay: &OverlayState<'_>) -> Hash {
+    fn compute_state_root(base: &S, overlay: &OverlayState<'_, StateView<S>>) -> Hash {
         use std::collections::BTreeMap;
 
         // Materialize into deterministic map

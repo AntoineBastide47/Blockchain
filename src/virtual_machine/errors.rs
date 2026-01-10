@@ -61,4 +61,16 @@ pub enum VMError {
     /// State value has invalid format for the expected type.
     #[error("invalid storage value format")]
     InvalidStateValue,
+    /// Label defined more than once.
+    #[error("duplicate label: {0}")]
+    DuplicateLabel(String),
+    /// Reference to undefined label.
+    #[error("undefined label: {0}")]
+    UndefinedLabel(String),
+    /// Call to undefined function.
+    #[error("undefined function: {0}")]
+    UndefinedFunction(String),
+    /// Return without matching call.
+    #[error("return without call")]
+    ReturnWithoutCall,
 }

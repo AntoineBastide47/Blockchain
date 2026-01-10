@@ -6,12 +6,13 @@
 use crate::types::bytes::Bytes;
 use crate::types::encoding::{Decode, DecodeError, Encode};
 use blockchain_derive::BinaryCodec;
+use std::collections::HashMap;
 
 /// Magic bytes identifying a serialized VM program.
 const MAGIC: &[u8; 5] = b"VM_BC";
 
 /// Current bytecode format version.
-const CURRENT_VERSION: Version = Version::new(0, 2, 0);
+const CURRENT_VERSION: Version = Version::new(0, 3, 0);
 
 /// Semantic version for bytecode format compatibility.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, BinaryCodec)]
@@ -32,14 +33,17 @@ impl Version {
     }
 }
 
-/// Compiled bytecode program with its string pool.
+/// Compiled bytecode program with its string pool and labels.
 ///
-/// Contains all data needed to execute a program: the raw bytecode
-/// and any string literals referenced by `LOAD_STR` instructions.
+/// Contains all data needed to execute a program: the raw bytecode,
+/// string literals referenced by `LOAD_STR` instructions, and label
+/// definitions mapping names to bytecode offsets.
 #[derive(Debug, Clone, BinaryCodec)]
 pub struct Program {
     /// Interned string literals referenced by index.
     pub strings: Vec<String>,
+    /// Label definitions mapping names to bytecode offsets.
+    pub labels: HashMap<String, usize>,
     /// Compiled instruction bytecode.
     pub bytecode: Vec<u8>,
 }
@@ -96,7 +100,24 @@ pub mod tests {
     impl Program {
         /// Creates a new program from pre-assembled components.
         pub(crate) fn new(strings: Vec<String>, bytecode: Vec<u8>) -> Program {
-            Self { strings, bytecode }
+            Self {
+                strings,
+                labels: HashMap::new(),
+                bytecode,
+            }
+        }
+
+        /// Creates a new program with labels.
+        pub(crate) fn with_labels(
+            strings: Vec<String>,
+            labels: HashMap<String, usize>,
+            bytecode: Vec<u8>,
+        ) -> Program {
+            Self {
+                strings,
+                labels,
+                bytecode,
+            }
         }
     }
 

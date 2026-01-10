@@ -196,23 +196,41 @@ async fn main() {
     if validator_mode {
         let server_for_txs = server.clone();
         tokio::spawn(async move {
-            let mut counter: u64 = 0;
+            /// Initial balance for test accounts (10^18).
+            const TEST_ACCOUNT_BALANCE: u128 = 1_000_000_000_000_000_000;
+
             loop {
+                // Compute factorial of 5 using a loop and function call
                 let source = r#"
-                    LOAD_I64 r0, 10
-                    LOAD_I64 r1, 32
-                    ADD r2, r0, r1
+                    JAL r0, main
+
+                    # factorial(n): computes n! iteratively
+                    # input: r1 = n, output: r10 = n!
+                    factorial:
+                        LOAD_I64 r10, 1         # result = 1
+                        LOAD_I64 r11, 1         # i = 1
+                        LOAD_I64 r12, 1         # increment
+                    fact_loop:
+                        MUL r10, r10, r11       # result *= i
+                        ADD r11, r11, r12       # i++
+                        BGE r1, r11, fact_loop  # while n >= i
+                        RET r10
+
+                    main:
+                        LOAD_I64 r1, 5          # compute 5!
+                        CALL r2, "factorial", 0, r0
+                        # r2 now contains 120 (5!)
                 "#;
                 let data = assemble_source(source).expect("assembly failed").to_bytes();
 
                 // Build a fully populated transaction for the demo.
                 let tx = Transaction::builder(data, PrivateKey::new(), DEV_CHAIN_ID)
                     .with_recipient(PrivateKey::new().public_key().address())
-                    .with_amount(1_000)
-                    .with_fee(10)
+                    .with_amount(0)
+                    .with_fee(0)
                     .with_gas_price(1)
                     .with_gas_limit(50_000)
-                    .with_nonce(counter)
+                    .with_nonce(0)
                     .build();
                 let msg = Message::new(MessageType::Transaction, tx.to_bytes());
 
@@ -226,7 +244,6 @@ async fn main() {
                     warn!("validator tx broadcast failed: {e}");
                 }
 
-                counter = counter.wrapping_add(1);
                 sleep(Duration::from_secs(1)).await;
             }
         });

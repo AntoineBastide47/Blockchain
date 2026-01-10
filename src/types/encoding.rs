@@ -26,6 +26,7 @@
 use crate::types::bytes::Bytes;
 use crate::types::hash::HashCache;
 use blockchain_derive::Error;
+use std::collections::HashMap;
 
 /// Maximum number of elements allowed when decoding a vector to avoid unbounded allocations.
 pub const MAX_VEC_LEN: usize = 1_000_000;
@@ -415,6 +416,45 @@ impl<A: Encode, B: Encode, C: Encode> Encode for (A, B, C) {
 impl<A: Decode, B: Decode, C: Decode> Decode for (A, B, C) {
     fn decode(input: &mut &[u8]) -> Result<Self, DecodeError> {
         Ok((A::decode(input)?, B::decode(input)?, C::decode(input)?))
+    }
+}
+
+impl<K: Encode + Decode + Eq + std::hash::Hash, V: Encode + Decode> Encode for HashMap<K, V> {
+    fn encode<S: EncodeSink>(&self, out: &mut S) {
+        let len = self.len();
+
+        if len > MAX_VEC_LEN {
+            0usize.encode(out);
+            return;
+        }
+
+        len.encode(out);
+        for (k, v) in self {
+            k.encode(out);
+            v.encode(out);
+        }
+    }
+}
+
+impl<K: Encode + Decode + Eq + std::hash::Hash, V: Encode + Decode> Decode for HashMap<K, V> {
+    fn decode(input: &mut &[u8]) -> Result<Self, DecodeError> {
+        let len = usize::decode(input)?;
+        if len > MAX_VEC_LEN {
+            return Err(DecodeError::LengthOverflow {
+                expected: MAX_VEC_LEN,
+                actual: len.to_string(),
+                type_name: "HashMap".to_string(),
+            });
+        }
+
+        // Conservative preallocation
+        let mut map = HashMap::with_capacity(len);
+        for _ in 0..len {
+            let k = K::decode(input)?;
+            let v = V::decode(input)?;
+            map.insert(k, v);
+        }
+        Ok(map)
     }
 }
 

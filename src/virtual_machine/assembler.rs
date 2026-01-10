@@ -25,18 +25,22 @@ use crate::for_each_instruction;
 use crate::virtual_machine::errors::VMError;
 use crate::virtual_machine::isa::Instruction;
 use crate::virtual_machine::program::Program;
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
 const COMMENT_CHAR: char = '#';
+const LABEL_SUFFIX: char = ':';
 
-/// Assembly context for string interning during compilation.
+/// Assembly context for string interning and label tracking during compilation.
 ///
-/// Tracks string literals encountered during assembly, assigning each
-/// a unique index that becomes part of the compiled [`Program`].
+/// Tracks string literals and labels encountered during assembly, assigning each
+/// string a unique index that becomes part of the compiled [`Program`].
 pub struct AsmContext {
     /// Accumulated string literals.
     pub strings: Vec<String>,
+    /// Label definitions mapping names to bytecode offsets.
+    pub labels: HashMap<String, usize>,
 }
 
 impl AsmContext {
@@ -44,6 +48,7 @@ impl AsmContext {
     pub fn new() -> Self {
         Self {
             strings: Vec::new(),
+            labels: HashMap::new(),
         }
     }
 
@@ -52,6 +57,23 @@ impl AsmContext {
         let id = self.strings.len() as u32;
         self.strings.push(s);
         id
+    }
+
+    /// Registers a label at the given bytecode offset.
+    pub fn define_label(&mut self, name: String, offset: usize) -> Result<(), VMError> {
+        if self.labels.contains_key(&name) {
+            return Err(VMError::DuplicateLabel(name));
+        }
+        self.labels.insert(name, offset);
+        Ok(())
+    }
+
+    /// Resolves a label to its bytecode offset.
+    pub fn resolve_label(&self, name: &str) -> Result<usize, VMError> {
+        self.labels
+            .get(name)
+            .copied()
+            .ok_or_else(|| VMError::UndefinedLabel(name.to_string()))
     }
 }
 
@@ -146,6 +168,33 @@ pub(crate) fn parse_bool(tok: &str) -> Result<bool, VMError> {
     }
 }
 
+/// Parse an i64 immediate or a label reference.
+///
+/// If `tok` parses as an integer, returns it directly.
+/// Otherwise, treats it as a label name and computes a relative offset
+/// from `after_instr` (the PC value after decoding the current instruction).
+pub(crate) fn parse_i64_or_label(
+    tok: &str,
+    ctx: &AsmContext,
+    after_instr: usize,
+) -> Result<i64, VMError> {
+    if let Ok(v) = tok.parse::<i64>() {
+        return Ok(v);
+    }
+    let target = ctx.resolve_label(tok)?;
+    Ok(target as i64 - after_instr as i64)
+}
+
+/// Checks if a token is a label definition (ends with `:`)
+fn is_label_def(tok: &str) -> bool {
+    tok.ends_with(LABEL_SUFFIX) && tok.len() > 1
+}
+
+/// Extracts the label name from a label definition token.
+fn label_name(tok: &str) -> &str {
+    &tok[..tok.len() - 1]
+}
+
 macro_rules! define_parse_instruction {
     (
         $(
@@ -191,13 +240,32 @@ macro_rules! define_parse_instruction {
             }
         }
 
+        /// Returns the bytecode size for an instruction (opcode + operands).
+        fn instruction_size(instr: Instruction) -> usize {
+            match instr {
+                $(
+                    Instruction::$name => {
+                        1usize $( + define_parse_instruction!(@size $kind) )*
+                    }
+                ),*
+            }
+        }
+
         /// Parse one instruction from tokens into [`AsmInstr`].
-        fn parse_instruction(ctx: &mut AsmContext, tokens: &[String]) -> Result<AsmInstr, VMError> {
+        ///
+        /// `current_offset` is the bytecode offset where this instruction starts,
+        /// used for resolving label references to relative offsets.
+        fn parse_instruction(
+            ctx: &mut AsmContext,
+            tokens: &[String],
+            current_offset: usize,
+        ) -> Result<AsmInstr, VMError> {
             if tokens.is_empty() {
                 return Err(VMError::ArityMismatch);
             }
 
             let instr = instruction_from_str(&tokens[0])?;
+            let instr_size = instruction_size(instr);
 
             match instr {
                 $(
@@ -211,7 +279,7 @@ macro_rules! define_parse_instruction {
                         Ok(AsmInstr::$name {
                             $(
                                 $field: define_parse_instruction!(
-                                    @parse_operand $kind, it.next().unwrap(), ctx
+                                    @parse_operand $kind, it.next().unwrap(), ctx, current_offset + instr_size
                                 )?,
                             )*
                         })
@@ -228,16 +296,22 @@ macro_rules! define_parse_instruction {
 
     (@unit $x:ident) => { () };
 
+    // ---------- operand sizes ----------
+    (@size Reg)    => { 1usize };
+    (@size Bool)   => { 1usize };
+    (@size RefU32) => { 4usize };
+    (@size ImmI64) => { 8usize };
+
     // ---------- parsing ----------
-    (@parse_operand Reg, $tok:expr, $ctx:expr) => {
+    (@parse_operand Reg, $tok:expr, $ctx:expr, $current_offset:expr) => {
         parse_reg($tok)
     };
 
-    (@parse_operand ImmI64, $tok:expr, $ctx:expr) => {
-        parse_i64($tok)
+    (@parse_operand ImmI64, $tok:expr, $ctx:expr, $current_offset:expr) => {
+        parse_i64_or_label($tok, $ctx, $current_offset)
     };
 
-    (@parse_operand RefU32, $tok:expr, $ctx:expr) => {{
+    (@parse_operand RefU32, $tok:expr, $ctx:expr, $current_offset:expr) => {{
         if let Some(s) = $tok.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
             Ok($ctx.intern_string(s.to_string()))
         } else {
@@ -245,35 +319,90 @@ macro_rules! define_parse_instruction {
         }
     }};
 
-    (@parse_operand Bool, $tok:expr, $ctx:expr) => {
+    (@parse_operand Bool, $tok:expr, $ctx:expr, $current_offset:expr) => {
         parse_bool($tok)
     };
 }
 
 for_each_instruction!(define_parse_instruction);
 
+/// Parsed line: either a label definition or an instruction.
+enum ParsedLine {
+    Label(String),
+    Instruction(Vec<String>),
+}
+
 /// Assemble a full source string into bytecode.
+///
+/// Uses two-pass assembly:
+/// 1. First pass: tokenize lines, record label positions
+/// 2. Second pass: parse instructions with label resolution, emit bytecode
 pub fn assemble_source(source: impl Into<String>) -> Result<Program, VMError> {
-    let mut bytecode = Vec::new();
+    let source = source.into();
     let mut asm_context = AsmContext::new();
 
-    for (line_no, line) in source.into().lines().enumerate() {
+    // First pass: tokenize all lines and collect label definitions
+    let mut parsed_lines: Vec<(usize, ParsedLine)> = Vec::new();
+    let mut offset = 0usize;
+
+    for (line_no, line) in source.lines().enumerate() {
         let tokens = tokenize(line);
         if tokens.is_empty() {
             continue;
         }
 
-        let instr =
-            parse_instruction(&mut asm_context, &tokens).map_err(|e| VMError::AssemblyError {
+        // Check if first token is a label definition
+        if is_label_def(&tokens[0]) {
+            let name = label_name(&tokens[0]).to_string();
+            asm_context
+                .define_label(name.clone(), offset)
+                .map_err(|e| VMError::AssemblyError {
+                    line: line_no + 1,
+                    source: e.to_string(),
+                })?;
+            parsed_lines.push((line_no, ParsedLine::Label(name)));
+
+            // If there are more tokens after the label, treat them as an instruction
+            if tokens.len() > 1 {
+                let instr_tokens: Vec<String> = tokens[1..].to_vec();
+                let instr =
+                    instruction_from_str(&instr_tokens[0]).map_err(|e| VMError::AssemblyError {
+                        line: line_no + 1,
+                        source: e.to_string(),
+                    })?;
+                offset += instruction_size(instr);
+                parsed_lines.push((line_no, ParsedLine::Instruction(instr_tokens)));
+            }
+        } else {
+            let instr = instruction_from_str(&tokens[0]).map_err(|e| VMError::AssemblyError {
                 line: line_no + 1,
                 source: e.to_string(),
             })?;
+            offset += instruction_size(instr);
+            parsed_lines.push((line_no, ParsedLine::Instruction(tokens)));
+        }
+    }
 
-        instr.assemble(&mut bytecode);
+    // Second pass: parse instructions and emit bytecode
+    let mut bytecode = Vec::new();
+
+    for (line_no, parsed) in parsed_lines {
+        if let ParsedLine::Instruction(tokens) = parsed {
+            let current_offset = bytecode.len();
+            let instr =
+                parse_instruction(&mut asm_context, &tokens, current_offset).map_err(|e| {
+                    VMError::AssemblyError {
+                        line: line_no + 1,
+                        source: e.to_string(),
+                    }
+                })?;
+            instr.assemble(&mut bytecode);
+        }
     }
 
     Ok(Program {
         strings: asm_context.strings,
+        labels: asm_context.labels,
         bytecode,
     })
 }
@@ -362,8 +491,8 @@ mod tests {
     #[test]
     fn assemble_single_instruction() {
         let program = assemble_source("LOAD_I64 r0, 42").unwrap();
-        assert_eq!(program.bytecode[0], 0x00); // LOAD_I64 opcode
-        assert_eq!(program.bytecode[1], 0); // r0
+        assert_eq!(program.bytecode[0], 0x01);
+        assert_eq!(program.bytecode[1], 0);
         assert_eq!(
             i64::from_le_bytes(program.bytecode[2..10].try_into().unwrap()),
             42
@@ -418,7 +547,7 @@ mod tests {
     fn assemble_string_literal() {
         let program = assemble_source(r#"LOAD_STR r0, "hello""#).unwrap();
         assert_eq!(program.strings, vec!["hello"]);
-        assert_eq!(program.bytecode[0], 0x06); // LOAD_STR opcode
+        assert_eq!(program.bytecode[0], 0x07);
     }
 
     #[test]
@@ -434,12 +563,12 @@ mod tests {
     #[test]
     fn assemble_bool_literal() {
         let program = assemble_source("LOAD_BOOL r0, true").unwrap();
-        assert_eq!(program.bytecode[0], 0x03); // LOAD_BOOL opcode
-        assert_eq!(program.bytecode[2], 1); // true = 1
+        assert_eq!(program.bytecode[0], 0x04);
+        assert_eq!(program.bytecode[2], 1);
 
         let program = assemble_source("LOAD_BOOL r0, false").unwrap();
-        assert_eq!(program.bytecode[0], 0x03); // LOAD_BOOL opcode
-        assert_eq!(program.bytecode[2], 0); // false = 0
+        assert_eq!(program.bytecode[0], 0x04);
+        assert_eq!(program.bytecode[2], 0);
 
         let err = assemble_source("LOAD_BOOL r0, 1").unwrap_err();
         assert!(matches!(err, VMError::AssemblyError { .. }));
@@ -448,7 +577,7 @@ mod tests {
     #[test]
     fn instruction_parse_empty() {
         assert!(matches!(
-            parse_instruction(&mut AsmContext::new(), &[]),
+            parse_instruction(&mut AsmContext::new(), &[], 0),
             Err(VMError::ArityMismatch)
         ));
     }
@@ -456,7 +585,7 @@ mod tests {
     #[test]
     fn instruction_parse_load_i64() {
         let tokens = vec!["LOAD_I64".into(), "r5".into(), "100".into()];
-        let instr = parse_instruction(&mut AsmContext::new(), &tokens).unwrap();
+        let instr = parse_instruction(&mut AsmContext::new(), &tokens, 0).unwrap();
         match instr {
             AsmInstr::LoadI64 { rd, imm } => {
                 assert_eq!(rd, 5);
@@ -469,7 +598,7 @@ mod tests {
     #[test]
     fn instruction_parse_three_reg() {
         let tokens = vec!["ADD".into(), "r0".into(), "r1".into(), "r2".into()];
-        let instr = parse_instruction(&mut AsmContext::new(), &tokens).unwrap();
+        let instr = parse_instruction(&mut AsmContext::new(), &tokens, 0).unwrap();
         match instr {
             AsmInstr::Add { rd, rs1, rs2 } => {
                 assert_eq!(rd, 0);
@@ -507,7 +636,7 @@ mod tests {
         let instr = AsmInstr::LoadI64 { rd: 3, imm: -1 };
         let mut out = Vec::new();
         instr.assemble(&mut out);
-        assert_eq!(out[0], 0x00);
+        assert_eq!(out[0], 0x01);
         assert_eq!(out[1], 3);
         assert_eq!(i64::from_le_bytes(out[2..10].try_into().unwrap()), -1);
     }
@@ -537,7 +666,7 @@ mod tests {
         let instr = AsmInstr::LoadBool { rd: 0, bool: true };
         let mut out = Vec::new();
         instr.assemble(&mut out);
-        assert_eq!(out, vec![0x03, 0, 1]);
+        assert_eq!(out, vec![0x04, 0, 1]);
     }
 
     #[test]
@@ -545,8 +674,103 @@ mod tests {
         let instr = AsmInstr::LoadStr { rd: 1, str: 0x1234 };
         let mut out = Vec::new();
         instr.assemble(&mut out);
-        assert_eq!(out[0], 0x06);
+        assert_eq!(out[0], 0x07);
         assert_eq!(out[1], 1);
         assert_eq!(u32::from_le_bytes(out[2..6].try_into().unwrap()), 0x1234);
+    }
+
+    // ==================== Labels ====================
+
+    #[test]
+    fn label_definition() {
+        let source = "start: LOAD_I64 r0, 42";
+        let program = assemble_source(source).unwrap();
+        assert_eq!(program.labels.get("start"), Some(&0));
+    }
+
+    #[test]
+    fn label_on_separate_line() {
+        let source = "start:\n    LOAD_I64 r0, 42";
+        let program = assemble_source(source).unwrap();
+        assert_eq!(program.labels.get("start"), Some(&0));
+    }
+
+    #[test]
+    fn multiple_labels() {
+        let source = r#"
+            first: LOAD_I64 r0, 1
+            second: LOAD_I64 r1, 2
+        "#;
+        let program = assemble_source(source).unwrap();
+        assert_eq!(program.labels.get("first"), Some(&0));
+        // LOAD_I64 is 1 (opcode) + 1 (reg) + 8 (imm) = 10 bytes
+        assert_eq!(program.labels.get("second"), Some(&10));
+    }
+
+    #[test]
+    fn label_forward_reference() {
+        // JAL r0, end should jump forward
+        // JAL is 1 (opcode) + 1 (reg) + 8 (offset) = 10 bytes
+        // LOAD_I64 is 10 bytes
+        let source = r#"
+            JAL r0, end
+            LOAD_I64 r1, 99
+            end: LOAD_I64 r2, 0
+        "#;
+        let program = assemble_source(source).unwrap();
+        assert_eq!(program.labels.get("end"), Some(&20));
+        // Offset in JAL should be 20 - 10 = 10 (target - after_instr)
+        let offset = i64::from_le_bytes(program.bytecode[2..10].try_into().unwrap());
+        assert_eq!(offset, 10);
+    }
+
+    #[test]
+    fn label_backward_reference() {
+        // BEQ should jump backward
+        // BEQ is 1 (opcode) + 1 (rs1) + 1 (rs2) + 8 (offset) = 11 bytes
+        let source = r#"
+            loop: LOAD_I64 r0, 1
+            BEQ r0, r0, loop
+        "#;
+        let program = assemble_source(source).unwrap();
+        assert_eq!(program.labels.get("loop"), Some(&0));
+        // BEQ starts at offset 10: opcode[10], rs1[11], rs2[12], offset[13..20]
+        // Offset should be 0 - 21 = -21
+        let offset = i64::from_le_bytes(program.bytecode[13..21].try_into().unwrap());
+        assert_eq!(offset, -21);
+    }
+
+    #[test]
+    fn duplicate_label_error() {
+        let source = "dup: LOAD_I64 r0, 1\ndup: LOAD_I64 r1, 2";
+        let err = assemble_source(source).unwrap_err();
+        assert!(matches!(
+            err,
+            VMError::AssemblyError { line: 2, ref source } if source.contains("duplicate")
+        ));
+    }
+
+    #[test]
+    fn undefined_label_error() {
+        let source = "JAL r0, missing";
+        let err = assemble_source(source).unwrap_err();
+        assert!(matches!(
+            err,
+            VMError::AssemblyError { line: 1, ref source } if source.contains("undefined")
+        ));
+    }
+
+    #[test]
+    fn is_label_def_valid() {
+        assert!(is_label_def("start:"));
+        assert!(is_label_def("_loop:"));
+        assert!(is_label_def("label123:"));
+    }
+
+    #[test]
+    fn is_label_def_invalid() {
+        assert!(!is_label_def(":"));
+        assert!(!is_label_def("label"));
+        assert!(!is_label_def(""));
     }
 }

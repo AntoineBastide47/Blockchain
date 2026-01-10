@@ -34,24 +34,26 @@ macro_rules! for_each_instruction {
             // =========================
             // Store and Load
             // =========================
+            /// DELETE_STATE key ; delete's the value at key in storage
+            DeleteState = 0x00, "DELETE_STATE" => [key: Reg],
             /// LOAD_I64 rd, imm64 ; rd = imm64
-            LoadI64 = 0x00, "LOAD_I64" => [rd: Reg, imm: ImmI64],
+            LoadI64 = 0x01, "LOAD_I64" => [rd: Reg, imm: ImmI64],
             /// STORE_I64 key, value ; store i64 value at key in storage
-            StoreI64 = 0x01, "STORE_I64" => [key: Reg, value: Reg],
+            StoreI64 = 0x02, "STORE_I64" => [key: Reg, value: Reg],
             /// LOAD_I64_STATE dst, key ; loads the i64 stored as key from storage
-            LoadI64State = 0x02, "LOAD_I64_STATE" => [rd: Reg, key: Reg],
+            LoadI64State = 0x03, "LOAD_I64_STATE" => [rd: Reg, key: Reg],
             /// LOAD_BOOL rd, true|false ; rd = true|false
-            LoadBool = 0x03, "LOAD_BOOL" => [rd: Reg, bool: Bool],
+            LoadBool = 0x04, "LOAD_BOOL" => [rd: Reg, bool: Bool],
             /// STORE_BOOL key, value ; store bool value at key in storage
-            StoreBool = 0x04, "STORE_BOOL" => [key: Reg, value: Reg],
+            StoreBool = 0x05, "STORE_BOOL" => [key: Reg, value: Reg],
             /// LOAD_BOOL_STATE dst, key ; loads the boolean stored as key from storage
-            LoadBoolState = 0x05, "LOAD_BOOL_STATE" => [rd: Reg, key: Reg],
+            LoadBoolState = 0x06, "LOAD_BOOL_STATE" => [rd: Reg, key: Reg],
             /// LOAD_STR rd, ref ; rd = ref
-            LoadStr = 0x06, "LOAD_STR" => [rd: Reg, str: RefU32],
+            LoadStr = 0x07, "LOAD_STR" => [rd: Reg, str: RefU32],
             /// STORE_STR key, value ; store string value at key in storage
-            StoreStr = 0x07, "STORE_STR" => [key: Reg, value: Reg],
+            StoreStr = 0x08, "STORE_STR" => [key: Reg, value: Reg],
             /// LOAD_STR_STATE dst, key ; loads the string stored as key from storage
-            LoadStrState = 0x08, "LOAD_STR_STATE" => [rd: Reg, key: Reg],
+            LoadStrState = 0x09, "LOAD_STR_STATE" => [rd: Reg, key: Reg],
             // =========================
             // Moves / casts
             // =========================
@@ -110,8 +112,28 @@ macro_rules! for_each_instruction {
             // =========================
             // Control Flow
             // =========================
-            /// CALL dst, fn, argc, argv ; call function fn with argc args from regs[argv..] ; return -> dst
+            /// CALL_HOST dst, fn, argc, argv ; call host function fn with argc args from regs[argv..] ; return -> dst
             CallHost = 0x40, "CALL_HOST" => [dst: Reg, fn_id: RefU32, argc: ImmI64, argv: Reg],
+            /// CALL dst, fn, argc, argv ; call function fn with argc args from regs[argv..] ; return -> dst
+            Call = 0x41, "CALL" => [dst: Reg, fn_id: RefU32, argc: ImmI64, argv: Reg],
+            /// JAL rd, offset ; rd = PC + instr_size; PC += offset (jump and link)
+            Jal = 0x42, "JAL" => [rd: Reg, offset: ImmI64],
+            /// JALR rd, rs, offset ; rd = PC + instr_size; PC = rs + offset (jump and link register)
+            Jalr = 0x43, "JALR" => [rd: Reg, rs: Reg, offset: ImmI64],
+            /// BEQ rs1, rs2, offset ; if rs1 == rs2 then PC += offset
+            Beq = 0x44, "BEQ" => [rs1: Reg, rs2: Reg, offset: ImmI64],
+            /// BNE rs1, rs2, offset ; if rs1 != rs2 then PC += offset
+            Bne = 0x45, "BNE" => [rs1: Reg, rs2: Reg, offset: ImmI64],
+            /// BLT rs1, rs2, offset ; if rs1 < rs2 (signed) then PC += offset
+            Blt = 0x46, "BLT" => [rs1: Reg, rs2: Reg, offset: ImmI64],
+            /// BGE rs1, rs2, offset ; if rs1 >= rs2 (signed) then PC += offset
+            Bge = 0x47, "BGE" => [rs1: Reg, rs2: Reg, offset: ImmI64],
+            /// BLTU rs1, rs2, offset ; if rs1 < rs2 (unsigned) then PC += offset
+            Bltu = 0x48, "BLTU" => [rs1: Reg, rs2: Reg, offset: ImmI64],
+            /// BGEU rs1, rs2, offset ; if rs1 >= rs2 (unsigned) then PC += offset
+            Bgeu = 0x49, "BGEU" => [rs1: Reg, rs2: Reg, offset: ImmI64],
+            /// RET rs ; return from function call with value in rs
+            Ret = 0x4A, "RET" => [rs: Reg],
         }
     };
 }
@@ -181,7 +203,10 @@ mod tests {
 
     #[test]
     fn instruction_try_from_valid() {
-        assert_eq!(Instruction::try_from(0x00).unwrap(), Instruction::LoadI64);
+        assert_eq!(
+            Instruction::try_from(0x00).unwrap(),
+            Instruction::DeleteState
+        );
         assert_eq!(Instruction::try_from(0x20).unwrap(), Instruction::Add);
         assert_eq!(Instruction::try_from(0x38).unwrap(), Instruction::Gt);
     }

@@ -38,7 +38,7 @@ const LABEL_SUFFIX: char = ':';
 /// string a unique index that becomes part of the compiled [`Program`].
 pub struct AsmContext {
     /// Accumulated string literals.
-    pub strings: Vec<String>,
+    pub strings: Vec<Vec<u8>>,
     /// Label definitions mapping names to bytecode offsets.
     pub labels: HashMap<String, usize>,
 }
@@ -55,7 +55,7 @@ impl AsmContext {
     /// Adds a string to the pool, returning its index.
     pub fn intern_string(&mut self, s: String) -> u32 {
         let id = self.strings.len() as u32;
-        self.strings.push(s);
+        self.strings.push(s.into_bytes());
         id
     }
 
@@ -83,7 +83,7 @@ impl AsmContext {
 /// - `#` starts a comment
 /// - commas are ignored
 /// - whitespace-separated tokens
-fn tokenize(line: &str) -> Vec<String> {
+fn tokenize(line: &str) -> Result<Vec<String>, VMError> {
     let line = line.split(COMMENT_CHAR).next().unwrap_or("");
     let bytes = line.as_bytes();
 
@@ -128,8 +128,12 @@ fn tokenize(line: &str) -> Vec<String> {
         }
     }
 
+    if in_str {
+        return Err(VMError::ParseError);
+    }
+
     flush(&mut out, &mut cur);
-    out
+    Ok(out)
 }
 
 /// Parse a register token like `r0`, `r15`
@@ -138,12 +142,6 @@ pub(crate) fn parse_reg(tok: &str) -> Result<u8, VMError> {
         .ok_or_else(|| VMError::ExpectedRegister(tok.to_string()))?
         .parse::<u8>()
         .map_err(|_| VMError::InvalidRegister(tok.to_string()))
-}
-
-/// Parse an i64 immediate
-pub(crate) fn parse_i64(tok: &str) -> Result<i64, VMError> {
-    tok.parse::<i64>()
-        .map_err(|_| VMError::InvalidI64(tok.to_string()))
 }
 
 /// Parse a reference token like `@0`, `@123`.
@@ -265,7 +263,7 @@ macro_rules! define_parse_instruction {
             }
 
             let instr = instruction_from_str(&tokens[0])?;
-            let instr_size = instruction_size(instr);
+            let offset = current_offset + instruction_size(instr);
 
             match instr {
                 $(
@@ -279,7 +277,7 @@ macro_rules! define_parse_instruction {
                         Ok(AsmInstr::$name {
                             $(
                                 $field: define_parse_instruction!(
-                                    @parse_operand $kind, it.next().unwrap(), ctx, current_offset + instr_size
+                                    @parse_operand $kind, it.next().unwrap(), ctx, offset
                                 )?,
                             )*
                         })
@@ -312,10 +310,11 @@ macro_rules! define_parse_instruction {
     };
 
     (@parse_operand RefU32, $tok:expr, $ctx:expr, $current_offset:expr) => {{
-        if let Some(s) = $tok.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
+        let tok = $tok;
+        if let Some(s) = tok.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
             Ok($ctx.intern_string(s.to_string()))
         } else {
-            parse_ref_u32($tok)
+            parse_ref_u32(tok)
         }
     }};
 
@@ -325,12 +324,6 @@ macro_rules! define_parse_instruction {
 }
 
 for_each_instruction!(define_parse_instruction);
-
-/// Parsed line: either a label definition or an instruction.
-enum ParsedLine {
-    Label(String),
-    Instruction(Vec<String>),
-}
 
 /// Assemble a full source string into bytecode.
 ///
@@ -342,11 +335,11 @@ pub fn assemble_source(source: impl Into<String>) -> Result<Program, VMError> {
     let mut asm_context = AsmContext::new();
 
     // First pass: tokenize all lines and collect label definitions
-    let mut parsed_lines: Vec<(usize, ParsedLine)> = Vec::new();
+    let mut parsed_lines: Vec<(usize, Vec<String>)> = Vec::new();
     let mut offset = 0usize;
 
     for (line_no, line) in source.lines().enumerate() {
-        let tokens = tokenize(line);
+        let tokens = tokenize(line)?;
         if tokens.is_empty() {
             continue;
         }
@@ -355,12 +348,11 @@ pub fn assemble_source(source: impl Into<String>) -> Result<Program, VMError> {
         if is_label_def(&tokens[0]) {
             let name = label_name(&tokens[0]).to_string();
             asm_context
-                .define_label(name.clone(), offset)
+                .define_label(name, offset)
                 .map_err(|e| VMError::AssemblyError {
                     line: line_no + 1,
                     source: e.to_string(),
                 })?;
-            parsed_lines.push((line_no, ParsedLine::Label(name)));
 
             // If there are more tokens after the label, treat them as an instruction
             if tokens.len() > 1 {
@@ -371,7 +363,7 @@ pub fn assemble_source(source: impl Into<String>) -> Result<Program, VMError> {
                         source: e.to_string(),
                     })?;
                 offset += instruction_size(instr);
-                parsed_lines.push((line_no, ParsedLine::Instruction(instr_tokens)));
+                parsed_lines.push((line_no, instr_tokens));
             }
         } else {
             let instr = instruction_from_str(&tokens[0]).map_err(|e| VMError::AssemblyError {
@@ -379,25 +371,22 @@ pub fn assemble_source(source: impl Into<String>) -> Result<Program, VMError> {
                 source: e.to_string(),
             })?;
             offset += instruction_size(instr);
-            parsed_lines.push((line_no, ParsedLine::Instruction(tokens)));
+            parsed_lines.push((line_no, tokens));
         }
     }
 
     // Second pass: parse instructions and emit bytecode
     let mut bytecode = Vec::new();
 
-    for (line_no, parsed) in parsed_lines {
-        if let ParsedLine::Instruction(tokens) = parsed {
-            let current_offset = bytecode.len();
-            let instr =
-                parse_instruction(&mut asm_context, &tokens, current_offset).map_err(|e| {
-                    VMError::AssemblyError {
-                        line: line_no + 1,
-                        source: e.to_string(),
-                    }
-                })?;
-            instr.assemble(&mut bytecode);
-        }
+    for (line_no, tokens) in parsed_lines {
+        let current_offset = bytecode.len();
+        let instr = parse_instruction(&mut asm_context, &tokens, current_offset).map_err(|e| {
+            VMError::AssemblyError {
+                line: line_no + 1,
+                source: e.to_string(),
+            }
+        })?;
+        instr.assemble(&mut bytecode);
     }
 
     Ok(Program {
@@ -408,6 +397,7 @@ pub fn assemble_source(source: impl Into<String>) -> Result<Program, VMError> {
 }
 
 /// Convenience: assemble directly from file path
+#[allow(dead_code)]
 pub fn assemble_file<P: AsRef<Path>>(path: P) -> Result<Program, VMError> {
     let source = fs::read_to_string(path).map_err(|e| VMError::IoError(e.to_string()))?;
     assemble_source(source)
@@ -441,24 +431,6 @@ mod tests {
         assert!(matches!(
             parse_reg("rabc"),
             Err(VMError::InvalidRegister(_))
-        ));
-    }
-
-    #[test]
-    fn parse_i64_valid() {
-        assert_eq!(parse_i64("0").unwrap(), 0);
-        assert_eq!(parse_i64("-1").unwrap(), -1);
-        assert_eq!(parse_i64("9223372036854775807").unwrap(), i64::MAX);
-        assert_eq!(parse_i64("-9223372036854775808").unwrap(), i64::MIN);
-    }
-
-    #[test]
-    fn parse_i64_invalid() {
-        assert!(matches!(parse_i64("abc"), Err(VMError::InvalidI64(_))));
-        assert!(matches!(parse_i64(""), Err(VMError::InvalidI64(_))));
-        assert!(matches!(
-            parse_i64("9223372036854775808"),
-            Err(VMError::InvalidI64(_))
         ));
     }
 
@@ -546,7 +518,7 @@ mod tests {
     #[test]
     fn assemble_string_literal() {
         let program = assemble_source(r#"LOAD_STR r0, "hello""#).unwrap();
-        assert_eq!(program.strings, vec!["hello"]);
+        assert_eq!(program.strings, vec!["hello".as_bytes().to_vec()]);
         assert_eq!(program.bytecode[0], 0x07);
     }
 
@@ -557,7 +529,28 @@ mod tests {
             LOAD_STR r1, "second"
         "#;
         let program = assemble_source(source).unwrap();
-        assert_eq!(program.strings, vec!["first", "second"]);
+        assert_eq!(
+            program.strings,
+            vec!["first".as_bytes().to_vec(), "second".as_bytes().to_vec()]
+        );
+    }
+
+    #[test]
+    fn assemble_invalid_string_literal() {
+        let source = r#"
+            LOAD_STR r0, "first
+        "#;
+        assert!(assemble_source(source).is_err());
+
+        let source = r#"
+            LOAD_STR r0, first
+        "#;
+        assert!(assemble_source(source).is_err());
+
+        let source = r#"
+            LOAD_STR r0, first"
+        "#;
+        assert!(assemble_source(source).is_err());
     }
 
     #[test]

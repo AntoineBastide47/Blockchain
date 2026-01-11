@@ -4,6 +4,7 @@
 //! registers. All arithmetic uses wrapping semantics to prevent overflow panics.
 
 use crate::types::bytes::Bytes;
+use crate::types::encoding::Encode;
 use crate::types::hash::Hash;
 use crate::virtual_machine::errors::VMError;
 use crate::virtual_machine::isa::Instruction;
@@ -122,14 +123,29 @@ impl Registers {
 ///
 /// Currently, holds only the string pool loaded from the program.
 struct Heap {
-    /// String pool (indices correspond to `Ref` values).
-    strings: Vec<String>,
+    items: Vec<Vec<u8>>,
 }
 
 impl Heap {
+    fn push(&mut self, item: Vec<u8>) {
+        self.items.push(item)
+    }
+
+    fn len(&self) -> usize {
+        self.items.len()
+    }
+
     /// Retrieves a string by its reference index.
-    fn get_string(&self, id: u32) -> &str {
-        &self.strings[id as usize]
+    fn get_string(&self, id: u32) -> Result<String, VMError> {
+        String::from_utf8(self.items[id as usize].clone()).map_err(|_| VMError::InvalidUtf8)
+    }
+
+    /// Retrieves a hash by its reference index.
+    fn get_hash(&self, id: u32) -> Result<Hash, VMError> {
+        match Hash::from_slice(&self.items[id as usize]) {
+            None => Err(VMError::InvalidHash),
+            Some(hash) => Ok(hash),
+        }
     }
 }
 
@@ -212,10 +228,10 @@ struct CallFrame {
 ///
 /// # TODO for 0.14.0:
 /// 1) 🟢 Add full control flow for function support
-/// 2) 🔴 Add full string and hash support
-/// 3) 🔴 Add full list and map support
+/// 2) 🟢 Add string and hash support
 ///
 /// # TODO after 1.0.0:
+/// 3) 🔴 Add list and map support
 /// 4) 🔴 Add a smart contract language to not require assembly written smart contracts
 /// 5) 🔴 Add a deterministic compiler to convert the language to assembly
 /// 6) 🔴 Add arithmetic op codes that take in immediate instead of register
@@ -244,7 +260,7 @@ impl VM {
             ip: 0,
             registers: Registers::new(256),
             heap: Heap {
-                strings: program.strings,
+                items: program.strings,
             },
             labels: program.labels,
             call_stack: Vec::new(),
@@ -295,7 +311,7 @@ impl VM {
             instr = instruction,
             {
                 // Store and Load
-                DeleteState => op_delete(state, ctx; rd: Reg),
+                DeleteState => op_delete_state(state, ctx; rd: Reg),
                 LoadI64 => op_load_i64(rd: Reg, imm: ImmI64),
                 StoreI64 => op_store_i64(state, ctx; key: Reg, value: Reg),
                 LoadI64State => op_load_i64_state(state, ctx; rd: Reg, key: Reg),
@@ -305,6 +321,9 @@ impl VM {
                 LoadStr => op_load_str(rd: Reg, str_ref: RefU32),
                 StoreStr => op_store_str(state, ctx; key: Reg, value: Reg),
                 LoadStrState => op_load_str_state(state, ctx; rd: Reg, key: Reg),
+                LoadHash => op_load_hash(rd: Reg, hash_ref: RefU32),
+                StoreHash => op_store_hash(state, ctx; key: Reg, value: Reg),
+                LoadHashState => op_load_hash_state(state, ctx; rd: Reg, key: Reg),
                 // Moves / casts
                 Move => op_move(rd: Reg, rs: Reg),
                 I64ToBool => op_i64_to_bool(rd: Reg, rs: Reg),
@@ -360,14 +379,14 @@ impl VM {
         h.finalize()
     }
 
-    fn op_delete<S: State>(
+    fn op_delete_state<S: State>(
         &mut self,
         state: &mut S,
         ctx: &ExecContext,
         key: u8,
     ) -> Result<(), VMError> {
-        let key_ref = self.registers.get_ref(key, "STORE_I64")?;
-        let key_str = self.heap.get_string(key_ref).to_owned();
+        let key_ref = self.registers.get_ref(key, "DELETE_STATE")?;
+        let key_str = self.heap.get_string(key_ref)?;
         let key = Self::make_state_key(ctx.chain_id, ctx.contract_id, key_str.as_bytes());
         state.delete(key);
         Ok(())
@@ -385,7 +404,7 @@ impl VM {
         value: u8,
     ) -> Result<(), VMError> {
         let key_ref = self.registers.get_ref(key, "STORE_I64")?;
-        let key_str = self.heap.get_string(key_ref).to_owned();
+        let key_str = self.heap.get_string(key_ref)?;
         let val = self.registers.get_int(value, "STORE_I64")?;
         let key = Self::make_state_key(ctx.chain_id, ctx.contract_id, key_str.as_bytes());
         state.push(key, val.to_le_bytes().to_vec());
@@ -400,11 +419,9 @@ impl VM {
         key: u8,
     ) -> Result<(), VMError> {
         let key_ref = self.registers.get_ref(key, "LOAD_I64_STATE")?;
-        let key_str = self.heap.get_string(key_ref);
+        let key_str = self.heap.get_string(key_ref)?;
         let state_key = Self::make_state_key(ctx.chain_id, ctx.contract_id, key_str.as_bytes());
-        let value = state
-            .get(state_key)
-            .ok_or_else(|| VMError::KeyNotFound(key_str.to_string()))?;
+        let value = state.get(state_key).ok_or(VMError::KeyNotFound(key_str))?;
         let bytes: [u8; 8] = value.try_into().map_err(|_| VMError::InvalidStateValue)?;
         self.registers
             .set(dst, Value::Int(i64::from_le_bytes(bytes)))
@@ -422,7 +439,7 @@ impl VM {
         value: u8,
     ) -> Result<(), VMError> {
         let key_ref = self.registers.get_ref(key, "STORE_BOOL")?;
-        let key_str = self.heap.get_string(key_ref).to_owned();
+        let key_str = self.heap.get_string(key_ref)?;
         let val = self.registers.get_bool(value, "STORE_BOOL")?;
         let key = Self::make_state_key(ctx.chain_id, ctx.contract_id, key_str.as_bytes());
         state.push(key, [val as u8].into());
@@ -437,11 +454,9 @@ impl VM {
         key: u8,
     ) -> Result<(), VMError> {
         let key_ref = self.registers.get_ref(key, "LOAD_BOOL_STATE")?;
-        let key_str = self.heap.get_string(key_ref);
+        let key_str = self.heap.get_string(key_ref)?;
         let state_key = Self::make_state_key(ctx.chain_id, ctx.contract_id, key_str.as_bytes());
-        let value = state
-            .get(state_key)
-            .ok_or_else(|| VMError::KeyNotFound(key_str.to_string()))?;
+        let value = state.get(state_key).ok_or(VMError::KeyNotFound(key_str))?;
         if value.len() != 1 {
             return Err(VMError::InvalidStateValue);
         }
@@ -460,11 +475,11 @@ impl VM {
         value: u8,
     ) -> Result<(), VMError> {
         let key_ref = self.registers.get_ref(key, "STORE_STR")?;
-        let key_str = self.heap.get_string(key_ref).to_owned();
+        let key_str = self.heap.get_string(key_ref)?;
         let val_ref = self.registers.get_ref(value, "STORE_STR")?;
-        let val_str = self.heap.get_string(val_ref);
+        let val_str = self.heap.get_string(val_ref)?;
         let key = Self::make_state_key(ctx.chain_id, ctx.contract_id, key_str.as_bytes());
-        state.push(key, val_str.as_bytes().into());
+        state.push(key, val_str.into_bytes());
         Ok(())
     }
 
@@ -476,14 +491,47 @@ impl VM {
         key: u8,
     ) -> Result<(), VMError> {
         let key_ref = self.registers.get_ref(key, "LOAD_STR_STATE")?;
-        let key_str = self.heap.get_string(key_ref);
+        let key_str = self.heap.get_string(key_ref)?;
         let state_key = Self::make_state_key(ctx.chain_id, ctx.contract_id, key_str.as_bytes());
-        let value = state
-            .get(state_key)
-            .ok_or_else(|| VMError::KeyNotFound(key_str.to_string()))?;
-        let str_val = String::from_utf8(value).map_err(|_| VMError::InvalidStateValue)?;
-        let str_idx = self.heap.strings.len() as u32;
-        self.heap.strings.push(str_val);
+        let value = state.get(state_key).ok_or(VMError::KeyNotFound(key_str))?;
+        let str_idx = self.heap.len() as u32;
+        self.heap.push(value);
+        self.registers.set(dst, Value::Ref(str_idx))
+    }
+
+    fn op_load_hash(&mut self, dst: u8, hash_ref: u32) -> Result<(), VMError> {
+        self.registers.set(dst, Value::Ref(hash_ref))
+    }
+
+    fn op_store_hash<S: State>(
+        &mut self,
+        state: &mut S,
+        ctx: &ExecContext,
+        key: u8,
+        value: u8,
+    ) -> Result<(), VMError> {
+        let key_ref = self.registers.get_ref(key, "STORE_HASH")?;
+        let key_str = self.heap.get_string(key_ref)?;
+        let val_ref = self.registers.get_ref(value, "STORE_HASH")?;
+        let val_hash = self.heap.get_hash(val_ref)?;
+        let key = Self::make_state_key(ctx.chain_id, ctx.contract_id, key_str.as_bytes());
+        state.push(key, val_hash.to_vec());
+        Ok(())
+    }
+
+    fn op_load_hash_state<S: State>(
+        &mut self,
+        state: &mut S,
+        ctx: &ExecContext,
+        dst: u8,
+        key: u8,
+    ) -> Result<(), VMError> {
+        let key_ref = self.registers.get_ref(key, "LOAD_HASH_STATE")?;
+        let key_str = self.heap.get_string(key_ref)?;
+        let state_key = Self::make_state_key(ctx.chain_id, ctx.contract_id, key_str.as_bytes());
+        let value = state.get(state_key).ok_or(VMError::KeyNotFound(key_str))?;
+        let str_idx = self.heap.len() as u32;
+        self.heap.push(value);
         self.registers.set(dst, Value::Ref(str_idx))
     }
 
@@ -627,21 +675,165 @@ impl VM {
         self.registers.set(dst, Value::Bool(va >= vb))
     }
 
-    fn op_call_host(&mut self, _dst: u8, fn_id: u32, argc: i64, argv: u8) -> Result<(), VMError> {
-        let fn_name = self.heap.get_string(fn_id);
-        let _args: Vec<&Value> = (0..argc as u8)
+    fn op_call_host(&mut self, dst: u8, fn_id: u32, argc: i64, argv: u8) -> Result<(), VMError> {
+        let fn_name = self.heap.get_string(fn_id)?;
+        let args: Vec<&Value> = (0..argc as u8)
             .map(|i| self.registers.get(argv.wrapping_add(i)))
             .collect::<Result<_, _>>()?;
 
-        // match fn_name {
-        //     _ => Err(VMError::InvalidCallHostFunction(fn_name.to_string())),
-        // }
+        match fn_name.as_str() {
+            "len" => {
+                if args.len() != 1 {
+                    return Err(VMError::ArityMismatch);
+                }
+                let str_ref = match args[0] {
+                    Value::Ref(r) => *r,
+                    other => {
+                        return Err(VMError::TypeMismatch {
+                            instruction: "CALL_HOST reg, \"len\"",
+                            arg_index: 0,
+                            expected: "Ref",
+                            actual: other.type_name().to_string(),
+                        });
+                    }
+                };
+                let len = self.heap.items[str_ref as usize].len();
+                self.registers.set(dst, Value::Int(len as i64))
+            }
+            "slice" => {
+                if args.len() != 3 {
+                    return Err(VMError::ArityMismatch);
+                }
+                let str_ref = match args[0] {
+                    Value::Ref(r) => *r,
+                    other => {
+                        return Err(VMError::TypeMismatch {
+                            instruction: "CALL_HOST reg, \"slice\"",
+                            arg_index: 0,
+                            expected: "Ref",
+                            actual: other.type_name().to_string(),
+                        });
+                    }
+                };
+                let start = match args[1] {
+                    Value::Int(i) => *i as usize,
+                    other => {
+                        return Err(VMError::TypeMismatch {
+                            instruction: "CALL_HOST reg, \"slice\"",
+                            arg_index: 1,
+                            expected: "Int",
+                            actual: other.type_name().to_string(),
+                        });
+                    }
+                };
+                let end = match args[2] {
+                    Value::Int(i) => *i as usize,
+                    other => {
+                        return Err(VMError::TypeMismatch {
+                            instruction: "CALL_HOST reg, \"slice\"",
+                            arg_index: 2,
+                            expected: "Int",
+                            actual: other.type_name().to_string(),
+                        });
+                    }
+                };
+                let bytes = &self.heap.items[str_ref as usize];
+                let end = end.min(bytes.len());
+                let start = start.min(end);
+                let sliced = bytes[start..end].to_vec();
+                let new_ref = self.heap.len() as u32;
+                self.heap.push(sliced);
+                self.registers.set(dst, Value::Ref(new_ref))
+            }
+            "concat" => {
+                if args.len() != 2 {
+                    return Err(VMError::ArityMismatch);
+                }
+                let ref1 = match args[0] {
+                    Value::Ref(r) => *r,
+                    other => {
+                        return Err(VMError::TypeMismatch {
+                            instruction: "CALL_HOST reg, \"concat\"",
+                            arg_index: 0,
+                            expected: "Ref",
+                            actual: other.type_name().to_string(),
+                        });
+                    }
+                };
+                let ref2 = match args[1] {
+                    Value::Ref(r) => *r,
+                    other => {
+                        return Err(VMError::TypeMismatch {
+                            instruction: "CALL_HOST reg, \"concat\"",
+                            arg_index: 1,
+                            expected: "Ref",
+                            actual: other.type_name().to_string(),
+                        });
+                    }
+                };
+                let mut result = self.heap.items[ref1 as usize].clone();
+                result.extend_from_slice(&self.heap.items[ref2 as usize]);
+                let new_ref = self.heap.len() as u32;
+                self.heap.push(result);
+                self.registers.set(dst, Value::Ref(new_ref))
+            }
+            "compare" => {
+                if args.len() != 2 {
+                    return Err(VMError::ArityMismatch);
+                }
+                let ref1 = match args[0] {
+                    Value::Ref(r) => *r,
+                    other => {
+                        return Err(VMError::TypeMismatch {
+                            instruction: "CALL_HOST reg, \"compare\"",
+                            arg_index: 0,
+                            expected: "Ref",
+                            actual: other.type_name().to_string(),
+                        });
+                    }
+                };
+                let ref2 = match args[1] {
+                    Value::Ref(r) => *r,
+                    other => {
+                        return Err(VMError::TypeMismatch {
+                            instruction: "CALL_HOST reg, \"compare\"",
+                            arg_index: 1,
+                            expected: "Ref",
+                            actual: other.type_name().to_string(),
+                        });
+                    }
+                };
+                let s1 = &self.heap.items[ref1 as usize];
+                let s2 = &self.heap.items[ref2 as usize];
+                let cmp = match s1.cmp(s2) {
+                    std::cmp::Ordering::Less => -1,
+                    std::cmp::Ordering::Equal => 0,
+                    std::cmp::Ordering::Greater => 1,
+                };
+                self.registers.set(dst, Value::Int(cmp))
+            }
+            "hash" => {
+                if args.len() != 1 {
+                    return Err(VMError::ArityMismatch);
+                }
+                let bytes: &[u8] = match args[0] {
+                    Value::Zero => &[],
+                    Value::Bool(b) => &[*b as u8],
+                    Value::Ref(r) => &self.heap.items[*r as usize],
+                    Value::Int(i) => &i.to_le_bytes(),
+                };
 
-        Err(VMError::InvalidCallHostFunction(fn_name.to_string()))
+                let hash = Hash::sha3().chain(bytes).finalize();
+                let new_ref = self.heap.len() as u32;
+                self.heap.push(hash.to_vec());
+                self.registers.set(dst, Value::Ref(new_ref))
+            }
+            _ => Err(VMError::InvalidCallHostFunction(fn_name)),
+        }
     }
 
     fn op_call(&mut self, dst: u8, fn_id: u32, _argc: i64, _argv: u8) -> Result<(), VMError> {
-        let fn_name = self.heap.get_string(fn_id).to_owned();
+        let fn_name = self.heap.get_string(fn_id)?;
         let target = *self
             .labels
             .get(&fn_name)
@@ -795,7 +987,15 @@ mod tests {
     fn load_str() {
         let vm = run_vm(r#"LOAD_STR r0, "hello""#);
         let ref_id = vm.registers.get_ref(0, "").unwrap();
-        assert_eq!(vm.heap.get_string(ref_id), "hello");
+        assert_eq!(vm.heap.get_string(ref_id).unwrap(), "hello");
+    }
+
+    #[test]
+    fn load_hash() {
+        let vm = run_vm(r#"LOAD_HASH r0, "00000000000000000000000000000000""#);
+        let ref_id = vm.registers.get_ref(0, "").unwrap();
+        let expected = Hash::from_slice(b"00000000000000000000000000000000").unwrap();
+        assert_eq!(vm.heap.get_hash(ref_id).unwrap(), expected);
     }
 
     // ==================== Moves / Casts ====================
@@ -1138,6 +1338,19 @@ STORE_STR r0, r1"#,
     }
 
     #[test]
+    fn store_hash() {
+        let state = run_vm_with_state(
+            r#"LOAD_STR r0, "hash_key"
+LOAD_HASH r1, "00000000000000000000000000000000"
+STORE_HASH r0, r1"#,
+        );
+        let key = make_test_key(b"hash_key");
+        let value = state.get(key).expect("key not found");
+        let expected = Hash::from_slice(b"00000000000000000000000000000000").unwrap();
+        assert_eq!(value, expected.to_vec());
+    }
+
+    #[test]
     fn store_bool() {
         let state = run_vm_with_state(
             r#"LOAD_STR r0, "flag"
@@ -1258,7 +1471,7 @@ LOAD_STR_STATE r1, r0"#,
             &mut state,
         );
         let ref_id = vm.registers.get_ref(1, "").unwrap();
-        assert_eq!(vm.heap.get_string(ref_id), "alice");
+        assert_eq!(vm.heap.get_string(ref_id).unwrap(), "alice");
     }
 
     #[test]
@@ -1271,7 +1484,21 @@ LOAD_STR_STATE r1, r0"#,
             &mut state,
         );
         let ref_id = vm.registers.get_ref(1, "").unwrap();
-        assert_eq!(vm.heap.get_string(ref_id), "");
+        assert_eq!(vm.heap.get_string(ref_id).unwrap(), "");
+    }
+
+    #[test]
+    fn load_hash_state() {
+        let key = make_test_key(b"hash_key");
+        let expected = Hash::from_slice(b"11111111111111111111111111111111").unwrap();
+        let mut state = TestState::with_data(vec![(key, expected.to_vec())]);
+        let vm = run_vm_on_state(
+            r#"LOAD_STR r0, "hash_key"
+LOAD_HASH_STATE r1, r0"#,
+            &mut state,
+        );
+        let ref_id = vm.registers.get_ref(1, "").unwrap();
+        assert_eq!(vm.heap.get_hash(ref_id).unwrap(), expected);
     }
 
     #[test]
@@ -1319,7 +1546,20 @@ STORE_STR r0, r1
 LOAD_STR_STATE r2, r0"#,
         );
         let ref_id = vm.registers.get_ref(2, "").unwrap();
-        assert_eq!(vm.heap.get_string(ref_id), "hello");
+        assert_eq!(vm.heap.get_string(ref_id).unwrap(), "hello");
+    }
+
+    #[test]
+    fn store_then_load_hash() {
+        let vm = run_vm(
+            r#"LOAD_STR r0, "hash_key"
+LOAD_HASH r1, "22222222222222222222222222222222"
+STORE_HASH r0, r1
+LOAD_HASH_STATE r2, r0"#,
+        );
+        let ref_id = vm.registers.get_ref(2, "").unwrap();
+        let expected = Hash::from_slice(b"22222222222222222222222222222222").unwrap();
+        assert_eq!(vm.heap.get_hash(ref_id).unwrap(), expected);
     }
 
     // ==================== Control Flow ====================
@@ -1944,6 +2184,404 @@ LOAD_STR_STATE r2, r0"#,
             Value::Ref(r) => *r,
             other => panic!("expected Ref, got {:?}", other),
         };
-        assert_eq!(vm.heap.get_string(ref_id), "hello");
+        assert_eq!(vm.heap.get_string(ref_id).unwrap(), "hello");
+    }
+
+    // ==================== Host Functions ====================
+
+    // --- len ---
+
+    #[test]
+    fn host_len_empty_string() {
+        let source = r#"
+            LOAD_STR r1, ""
+            CALL_HOST r0, "len", 1, r1
+        "#;
+        assert_eq!(run_and_get_int(source, 0), 0);
+    }
+
+    #[test]
+    fn host_len_ascii_string() {
+        let source = r#"
+            LOAD_STR r1, "hello"
+            CALL_HOST r0, "len", 1, r1
+        "#;
+        assert_eq!(run_and_get_int(source, 0), 5);
+    }
+
+    #[test]
+    fn host_len_single_char() {
+        let source = r#"
+            LOAD_STR r1, "x"
+            CALL_HOST r0, "len", 1, r1
+        "#;
+        assert_eq!(run_and_get_int(source, 0), 1);
+    }
+
+    #[test]
+    fn host_len_wrong_arg_count() {
+        let source = r#"
+            LOAD_STR r1, "test"
+            LOAD_STR r2, "extra"
+            CALL_HOST r0, "len", 2, r1
+        "#;
+        assert!(matches!(run_expect_err(source), VMError::ArityMismatch));
+    }
+
+    #[test]
+    fn host_len_wrong_type() {
+        let source = r#"
+            LOAD_I64 r1, 42
+            CALL_HOST r0, "len", 1, r1
+        "#;
+        assert!(matches!(
+            run_expect_err(source),
+            VMError::TypeMismatch { .. }
+        ));
+    }
+
+    // --- slice ---
+
+    #[test]
+    fn host_slice_middle() {
+        let source = r#"
+            LOAD_STR r1, "hello world"
+            LOAD_I64 r2, 0
+            LOAD_I64 r3, 5
+            CALL_HOST r0, "slice", 3, r1
+        "#;
+        let vm = run_vm(source);
+        let ref_id = vm.registers.get_ref(0, "").unwrap();
+        assert_eq!(vm.heap.get_string(ref_id).unwrap(), "hello");
+    }
+
+    #[test]
+    fn host_slice_from_offset() {
+        let source = r#"
+            LOAD_STR r1, "hello world"
+            LOAD_I64 r2, 6
+            LOAD_I64 r3, 11
+            CALL_HOST r0, "slice", 3, r1
+        "#;
+        let vm = run_vm(source);
+        let ref_id = vm.registers.get_ref(0, "").unwrap();
+        assert_eq!(vm.heap.get_string(ref_id).unwrap(), "world");
+    }
+
+    #[test]
+    fn host_slice_empty_result() {
+        let source = r#"
+            LOAD_STR r1, "hello"
+            LOAD_I64 r2, 2
+            LOAD_I64 r3, 2
+            CALL_HOST r0, "slice", 3, r1
+        "#;
+        let vm = run_vm(source);
+        let ref_id = vm.registers.get_ref(0, "").unwrap();
+        assert_eq!(vm.heap.get_string(ref_id).unwrap(), "");
+    }
+
+    #[test]
+    fn host_slice_full_string() {
+        let source = r#"
+            LOAD_STR r1, "abc"
+            LOAD_I64 r2, 0
+            LOAD_I64 r3, 3
+            CALL_HOST r0, "slice", 3, r1
+        "#;
+        let vm = run_vm(source);
+        let ref_id = vm.registers.get_ref(0, "").unwrap();
+        assert_eq!(vm.heap.get_string(ref_id).unwrap(), "abc");
+    }
+
+    #[test]
+    fn host_slice_clamps_end_beyond_length() {
+        let source = r#"
+            LOAD_STR r1, "short"
+            LOAD_I64 r2, 0
+            LOAD_I64 r3, 100
+            CALL_HOST r0, "slice", 3, r1
+        "#;
+        let vm = run_vm(source);
+        let ref_id = vm.registers.get_ref(0, "").unwrap();
+        assert_eq!(vm.heap.get_string(ref_id).unwrap(), "short");
+    }
+
+    #[test]
+    fn host_slice_clamps_start_beyond_end() {
+        let source = r#"
+            LOAD_STR r1, "hello"
+            LOAD_I64 r2, 10
+            LOAD_I64 r3, 5
+            CALL_HOST r0, "slice", 3, r1
+        "#;
+        let vm = run_vm(source);
+        let ref_id = vm.registers.get_ref(0, "").unwrap();
+        assert_eq!(vm.heap.get_string(ref_id).unwrap(), "");
+    }
+
+    #[test]
+    fn host_slice_wrong_arg_count() {
+        let source = r#"
+            LOAD_STR r1, "test"
+            LOAD_I64 r2, 0
+            CALL_HOST r0, "slice", 2, r1
+        "#;
+        assert!(matches!(run_expect_err(source), VMError::ArityMismatch));
+    }
+
+    // --- concat ---
+
+    #[test]
+    fn host_concat_two_strings() {
+        let source = r#"
+            LOAD_STR r1, "hello"
+            LOAD_STR r2, " world"
+            CALL_HOST r0, "concat", 2, r1
+        "#;
+        let vm = run_vm(source);
+        let ref_id = vm.registers.get_ref(0, "").unwrap();
+        assert_eq!(vm.heap.get_string(ref_id).unwrap(), "hello world");
+    }
+
+    #[test]
+    fn host_concat_empty_left() {
+        let source = r#"
+            LOAD_STR r1, ""
+            LOAD_STR r2, "world"
+            CALL_HOST r0, "concat", 2, r1
+        "#;
+        let vm = run_vm(source);
+        let ref_id = vm.registers.get_ref(0, "").unwrap();
+        assert_eq!(vm.heap.get_string(ref_id).unwrap(), "world");
+    }
+
+    #[test]
+    fn host_concat_empty_right() {
+        let source = r#"
+            LOAD_STR r1, "hello"
+            LOAD_STR r2, ""
+            CALL_HOST r0, "concat", 2, r1
+        "#;
+        let vm = run_vm(source);
+        let ref_id = vm.registers.get_ref(0, "").unwrap();
+        assert_eq!(vm.heap.get_string(ref_id).unwrap(), "hello");
+    }
+
+    #[test]
+    fn host_concat_both_empty() {
+        let source = r#"
+            LOAD_STR r1, ""
+            LOAD_STR r2, ""
+            CALL_HOST r0, "concat", 2, r1
+        "#;
+        let vm = run_vm(source);
+        let ref_id = vm.registers.get_ref(0, "").unwrap();
+        assert_eq!(vm.heap.get_string(ref_id).unwrap(), "");
+    }
+
+    #[test]
+    fn host_concat_wrong_arg_count() {
+        let source = r#"
+            LOAD_STR r1, "only one"
+            CALL_HOST r0, "concat", 1, r1
+        "#;
+        assert!(matches!(run_expect_err(source), VMError::ArityMismatch));
+    }
+
+    #[test]
+    fn host_concat_wrong_type() {
+        let source = r#"
+            LOAD_STR r1, "str"
+            LOAD_I64 r2, 42
+            CALL_HOST r0, "concat", 2, r1
+        "#;
+        assert!(matches!(
+            run_expect_err(source),
+            VMError::TypeMismatch { .. }
+        ));
+    }
+
+    // --- compare ---
+
+    #[test]
+    fn host_compare_equal() {
+        let source = r#"
+            LOAD_STR r1, "abc"
+            LOAD_STR r2, "abc"
+            CALL_HOST r0, "compare", 2, r1
+        "#;
+        assert_eq!(run_and_get_int(source, 0), 0);
+    }
+
+    #[test]
+    fn host_compare_less_than() {
+        let source = r#"
+            LOAD_STR r1, "abc"
+            LOAD_STR r2, "abd"
+            CALL_HOST r0, "compare", 2, r1
+        "#;
+        assert_eq!(run_and_get_int(source, 0), -1);
+    }
+
+    #[test]
+    fn host_compare_greater_than() {
+        let source = r#"
+            LOAD_STR r1, "abd"
+            LOAD_STR r2, "abc"
+            CALL_HOST r0, "compare", 2, r1
+        "#;
+        assert_eq!(run_and_get_int(source, 0), 1);
+    }
+
+    #[test]
+    fn host_compare_prefix_shorter() {
+        let source = r#"
+            LOAD_STR r1, "ab"
+            LOAD_STR r2, "abc"
+            CALL_HOST r0, "compare", 2, r1
+        "#;
+        assert_eq!(run_and_get_int(source, 0), -1);
+    }
+
+    #[test]
+    fn host_compare_prefix_longer() {
+        let source = r#"
+            LOAD_STR r1, "abc"
+            LOAD_STR r2, "ab"
+            CALL_HOST r0, "compare", 2, r1
+        "#;
+        assert_eq!(run_and_get_int(source, 0), 1);
+    }
+
+    #[test]
+    fn host_compare_empty_strings() {
+        let source = r#"
+            LOAD_STR r1, ""
+            LOAD_STR r2, ""
+            CALL_HOST r0, "compare", 2, r1
+        "#;
+        assert_eq!(run_and_get_int(source, 0), 0);
+    }
+
+    #[test]
+    fn host_compare_empty_vs_nonempty() {
+        let source = r#"
+            LOAD_STR r1, ""
+            LOAD_STR r2, "a"
+            CALL_HOST r0, "compare", 2, r1
+        "#;
+        assert_eq!(run_and_get_int(source, 0), -1);
+    }
+
+    #[test]
+    fn host_compare_wrong_arg_count() {
+        let source = r#"
+            LOAD_STR r1, "only"
+            CALL_HOST r0, "compare", 1, r1
+        "#;
+        assert!(matches!(run_expect_err(source), VMError::ArityMismatch));
+    }
+
+    // --- hash ---
+
+    #[test]
+    fn host_hash_returns_ref() {
+        let source = r#"
+            LOAD_STR r1, "hello"
+            CALL_HOST r0, "hash", 1, r1
+        "#;
+        let vm = run_vm(source);
+        assert!(matches!(vm.registers.get(0).unwrap(), Value::Ref(_)));
+    }
+
+    #[test]
+    fn host_hash_consistent() {
+        let source = r#"
+            LOAD_STR r1, "test"
+            CALL_HOST r1, "hash", 1, r1
+            LOAD_STR r2, "test"
+            CALL_HOST r2, "hash", 1, r2
+            CALL_HOST r0, "compare", 2, r1
+        "#;
+        assert_eq!(run_and_get_int(source, 0), 0);
+    }
+
+    #[test]
+    fn host_hash_different_inputs() {
+        let source = r#"
+            LOAD_STR r1, "abc"
+            CALL_HOST r2, "hash", 1, r1
+            LOAD_STR r3, "abd"
+            CALL_HOST r4, "hash", 1, r3
+            CALL_HOST r0, "compare", 2, r2
+        "#;
+        // Different inputs should produce different hashes
+        assert_ne!(run_and_get_int(source, 0), 0);
+    }
+
+    #[test]
+    fn host_hash_empty_string() {
+        let source = r#"
+            LOAD_STR r1, ""
+            CALL_HOST r0, "hash", 1, r1
+        "#;
+        let vm = run_vm(source);
+        let ref_id = vm.registers.get_ref(0, "").unwrap();
+        let hash_bytes = &vm.heap.get_hash(ref_id).unwrap();
+        // Verify against known SHA3-256 of empty string
+        let expected = Hash::sha3().chain(b"").finalize();
+        assert_eq!(hash_bytes.as_slice(), expected.as_slice());
+    }
+
+    #[test]
+    fn host_hash_known_value() {
+        let source = r#"
+            LOAD_STR r1, "hello"
+            CALL_HOST r0, "hash", 1, r1
+        "#;
+        let vm = run_vm(source);
+        let ref_id = vm.registers.get_ref(0, "").unwrap();
+        let hash_bytes = &vm.heap.items[ref_id as usize];
+        let expected = Hash::sha3().chain(b"hello").finalize();
+        assert_eq!(hash_bytes, expected.as_slice());
+    }
+
+    #[test]
+    fn host_hash_wrong_arg_count() {
+        let source = r#"
+            LOAD_STR r1, "a"
+            LOAD_STR r2, "b"
+            CALL_HOST r0, "hash", 2, r1
+        "#;
+        assert!(matches!(run_expect_err(source), VMError::ArityMismatch));
+    }
+
+    #[test]
+    fn host_hash_wrong_type() {
+        let source = r#"
+            LOAD_I64 r1, 123
+            CALL_HOST r0, "hash", 1, r1
+        "#;
+        let vm = run_vm(source);
+        let ref_id = vm.registers.get_ref(0, "").unwrap();
+        let hash_bytes = &vm.heap.items[ref_id as usize];
+        let reg = vm.registers.get_int(1, "").unwrap();
+        let expected = Hash::sha3().chain(&reg.to_le_bytes()).finalize();
+        assert_eq!(hash_bytes, expected.as_slice());
+    }
+
+    // --- invalid host function ---
+
+    #[test]
+    fn host_invalid_function() {
+        let source = r#"
+            LOAD_STR r1, "arg"
+            CALL_HOST r0, "nonexistent", 1, r1
+        "#;
+        assert!(matches!(
+            run_expect_err(source),
+            VMError::InvalidCallHostFunction(_)
+        ));
     }
 }

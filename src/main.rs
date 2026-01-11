@@ -196,9 +196,6 @@ async fn main() {
     if validator_mode {
         let server_for_txs = server.clone();
         tokio::spawn(async move {
-            /// Initial balance for test accounts (10^18).
-            const TEST_ACCOUNT_BALANCE: u128 = 1_000_000_000_000_000_000;
-
             loop {
                 // Compute factorial of 5 using a loop and function call
                 let source = r#"
@@ -207,19 +204,21 @@ async fn main() {
                     # factorial(n): computes n! iteratively
                     # input: r1 = n, output: r10 = n!
                     factorial:
-                        LOAD_I64 r10, 1         # result = 1
-                        LOAD_I64 r11, 1         # i = 1
-                        LOAD_I64 r12, 1         # increment
+                        LOAD_I64 r10, 1              # result = 1
+                        LOAD_I64 r11, 1              # i = 1
+                        LOAD_I64 r12, 1              # increment
                     fact_loop:
-                        MUL r10, r10, r11       # result *= i
-                        ADD r11, r11, r12       # i++
-                        BGE r1, r11, fact_loop  # while n >= i
+                        MUL r10, r10, r11            # result *= i
+                        ADD r11, r11, r12            # i++
+                        BGE r1, r11, fact_loop       # while n >= i
                         RET r10
 
                     main:
-                        LOAD_I64 r1, 5          # compute 5!
-                        CALL r2, "factorial", 0, r0
-                        # r2 now contains 120 (5!)
+                        LOAD_I64 r1, 5               # compute 5!
+                        CALL r2, "factorial", 0, r0  # r2 now contains 120 (5!)
+                        CALL_HOST r2, "hash", 1, r2  # hash the value
+                        LOAD_STR r1, "hash"
+                        STORE_HASH r1, r2            # Store the hashes value at key "hash"
                 "#;
                 let data = assemble_source(source).expect("assembly failed").to_bytes();
 
@@ -231,6 +230,7 @@ async fn main() {
                     .with_gas_price(1)
                     .with_gas_limit(50_000)
                     .with_nonce(0)
+                    .with_gas_sponsor(PrivateKey::new().public_key().address())
                     .build();
                 let msg = Message::new(MessageType::Transaction, tx.to_bytes());
 

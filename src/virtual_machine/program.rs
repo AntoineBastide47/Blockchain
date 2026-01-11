@@ -41,7 +41,7 @@ impl Version {
 #[derive(Debug, Clone, BinaryCodec)]
 pub struct Program {
     /// Interned string literals referenced by index.
-    pub strings: Vec<String>,
+    pub strings: Vec<Vec<u8>>,
     /// Label definitions mapping names to bytecode offsets.
     pub labels: HashMap<String, usize>,
     /// Compiled instruction bytecode.
@@ -99,23 +99,10 @@ pub mod tests {
 
     impl Program {
         /// Creates a new program from pre-assembled components.
-        pub(crate) fn new(strings: Vec<String>, bytecode: Vec<u8>) -> Program {
+        pub(crate) fn new(strings: Vec<Vec<u8>>, bytecode: Vec<u8>) -> Program {
             Self {
                 strings,
                 labels: HashMap::new(),
-                bytecode,
-            }
-        }
-
-        /// Creates a new program with labels.
-        pub(crate) fn with_labels(
-            strings: Vec<String>,
-            labels: HashMap<String, usize>,
-            bytecode: Vec<u8>,
-        ) -> Program {
-            Self {
-                strings,
-                labels,
                 bytecode,
             }
         }
@@ -143,7 +130,7 @@ pub mod tests {
         let program = Program::new(vec!["hello".into(), "world".into()], vec![0x01, 0x00]);
         let bytes = program.to_bytes();
         let decoded = Program::from_bytes(&bytes).unwrap();
-        assert_eq!(decoded.strings, vec!["hello", "world"]);
+        assert_eq!(decoded.strings, vec![b"hello", b"world"]);
         assert_eq!(decoded.bytecode, vec![0x01, 0x00]);
     }
 

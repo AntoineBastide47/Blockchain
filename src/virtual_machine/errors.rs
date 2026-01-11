@@ -18,9 +18,6 @@ pub enum VMError {
     /// Register index out of range or malformed.
     #[error("invalid register {0}")]
     InvalidRegister(String),
-    /// Failed to parse an immediate value as i64.
-    #[error("invalid i64 literal {0}")]
-    InvalidI64(String),
     /// Register index exceeds the register file size.
     #[error("register index {0} out of bounds")]
     InvalidRegisterIndex(u8),
@@ -55,7 +52,7 @@ pub enum VMError {
     /// Failed to decode program bytecode.
     #[error("decoding error: {0}")]
     DecodeError(String),
-    /// Key not found in storage storage.
+    /// Key not found in storage.
     #[error("key not found in storage: {0}")]
     KeyNotFound(String),
     /// State value has invalid format for the expected type.
@@ -73,4 +70,10 @@ pub enum VMError {
     /// Return without matching call.
     #[error("return without call")]
     ReturnWithoutCall,
+    #[error("invalid utf8 in string")]
+    InvalidUtf8,
+    #[error("unterminated string literal")]
+    ParseError,
+    #[error("invalid hash format")]
+    InvalidHash,
 }

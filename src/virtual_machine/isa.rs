@@ -54,6 +54,12 @@ macro_rules! for_each_instruction {
             StoreStr = 0x08, "STORE_STR" => [key: Reg, value: Reg],
             /// LOAD_STR_STATE dst, key ; loads the string stored as key from storage
             LoadStrState = 0x09, "LOAD_STR_STATE" => [rd: Reg, key: Reg],
+            /// LOAD_HASH rd, ref ; rd = ref
+            LoadHash = 0x0A, "LOAD_HASH" => [rd: Reg, str: RefU32],
+            /// STORE_HASH key, value ; store string value at key in storage
+            StoreHash = 0x0B, "STORE_HASH" => [key: Reg, value: Reg],
+            /// LOAD_HASH_STATE dst, key ; loads the string stored as key from storage
+            LoadHashState = 0x0C, "LOAD_HASH_STATE" => [rd: Reg, key: Reg],
             // =========================
             // Moves / casts
             // =========================

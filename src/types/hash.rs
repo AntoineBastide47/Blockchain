@@ -30,6 +30,11 @@ impl Hash {
         &self.0
     }
 
+    /// Returns the hash as a byte Vec.
+    pub fn to_vec(self) -> Vec<u8> {
+        self.0.to_vec()
+    }
+
     /// Creates a hash from a byte slice.
     ///
     /// Returns `None` if the slice length is not exactly [`HASH_LEN`] bytes.
@@ -80,6 +85,11 @@ impl HashBuilder {
     /// Feeds data into the hash computation.
     pub fn update(&mut self, data: &[u8]) {
         self.hasher.update(data);
+    }
+
+    pub fn chain(mut self, data: &[u8]) -> Self {
+        self.hasher.update(data);
+        self
     }
 
     /// Consumes the builder and returns the final hash.

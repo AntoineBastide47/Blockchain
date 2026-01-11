@@ -171,7 +171,10 @@ macro_rules! define_instructions {
             fn try_from(value: u8) -> Result<Self, Self::Error> {
                 match value {
                     $( $opcode => Ok(Instruction::$name), )*
-                    _ => Err(VMError::InvalidInstruction(value)),
+                    _ => Err(VMError::InvalidInstruction {
+                        opcode: value,
+                        offset: 0,
+                    }),
                 }
             }
         }
@@ -221,7 +224,7 @@ mod tests {
     fn instruction_try_from_invalid() {
         assert!(matches!(
             Instruction::try_from(0xFF),
-            Err(VMError::InvalidInstruction(0xFF))
+            Err(VMError::InvalidInstruction { opcode: 0xFF, .. })
         ));
     }
 }

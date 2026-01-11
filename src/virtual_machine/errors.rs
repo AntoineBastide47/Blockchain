@@ -4,29 +4,49 @@ use blockchain_derive::Error;
 #[derive(Debug, Error)]
 pub enum VMError {
     /// Unknown opcode encountered in bytecode.
-    #[error("invalid instruction: {0}")]
-    InvalidInstruction(u8),
+    #[error("invalid instruction opcode 0x{opcode:02X} at byte offset {offset}")]
+    InvalidInstruction { opcode: u8, offset: usize },
     /// Unrecognized instruction mnemonic during assembly.
-    #[error("invalid instruction name: {0}")]
-    InvalidInstructionName(String),
+    #[error("unknown instruction mnemonic '{name}' during assembly")]
+    InvalidInstructionName { name: String },
     /// Wrong number of operands for an instruction.
-    #[error("arity mismatch")]
-    ArityMismatch,
+    #[error("operand count mismatch for {instruction}: expected {expected}, got {actual}")]
+    ArityMismatch {
+        instruction: String,
+        expected: usize,
+        actual: usize,
+    },
     /// Expected a register operand (e.g., `r0`) but got something else.
-    #[error("expected register, got {0}")]
+    #[error("expected register operand (e.g., r0) but got '{0}'")]
     ExpectedRegister(String),
     /// Register index out of range or malformed.
-    #[error("invalid register {0}")]
-    InvalidRegister(String),
+    #[error("register or reference '{token}' is invalid or malformed")]
+    InvalidRegister { token: String },
     /// Register index exceeds the register file size.
-    #[error("register index {0} out of bounds")]
-    InvalidRegisterIndex(u8),
+    #[error("register index {index} is out of bounds (register file has {available} slots)")]
+    InvalidRegisterIndex { index: u8, available: usize },
     /// Bytecode ended unexpectedly while reading an instruction.
-    #[error("unexpected end of bytecode")]
-    UnexpectedEndOfBytecode,
+    #[error(
+        "unexpected end of bytecode at offset {ip}: needed {requested} more bytes but only {available} remain"
+    )]
+    UnexpectedEndOfBytecode {
+        ip: usize,
+        requested: usize,
+        available: usize,
+    },
     /// Operand type does not match expected type.
     #[error(
-        "instruction {instruction} expected argument {arg_index} to be of type {expected} but got {actual}"
+        "type mismatch in {instruction} for argument {arg_index}: expected {expected}, got {actual}"
+    )]
+    TypeMismatchStatic {
+        instruction: &'static str,
+        arg_index: i32,
+        expected: &'static str,
+        actual: &'static str,
+    },
+    /// Operand type does not match expected type.
+    #[error(
+        "type mismatch in {instruction} for argument {arg_index}: expected {expected}, got {actual}"
     )]
     TypeMismatch {
         instruction: &'static str,
@@ -35,45 +55,58 @@ pub enum VMError {
         actual: String,
     },
     /// Instruction pointer overflow or out of bounds.
-    #[error("invalid instruction pointer")]
-    InvalidIP,
+    #[error("instruction pointer {ip} is out of bounds or overflowed")]
+    InvalidIP { ip: usize },
     /// Division or modulo by zero.
-    #[error("division by zero")]
+    #[error("attempted division or modulo by zero during execution")]
     DivisionByZero,
-    /// Assembly error with line number context.
-    #[error("line {line}: {source}")]
-    AssemblyError { line: usize, source: String },
+    /// Assembly error with line/column context.
+    #[error("assembly error at line {line}, column {offset}: {source}")]
+    AssemblyError {
+        line: usize,
+        offset: usize,
+        source: String,
+    },
     /// File I/O error during assembly.
-    #[error("io error: {0}")]
-    IoError(String),
+    #[error("I/O failure during assembly at {path}: {source}")]
+    IoError { path: String, source: String },
     /// Unknown host function called via CALL_HOST instruction.
-    #[error("invalid CALL_HOST function name {0}")]
-    InvalidCallHostFunction(String),
+    #[error("CALL_HOST invoked with unknown function '{name}'")]
+    InvalidCallHostFunction { name: String },
     /// Failed to decode program bytecode.
-    #[error("decoding error: {0}")]
-    DecodeError(String),
+    #[error("failed to decode program bytecode: {reason}")]
+    DecodeError { reason: String },
     /// Key not found in storage.
-    #[error("key not found in storage: {0}")]
-    KeyNotFound(String),
+    #[error("storage key '{key}' not found")]
+    KeyNotFound { key: String },
     /// State value has invalid format for the expected type.
-    #[error("invalid storage value format")]
-    InvalidStateValue,
+    #[error("storage value for key '{key}' has invalid format: expected {expected}")]
+    InvalidStateValue { key: String, expected: &'static str },
     /// Label defined more than once.
-    #[error("duplicate label: {0}")]
-    DuplicateLabel(String),
+    #[error("duplicate label definition: '{label}'")]
+    DuplicateLabel { label: String },
     /// Reference to undefined label.
-    #[error("undefined label: {0}")]
-    UndefinedLabel(String),
+    #[error("reference to undefined label '{label}'")]
+    UndefinedLabel { label: String },
     /// Call to undefined function.
-    #[error("undefined function: {0}")]
-    UndefinedFunction(String),
+    #[error("call to undefined function '{function}'")]
+    UndefinedFunction { function: String },
     /// Return without matching call.
-    #[error("return without call")]
-    ReturnWithoutCall,
-    #[error("invalid utf8 in string")]
-    InvalidUtf8,
-    #[error("unterminated string literal")]
-    ParseError,
-    #[error("invalid hash format")]
-    InvalidHash,
+    #[error(
+        "RETURN instruction encountered without matching CALL frame (call stack depth {call_depth})"
+    )]
+    ReturnWithoutCall { call_depth: usize },
+    #[error("string #{string_ref} is not valid UTF-8")]
+    InvalidUtf8 { string_ref: u32 },
+    #[error("parse error at line {line}, column {offset}: {message}")]
+    ParseError {
+        line: usize,
+        offset: usize,
+        message: &'static str,
+    },
+    #[error("invalid hash format: expected {expected_len} bytes but got {actual_len}")]
+    InvalidHash {
+        expected_len: usize,
+        actual_len: usize,
+    },
 }

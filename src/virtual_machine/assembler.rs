@@ -62,7 +62,7 @@ impl AsmContext {
     /// Registers a label at the given bytecode offset.
     pub fn define_label(&mut self, name: String, offset: usize) -> Result<(), VMError> {
         if self.labels.contains_key(&name) {
-            return Err(VMError::DuplicateLabel(name));
+            return Err(VMError::DuplicateLabel { label: name });
         }
         self.labels.insert(name, offset);
         Ok(())
@@ -73,8 +73,17 @@ impl AsmContext {
         self.labels
             .get(name)
             .copied()
-            .ok_or_else(|| VMError::UndefinedLabel(name.to_string()))
+            .ok_or(VMError::UndefinedLabel {
+                label: name.to_string(),
+            })
     }
+}
+
+#[derive(Debug, Clone)]
+struct Token {
+    text: String,
+    /// 1-based column offset in the line.
+    offset: usize,
 }
 
 /// Tokenize a single line of assembly.
@@ -83,57 +92,72 @@ impl AsmContext {
 /// - `#` starts a comment
 /// - commas are ignored
 /// - whitespace-separated tokens
-fn tokenize(line: &str) -> Result<Vec<String>, VMError> {
+fn tokenize(line_no: usize, line: &str) -> Result<Vec<Token>, VMError> {
     let line = line.split(COMMENT_CHAR).next().unwrap_or("");
-    let bytes = line.as_bytes();
 
     let mut out = Vec::with_capacity(8);
     let mut cur = String::with_capacity(line.len().min(64));
-
-    let mut i = 0usize;
+    let mut start_col: Option<usize> = None;
     let mut in_str = false;
+    let mut col = 0usize;
 
-    // helper: finalize current token
-    let flush = |out: &mut Vec<String>, cur: &mut String| {
-        if !cur.is_empty() {
-            let t = cur.trim();
-            if !t.is_empty() {
-                out.push(t.to_string());
-            }
-            cur.clear();
+    for ch in line.chars() {
+        col += 1;
+
+        if ch == COMMENT_CHAR && !in_str {
+            break;
         }
-    };
 
-    while i < bytes.len() {
-        let b = bytes[i];
-        match b {
-            b'"' => {
-                cur.push('"');
+        match ch {
+            '"' => {
+                if start_col.is_none() {
+                    start_col = Some(col);
+                }
+                cur.push(ch);
                 in_str = !in_str;
-                i += 1;
             }
-            b',' if !in_str => {
-                flush(&mut out, &mut cur);
-                i += 1;
+            ',' if !in_str => {
+                flush_token(&mut out, &mut cur, &mut start_col);
             }
-            b if !in_str && (b as char).is_whitespace() => {
-                flush(&mut out, &mut cur);
-                i += 1;
+            c if !in_str && c.is_whitespace() => {
+                flush_token(&mut out, &mut cur, &mut start_col);
             }
             _ => {
-                // push as char; safe because original line is valid UTF-8
-                cur.push(bytes[i] as char);
-                i += 1;
+                if start_col.is_none() {
+                    start_col = Some(col);
+                }
+                cur.push(ch);
             }
         }
     }
 
     if in_str {
-        return Err(VMError::ParseError);
+        let offset = start_col.unwrap_or(col + 1);
+        return Err(VMError::ParseError {
+            line: line_no,
+            offset,
+            message: "unterminated string literal (missing closing quote)",
+        });
     }
 
-    flush(&mut out, &mut cur);
+    flush_token(&mut out, &mut cur, &mut start_col);
     Ok(out)
+}
+
+fn flush_token(out: &mut Vec<Token>, cur: &mut String, start_col: &mut Option<usize>) {
+    if cur.is_empty() {
+        *start_col = None;
+        return;
+    }
+    let token = cur.trim();
+    if !token.is_empty() {
+        out.push(Token {
+            text: token.to_string(),
+            offset: start_col.unwrap_or(1),
+        });
+    }
+    cur.clear();
+    *start_col = None;
 }
 
 /// Parse a register token like `r0`, `r15`
@@ -141,15 +165,21 @@ pub(crate) fn parse_reg(tok: &str) -> Result<u8, VMError> {
     tok.strip_prefix('r')
         .ok_or_else(|| VMError::ExpectedRegister(tok.to_string()))?
         .parse::<u8>()
-        .map_err(|_| VMError::InvalidRegister(tok.to_string()))
+        .map_err(|_| VMError::InvalidRegister {
+            token: tok.to_string(),
+        })
 }
 
 /// Parse a reference token like `@0`, `@123`.
 pub(crate) fn parse_ref_u32(tok: &str) -> Result<u32, VMError> {
     tok.strip_prefix('@')
-        .ok_or_else(|| VMError::InvalidRegister(tok.to_string()))?
+        .ok_or_else(|| VMError::InvalidRegister {
+            token: tok.to_string(),
+        })?
         .parse::<u32>()
-        .map_err(|_| VMError::InvalidRegister(tok.to_string()))
+        .map_err(|_| VMError::InvalidRegister {
+            token: tok.to_string(),
+        })
 }
 
 /// Parse a boolean literal (`true` or `false`).
@@ -234,7 +264,9 @@ macro_rules! define_parse_instruction {
         fn instruction_from_str(name: &str) -> Result<Instruction, VMError> {
             match name {
                 $( $mnemonic => Ok(Instruction::$name), )*
-                _ => Err(VMError::InvalidInstructionName(name.to_string())),
+                _ => Err(VMError::InvalidInstructionName {
+                    name: name.to_string(),
+                }),
             }
         }
 
@@ -255,14 +287,18 @@ macro_rules! define_parse_instruction {
         /// used for resolving label references to relative offsets.
         fn parse_instruction(
             ctx: &mut AsmContext,
-            tokens: &[String],
+            tokens: &[Token],
             current_offset: usize,
         ) -> Result<AsmInstr, VMError> {
             if tokens.is_empty() {
-                return Err(VMError::ArityMismatch);
+                return Err(VMError::ArityMismatch {
+                    instruction: "<missing opcode>".to_string(),
+                    expected: 1,
+                    actual: 0,
+                });
             }
 
-            let instr = instruction_from_str(&tokens[0])?;
+            let instr = instruction_from_str(&tokens[0].text)?;
             let offset = current_offset + instruction_size(instr);
 
             match instr {
@@ -270,7 +306,11 @@ macro_rules! define_parse_instruction {
                     Instruction::$name => {
                         const EXPECTED: usize = 1 + define_parse_instruction!(@count $( $field ),*);
                         if tokens.len() != EXPECTED {
-                            return Err(VMError::ArityMismatch);
+                            return Err(VMError::ArityMismatch {
+                                instruction: tokens[0].text.clone(),
+                                expected: EXPECTED - 1,
+                                actual: tokens.len() - 1,
+                            });
                         }
 
                         let mut it = tokens.iter().skip(1);
@@ -302,15 +342,15 @@ macro_rules! define_parse_instruction {
 
     // ---------- parsing ----------
     (@parse_operand Reg, $tok:expr, $ctx:expr, $current_offset:expr) => {
-        parse_reg($tok)
+        parse_reg(&$tok.text)
     };
 
     (@parse_operand ImmI64, $tok:expr, $ctx:expr, $current_offset:expr) => {
-        parse_i64_or_label($tok, $ctx, $current_offset)
+        parse_i64_or_label(&$tok.text, $ctx, $current_offset)
     };
 
     (@parse_operand RefU32, $tok:expr, $ctx:expr, $current_offset:expr) => {{
-        let tok = $tok;
+        let tok = &$tok.text;
         if let Some(s) = tok.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
             Ok($ctx.intern_string(s.to_string()))
         } else {
@@ -319,7 +359,7 @@ macro_rules! define_parse_instruction {
     }};
 
     (@parse_operand Bool, $tok:expr, $ctx:expr, $current_offset:expr) => {
-        parse_bool($tok)
+        parse_bool(&$tok.text)
     };
 }
 
@@ -335,41 +375,46 @@ pub fn assemble_source(source: impl Into<String>) -> Result<Program, VMError> {
     let mut asm_context = AsmContext::new();
 
     // First pass: tokenize all lines and collect label definitions
-    let mut parsed_lines: Vec<(usize, Vec<String>)> = Vec::new();
+    let mut parsed_lines: Vec<(usize, Vec<Token>)> = Vec::new();
     let mut offset = 0usize;
 
     for (line_no, line) in source.lines().enumerate() {
-        let tokens = tokenize(line)?;
+        let tokens = tokenize(line_no + 1, line)?;
         if tokens.is_empty() {
             continue;
         }
 
         // Check if first token is a label definition
-        if is_label_def(&tokens[0]) {
-            let name = label_name(&tokens[0]).to_string();
+        if is_label_def(&tokens[0].text) {
+            let name = label_name(&tokens[0].text).to_string();
             asm_context
                 .define_label(name, offset)
                 .map_err(|e| VMError::AssemblyError {
                     line: line_no + 1,
+                    offset: tokens[0].offset,
                     source: e.to_string(),
                 })?;
 
             // If there are more tokens after the label, treat them as an instruction
             if tokens.len() > 1 {
-                let instr_tokens: Vec<String> = tokens[1..].to_vec();
-                let instr =
-                    instruction_from_str(&instr_tokens[0]).map_err(|e| VMError::AssemblyError {
+                let instr_tokens: Vec<Token> = tokens[1..].to_vec();
+                let instr = instruction_from_str(&instr_tokens[0].text).map_err(|e| {
+                    VMError::AssemblyError {
                         line: line_no + 1,
+                        offset: instr_tokens[0].offset,
                         source: e.to_string(),
-                    })?;
+                    }
+                })?;
                 offset += instruction_size(instr);
                 parsed_lines.push((line_no, instr_tokens));
             }
         } else {
-            let instr = instruction_from_str(&tokens[0]).map_err(|e| VMError::AssemblyError {
-                line: line_no + 1,
-                source: e.to_string(),
-            })?;
+            let instr =
+                instruction_from_str(&tokens[0].text).map_err(|e| VMError::AssemblyError {
+                    line: line_no + 1,
+                    offset: tokens[0].offset,
+                    source: e.to_string(),
+                })?;
             offset += instruction_size(instr);
             parsed_lines.push((line_no, tokens));
         }
@@ -383,6 +428,7 @@ pub fn assemble_source(source: impl Into<String>) -> Result<Program, VMError> {
         let instr = parse_instruction(&mut asm_context, &tokens, current_offset).map_err(|e| {
             VMError::AssemblyError {
                 line: line_no + 1,
+                offset: tokens.first().map(|t| t.offset).unwrap_or(1),
                 source: e.to_string(),
             }
         })?;
@@ -399,7 +445,11 @@ pub fn assemble_source(source: impl Into<String>) -> Result<Program, VMError> {
 /// Convenience: assemble directly from file path
 #[allow(dead_code)]
 pub fn assemble_file<P: AsRef<Path>>(path: P) -> Result<Program, VMError> {
-    let source = fs::read_to_string(path).map_err(|e| VMError::IoError(e.to_string()))?;
+    let path_ref = path.as_ref();
+    let source = fs::read_to_string(path_ref).map_err(|e| VMError::IoError {
+        path: path_ref.display().to_string(),
+        source: e.to_string(),
+    })?;
     assemble_source(source)
 }
 
@@ -422,15 +472,21 @@ mod tests {
 
     #[test]
     fn parse_reg_invalid_number() {
-        assert!(matches!(parse_reg("r"), Err(VMError::InvalidRegister(_))));
+        assert!(matches!(
+            parse_reg("r"),
+            Err(VMError::InvalidRegister { token: _ })
+        ));
         assert!(matches!(
             parse_reg("r256"),
-            Err(VMError::InvalidRegister(_))
+            Err(VMError::InvalidRegister { token: _ })
         ));
-        assert!(matches!(parse_reg("r-1"), Err(VMError::InvalidRegister(_))));
+        assert!(matches!(
+            parse_reg("r-1"),
+            Err(VMError::InvalidRegister { token: _ })
+        ));
         assert!(matches!(
             parse_reg("rabc"),
-            Err(VMError::InvalidRegister(_))
+            Err(VMError::InvalidRegister { token: _ })
         ));
     }
 
@@ -476,7 +532,7 @@ mod tests {
         let err = assemble_source("INVALID r0").unwrap_err();
         assert!(matches!(
             err,
-            VMError::AssemblyError { line: 1, ref source } if source.contains("invalid instruction name")
+            VMError::AssemblyError { line: 1, offset: _, ref source } if source.contains("unknown instruction")
         ));
     }
 
@@ -485,7 +541,7 @@ mod tests {
         let err = assemble_source("ADD r0, r1").unwrap_err();
         assert!(matches!(
             err,
-            VMError::AssemblyError { line: 1, ref source } if source.contains("arity")
+            VMError::AssemblyError { line: 1, offset: _, ref source } if source.contains("operand count mismatch")
         ));
     }
 
@@ -571,13 +627,26 @@ mod tests {
     fn instruction_parse_empty() {
         assert!(matches!(
             parse_instruction(&mut AsmContext::new(), &[], 0),
-            Err(VMError::ArityMismatch)
+            Err(VMError::ArityMismatch { .. })
         ));
     }
 
     #[test]
     fn instruction_parse_load_i64() {
-        let tokens = vec!["LOAD_I64".into(), "r5".into(), "100".into()];
+        let tokens = vec![
+            Token {
+                text: "LOAD_I64".into(),
+                offset: 1,
+            },
+            Token {
+                text: "r5".into(),
+                offset: 10,
+            },
+            Token {
+                text: "100".into(),
+                offset: 14,
+            },
+        ];
         let instr = parse_instruction(&mut AsmContext::new(), &tokens, 0).unwrap();
         match instr {
             AsmInstr::LoadI64 { rd, imm } => {
@@ -590,7 +659,24 @@ mod tests {
 
     #[test]
     fn instruction_parse_three_reg() {
-        let tokens = vec!["ADD".into(), "r0".into(), "r1".into(), "r2".into()];
+        let tokens = vec![
+            Token {
+                text: "ADD".into(),
+                offset: 1,
+            },
+            Token {
+                text: "r0".into(),
+                offset: 5,
+            },
+            Token {
+                text: "r1".into(),
+                offset: 9,
+            },
+            Token {
+                text: "r2".into(),
+                offset: 13,
+            },
+        ];
         let instr = parse_instruction(&mut AsmContext::new(), &tokens, 0).unwrap();
         match instr {
             AsmInstr::Add { rd, rs1, rs2 } => {
@@ -616,11 +702,11 @@ mod tests {
     fn instruction_from_str_invalid() {
         assert!(matches!(
             instruction_from_str("INVALID"),
-            Err(VMError::InvalidInstructionName(_))
+            Err(VMError::InvalidInstructionName { .. })
         ));
         assert!(matches!(
             instruction_from_str("add"), // case sensitive
-            Err(VMError::InvalidInstructionName(_))
+            Err(VMError::InvalidInstructionName { .. })
         ));
     }
 
@@ -739,7 +825,7 @@ mod tests {
         let err = assemble_source(source).unwrap_err();
         assert!(matches!(
             err,
-            VMError::AssemblyError { line: 2, ref source } if source.contains("duplicate")
+            VMError::AssemblyError { line: 2, offset: _, ref source } if source.contains("duplicate")
         ));
     }
 
@@ -749,7 +835,7 @@ mod tests {
         let err = assemble_source(source).unwrap_err();
         assert!(matches!(
             err,
-            VMError::AssemblyError { line: 1, ref source } if source.contains("undefined")
+            VMError::AssemblyError { line: 1, offset: _, ref source } if source.contains("undefined")
         ));
     }
 

@@ -5,7 +5,7 @@
 
 use crate::types::bytes::Bytes;
 use crate::types::encoding::Encode;
-use crate::types::hash::Hash;
+use crate::types::hash::{HASH_LEN, Hash};
 use crate::virtual_machine::errors::VMError;
 use crate::virtual_machine::isa::Instruction;
 use crate::virtual_machine::program::Program;
@@ -58,7 +58,10 @@ impl Registers {
     pub fn get(&self, idx: u8) -> Result<&Value, VMError> {
         self.regs
             .get(idx as usize)
-            .ok_or(VMError::InvalidRegisterIndex(idx))
+            .ok_or(VMError::InvalidRegisterIndex {
+                index: idx,
+                available: self.regs.len(),
+            })
     }
 
     /// Returns the boolean value in register `idx`.
@@ -67,11 +70,11 @@ impl Registers {
     pub fn get_bool(&self, idx: u8, instr: &'static str) -> Result<bool, VMError> {
         match self.get(idx)? {
             Value::Bool(v) => Ok(*v),
-            other => Err(VMError::TypeMismatch {
+            other => Err(VMError::TypeMismatchStatic {
                 instruction: instr,
                 arg_index: idx as i32,
                 expected: "Bool",
-                actual: other.type_name().to_string(),
+                actual: other.type_name(),
             }),
         }
     }
@@ -82,11 +85,11 @@ impl Registers {
     pub fn get_ref(&self, idx: u8, instr: &'static str) -> Result<u32, VMError> {
         match self.get(idx)? {
             Value::Ref(v) => Ok(*v),
-            other => Err(VMError::TypeMismatch {
+            other => Err(VMError::TypeMismatchStatic {
                 instruction: instr,
                 arg_index: idx as i32,
                 expected: "Ref",
-                actual: other.type_name().to_string(),
+                actual: other.type_name(),
             }),
         }
     }
@@ -97,11 +100,11 @@ impl Registers {
     pub fn get_int(&self, idx: u8, instr: &'static str) -> Result<i64, VMError> {
         match self.get(idx)? {
             Value::Int(v) => Ok(*v),
-            other => Err(VMError::TypeMismatch {
+            other => Err(VMError::TypeMismatchStatic {
                 instruction: instr,
                 arg_index: idx as i32,
                 expected: "Int",
-                actual: other.type_name().to_string(),
+                actual: other.type_name(),
             }),
         }
     }
@@ -110,10 +113,14 @@ impl Registers {
     ///
     /// Returns [`VMError::InvalidRegisterIndex`] if `idx` is out of bounds.
     pub fn set(&mut self, idx: u8, v: Value) -> Result<(), VMError> {
+        let available = self.regs.len();
         let slot = self
             .regs
             .get_mut(idx as usize)
-            .ok_or(VMError::InvalidRegisterIndex(idx))?;
+            .ok_or(VMError::InvalidRegisterIndex {
+                index: idx,
+                available,
+            })?;
         *slot = v;
         Ok(())
     }
@@ -137,13 +144,18 @@ impl Heap {
 
     /// Retrieves a string by its reference index.
     fn get_string(&self, id: u32) -> Result<String, VMError> {
-        String::from_utf8(self.items[id as usize].clone()).map_err(|_| VMError::InvalidUtf8)
+        String::from_utf8(self.items[id as usize].clone())
+            .map_err(|_| VMError::InvalidUtf8 { string_ref: id })
     }
 
     /// Retrieves a hash by its reference index.
     fn get_hash(&self, id: u32) -> Result<Hash, VMError> {
-        match Hash::from_slice(&self.items[id as usize]) {
-            None => Err(VMError::InvalidHash),
+        let bytes = &self.items[id as usize];
+        match Hash::from_slice(bytes) {
+            None => Err(VMError::InvalidHash {
+                expected_len: HASH_LEN,
+                actual_len: bytes.len(),
+            }),
             Some(hash) => Ok(hash),
         }
     }
@@ -273,9 +285,13 @@ impl VM {
     /// the end of the bytecode buffer.
     pub fn run<S: State>(&mut self, state: &mut S, ctx: &ExecContext) -> Result<(), VMError> {
         while self.ip < self.data.len() {
-            let opcode = self.data[self.ip];
+            let opcode_offset = self.ip;
+            let opcode = self.data[opcode_offset];
             self.ip += 1;
-            let instr = Instruction::try_from(opcode)?;
+            let instr = Instruction::try_from(opcode).map_err(|_| VMError::InvalidInstruction {
+                opcode,
+                offset: opcode_offset,
+            })?;
             self.exec(instr, state, ctx)?;
         }
         Ok(())
@@ -286,12 +302,20 @@ impl VM {
     /// Advances the instruction pointer by `count` bytes.
     fn read_exact(&mut self, count: usize) -> Result<&[u8], VMError> {
         let start = self.ip;
-        let end = self.ip.checked_add(count).ok_or(VMError::InvalidIP)?;
+        let end = self
+            .ip
+            .checked_add(count)
+            .ok_or(VMError::InvalidIP { ip: self.ip })?;
+        let available = self.data.len().saturating_sub(start);
 
         let slice = self
             .data
             .get(start..end)
-            .ok_or(VMError::UnexpectedEndOfBytecode)?;
+            .ok_or(VMError::UnexpectedEndOfBytecode {
+                ip: start,
+                requested: count,
+                available,
+            })?;
 
         self.ip = end;
         Ok(slice)
@@ -421,8 +445,13 @@ impl VM {
         let key_ref = self.registers.get_ref(key, "LOAD_I64_STATE")?;
         let key_str = self.heap.get_string(key_ref)?;
         let state_key = Self::make_state_key(ctx.chain_id, ctx.contract_id, key_str.as_bytes());
-        let value = state.get(state_key).ok_or(VMError::KeyNotFound(key_str))?;
-        let bytes: [u8; 8] = value.try_into().map_err(|_| VMError::InvalidStateValue)?;
+        let value = state.get(state_key).ok_or(VMError::KeyNotFound {
+            key: key_str.clone(),
+        })?;
+        let bytes: [u8; 8] = value.try_into().map_err(|_| VMError::InvalidStateValue {
+            key: key_str.clone(),
+            expected: "8 bytes for i64",
+        })?;
         self.registers
             .set(dst, Value::Int(i64::from_le_bytes(bytes)))
     }
@@ -456,9 +485,14 @@ impl VM {
         let key_ref = self.registers.get_ref(key, "LOAD_BOOL_STATE")?;
         let key_str = self.heap.get_string(key_ref)?;
         let state_key = Self::make_state_key(ctx.chain_id, ctx.contract_id, key_str.as_bytes());
-        let value = state.get(state_key).ok_or(VMError::KeyNotFound(key_str))?;
+        let value = state.get(state_key).ok_or(VMError::KeyNotFound {
+            key: key_str.clone(),
+        })?;
         if value.len() != 1 {
-            return Err(VMError::InvalidStateValue);
+            return Err(VMError::InvalidStateValue {
+                key: key_str,
+                expected: "1 byte for bool",
+            });
         }
         self.registers.set(dst, Value::Bool(value[0] != 0))
     }
@@ -493,7 +527,9 @@ impl VM {
         let key_ref = self.registers.get_ref(key, "LOAD_STR_STATE")?;
         let key_str = self.heap.get_string(key_ref)?;
         let state_key = Self::make_state_key(ctx.chain_id, ctx.contract_id, key_str.as_bytes());
-        let value = state.get(state_key).ok_or(VMError::KeyNotFound(key_str))?;
+        let value = state
+            .get(state_key)
+            .ok_or(VMError::KeyNotFound { key: key_str })?;
         let str_idx = self.heap.len() as u32;
         self.heap.push(value);
         self.registers.set(dst, Value::Ref(str_idx))
@@ -529,7 +565,9 @@ impl VM {
         let key_ref = self.registers.get_ref(key, "LOAD_HASH_STATE")?;
         let key_str = self.heap.get_string(key_ref)?;
         let state_key = Self::make_state_key(ctx.chain_id, ctx.contract_id, key_str.as_bytes());
-        let value = state.get(state_key).ok_or(VMError::KeyNotFound(key_str))?;
+        let value = state
+            .get(state_key)
+            .ok_or(VMError::KeyNotFound { key: key_str })?;
         let str_idx = self.heap.len() as u32;
         self.heap.push(value);
         self.registers.set(dst, Value::Ref(str_idx))
@@ -684,16 +722,20 @@ impl VM {
         match fn_name.as_str() {
             "len" => {
                 if args.len() != 1 {
-                    return Err(VMError::ArityMismatch);
+                    return Err(VMError::ArityMismatch {
+                        instruction: "CALL_HOST \"len\"".to_string(),
+                        expected: 1,
+                        actual: args.len(),
+                    });
                 }
                 let str_ref = match args[0] {
                     Value::Ref(r) => *r,
                     other => {
-                        return Err(VMError::TypeMismatch {
+                        return Err(VMError::TypeMismatchStatic {
                             instruction: "CALL_HOST reg, \"len\"",
                             arg_index: 0,
                             expected: "Ref",
-                            actual: other.type_name().to_string(),
+                            actual: other.type_name(),
                         });
                     }
                 };
@@ -702,38 +744,42 @@ impl VM {
             }
             "slice" => {
                 if args.len() != 3 {
-                    return Err(VMError::ArityMismatch);
+                    return Err(VMError::ArityMismatch {
+                        instruction: "CALL_HOST \"slice\"".to_string(),
+                        expected: 3,
+                        actual: args.len(),
+                    });
                 }
                 let str_ref = match args[0] {
                     Value::Ref(r) => *r,
                     other => {
-                        return Err(VMError::TypeMismatch {
+                        return Err(VMError::TypeMismatchStatic {
                             instruction: "CALL_HOST reg, \"slice\"",
                             arg_index: 0,
                             expected: "Ref",
-                            actual: other.type_name().to_string(),
+                            actual: other.type_name(),
                         });
                     }
                 };
                 let start = match args[1] {
                     Value::Int(i) => *i as usize,
                     other => {
-                        return Err(VMError::TypeMismatch {
+                        return Err(VMError::TypeMismatchStatic {
                             instruction: "CALL_HOST reg, \"slice\"",
                             arg_index: 1,
                             expected: "Int",
-                            actual: other.type_name().to_string(),
+                            actual: other.type_name(),
                         });
                     }
                 };
                 let end = match args[2] {
                     Value::Int(i) => *i as usize,
                     other => {
-                        return Err(VMError::TypeMismatch {
+                        return Err(VMError::TypeMismatchStatic {
                             instruction: "CALL_HOST reg, \"slice\"",
                             arg_index: 2,
                             expected: "Int",
-                            actual: other.type_name().to_string(),
+                            actual: other.type_name(),
                         });
                     }
                 };
@@ -747,27 +793,31 @@ impl VM {
             }
             "concat" => {
                 if args.len() != 2 {
-                    return Err(VMError::ArityMismatch);
+                    return Err(VMError::ArityMismatch {
+                        instruction: "CALL_HOST \"concat\"".to_string(),
+                        expected: 2,
+                        actual: args.len(),
+                    });
                 }
                 let ref1 = match args[0] {
                     Value::Ref(r) => *r,
                     other => {
-                        return Err(VMError::TypeMismatch {
+                        return Err(VMError::TypeMismatchStatic {
                             instruction: "CALL_HOST reg, \"concat\"",
                             arg_index: 0,
                             expected: "Ref",
-                            actual: other.type_name().to_string(),
+                            actual: other.type_name(),
                         });
                     }
                 };
                 let ref2 = match args[1] {
                     Value::Ref(r) => *r,
                     other => {
-                        return Err(VMError::TypeMismatch {
+                        return Err(VMError::TypeMismatchStatic {
                             instruction: "CALL_HOST reg, \"concat\"",
                             arg_index: 1,
                             expected: "Ref",
-                            actual: other.type_name().to_string(),
+                            actual: other.type_name(),
                         });
                     }
                 };
@@ -779,27 +829,31 @@ impl VM {
             }
             "compare" => {
                 if args.len() != 2 {
-                    return Err(VMError::ArityMismatch);
+                    return Err(VMError::ArityMismatch {
+                        instruction: "CALL_HOST \"compare\"".to_string(),
+                        expected: 2,
+                        actual: args.len(),
+                    });
                 }
                 let ref1 = match args[0] {
                     Value::Ref(r) => *r,
                     other => {
-                        return Err(VMError::TypeMismatch {
+                        return Err(VMError::TypeMismatchStatic {
                             instruction: "CALL_HOST reg, \"compare\"",
                             arg_index: 0,
                             expected: "Ref",
-                            actual: other.type_name().to_string(),
+                            actual: other.type_name(),
                         });
                     }
                 };
                 let ref2 = match args[1] {
                     Value::Ref(r) => *r,
                     other => {
-                        return Err(VMError::TypeMismatch {
+                        return Err(VMError::TypeMismatchStatic {
                             instruction: "CALL_HOST reg, \"compare\"",
                             arg_index: 1,
                             expected: "Ref",
-                            actual: other.type_name().to_string(),
+                            actual: other.type_name(),
                         });
                     }
                 };
@@ -814,7 +868,11 @@ impl VM {
             }
             "hash" => {
                 if args.len() != 1 {
-                    return Err(VMError::ArityMismatch);
+                    return Err(VMError::ArityMismatch {
+                        instruction: "CALL_HOST \"hash\"".to_string(),
+                        expected: 1,
+                        actual: args.len(),
+                    });
                 }
                 let bytes: &[u8] = match args[0] {
                     Value::Zero => &[],
@@ -828,7 +886,7 @@ impl VM {
                 self.heap.push(hash.to_vec());
                 self.registers.set(dst, Value::Ref(new_ref))
             }
-            _ => Err(VMError::InvalidCallHostFunction(fn_name)),
+            _ => Err(VMError::InvalidCallHostFunction { name: fn_name }),
         }
     }
 
@@ -837,7 +895,7 @@ impl VM {
         let target = *self
             .labels
             .get(&fn_name)
-            .ok_or(VMError::UndefinedFunction(fn_name))?;
+            .ok_or(VMError::UndefinedFunction { function: fn_name })?;
 
         self.call_stack.push(CallFrame {
             return_addr: self.ip,
@@ -916,7 +974,9 @@ impl VM {
     }
 
     fn op_ret(&mut self, rs: u8) -> Result<(), VMError> {
-        let frame = self.call_stack.pop().ok_or(VMError::ReturnWithoutCall)?;
+        let frame = self.call_stack.pop().ok_or(VMError::ReturnWithoutCall {
+            call_depth: self.call_stack.len(),
+        })?;
 
         let ret_val = self.registers.get(rs)?.clone();
         self.registers.set(frame.dst_reg, ret_val)?;
@@ -1262,7 +1322,7 @@ mod tests {
         let source = "LOAD_I64 r0, 1\nNOT r1, r0";
         assert!(matches!(
             run_expect_err(source),
-            VMError::TypeMismatch { .. }
+            VMError::TypeMismatchStatic { .. }
         ));
     }
 
@@ -1271,7 +1331,7 @@ mod tests {
         let source = "LOAD_BOOL r0, true\nLOAD_BOOL r1, true\nADD r2, r0, r1";
         assert!(matches!(
             run_expect_err(source),
-            VMError::TypeMismatch { .. }
+            VMError::TypeMismatchStatic { .. }
         ));
     }
 
@@ -1281,7 +1341,7 @@ mod tests {
     fn read_uninitialized_register() {
         assert!(matches!(
             run_expect_err("ADD r2, r0, r1"),
-            VMError::TypeMismatch { .. }
+            VMError::TypeMismatchStatic { .. }
         ));
     }
 
@@ -1290,7 +1350,7 @@ mod tests {
         let mut vm = VM::new(Program::new(vec![], vec![0xFF]));
         assert!(matches!(
             vm.run(&mut TestState::new(), EXECUTION_CONTEXT),
-            Err(VMError::InvalidInstruction(0xFF))
+            Err(VMError::InvalidInstruction { opcode: 0xFF, .. })
         ));
     }
 
@@ -1299,7 +1359,7 @@ mod tests {
         let mut vm = VM::new(Program::new(vec![], vec![0x01, 0x00]));
         assert!(matches!(
             vm.run(&mut TestState::new(), EXECUTION_CONTEXT),
-            Err(VMError::UnexpectedEndOfBytecode)
+            Err(VMError::UnexpectedEndOfBytecode { .. })
         ));
     }
 
@@ -1420,7 +1480,7 @@ LOAD_I64_STATE r1, r0"#,
         let err = vm
             .run(&mut TestState::new(), EXECUTION_CONTEXT)
             .expect_err("expected error");
-        assert!(matches!(err, VMError::KeyNotFound(_)));
+        assert!(matches!(err, VMError::KeyNotFound { .. }));
     }
 
     #[test]
@@ -1458,7 +1518,7 @@ LOAD_BOOL_STATE r1, r0"#,
         let err = vm
             .run(&mut TestState::new(), EXECUTION_CONTEXT)
             .expect_err("expected error");
-        assert!(matches!(err, VMError::KeyNotFound(_)));
+        assert!(matches!(err, VMError::KeyNotFound { .. }));
     }
 
     #[test]
@@ -1512,7 +1572,7 @@ LOAD_STR_STATE r1, r0"#,
         let err = vm
             .run(&mut TestState::new(), EXECUTION_CONTEXT)
             .expect_err("expected error");
-        assert!(matches!(err, VMError::KeyNotFound(_)));
+        assert!(matches!(err, VMError::KeyNotFound { .. }));
     }
 
     #[test]
@@ -1818,14 +1878,14 @@ LOAD_HASH_STATE r2, r0"#,
     fn call_undefined_function() {
         let source = r#"CALL r0, "nonexistent", 0, r0"#;
         let err = run_expect_err(source);
-        assert!(matches!(err, VMError::UndefinedFunction(_)));
+        assert!(matches!(err, VMError::UndefinedFunction { .. }));
     }
 
     #[test]
     fn ret_without_call() {
         let source = "LOAD_I64 r0, 1\nRET r0";
         let err = run_expect_err(source);
-        assert!(matches!(err, VMError::ReturnWithoutCall));
+        assert!(matches!(err, VMError::ReturnWithoutCall { .. }));
     }
 
     #[test]
@@ -2015,7 +2075,7 @@ LOAD_HASH_STATE r2, r0"#,
         // Direct RET without any CALL
         let source = "LOAD_I64 r0, 42\nRET r0";
         let err = run_expect_err(source);
-        assert!(matches!(err, VMError::ReturnWithoutCall));
+        assert!(matches!(err, VMError::ReturnWithoutCall { .. }));
     }
 
     #[test]
@@ -2225,7 +2285,10 @@ LOAD_HASH_STATE r2, r0"#,
             LOAD_STR r2, "extra"
             CALL_HOST r0, "len", 2, r1
         "#;
-        assert!(matches!(run_expect_err(source), VMError::ArityMismatch));
+        assert!(matches!(
+            run_expect_err(source),
+            VMError::ArityMismatch { .. }
+        ));
     }
 
     #[test]
@@ -2236,7 +2299,7 @@ LOAD_HASH_STATE r2, r0"#,
         "#;
         assert!(matches!(
             run_expect_err(source),
-            VMError::TypeMismatch { .. }
+            VMError::TypeMismatchStatic { .. }
         ));
     }
 
@@ -2327,7 +2390,10 @@ LOAD_HASH_STATE r2, r0"#,
             LOAD_I64 r2, 0
             CALL_HOST r0, "slice", 2, r1
         "#;
-        assert!(matches!(run_expect_err(source), VMError::ArityMismatch));
+        assert!(matches!(
+            run_expect_err(source),
+            VMError::ArityMismatch { .. }
+        ));
     }
 
     // --- concat ---
@@ -2386,7 +2452,10 @@ LOAD_HASH_STATE r2, r0"#,
             LOAD_STR r1, "only one"
             CALL_HOST r0, "concat", 1, r1
         "#;
-        assert!(matches!(run_expect_err(source), VMError::ArityMismatch));
+        assert!(matches!(
+            run_expect_err(source),
+            VMError::ArityMismatch { .. }
+        ));
     }
 
     #[test]
@@ -2398,7 +2467,7 @@ LOAD_HASH_STATE r2, r0"#,
         "#;
         assert!(matches!(
             run_expect_err(source),
-            VMError::TypeMismatch { .. }
+            VMError::TypeMismatchStatic { .. }
         ));
     }
 
@@ -2480,7 +2549,10 @@ LOAD_HASH_STATE r2, r0"#,
             LOAD_STR r1, "only"
             CALL_HOST r0, "compare", 1, r1
         "#;
-        assert!(matches!(run_expect_err(source), VMError::ArityMismatch));
+        assert!(matches!(
+            run_expect_err(source),
+            VMError::ArityMismatch { .. }
+        ));
     }
 
     // --- hash ---
@@ -2554,7 +2626,10 @@ LOAD_HASH_STATE r2, r0"#,
             LOAD_STR r2, "b"
             CALL_HOST r0, "hash", 2, r1
         "#;
-        assert!(matches!(run_expect_err(source), VMError::ArityMismatch));
+        assert!(matches!(
+            run_expect_err(source),
+            VMError::ArityMismatch { .. }
+        ));
     }
 
     #[test]
@@ -2581,7 +2656,7 @@ LOAD_HASH_STATE r2, r0"#,
         "#;
         assert!(matches!(
             run_expect_err(source),
-            VMError::InvalidCallHostFunction(_)
+            VMError::InvalidCallHostFunction { .. }
         ));
     }
 }

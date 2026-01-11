@@ -90,8 +90,10 @@ impl<V: Validator, S: Storage + VmStorage + AccountStorage + IterableState + Sta
         let mut overlay = OverlayState::new(&base_state);
 
         for tx in &transactions {
-            let program = Program::from_bytes(tx.data.as_slice())
-                .map_err(|e| VMError::DecodeError(e.to_string()))?;
+            let program =
+                Program::from_bytes(tx.data.as_slice()).map_err(|e| VMError::DecodeError {
+                    reason: e.to_string(),
+                })?;
             let mut vm = VM::new(program);
 
             let contract_bytes = tx.from.to_bytes();

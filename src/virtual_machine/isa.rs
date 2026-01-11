@@ -69,6 +69,14 @@ macro_rules! for_each_instruction {
             I64ToBool = 0x11, "I64_TO_BOOL" => [rd: Reg, rs: Reg],
             /// BOOL_TO_I64 rd, rs ; rd = rs as i64 (false=0, true=1)
             BoolToI64 = 0x12, "BOOL_TO_I64" => [rd: Reg, rs: Reg],
+            /// STR_TO_I64 rd, rs ; rd = parse_i64(rs)
+            StrToI64 = 0x13, "STR_TO_I64" => [rd: Reg, rs: Reg],
+            /// I64_TO_STR rd, rs ; rd = rs formatted as string
+            I64ToStr = 0x14, "I64_TO_STR" => [rd: Reg, rs: Reg],
+            /// STR_TO_BOOL rd, rs ; rd = parse_bool(rs)
+            StrToBool = 0x15, "STR_TO_BOOL" => [rd: Reg, rs: Reg],
+            /// BOOL_TO_STR rd, rs ; rd = rs formatted as string
+            BoolToStr = 0x16, "BOOL_TO_STR" => [rd: Reg, rs: Reg],
             // =========================
             // Integer arithmetic
             // =========================
@@ -138,8 +146,10 @@ macro_rules! for_each_instruction {
             Bltu = 0x48, "BLTU" => [rs1: Reg, rs2: Reg, offset: ImmI64],
             /// BGEU rs1, rs2, offset ; if rs1 >= rs2 (unsigned) then PC += offset
             Bgeu = 0x49, "BGEU" => [rs1: Reg, rs2: Reg, offset: ImmI64],
+            /// JUMP offset ; PC += offset (unconditional jump)
+            Jump = 0x4A, "JUMP" => [offset: ImmI64],
             /// RET rs ; return from function call with value in rs
-            Ret = 0x4A, "RET" => [rs: Reg],
+            Ret = 0x4B, "RET" => [rs: Reg],
         }
     };
 }
@@ -175,6 +185,15 @@ macro_rules! define_instructions {
                         opcode: value,
                         offset: 0,
                     }),
+                }
+            }
+        }
+
+        impl Instruction {
+            /// Returns the assembly mnemonic for this instruction.
+            pub const fn mnemonic(&self) -> &'static str {
+                match self {
+                    $( Instruction::$name => $mnemonic, )*
                 }
             }
         }

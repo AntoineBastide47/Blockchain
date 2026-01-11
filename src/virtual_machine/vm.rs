@@ -4,8 +4,8 @@
 //! registers. All arithmetic uses wrapping semantics to prevent overflow panics.
 
 use crate::types::bytes::Bytes;
-use crate::types::encoding::Encode;
 use crate::types::hash::{HASH_LEN, Hash};
+use crate::virtual_machine::assembler::parse_i64;
 use crate::virtual_machine::errors::VMError;
 use crate::virtual_machine::isa::Instruction;
 use crate::virtual_machine::program::Program;
@@ -129,28 +129,38 @@ impl Registers {
 /// Heap storage for reference-counted objects.
 ///
 /// Currently, holds only the string pool loaded from the program.
-struct Heap {
-    items: Vec<Vec<u8>>,
-}
+struct Heap(Vec<Vec<u8>>);
 
 impl Heap {
-    fn push(&mut self, item: Vec<u8>) {
-        self.items.push(item)
+    fn new(items: Vec<Vec<u8>>) -> Self {
+        Self(items)
     }
 
+    /// Add the given item and returns it's index
+    fn index(&mut self, item: Vec<u8>) -> u32 {
+        self.0.push(item);
+        (self.len() - 1) as u32
+    }
+
+    /// Returns a reference to the raw Vec<u8> stored at the given index
+    fn get_raw_ref(&self, reference: u32) -> &Vec<u8> {
+        &self.0[reference as usize]
+    }
+
+    /// Returns how many items are stored in this heap
     fn len(&self) -> usize {
-        self.items.len()
+        self.0.len()
     }
 
     /// Retrieves a string by its reference index.
     fn get_string(&self, id: u32) -> Result<String, VMError> {
-        String::from_utf8(self.items[id as usize].clone())
+        String::from_utf8(self.0[id as usize].clone())
             .map_err(|_| VMError::InvalidUtf8 { string_ref: id })
     }
 
     /// Retrieves a hash by its reference index.
     fn get_hash(&self, id: u32) -> Result<Hash, VMError> {
-        let bytes = &self.items[id as usize];
+        let bytes = &self.0[id as usize];
         match Hash::from_slice(bytes) {
             None => Err(VMError::InvalidHash {
                 expected_len: HASH_LEN,
@@ -171,24 +181,29 @@ macro_rules! exec_vm {
         { $( $variant:ident => $handler:ident $args:tt ),* $(,)? }
     ) => {{
         match $instr {
-            $( Instruction::$variant => exec_vm!(@call $vm, $state, $ctx, $handler, $args) ),*
+            $(
+                Instruction::$variant => {
+                    let instr_name = $instr.mnemonic();
+                    exec_vm!(@call $vm, $state, $ctx, instr_name, $handler, $args)
+                }
+            ),*
         }
     }};
 
     // Handler with storage and chain_id (semicolon separator)
-    (@call $vm:ident, $state:ident, $ctx:ident, $handler:ident,
+    (@call $vm:ident, $state:ident, $ctx:ident, $instr_name:expr, $handler:ident,
         (state, ctx; $( $field:ident : $kind:ident ),* $(,)? )
     ) => {{
         $( let $field = exec_vm!(@read $vm, $kind)?; )*
-        $vm.$handler($state, $ctx, $( $field ),*)
+        $vm.$handler($instr_name, $state, $ctx, $( $field ),*)
     }};
 
     // Handler without storage (no semicolon)
-    (@call $vm:ident, $state:ident, $ctx:ident, $handler:ident,
+    (@call $vm:ident, $state:ident, $ctx:ident, $instr_name:expr, $handler:ident,
         ( $( $field:ident : $kind:ident ),* $(,)? )
     ) => {{
         $( let $field = exec_vm!(@read $vm, $kind)?; )*
-        $vm.$handler($( $field ),*)
+        $vm.$handler($instr_name, $( $field ),*)
     }};
 
     // Decode a u8 register index
@@ -271,9 +286,7 @@ impl VM {
             data: program.bytecode.into(),
             ip: 0,
             registers: Registers::new(256),
-            heap: Heap {
-                items: program.strings,
-            },
+            heap: Heap::new(program.strings),
             labels: program.labels,
             call_stack: Vec::new(),
         }
@@ -352,6 +365,10 @@ impl VM {
                 Move => op_move(rd: Reg, rs: Reg),
                 I64ToBool => op_i64_to_bool(rd: Reg, rs: Reg),
                 BoolToI64 => op_bool_to_i64(rd: Reg, rs: Reg),
+                StrToI64 => op_str_to_i64(rd: Reg, rs: Reg),
+                I64ToStr => op_i64_to_str(rd: Reg, rs: Reg),
+                StrToBool => op_str_to_bool(rd: Reg, rs: Reg),
+                BoolToStr => op_bool_to_str(rd: Reg, rs: Reg),
                 // Integer arithmetic
                 Add => op_add(rd: Reg, rs1: Reg, rs2: Reg),
                 Sub => op_sub(rd: Reg, rs1: Reg, rs2: Reg),
@@ -385,6 +402,7 @@ impl VM {
                 Bge => op_bge(rs1: Reg, rs2: Reg, offset: ImmI64),
                 Bltu => op_bltu(rs1: Reg, rs2: Reg, offset: ImmI64),
                 Bgeu => op_bgeu(rs1: Reg, rs2: Reg, offset: ImmI64),
+                Jump => op_jump(offset: ImmI64),
                 Ret => op_ret(rs: Reg),
             }
         }
@@ -405,31 +423,33 @@ impl VM {
 
     fn op_delete_state<S: State>(
         &mut self,
+        instr: &'static str,
         state: &mut S,
         ctx: &ExecContext,
         key: u8,
     ) -> Result<(), VMError> {
-        let key_ref = self.registers.get_ref(key, "DELETE_STATE")?;
+        let key_ref = self.registers.get_ref(key, instr)?;
         let key_str = self.heap.get_string(key_ref)?;
         let key = Self::make_state_key(ctx.chain_id, ctx.contract_id, key_str.as_bytes());
         state.delete(key);
         Ok(())
     }
 
-    fn op_load_i64(&mut self, dst: u8, imm: i64) -> Result<(), VMError> {
+    fn op_load_i64(&mut self, _instr: &'static str, dst: u8, imm: i64) -> Result<(), VMError> {
         self.registers.set(dst, Value::Int(imm))
     }
 
     fn op_store_i64<S: State>(
         &mut self,
+        instr: &'static str,
         state: &mut S,
         ctx: &ExecContext,
         key: u8,
         value: u8,
     ) -> Result<(), VMError> {
-        let key_ref = self.registers.get_ref(key, "STORE_I64")?;
+        let key_ref = self.registers.get_ref(key, instr)?;
         let key_str = self.heap.get_string(key_ref)?;
-        let val = self.registers.get_int(value, "STORE_I64")?;
+        let val = self.registers.get_int(value, instr)?;
         let key = Self::make_state_key(ctx.chain_id, ctx.contract_id, key_str.as_bytes());
         state.push(key, val.to_le_bytes().to_vec());
         Ok(())
@@ -437,12 +457,13 @@ impl VM {
 
     fn op_load_i64_state<S: State>(
         &mut self,
+        instr: &'static str,
         state: &mut S,
         ctx: &ExecContext,
         dst: u8,
         key: u8,
     ) -> Result<(), VMError> {
-        let key_ref = self.registers.get_ref(key, "LOAD_I64_STATE")?;
+        let key_ref = self.registers.get_ref(key, instr)?;
         let key_str = self.heap.get_string(key_ref)?;
         let state_key = Self::make_state_key(ctx.chain_id, ctx.contract_id, key_str.as_bytes());
         let value = state.get(state_key).ok_or(VMError::KeyNotFound {
@@ -456,20 +477,21 @@ impl VM {
             .set(dst, Value::Int(i64::from_le_bytes(bytes)))
     }
 
-    fn op_load_bool(&mut self, dst: u8, b: bool) -> Result<(), VMError> {
+    fn op_load_bool(&mut self, _instr: &'static str, dst: u8, b: bool) -> Result<(), VMError> {
         self.registers.set(dst, Value::Bool(b))
     }
 
     fn op_store_bool<S: State>(
         &mut self,
+        instr: &'static str,
         state: &mut S,
         ctx: &ExecContext,
         key: u8,
         value: u8,
     ) -> Result<(), VMError> {
-        let key_ref = self.registers.get_ref(key, "STORE_BOOL")?;
+        let key_ref = self.registers.get_ref(key, instr)?;
         let key_str = self.heap.get_string(key_ref)?;
-        let val = self.registers.get_bool(value, "STORE_BOOL")?;
+        let val = self.registers.get_bool(value, instr)?;
         let key = Self::make_state_key(ctx.chain_id, ctx.contract_id, key_str.as_bytes());
         state.push(key, [val as u8].into());
         Ok(())
@@ -477,12 +499,13 @@ impl VM {
 
     fn op_load_bool_state<S: State>(
         &mut self,
+        instr: &'static str,
         state: &mut S,
         ctx: &ExecContext,
         dst: u8,
         key: u8,
     ) -> Result<(), VMError> {
-        let key_ref = self.registers.get_ref(key, "LOAD_BOOL_STATE")?;
+        let key_ref = self.registers.get_ref(key, instr)?;
         let key_str = self.heap.get_string(key_ref)?;
         let state_key = Self::make_state_key(ctx.chain_id, ctx.contract_id, key_str.as_bytes());
         let value = state.get(state_key).ok_or(VMError::KeyNotFound {
@@ -497,20 +520,21 @@ impl VM {
         self.registers.set(dst, Value::Bool(value[0] != 0))
     }
 
-    fn op_load_str(&mut self, dst: u8, str_ref: u32) -> Result<(), VMError> {
+    fn op_load_str(&mut self, _instr: &'static str, dst: u8, str_ref: u32) -> Result<(), VMError> {
         self.registers.set(dst, Value::Ref(str_ref))
     }
 
     fn op_store_str<S: State>(
         &mut self,
+        instr: &'static str,
         state: &mut S,
         ctx: &ExecContext,
         key: u8,
         value: u8,
     ) -> Result<(), VMError> {
-        let key_ref = self.registers.get_ref(key, "STORE_STR")?;
+        let key_ref = self.registers.get_ref(key, instr)?;
         let key_str = self.heap.get_string(key_ref)?;
-        let val_ref = self.registers.get_ref(value, "STORE_STR")?;
+        let val_ref = self.registers.get_ref(value, instr)?;
         let val_str = self.heap.get_string(val_ref)?;
         let key = Self::make_state_key(ctx.chain_id, ctx.contract_id, key_str.as_bytes());
         state.push(key, val_str.into_bytes());
@@ -519,36 +543,42 @@ impl VM {
 
     fn op_load_str_state<S: State>(
         &mut self,
+        instr: &'static str,
         state: &mut S,
         ctx: &ExecContext,
         dst: u8,
         key: u8,
     ) -> Result<(), VMError> {
-        let key_ref = self.registers.get_ref(key, "LOAD_STR_STATE")?;
+        let key_ref = self.registers.get_ref(key, instr)?;
         let key_str = self.heap.get_string(key_ref)?;
         let state_key = Self::make_state_key(ctx.chain_id, ctx.contract_id, key_str.as_bytes());
         let value = state
             .get(state_key)
             .ok_or(VMError::KeyNotFound { key: key_str })?;
-        let str_idx = self.heap.len() as u32;
-        self.heap.push(value);
-        self.registers.set(dst, Value::Ref(str_idx))
+        let str_ref = self.heap.index(value);
+        self.op_load_str(instr, dst, str_ref)
     }
 
-    fn op_load_hash(&mut self, dst: u8, hash_ref: u32) -> Result<(), VMError> {
+    fn op_load_hash(
+        &mut self,
+        _instr: &'static str,
+        dst: u8,
+        hash_ref: u32,
+    ) -> Result<(), VMError> {
         self.registers.set(dst, Value::Ref(hash_ref))
     }
 
     fn op_store_hash<S: State>(
         &mut self,
+        instr: &'static str,
         state: &mut S,
         ctx: &ExecContext,
         key: u8,
         value: u8,
     ) -> Result<(), VMError> {
-        let key_ref = self.registers.get_ref(key, "STORE_HASH")?;
+        let key_ref = self.registers.get_ref(key, instr)?;
         let key_str = self.heap.get_string(key_ref)?;
-        let val_ref = self.registers.get_ref(value, "STORE_HASH")?;
+        let val_ref = self.registers.get_ref(value, instr)?;
         let val_hash = self.heap.get_hash(val_ref)?;
         let key = Self::make_state_key(ctx.chain_id, ctx.contract_id, key_str.as_bytes());
         state.push(key, val_hash.to_vec());
@@ -557,340 +587,320 @@ impl VM {
 
     fn op_load_hash_state<S: State>(
         &mut self,
+        instr: &'static str,
         state: &mut S,
         ctx: &ExecContext,
         dst: u8,
         key: u8,
     ) -> Result<(), VMError> {
-        let key_ref = self.registers.get_ref(key, "LOAD_HASH_STATE")?;
+        let key_ref = self.registers.get_ref(key, instr)?;
         let key_str = self.heap.get_string(key_ref)?;
         let state_key = Self::make_state_key(ctx.chain_id, ctx.contract_id, key_str.as_bytes());
         let value = state
             .get(state_key)
             .ok_or(VMError::KeyNotFound { key: key_str })?;
-        let str_idx = self.heap.len() as u32;
-        self.heap.push(value);
-        self.registers.set(dst, Value::Ref(str_idx))
+        let hash_ref = self.heap.index(value);
+        self.op_load_hash(instr, dst, hash_ref)
     }
 
-    fn op_move(&mut self, dst: u8, src: u8) -> Result<(), VMError> {
+    fn op_move(&mut self, _instr: &'static str, dst: u8, src: u8) -> Result<(), VMError> {
         let v = self.registers.get(src)?.clone();
         self.registers.set(dst, v)
     }
 
-    fn op_i64_to_bool(&mut self, dst: u8, src: u8) -> Result<(), VMError> {
-        let v = self.registers.get_int(src, "I64_TO_BOOL")?;
+    fn op_i64_to_bool(&mut self, instr: &'static str, dst: u8, src: u8) -> Result<(), VMError> {
+        let v = self.registers.get_int(src, instr)?;
         self.registers.set(dst, Value::Bool(v != 0))
     }
 
-    fn op_bool_to_i64(&mut self, dst: u8, src: u8) -> Result<(), VMError> {
-        let v = self.registers.get_bool(src, "BOOL_TO_I64")?;
+    fn op_bool_to_i64(&mut self, instr: &'static str, dst: u8, src: u8) -> Result<(), VMError> {
+        let v = self.registers.get_bool(src, instr)?;
         self.registers.set(dst, Value::Int(if v { 1 } else { 0 }))
     }
 
-    fn op_add(&mut self, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers.get_int(a, "ADD")?;
-        let vb = self.registers.get_int(b, "ADD")?;
+    fn op_str_to_i64(&mut self, instr: &'static str, dst: u8, src: u8) -> Result<(), VMError> {
+        let reg = self.registers.get_ref(src, instr)?;
+        let str = self.heap.get_string(reg)?;
+        self.op_load_i64(instr, dst, parse_i64(&str)?)
+    }
+
+    fn op_i64_to_str(&mut self, instr: &'static str, dst: u8, src: u8) -> Result<(), VMError> {
+        let reg = self.registers.get_int(src, instr)?;
+        let str_ref = self.heap.index(reg.to_string().into_bytes());
+        self.op_load_str(instr, dst, str_ref)
+    }
+
+    fn op_str_to_bool(&mut self, instr: &'static str, dst: u8, src: u8) -> Result<(), VMError> {
+        let reg = self.registers.get_ref(src, instr)?;
+        let str = self.heap.get_string(reg)?;
+        let b = if str == "true" {
+            true
+        } else if str == "false" {
+            false
+        } else {
+            return Err(VMError::TypeMismatch {
+                instruction: instr,
+                arg_index: 0,
+                expected: "\"true\" or \"false\"",
+                actual: str,
+            });
+        };
+        self.op_load_bool(instr, dst, b)
+    }
+
+    fn op_bool_to_str(&mut self, instr: &'static str, dst: u8, src: u8) -> Result<(), VMError> {
+        let reg = self.registers.get_bool(src, instr)?;
+        let str = (if reg { "true" } else { "false" }).to_string();
+        let bool_ref = self.heap.index(str.into_bytes());
+        self.op_load_str(instr, dst, bool_ref)
+    }
+
+    fn op_add(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
+        let va = self.registers.get_int(a, instr)?;
+        let vb = self.registers.get_int(b, instr)?;
         self.registers.set(dst, Value::Int(va.wrapping_add(vb)))
     }
 
-    fn op_sub(&mut self, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers.get_int(a, "SUB")?;
-        let vb = self.registers.get_int(b, "SUB")?;
+    fn op_sub(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
+        let va = self.registers.get_int(a, instr)?;
+        let vb = self.registers.get_int(b, instr)?;
         self.registers.set(dst, Value::Int(va.wrapping_sub(vb)))
     }
 
-    fn op_mul(&mut self, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers.get_int(a, "MUL")?;
-        let vb = self.registers.get_int(b, "MUL")?;
+    fn op_mul(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
+        let va = self.registers.get_int(a, instr)?;
+        let vb = self.registers.get_int(b, instr)?;
         self.registers.set(dst, Value::Int(va.wrapping_mul(vb)))
     }
 
-    fn op_div(&mut self, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers.get_int(a, "DIV")?;
-        let vb = self.registers.get_int(b, "DIV")?;
+    fn op_div(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
+        let va = self.registers.get_int(a, instr)?;
+        let vb = self.registers.get_int(b, instr)?;
         if vb == 0 {
             return Err(VMError::DivisionByZero);
         }
         self.registers.set(dst, Value::Int(va.wrapping_div(vb)))
     }
 
-    fn op_mod(&mut self, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers.get_int(a, "MOD")?;
-        let vb = self.registers.get_int(b, "MOD")?;
+    fn op_mod(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
+        let va = self.registers.get_int(a, instr)?;
+        let vb = self.registers.get_int(b, instr)?;
         if vb == 0 {
             return Err(VMError::DivisionByZero);
         }
         self.registers.set(dst, Value::Int(va.wrapping_rem(vb)))
     }
 
-    fn op_neg(&mut self, dst: u8, src: u8) -> Result<(), VMError> {
-        let v = self.registers.get_int(src, "NEG")?;
+    fn op_neg(&mut self, instr: &'static str, dst: u8, src: u8) -> Result<(), VMError> {
+        let v = self.registers.get_int(src, instr)?;
         self.registers.set(dst, Value::Int(v.wrapping_neg()))
     }
 
-    fn op_abs(&mut self, dst: u8, src: u8) -> Result<(), VMError> {
-        let v = self.registers.get_int(src, "ABS")?;
+    fn op_abs(&mut self, instr: &'static str, dst: u8, src: u8) -> Result<(), VMError> {
+        let v = self.registers.get_int(src, instr)?;
         self.registers.set(dst, Value::Int(v.wrapping_abs()))
     }
 
-    fn op_min(&mut self, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers.get_int(a, "MIN")?;
-        let vb = self.registers.get_int(b, "MIN")?;
+    fn op_min(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
+        let va = self.registers.get_int(a, instr)?;
+        let vb = self.registers.get_int(b, instr)?;
         self.registers.set(dst, Value::Int(va.min(vb)))
     }
 
-    fn op_max(&mut self, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers.get_int(a, "MAX")?;
-        let vb = self.registers.get_int(b, "MAX")?;
+    fn op_max(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
+        let va = self.registers.get_int(a, instr)?;
+        let vb = self.registers.get_int(b, instr)?;
         self.registers.set(dst, Value::Int(va.max(vb)))
     }
 
-    fn op_shl(&mut self, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers.get_int(a, "SHL")?;
-        let vb = self.registers.get_int(b, "SHL")?;
+    fn op_shl(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
+        let va = self.registers.get_int(a, instr)?;
+        let vb = self.registers.get_int(b, instr)?;
         self.registers
             .set(dst, Value::Int(va.wrapping_shl(vb as u32)))
     }
 
-    fn op_shr(&mut self, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers.get_int(a, "SHR")?;
-        let vb = self.registers.get_int(b, "SHR")?;
+    fn op_shr(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
+        let va = self.registers.get_int(a, instr)?;
+        let vb = self.registers.get_int(b, instr)?;
         self.registers
             .set(dst, Value::Int(va.wrapping_shr(vb as u32)))
     }
 
-    fn op_not(&mut self, dst: u8, src: u8) -> Result<(), VMError> {
-        let v = self.registers.get_bool(src, "NOT")?;
+    fn op_not(&mut self, instr: &'static str, dst: u8, src: u8) -> Result<(), VMError> {
+        let v = self.registers.get_bool(src, instr)?;
         self.registers.set(dst, Value::Bool(!v))
     }
 
-    fn op_and(&mut self, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers.get_bool(a, "AND")?;
-        let vb = self.registers.get_bool(b, "AND")?;
+    fn op_and(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
+        let va = self.registers.get_bool(a, instr)?;
+        let vb = self.registers.get_bool(b, instr)?;
         self.registers.set(dst, Value::Bool(va && vb))
     }
 
-    fn op_or(&mut self, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers.get_bool(a, "OR")?;
-        let vb = self.registers.get_bool(b, "OR")?;
+    fn op_or(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
+        let va = self.registers.get_bool(a, instr)?;
+        let vb = self.registers.get_bool(b, instr)?;
         self.registers.set(dst, Value::Bool(va || vb))
     }
 
-    fn op_xor(&mut self, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers.get_bool(a, "XOR")?;
-        let vb = self.registers.get_bool(b, "XOR")?;
+    fn op_xor(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
+        let va = self.registers.get_bool(a, instr)?;
+        let vb = self.registers.get_bool(b, instr)?;
         self.registers.set(dst, Value::Bool(va ^ vb))
     }
 
-    fn op_eq(&mut self, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers.get_int(a, "EQ")?;
-        let vb = self.registers.get_int(b, "EQ")?;
+    fn op_eq(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
+        let va = self.registers.get_int(a, instr)?;
+        let vb = self.registers.get_int(b, instr)?;
         self.registers.set(dst, Value::Bool(va == vb))
     }
 
-    fn op_lt(&mut self, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers.get_int(a, "LT")?;
-        let vb = self.registers.get_int(b, "LT")?;
+    fn op_lt(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
+        let va = self.registers.get_int(a, instr)?;
+        let vb = self.registers.get_int(b, instr)?;
         self.registers.set(dst, Value::Bool(va < vb))
     }
 
-    fn op_gt(&mut self, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers.get_int(a, "GT")?;
-        let vb = self.registers.get_int(b, "GT")?;
+    fn op_gt(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
+        let va = self.registers.get_int(a, instr)?;
+        let vb = self.registers.get_int(b, instr)?;
         self.registers.set(dst, Value::Bool(va > vb))
     }
 
-    fn op_le(&mut self, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers.get_int(a, "LE")?;
-        let vb = self.registers.get_int(b, "LE")?;
+    fn op_le(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
+        let va = self.registers.get_int(a, instr)?;
+        let vb = self.registers.get_int(b, instr)?;
         self.registers.set(dst, Value::Bool(va <= vb))
     }
 
-    fn op_ge(&mut self, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers.get_int(a, "GE")?;
-        let vb = self.registers.get_int(b, "GE")?;
+    fn op_ge(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
+        let va = self.registers.get_int(a, instr)?;
+        let vb = self.registers.get_int(b, instr)?;
         self.registers.set(dst, Value::Bool(va >= vb))
     }
 
-    fn op_call_host(&mut self, dst: u8, fn_id: u32, argc: i64, argv: u8) -> Result<(), VMError> {
+    fn op_call_host(
+        &mut self,
+        _instr: &'static str,
+        dst: u8,
+        fn_id: u32,
+        argc: i64,
+        argv: u8,
+    ) -> Result<(), VMError> {
         let fn_name = self.heap.get_string(fn_id)?;
         let args: Vec<&Value> = (0..argc as u8)
             .map(|i| self.registers.get(argv.wrapping_add(i)))
             .collect::<Result<_, _>>()?;
 
-        match fn_name.as_str() {
-            "len" => {
-                if args.len() != 1 {
-                    return Err(VMError::ArityMismatch {
-                        instruction: "CALL_HOST \"len\"".to_string(),
-                        expected: 1,
-                        actual: args.len(),
-                    });
-                }
-                let str_ref = match args[0] {
-                    Value::Ref(r) => *r,
-                    other => {
-                        return Err(VMError::TypeMismatchStatic {
-                            instruction: "CALL_HOST reg, \"len\"",
-                            arg_index: 0,
-                            expected: "Ref",
-                            actual: other.type_name(),
-                        });
-                    }
-                };
-                let len = self.heap.items[str_ref as usize].len();
-                self.registers.set(dst, Value::Int(len as i64))
+        /// Returns an error if actual != expected
+        fn arg_len_check(expected: usize, actual: usize, name: &str) -> Result<(), VMError> {
+            if actual != expected {
+                return Err(VMError::ArityMismatch {
+                    instruction: format!("CALL_HOST reg, \"{name}\""),
+                    expected,
+                    actual,
+                });
             }
-            "slice" => {
-                if args.len() != 3 {
-                    return Err(VMError::ArityMismatch {
-                        instruction: "CALL_HOST \"slice\"".to_string(),
-                        expected: 3,
-                        actual: args.len(),
-                    });
-                }
-                let str_ref = match args[0] {
-                    Value::Ref(r) => *r,
-                    other => {
-                        return Err(VMError::TypeMismatchStatic {
-                            instruction: "CALL_HOST reg, \"slice\"",
-                            arg_index: 0,
-                            expected: "Ref",
-                            actual: other.type_name(),
-                        });
-                    }
-                };
-                let start = match args[1] {
-                    Value::Int(i) => *i as usize,
-                    other => {
-                        return Err(VMError::TypeMismatchStatic {
-                            instruction: "CALL_HOST reg, \"slice\"",
-                            arg_index: 1,
-                            expected: "Int",
-                            actual: other.type_name(),
-                        });
-                    }
-                };
-                let end = match args[2] {
-                    Value::Int(i) => *i as usize,
-                    other => {
-                        return Err(VMError::TypeMismatchStatic {
-                            instruction: "CALL_HOST reg, \"slice\"",
-                            arg_index: 2,
-                            expected: "Int",
-                            actual: other.type_name(),
-                        });
-                    }
-                };
-                let bytes = &self.heap.items[str_ref as usize];
+            Ok(())
+        }
+
+        /// Converts the given value to an u32 (ref), returns an error if it isn't a Value::Ref
+        fn get_ref(val: &Value) -> Result<u32, VMError> {
+            match val {
+                Value::Ref(r) => Ok(*r),
+                other => Err(VMError::TypeMismatchStatic {
+                    instruction: "CALL_HOST reg, \"len\"",
+                    arg_index: 0,
+                    expected: "Ref",
+                    actual: other.type_name(),
+                }),
+            }
+        }
+
+        /// Converts the given value to an i64, returns an error if it isn't a Value::Int
+        fn get_i64(val: &Value) -> Result<i64, VMError> {
+            match val {
+                Value::Int(i) => Ok(*i),
+                other => Err(VMError::TypeMismatchStatic {
+                    instruction: "CALL_HOST reg, \"len\"",
+                    arg_index: 0,
+                    expected: "Ref",
+                    actual: other.type_name(),
+                }),
+            }
+        }
+
+        match fn_name.as_str() {
+            k @ "len" => {
+                arg_len_check(1, args.len(), k)?;
+                let str_ref = get_ref(args[0])?;
+                self.op_load_i64(_instr, dst, self.heap.get_raw_ref(str_ref).len() as i64)
+            }
+            k @ "slice" => {
+                arg_len_check(3, args.len(), k)?;
+                let str_ref = get_ref(args[0])?;
+                let start = get_i64(args[1])? as usize;
+                let end = get_i64(args[2])? as usize;
+
+                let bytes = self.heap.get_raw_ref(str_ref);
                 let end = end.min(bytes.len());
                 let start = start.min(end);
+
                 let sliced = bytes[start..end].to_vec();
-                let new_ref = self.heap.len() as u32;
-                self.heap.push(sliced);
-                self.registers.set(dst, Value::Ref(new_ref))
+                let new_ref = self.heap.index(sliced);
+                self.op_load_str(_instr, dst, new_ref)
             }
-            "concat" => {
-                if args.len() != 2 {
-                    return Err(VMError::ArityMismatch {
-                        instruction: "CALL_HOST \"concat\"".to_string(),
-                        expected: 2,
-                        actual: args.len(),
-                    });
-                }
-                let ref1 = match args[0] {
-                    Value::Ref(r) => *r,
-                    other => {
-                        return Err(VMError::TypeMismatchStatic {
-                            instruction: "CALL_HOST reg, \"concat\"",
-                            arg_index: 0,
-                            expected: "Ref",
-                            actual: other.type_name(),
-                        });
-                    }
-                };
-                let ref2 = match args[1] {
-                    Value::Ref(r) => *r,
-                    other => {
-                        return Err(VMError::TypeMismatchStatic {
-                            instruction: "CALL_HOST reg, \"concat\"",
-                            arg_index: 1,
-                            expected: "Ref",
-                            actual: other.type_name(),
-                        });
-                    }
-                };
-                let mut result = self.heap.items[ref1 as usize].clone();
-                result.extend_from_slice(&self.heap.items[ref2 as usize]);
-                let new_ref = self.heap.len() as u32;
-                self.heap.push(result);
-                self.registers.set(dst, Value::Ref(new_ref))
+            k @ "concat" => {
+                arg_len_check(2, args.len(), k)?;
+                let ref1 = get_ref(args[0])?;
+                let ref2 = get_ref(args[1])?;
+
+                let mut result = self.heap.get_raw_ref(ref1).clone();
+                result.extend_from_slice(self.heap.get_raw_ref(ref2));
+
+                let new_ref = self.heap.index(result);
+                self.op_load_str(_instr, dst, new_ref)
             }
-            "compare" => {
-                if args.len() != 2 {
-                    return Err(VMError::ArityMismatch {
-                        instruction: "CALL_HOST \"compare\"".to_string(),
-                        expected: 2,
-                        actual: args.len(),
-                    });
-                }
-                let ref1 = match args[0] {
-                    Value::Ref(r) => *r,
-                    other => {
-                        return Err(VMError::TypeMismatchStatic {
-                            instruction: "CALL_HOST reg, \"compare\"",
-                            arg_index: 0,
-                            expected: "Ref",
-                            actual: other.type_name(),
-                        });
-                    }
-                };
-                let ref2 = match args[1] {
-                    Value::Ref(r) => *r,
-                    other => {
-                        return Err(VMError::TypeMismatchStatic {
-                            instruction: "CALL_HOST reg, \"compare\"",
-                            arg_index: 1,
-                            expected: "Ref",
-                            actual: other.type_name(),
-                        });
-                    }
-                };
-                let s1 = &self.heap.items[ref1 as usize];
-                let s2 = &self.heap.items[ref2 as usize];
+            k @ "compare" => {
+                arg_len_check(2, args.len(), k)?;
+                let ref1 = get_ref(args[0])?;
+                let ref2 = get_ref(args[1])?;
+
+                let s1 = self.heap.get_raw_ref(ref1);
+                let s2 = self.heap.get_raw_ref(ref2);
                 let cmp = match s1.cmp(s2) {
                     std::cmp::Ordering::Less => -1,
                     std::cmp::Ordering::Equal => 0,
                     std::cmp::Ordering::Greater => 1,
                 };
-                self.registers.set(dst, Value::Int(cmp))
+                self.op_load_i64(_instr, dst, cmp)
             }
-            "hash" => {
-                if args.len() != 1 {
-                    return Err(VMError::ArityMismatch {
-                        instruction: "CALL_HOST \"hash\"".to_string(),
-                        expected: 1,
-                        actual: args.len(),
-                    });
-                }
+            k @ "hash" => {
+                arg_len_check(1, args.len(), k)?;
                 let bytes: &[u8] = match args[0] {
                     Value::Zero => &[],
                     Value::Bool(b) => &[*b as u8],
-                    Value::Ref(r) => &self.heap.items[*r as usize],
+                    Value::Ref(r) => self.heap.get_raw_ref(*r),
                     Value::Int(i) => &i.to_le_bytes(),
                 };
 
                 let hash = Hash::sha3().chain(bytes).finalize();
-                let new_ref = self.heap.len() as u32;
-                self.heap.push(hash.to_vec());
-                self.registers.set(dst, Value::Ref(new_ref))
+                let new_ref = self.heap.index(hash.to_vec());
+                self.op_load_hash(_instr, dst, new_ref)
             }
             _ => Err(VMError::InvalidCallHostFunction { name: fn_name }),
         }
     }
 
-    fn op_call(&mut self, dst: u8, fn_id: u32, _argc: i64, _argv: u8) -> Result<(), VMError> {
+    fn op_call(
+        &mut self,
+        _instr: &'static str,
+        dst: u8,
+        fn_id: u32,
+        _argc: i64,
+        _argv: u8,
+    ) -> Result<(), VMError> {
         let fn_name = self.heap.get_string(fn_id)?;
         let target = *self
             .labels
@@ -906,74 +916,115 @@ impl VM {
         Ok(())
     }
 
-    fn op_jal(&mut self, rd: u8, offset: i64) -> Result<(), VMError> {
+    fn op_jal(&mut self, _instr: &'static str, rd: u8, offset: i64) -> Result<(), VMError> {
         self.registers.set(rd, Value::Int(self.ip as i64))?;
         self.ip = (self.ip as i64).wrapping_add(offset) as usize;
         Ok(())
     }
 
-    fn op_jalr(&mut self, rd: u8, rs: u8, offset: i64) -> Result<(), VMError> {
-        let base = self.registers.get_int(rs, "JALR")?;
+    fn op_jalr(&mut self, instr: &'static str, rd: u8, rs: u8, offset: i64) -> Result<(), VMError> {
+        let base = self.registers.get_int(rs, instr)?;
         self.registers.set(rd, Value::Int(self.ip as i64))?;
         self.ip = base.wrapping_add(offset) as usize;
         Ok(())
     }
 
-    fn op_beq(&mut self, rs1: u8, rs2: u8, offset: i64) -> Result<(), VMError> {
-        let a = self.registers.get_int(rs1, "BEQ")?;
-        let b = self.registers.get_int(rs2, "BEQ")?;
+    fn op_beq(
+        &mut self,
+        instr: &'static str,
+        rs1: u8,
+        rs2: u8,
+        offset: i64,
+    ) -> Result<(), VMError> {
+        let a = self.registers.get_int(rs1, instr)?;
+        let b = self.registers.get_int(rs2, instr)?;
         if a == b {
             self.ip = (self.ip as i64).wrapping_add(offset) as usize;
         }
         Ok(())
     }
 
-    fn op_bne(&mut self, rs1: u8, rs2: u8, offset: i64) -> Result<(), VMError> {
-        let a = self.registers.get_int(rs1, "BNE")?;
-        let b = self.registers.get_int(rs2, "BNE")?;
+    fn op_bne(
+        &mut self,
+        instr: &'static str,
+        rs1: u8,
+        rs2: u8,
+        offset: i64,
+    ) -> Result<(), VMError> {
+        let a = self.registers.get_int(rs1, instr)?;
+        let b = self.registers.get_int(rs2, instr)?;
         if a != b {
             self.ip = (self.ip as i64).wrapping_add(offset) as usize;
         }
         Ok(())
     }
 
-    fn op_blt(&mut self, rs1: u8, rs2: u8, offset: i64) -> Result<(), VMError> {
-        let a = self.registers.get_int(rs1, "BLT")?;
-        let b = self.registers.get_int(rs2, "BLT")?;
+    fn op_blt(
+        &mut self,
+        instr: &'static str,
+        rs1: u8,
+        rs2: u8,
+        offset: i64,
+    ) -> Result<(), VMError> {
+        let a = self.registers.get_int(rs1, instr)?;
+        let b = self.registers.get_int(rs2, instr)?;
         if a < b {
             self.ip = (self.ip as i64).wrapping_add(offset) as usize;
         }
         Ok(())
     }
 
-    fn op_bge(&mut self, rs1: u8, rs2: u8, offset: i64) -> Result<(), VMError> {
-        let a = self.registers.get_int(rs1, "BGE")?;
-        let b = self.registers.get_int(rs2, "BGE")?;
+    fn op_bge(
+        &mut self,
+        instr: &'static str,
+        rs1: u8,
+        rs2: u8,
+        offset: i64,
+    ) -> Result<(), VMError> {
+        let a = self.registers.get_int(rs1, instr)?;
+        let b = self.registers.get_int(rs2, instr)?;
         if a >= b {
             self.ip = (self.ip as i64).wrapping_add(offset) as usize;
         }
         Ok(())
     }
 
-    fn op_bltu(&mut self, rs1: u8, rs2: u8, offset: i64) -> Result<(), VMError> {
-        let a = self.registers.get_int(rs1, "BLTU")? as u64;
-        let b = self.registers.get_int(rs2, "BLTU")? as u64;
+    fn op_bltu(
+        &mut self,
+        instr: &'static str,
+        rs1: u8,
+        rs2: u8,
+        offset: i64,
+    ) -> Result<(), VMError> {
+        let a = self.registers.get_int(rs1, instr)? as u64;
+        let b = self.registers.get_int(rs2, instr)? as u64;
         if a < b {
             self.ip = (self.ip as i64).wrapping_add(offset) as usize;
         }
         Ok(())
     }
 
-    fn op_bgeu(&mut self, rs1: u8, rs2: u8, offset: i64) -> Result<(), VMError> {
-        let a = self.registers.get_int(rs1, "BGEU")? as u64;
-        let b = self.registers.get_int(rs2, "BGEU")? as u64;
+    fn op_bgeu(
+        &mut self,
+        instr: &'static str,
+        rs1: u8,
+        rs2: u8,
+        offset: i64,
+    ) -> Result<(), VMError> {
+        let a = self.registers.get_int(rs1, instr)? as u64;
+        let b = self.registers.get_int(rs2, instr)? as u64;
         if a >= b {
             self.ip = (self.ip as i64).wrapping_add(offset) as usize;
         }
         Ok(())
     }
 
-    fn op_ret(&mut self, rs: u8) -> Result<(), VMError> {
+    fn op_jump(&mut self, _instr: &'static str, offset: i64) -> Result<(), VMError> {
+        self.ip = (self.ip as i64).wrapping_add(offset) as usize;
+        Ok(())
+    }
+
+    fn op_ret(&mut self, _instr: &'static str, rs: u8) -> Result<(), VMError> {
         let frame = self.call_stack.pop().ok_or(VMError::ReturnWithoutCall {
             call_depth: self.call_stack.len(),
         })?;
@@ -1010,6 +1061,12 @@ mod tests {
 
     fn run_and_get_bool(source: &str, reg: u8) -> bool {
         run_vm(source).registers.get_bool(reg, "").unwrap()
+    }
+
+    fn run_and_get_str(source: &str, reg: u8) -> String {
+        let vm = run_vm(source);
+        let r = vm.registers.get_ref(reg, "").unwrap();
+        vm.heap.get_string(r).unwrap()
     }
 
     fn run_expect_err(source: &str) -> VMError {
@@ -1087,6 +1144,105 @@ mod tests {
             run_and_get_int("LOAD_BOOL r0, false\nBOOL_TO_I64 r1, r0", 1),
             0
         );
+    }
+
+    #[test]
+    fn str_to_i64_parses_numbers() {
+        assert_eq!(
+            run_and_get_int(
+                r#"
+                LOAD_STR r0, "12345"
+                STR_TO_I64 r1, r0
+            "#,
+                1
+            ),
+            12345
+        );
+        assert_eq!(
+            run_and_get_int(
+                r#"
+                LOAD_STR r0, "-7"
+                STR_TO_I64 r1, r0
+            "#,
+                1
+            ),
+            -7
+        );
+    }
+
+    #[test]
+    fn str_to_i64_rejects_non_numbers() {
+        assert!(matches!(
+            run_expect_err(
+                r#"
+                LOAD_STR r0, "abc"
+                STR_TO_I64 r1, r0
+            "#
+            ),
+            VMError::InvalidRegister { .. }
+        ));
+    }
+
+    #[test]
+    fn i64_to_str_round_trips() {
+        assert_eq!(
+            run_and_get_int("LOAD_I64 r0, -99\nI64_TO_STR r1, r0\nSTR_TO_I64 r2, r1", 2),
+            -99
+        );
+        assert_eq!(
+            run_and_get_str("LOAD_I64 r0, -99\nI64_TO_STR r1, r0", 1),
+            "-99"
+        );
+    }
+
+    #[test]
+    fn str_to_bool_accepts_true_and_false() {
+        assert!(run_and_get_bool(
+            r#"
+            LOAD_STR r0, "true"
+            STR_TO_BOOL r1, r0
+            "#,
+            1
+        ));
+        assert!(!run_and_get_bool(
+            r#"
+            LOAD_STR r0, "false"
+            STR_TO_BOOL r1, r0
+            "#,
+            1
+        ));
+    }
+
+    #[test]
+    fn str_to_bool_rejects_other_strings() {
+        assert!(matches!(
+            run_expect_err(
+                r#"
+                LOAD_STR r0, "notabool"
+                STR_TO_BOOL r1, r0
+            "#
+            ),
+            VMError::TypeMismatch {
+                instruction: "STR_TO_BOOL",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn bool_to_str_round_trips() {
+        assert_eq!(
+            run_and_get_str("LOAD_BOOL r0, true\nBOOL_TO_STR r1, r0", 1),
+            "true"
+        );
+        assert!(run_and_get_bool(
+            "LOAD_BOOL r0, true\nBOOL_TO_STR r1, r0\nSTR_TO_BOOL r2, r1",
+            2
+        ));
+        assert!(!run_and_get_bool(
+            "LOAD_BOOL r0, false\nBOOL_TO_STR r1, r0\nSTR_TO_BOOL r2, r1",
+            2
+        ));
     }
 
     // ==================== Arithmetic ====================
@@ -1646,6 +1802,13 @@ LOAD_HASH_STATE r2, r0"#,
         assert_eq!(vm.registers.get(1).unwrap(), &Value::Zero);
         // r2 should be 42
         assert_eq!(vm.registers.get_int(2, "").unwrap(), 42);
+    }
+
+    #[test]
+    fn jump_skips_instructions() {
+        // LOAD_I64 is 10 bytes, so jump forward by 10 to skip the following load
+        let vm = run_vm("LOAD_I64 r0, 1\nJUMP 10\nLOAD_I64 r0, 99");
+        assert_eq!(vm.registers.get_int(0, "").unwrap(), 1);
     }
 
     #[test]
@@ -2614,7 +2777,7 @@ LOAD_HASH_STATE r2, r0"#,
         "#;
         let vm = run_vm(source);
         let ref_id = vm.registers.get_ref(0, "").unwrap();
-        let hash_bytes = &vm.heap.items[ref_id as usize];
+        let hash_bytes = vm.heap.get_raw_ref(ref_id);
         let expected = Hash::sha3().chain(b"hello").finalize();
         assert_eq!(hash_bytes, expected.as_slice());
     }
@@ -2640,7 +2803,7 @@ LOAD_HASH_STATE r2, r0"#,
         "#;
         let vm = run_vm(source);
         let ref_id = vm.registers.get_ref(0, "").unwrap();
-        let hash_bytes = &vm.heap.items[ref_id as usize];
+        let hash_bytes = vm.heap.get_raw_ref(ref_id);
         let reg = vm.registers.get_int(1, "").unwrap();
         let expected = Hash::sha3().chain(&reg.to_le_bytes()).finalize();
         assert_eq!(hash_bytes, expected.as_slice());

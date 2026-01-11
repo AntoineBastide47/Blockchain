@@ -199,7 +199,7 @@ async fn main() {
             loop {
                 // Compute factorial of 5 using a loop and function call
                 let source = r#"
-                    JAL r0, main
+                    JUMP main
 
                     # factorial(n): computes n! iteratively
                     # input: r1 = n, output: r10 = n!

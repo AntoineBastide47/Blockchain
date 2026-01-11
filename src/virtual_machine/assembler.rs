@@ -170,6 +170,13 @@ pub(crate) fn parse_reg(tok: &str) -> Result<u8, VMError> {
         })
 }
 
+/// Parse an i64 immediate
+pub(crate) fn parse_i64(tok: &str) -> Result<i64, VMError> {
+    tok.parse::<i64>().map_err(|_| VMError::InvalidRegister {
+        token: tok.to_string(),
+    })
+}
+
 /// Parse a reference token like `@0`, `@123`.
 pub(crate) fn parse_ref_u32(tok: &str) -> Result<u32, VMError> {
     tok.strip_prefix('@')

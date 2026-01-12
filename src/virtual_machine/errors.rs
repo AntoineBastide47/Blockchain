@@ -1,3 +1,4 @@
+use crate::types::encoding::DecodeError;
 use blockchain_derive::Error;
 
 /// Errors that can occur during VM execution or assembly.
@@ -25,6 +26,8 @@ pub enum VMError {
     /// Register index exceeds the register file size.
     #[error("register index {index} is out of bounds (register file has {available} slots)")]
     InvalidRegisterIndex { index: u8, available: usize },
+    #[error("provided argc is out of range, got {actual} expected 0 <= val <= 255")]
+    ArgcOutOfRange { actual: String },
     /// Bytecode ended unexpectedly while reading an instruction.
     #[error(
         "unexpected end of bytecode at offset {ip}: needed {requested} more bytes but only {available} remain"
@@ -109,4 +112,18 @@ pub enum VMError {
         expected_len: usize,
         actual_len: usize,
     },
+    #[error("jump target is out of bounds: from {from} to {to} max {max}")]
+    JumpOutOfBounds { from: usize, to: i64, max: usize },
+    #[error("out of gas: used {used}, limit {limit}")]
+    OutOfGas { used: u64, limit: u64 },
+    #[error("reference out of bounds, max: {max} got: {reference}")]
+    ReferenceOutOfBounds { reference: u32, max: usize },
+}
+
+impl From<DecodeError> for VMError {
+    fn from(value: DecodeError) -> Self {
+        VMError::DecodeError {
+            reason: value.to_string(),
+        }
+    }
 }

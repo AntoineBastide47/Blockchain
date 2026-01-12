@@ -32,30 +32,33 @@ use std::path::Path;
 const COMMENT_CHAR: char = '#';
 const LABEL_SUFFIX: char = ':';
 
-/// Assembly context for string interning and label tracking during compilation.
+/// Assembly context for heap items interning and label tracking during compilation.
 ///
-/// Tracks string literals and labels encountered during assembly, assigning each
-/// string a unique index that becomes part of the compiled [`Program`].
+/// Tracks heap items and labels encountered during assembly, assigning each
+/// heap items a unique index that becomes part of the compiled [`Program`].
 pub struct AsmContext {
-    /// Accumulated string literals.
-    pub strings: Vec<Vec<u8>>,
+    /// Accumulated heap items.
+    pub items: Vec<Vec<u8>>,
     /// Label definitions mapping names to bytecode offsets.
     pub labels: HashMap<String, usize>,
+    /// The maximal register found
+    pub max_register: u8,
 }
 
 impl AsmContext {
     /// Creates an empty assembly context.
     pub fn new() -> Self {
         Self {
-            strings: Vec::new(),
+            items: Vec::new(),
             labels: HashMap::new(),
+            max_register: 0,
         }
     }
 
     /// Adds a string to the pool, returning its index.
     pub fn intern_string(&mut self, s: String) -> u32 {
-        let id = self.strings.len() as u32;
-        self.strings.push(s.into_bytes());
+        let id = self.items.len() as u32;
+        self.items.push(s.into_bytes());
         id
     }
 
@@ -177,6 +180,13 @@ pub(crate) fn parse_i64(tok: &str) -> Result<i64, VMError> {
     })
 }
 
+/// Parse a u8 immediate
+pub(crate) fn parse_u8(tok: &str) -> Result<u8, VMError> {
+    tok.parse::<u8>().map_err(|_| VMError::ArgcOutOfRange {
+        actual: tok.to_string(),
+    })
+}
+
 /// Parse a reference token like `@0`, `@123`.
 pub(crate) fn parse_ref_u32(tok: &str) -> Result<u32, VMError> {
     tok.strip_prefix('@')
@@ -236,7 +246,7 @@ macro_rules! define_parse_instruction {
             $(#[$doc:meta])*
             $name:ident = $opcode:expr, $mnemonic:literal => [
                 $( $field:ident : $kind:ident ),* $(,)?
-            ]
+            ], $gas:expr
         ),* $(,)?
     ) => {
 
@@ -345,11 +355,20 @@ macro_rules! define_parse_instruction {
     (@size Reg)    => { 1usize };
     (@size Bool)   => { 1usize };
     (@size RefU32) => { 4usize };
+    (@size ImmU8)  => { 1usize };
     (@size ImmI64) => { 8usize };
 
     // ---------- parsing ----------
-    (@parse_operand Reg, $tok:expr, $ctx:expr, $current_offset:expr) => {
-        parse_reg(&$tok.text)
+    (@parse_operand Reg, $tok:expr, $ctx:expr, $current_offset:expr) => {{
+          let reg = parse_reg(&$tok.text)?;
+          if reg > $ctx.max_register {
+              $ctx.max_register = reg;
+          }
+          Ok::<_, VMError>(reg)
+      }};
+
+    (@parse_operand ImmU8, $tok:expr, $ctx:expr, $current_offset:expr) => {
+        parse_u8(&$tok.text)
     };
 
     (@parse_operand ImmI64, $tok:expr, $ctx:expr, $current_offset:expr) => {
@@ -443,7 +462,8 @@ pub fn assemble_source(source: impl Into<String>) -> Result<Program, VMError> {
     }
 
     Ok(Program {
-        strings: asm_context.strings,
+        max_register: asm_context.max_register,
+        items: asm_context.items,
         labels: asm_context.labels,
         bytecode,
     })
@@ -492,7 +512,7 @@ mod tests {
             Err(VMError::InvalidRegister { token: _ })
         ));
         assert!(matches!(
-            parse_reg("rabc"),
+            parse_reg("rAbc"),
             Err(VMError::InvalidRegister { token: _ })
         ));
     }
@@ -581,7 +601,7 @@ mod tests {
     #[test]
     fn assemble_string_literal() {
         let program = assemble_source(r#"LOAD_STR r0, "hello""#).unwrap();
-        assert_eq!(program.strings, vec!["hello".as_bytes().to_vec()]);
+        assert_eq!(program.items, vec!["hello".as_bytes().to_vec()]);
         assert_eq!(program.bytecode[0], 0x07);
     }
 
@@ -593,7 +613,7 @@ mod tests {
         "#;
         let program = assemble_source(source).unwrap();
         assert_eq!(
-            program.strings,
+            program.items,
             vec!["first".as_bytes().to_vec(), "second".as_bytes().to_vec()]
         );
     }
@@ -712,7 +732,7 @@ mod tests {
             Err(VMError::InvalidInstructionName { .. })
         ));
         assert!(matches!(
-            instruction_from_str("add"), // case sensitive
+            instruction_from_str("add"), // case-sensitive
             Err(VMError::InvalidInstructionName { .. })
         ));
     }
@@ -858,5 +878,55 @@ mod tests {
         assert!(!is_label_def(":"));
         assert!(!is_label_def("label"));
         assert!(!is_label_def(""));
+    }
+
+    #[test]
+    fn parse_u8_valid() {
+        assert_eq!(parse_u8("0").unwrap(), 0);
+        assert_eq!(parse_u8("255").unwrap(), 255);
+        assert_eq!(parse_u8("42").unwrap(), 42);
+    }
+
+    #[test]
+    fn parse_u8_invalid() {
+        assert!(parse_u8("256").is_err());
+        assert!(parse_u8("-1").is_err());
+        assert!(parse_u8("abc").is_err());
+        assert!(parse_u8("").is_err());
+    }
+
+    #[test]
+    fn assemble_call_host_argc_u8() {
+        // CALL_HOST: opcode(1) + dst(1) + fn_id(4) + argc(1) + argv(1) = 8 bytes
+        let program = assemble_source(r#"CALL_HOST r0, "test_fn", 3, r1"#).unwrap();
+        assert_eq!(program.bytecode[0], 0x40); // CallHost opcode
+        assert_eq!(program.bytecode[1], 0); // dst = r0
+        assert_eq!(program.bytecode[6], 3); // argc = 3 (single byte)
+        assert_eq!(program.bytecode[7], 1); // argv = r1
+        assert_eq!(program.bytecode.len(), 8);
+    }
+
+    #[test]
+    fn assemble_call_argc_u8() {
+        // CALL: opcode(1) + dst(1) + fn_id(4) + argc(1) + argv(1) = 8 bytes
+        let program = assemble_source(r#"CALL r0, "my_func", 5, r2"#).unwrap();
+        assert_eq!(program.bytecode[0], 0x41); // Call opcode
+        assert_eq!(program.bytecode[1], 0); // dst = r0
+        assert_eq!(program.bytecode[6], 5); // argc = 5 (single byte)
+        assert_eq!(program.bytecode[7], 2); // argv = r2
+        assert_eq!(program.bytecode.len(), 8);
+    }
+
+    #[test]
+    fn assemble_call_argc_max_u8() {
+        let program = assemble_source(r#"CALL_HOST r0, "fn", 255, r0"#).unwrap();
+        assert_eq!(program.bytecode[6], 255); // max u8 value
+    }
+
+    #[test]
+    fn assemble_call_argc_overflow() {
+        // 256 exceeds u8 range
+        let err = assemble_source(r#"CALL_HOST r0, "fn", 256, r0"#).unwrap_err();
+        assert!(matches!(err, VMError::AssemblyError { .. }));
     }
 }

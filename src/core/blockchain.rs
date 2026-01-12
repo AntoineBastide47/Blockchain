@@ -90,18 +90,7 @@ impl<V: Validator, S: Storage + VmStorage + AccountStorage + IterableState + Sta
         let mut overlay = OverlayState::new(&base_state);
 
         for tx in &transactions {
-            let program =
-                Program::from_bytes(tx.data.as_slice()).map_err(|e| VMError::DecodeError {
-                    reason: e.to_string(),
-                })?;
-            let mut vm = VM::new(program);
-
-            let contract_bytes = tx.from.to_bytes();
-            let ctx = ExecContext {
-                chain_id: self.id,
-                contract_id: contract_bytes.as_slice(), // TODO: use real smart contract id
-            };
-            vm.run(&mut overlay, &ctx)?;
+            self.execute_tx(tx, &mut overlay)?;
         }
 
         let header = Header {
@@ -118,6 +107,24 @@ impl<V: Validator, S: Storage + VmStorage + AccountStorage + IterableState + Sta
 
         Ok(Block::new(header, validator, transactions, self.id))
     }
+
+    fn execute_tx<T: State>(
+        &self,
+        transaction: &Transaction,
+        tx_overlay: &mut OverlayState<T>,
+    ) -> Result<(), VMError> {
+        let program = Program::from_bytes(transaction.data.as_slice())?;
+        let mut vm = VM::new(program);
+        let contract_bytes = transaction.from.to_bytes();
+        let ctx = ExecContext {
+            chain_id: self.id,
+            contract_id: contract_bytes.as_slice(), // TODO: use real smart contract id
+        };
+
+        // Execute tx in its own overlay, reading from current block overlay
+        vm.run(tx_overlay, &ctx)
+    }
+
     /// Validates and executes a single transaction into the provided block overlay.
     ///
     /// Runs validator checks (signature, nonce, balance, gas) before decoding the
@@ -132,18 +139,8 @@ impl<V: Validator, S: Storage + VmStorage + AccountStorage + IterableState + Sta
             .validate_tx(transaction, &self.storage, self.id)
             .map_err(|e| StorageError::ValidationFailed(e.to_string()))?;
 
-        let program = Program::from_bytes(transaction.data.as_slice())
-            .map_err(|e| StorageError::VMError(e.to_string()))?;
-        let mut vm = VM::new(program);
-        let contract_bytes = transaction.from.to_bytes();
-        let ctx = ExecContext {
-            chain_id: self.id,
-            contract_id: contract_bytes.as_slice(), // TODO: use real smart contract id
-        };
-
-        // Execute tx in its own overlay, reading from current block overlay
         let mut tx_overlay = OverlayState::new(block_overlay);
-        vm.run(&mut tx_overlay, &ctx)
+        self.execute_tx(transaction, &mut tx_overlay)
             .map_err(|e| StorageError::VMError(e.to_string()))?;
 
         // Merge tx writes into block overlay
@@ -174,13 +171,6 @@ impl<V: Validator, S: Storage + VmStorage + AccountStorage + IterableState + Sta
             .validate_block(&block, &self.storage, self.id)
             .map_err(|e| StorageError::ValidationFailed(e.to_string()))?;
 
-        info!(
-            "adding a new block to the chain: height={} hash={} transactions={}",
-            block.header.height,
-            block.header_hash(self.id),
-            block.transactions.len()
-        );
-
         let base = self.storage.state_view();
         let mut block_overlay = OverlayState::new(&base);
 
@@ -194,6 +184,13 @@ impl<V: Validator, S: Storage + VmStorage + AccountStorage + IterableState + Sta
         if computed_root != block.header.state_root {
             return Err(StorageError::ValidationFailed("state_root mismatch".into()));
         }
+
+        info!(
+            "adding a new block to the chain: height={} hash={} transactions={}",
+            block.header.height,
+            block.header_hash(self.id),
+            block.transactions.len()
+        );
 
         // Commit writes to canonical storage store
         self.storage.apply_batch(block_overlay.into_writes());

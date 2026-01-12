@@ -4,7 +4,8 @@
 //! enabling portable serialization with version checking.
 
 use crate::types::bytes::Bytes;
-use crate::types::encoding::{Decode, DecodeError, Encode};
+use crate::types::encoding::{Decode, Encode};
+use crate::virtual_machine::errors::VMError;
 use blockchain_derive::BinaryCodec;
 use std::collections::HashMap;
 
@@ -40,12 +41,14 @@ impl Version {
 /// definitions mapping names to bytecode offsets.
 #[derive(Debug, Clone, BinaryCodec)]
 pub struct Program {
-    /// Interned string literals referenced by index.
-    pub strings: Vec<Vec<u8>>,
-    /// Label definitions mapping names to bytecode offsets.
-    pub labels: HashMap<String, usize>,
+    /// The maximal register used by this program, i.e: r{max_register}
+    pub max_register: u8,
     /// Compiled instruction bytecode.
     pub bytecode: Vec<u8>,
+    /// Interned string literals referenced by index.
+    pub items: Vec<Vec<u8>>,
+    /// Label definitions mapping names to bytecode offsets.
+    pub labels: HashMap<String, usize>,
 }
 
 impl Program {
@@ -64,30 +67,30 @@ impl Program {
     ///
     /// Validates the magic header and version, rejecting programs from
     /// newer (incompatible) bytecode formats.
-    pub fn from_bytes(mut input: &[u8]) -> Result<Self, DecodeError> {
+    pub fn from_bytes(mut input: &[u8]) -> Result<Self, VMError> {
         if input.len() < MAGIC.len() {
-            return Err(DecodeError::InvalidValueWithMessage(
-                "truncated".to_string(),
-            ));
+            return Err(VMError::DecodeError {
+                reason: "truncated".to_string(),
+            });
         }
 
         if &<[u8; 5]>::decode(&mut input)? != MAGIC {
-            return Err(DecodeError::InvalidValueWithMessage(
-                "bad magic".to_string(),
-            ));
+            return Err(VMError::DecodeError {
+                reason: "bad magic".to_string(),
+            });
         }
 
         if Version::decode(&mut input)? > CURRENT_VERSION {
-            return Err(DecodeError::InvalidValueWithMessage(
-                "unsupported version".to_string(),
-            ));
+            return Err(VMError::DecodeError {
+                reason: "unsupported version".to_string(),
+            });
         }
 
         let p = Program::decode(&mut input)?;
         if !input.is_empty() {
-            return Err(DecodeError::InvalidValueWithMessage(
-                "trailing bytes".to_string(),
-            ));
+            return Err(VMError::DecodeError {
+                reason: "trailing bytes".to_string(),
+            });
         }
         Ok(p)
     }
@@ -101,7 +104,8 @@ pub mod tests {
         /// Creates a new program from pre-assembled components.
         pub(crate) fn new(strings: Vec<Vec<u8>>, bytecode: Vec<u8>) -> Program {
             Self {
-                strings,
+                max_register: 255,
+                items: strings,
                 labels: HashMap::new(),
                 bytecode,
             }
@@ -113,7 +117,7 @@ pub mod tests {
         let program = Program::new(vec![], vec![]);
         let bytes = program.to_bytes();
         let decoded = Program::from_bytes(&bytes).unwrap();
-        assert!(decoded.strings.is_empty());
+        assert!(decoded.items.is_empty());
         assert!(decoded.bytecode.is_empty());
     }
 
@@ -130,20 +134,20 @@ pub mod tests {
         let program = Program::new(vec!["hello".into(), "world".into()], vec![0x01, 0x00]);
         let bytes = program.to_bytes();
         let decoded = Program::from_bytes(&bytes).unwrap();
-        assert_eq!(decoded.strings, vec![b"hello", b"world"]);
+        assert_eq!(decoded.items, vec![b"hello", b"world"]);
         assert_eq!(decoded.bytecode, vec![0x01, 0x00]);
     }
 
     #[test]
     fn from_bytes_truncated() {
         let err = Program::from_bytes(&[0x00, 0x01]).unwrap_err();
-        assert!(matches!(err, DecodeError::InvalidValueWithMessage(msg) if msg == "truncated"));
+        assert!(matches!(err, VMError::DecodeError{ref reason} if reason == "truncated"));
     }
 
     #[test]
     fn from_bytes_bad_magic() {
         let err = Program::from_bytes(b"BADMA\x00\x02\x00").unwrap_err();
-        assert!(matches!(err, DecodeError::InvalidValueWithMessage(msg) if msg == "bad magic"));
+        assert!(matches!(err, VMError::DecodeError{ref reason} if reason == "bad magic"));
     }
 
     #[test]
@@ -152,9 +156,7 @@ pub mod tests {
         MAGIC.encode(&mut bytes);
         Version::new(255, 0, 0).encode(&mut bytes);
         let err = Program::from_bytes(&bytes).unwrap_err();
-        assert!(
-            matches!(err, DecodeError::InvalidValueWithMessage(msg) if msg == "unsupported version")
-        );
+        assert!(matches!(err, VMError::DecodeError{ref reason} if reason == "unsupported version"));
     }
 
     #[test]
@@ -163,8 +165,6 @@ pub mod tests {
         let mut bytes = program.to_bytes().to_vec();
         bytes.push(0xFF);
         let err = Program::from_bytes(&bytes).unwrap_err();
-        assert!(
-            matches!(err, DecodeError::InvalidValueWithMessage(msg) if msg == "trailing bytes")
-        );
+        assert!(matches!(err, VMError::DecodeError{ref reason} if reason == "trailing bytes"));
     }
 }

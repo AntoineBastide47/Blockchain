@@ -1,8 +1,9 @@
 //! Transaction structure with reference-counted data storage.
 
+use crate::core::validator::MAX_TX_BYTE_SIZE;
 use crate::crypto::key_pair::{Address, PrivateKey, PublicKey, SerializableSignature};
 use crate::types::bytes::Bytes;
-use crate::types::encoding::Encode;
+use crate::types::encoding::{Decode, DecodeError, Encode, EncodeSink, SizeCounter};
 use crate::types::hash::{Hash, HashCache};
 use blockchain_derive::BinaryCodec;
 
@@ -21,7 +22,7 @@ pub enum TransactionType {
 ///
 /// Uses `Bytes` for zero-copy sharing - transactions are immutable after creation
 /// and often referenced by multiple blocks during reorganizations.
-#[derive(Debug, Clone, PartialEq, Eq, BinaryCodec)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transaction {
     /// Sender's public key, also used for signature verification.
     pub from: PublicKey,
@@ -51,6 +52,48 @@ pub struct Transaction {
 
     /// Operation type determining how the transaction is processed.
     pub tx_type: TransactionType,
+}
+
+/// Custom encoding that prefixes the transaction with its byte length.
+///
+/// This length-prefixed format enables size validation during decoding,
+/// protecting against oversized transaction attacks.
+impl Encode for Transaction {
+    fn encode<S: EncodeSink>(&self, out: &mut S) {
+        self.content_byte_size().encode(out);
+        self.encode_content(out);
+    }
+}
+
+/// Custom decoding with size validation against `MAX_TX_BYTE_SIZE`.
+///
+/// Rejects transactions exceeding the maximum allowed size to prevent
+/// denial-of-service via oversized payloads.
+impl Decode for Transaction {
+    fn decode(input: &mut &[u8]) -> Result<Self, DecodeError> {
+        let len = usize::decode(input)?;
+        if len > MAX_TX_BYTE_SIZE {
+            return Err(DecodeError::LengthOverflow {
+                expected: MAX_TX_BYTE_SIZE,
+                actual: len,
+                type_name: "Transaction",
+            });
+        }
+
+        let before = input.len();
+        let decoded = Self::decode_inner(input)?;
+        let consumed = before - input.len();
+
+        if consumed > MAX_TX_BYTE_SIZE {
+            return Err(DecodeError::LengthOverflow {
+                expected: MAX_TX_BYTE_SIZE,
+                actual: consumed,
+                type_name: "Transaction",
+            });
+        }
+
+        Ok(decoded)
+    }
 }
 
 impl Transaction {
@@ -103,6 +146,55 @@ impl Transaction {
             nonce,
             tx_type,
         }
+    }
+
+    /// Decodes transaction fields from raw bytes without size validation.
+    ///
+    /// Called by `Decode::decode` after the length prefix has been verified.
+    fn decode_inner(input: &mut &[u8]) -> Result<Self, DecodeError> {
+        Ok(Transaction {
+            from: PublicKey::decode(input)?,
+            signature: SerializableSignature::decode(input)?,
+            cached_id: HashCache::decode(input)?,
+            recipient: Address::decode(input)?,
+            gas_sponsor: Option::<Address>::decode(input)?,
+            data: Bytes::decode(input)?,
+            amount: u128::decode(input)?,
+            fee: u128::decode(input)?,
+            gas_price: u128::decode(input)?,
+            gas_limit: u64::decode(input)?,
+            nonce: u64::decode(input)?,
+            tx_type: TransactionType::decode(input)?,
+        })
+    }
+
+    /// Encodes all transaction fields in canonical order.
+    ///
+    /// Used by both `Encode::encode` (for serialization) and
+    /// `content_byte_size` (for length calculation).
+    fn encode_content<S: EncodeSink>(&self, out: &mut S) {
+        self.from.encode(out);
+        self.signature.encode(out);
+        self.cached_id.encode(out);
+        self.recipient.encode(out);
+        self.gas_sponsor.encode(out);
+        self.data.encode(out);
+        self.amount.encode(out);
+        self.fee.encode(out);
+        self.gas_price.encode(out);
+        self.gas_limit.encode(out);
+        self.nonce.encode(out);
+        self.tx_type.encode(out);
+    }
+
+    /// Computes the encoded byte size of the transaction content.
+    ///
+    /// Returns the exact number of bytes that `encode_content` will write,
+    /// used to prefix the encoded output with its length.
+    fn content_byte_size(&self) -> usize {
+        let mut counter = SizeCounter::new();
+        self.encode_content(&mut counter);
+        counter.size()
     }
 
     /// Returns the bytes that were signed to produce this transaction's signature.
@@ -181,6 +273,7 @@ impl Transaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::validator::MAX_TX_BYTE_SIZE;
     use crate::types::encoding::Decode;
     use crate::utils::test_utils::utils::new_tx;
 
@@ -273,5 +366,178 @@ mod tests {
         let hash2 = tx2.id(TEST_CHAIN_ID);
 
         assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn encode_produces_length_prefixed_output() {
+        let key = PrivateKey::new();
+        let tx = new_tx(Bytes::new(b"test"), key, TEST_CHAIN_ID);
+
+        let encoded = tx.to_bytes();
+        let content_size = tx.content_byte_size();
+
+        // First bytes should be the length prefix (usize encoded as u64)
+        let mut slice = encoded.as_slice();
+        let decoded_len = usize::decode(&mut slice).expect("length prefix decode failed");
+
+        assert_eq!(decoded_len, content_size);
+        assert_eq!(slice.len(), content_size);
+    }
+
+    #[test]
+    fn decode_rejects_oversized_length_prefix() {
+        let key = PrivateKey::new();
+        let tx = new_tx(Bytes::new(b"small"), key, TEST_CHAIN_ID);
+
+        let mut encoded = tx.to_bytes().to_vec();
+
+        // Replace length prefix with value exceeding MAX_TX_BYTE_SIZE
+        let fake_len = (MAX_TX_BYTE_SIZE + 1) as u64;
+        encoded[..8].copy_from_slice(&fake_len.to_le_bytes());
+
+        let result = Transaction::from_bytes(&encoded);
+        assert!(matches!(
+            result,
+            Err(DecodeError::LengthOverflow {
+                type_name: "Transaction",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_trailing_bytes() {
+        let key = PrivateKey::new();
+        let tx = new_tx(Bytes::new(b"data"), key, TEST_CHAIN_ID);
+
+        let mut encoded = tx.to_bytes().to_vec();
+        encoded.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+
+        // from_bytes requires all bytes to be consumed
+        let result = Transaction::from_bytes(&encoded);
+        assert!(matches!(result, Err(DecodeError::InvalidValue)));
+    }
+
+    #[test]
+    fn content_byte_size_matches_actual_encoded_size() {
+        let key = PrivateKey::new();
+
+        for data_size in [0, 1, 100, 1000, 10000] {
+            let data = vec![0xAB; data_size];
+            let tx = new_tx(Bytes::new(data), key.clone(), TEST_CHAIN_ID);
+
+            let computed_size = tx.content_byte_size();
+            let encoded = tx.to_bytes();
+
+            // Encoded size = length prefix (8 bytes for u64) + content
+            assert_eq!(encoded.len(), 8 + computed_size);
+        }
+    }
+
+    #[test]
+    fn decode_fails_on_truncated_input() {
+        let key = PrivateKey::new();
+        let tx = new_tx(Bytes::new(b"test data"), key, TEST_CHAIN_ID);
+
+        let encoded = tx.to_bytes();
+
+        // Try decoding with progressively shorter input
+        for truncate_at in [0, 4, 8, encoded.len() / 2, encoded.len() - 1] {
+            let truncated = &encoded[..truncate_at];
+            let result = Transaction::from_bytes(truncated);
+            assert!(
+                result.is_err(),
+                "should fail at truncation point {truncate_at}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_fails_on_empty_input() {
+        let result = Transaction::from_bytes(&[]);
+        assert!(matches!(result, Err(DecodeError::UnexpectedEof)));
+    }
+
+    #[test]
+    fn encoding_is_deterministic() {
+        let key = PrivateKey::new();
+        let tx = new_tx(Bytes::new(b"determinism test"), key, TEST_CHAIN_ID);
+
+        let encoded1 = tx.to_bytes();
+        let encoded2 = tx.to_bytes();
+        let encoded3 = tx.to_bytes();
+
+        assert_eq!(encoded1, encoded2);
+        assert_eq!(encoded2, encoded3);
+    }
+
+    #[test]
+    fn roundtrip_with_empty_data() {
+        let key = PrivateKey::new();
+        let tx = new_tx(Bytes::new(b""), key, TEST_CHAIN_ID);
+
+        let encoded = tx.to_bytes();
+        let decoded = Transaction::from_bytes(encoded.as_slice()).expect("decode failed");
+
+        assert_eq!(tx, decoded);
+    }
+
+    #[test]
+    fn roundtrip_with_max_safe_data_size() {
+        let key = PrivateKey::new();
+        // Use a size that's large but won't exceed MAX_TX_BYTE_SIZE when combined
+        // with transaction overhead (signature, addresses, etc.)
+        let data = vec![0xFF; 90_000];
+        let tx = new_tx(Bytes::new(data), key, TEST_CHAIN_ID);
+
+        let encoded = tx.to_bytes();
+        let decoded = Transaction::from_bytes(encoded.as_slice()).expect("decode failed");
+
+        assert_eq!(tx, decoded);
+        assert!(tx.verify(TEST_CHAIN_ID));
+    }
+
+    #[test]
+    fn decode_inner_preserves_all_fields() {
+        let key = PrivateKey::new();
+        let original = new_tx(Bytes::new(b"field preservation test"), key, TEST_CHAIN_ID);
+
+        let encoded = original.to_bytes();
+        let decoded = Transaction::from_bytes(encoded.as_slice()).expect("decode failed");
+
+        assert_eq!(original.from, decoded.from);
+        assert_eq!(original.signature, decoded.signature);
+        assert_eq!(original.recipient, decoded.recipient);
+        assert_eq!(original.gas_sponsor, decoded.gas_sponsor);
+        assert_eq!(original.data, decoded.data);
+        assert_eq!(original.amount, decoded.amount);
+        assert_eq!(original.fee, decoded.fee);
+        assert_eq!(original.gas_price, decoded.gas_price);
+        assert_eq!(original.gas_limit, decoded.gas_limit);
+        assert_eq!(original.nonce, decoded.nonce);
+        assert_eq!(original.tx_type, decoded.tx_type);
+    }
+
+    #[test]
+    fn multiple_transactions_decode_sequentially() {
+        let key = PrivateKey::new();
+        let tx1 = new_tx(Bytes::new(b"first"), key.clone(), TEST_CHAIN_ID);
+        let tx2 = new_tx(Bytes::new(b"second"), key.clone(), TEST_CHAIN_ID);
+        let tx3 = new_tx(Bytes::new(b"third"), key, TEST_CHAIN_ID);
+
+        let mut buffer = Vec::new();
+        tx1.encode(&mut buffer);
+        tx2.encode(&mut buffer);
+        tx3.encode(&mut buffer);
+
+        let mut slice = buffer.as_slice();
+        let decoded1 = Transaction::decode(&mut slice).expect("tx1 decode failed");
+        let decoded2 = Transaction::decode(&mut slice).expect("tx2 decode failed");
+        let decoded3 = Transaction::decode(&mut slice).expect("tx3 decode failed");
+
+        assert!(slice.is_empty(), "all bytes should be consumed");
+        assert_eq!(tx1, decoded1);
+        assert_eq!(tx2, decoded2);
+        assert_eq!(tx3, decoded3);
     }
 }

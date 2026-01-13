@@ -8,6 +8,7 @@ use crate::core::transaction::Transaction;
 use crate::crypto::key_pair::Address;
 use crate::storage::state_store::AccountStorage;
 use crate::storage::storage_trait::Storage;
+use crate::types::encoding::Encode;
 use crate::types::hash::Hash;
 use blockchain_derive::Error;
 use std::error::Error;
@@ -67,6 +68,8 @@ pub enum BlockValidatorError {
     InsufficientBalance { balance: u128, required: u128 },
     #[error("invalid gas limit")]
     InvalidGasLimit,
+    #[error("transaction size exceeds max value: {actual} > {max}")]
+    TransactionTooLarge { max: usize, actual: usize },
 }
 
 /// Default block validator implementing consensus rules.
@@ -79,6 +82,9 @@ pub enum BlockValidatorError {
 #[derive(Clone, Default)]
 pub struct BlockValidator;
 
+/// Maximum allowed size for a single transaction in bytes.
+pub const MAX_TX_BYTE_SIZE: usize = 100_000;
+
 impl Validator for BlockValidator {
     type Error = BlockValidatorError;
 
@@ -88,14 +94,22 @@ impl Validator for BlockValidator {
         storage: &S,
         chain_id: u64,
     ) -> Result<(), Self::Error> {
+        if transaction.gas_limit == 0 {
+            return Err(BlockValidatorError::InvalidGasLimit);
+        }
+
+        let size = transaction.byte_size();
+        if size > MAX_TX_BYTE_SIZE {
+            return Err(BlockValidatorError::TransactionTooLarge {
+                max: MAX_TX_BYTE_SIZE,
+                actual: size,
+            });
+        }
+
         if !transaction.verify(chain_id) {
             return Err(BlockValidatorError::InvalidTransactionSignature(
                 transaction.id(chain_id),
             ));
-        }
-
-        if transaction.gas_limit == 0 {
-            return Err(BlockValidatorError::InvalidGasLimit);
         }
 
         let sender: Address = transaction.from.address();
@@ -247,6 +261,7 @@ mod tests {
         let key1 = PrivateKey::new();
         let key2 = PrivateKey::new();
         let mut tx = new_tx(Bytes::new(b"bad"), key1, TEST_CHAIN_ID);
+        tx.gas_limit = 1;
         tx.from = key2.public_key();
 
         let validator = BlockValidator;

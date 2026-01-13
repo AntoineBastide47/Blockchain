@@ -2,7 +2,7 @@
 set -e
 
 cargo fmt
-cargo clippy --all-targets --all-features -- -D warnings -A dead_code
+cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 
 exit 0

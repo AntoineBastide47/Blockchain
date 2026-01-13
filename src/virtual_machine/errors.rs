@@ -118,6 +118,8 @@ pub enum VMError {
     OutOfGas { used: u64, limit: u64 },
     #[error("reference out of bounds, max: {max} got: {reference}")]
     ReferenceOutOfBounds { reference: u32, max: usize },
+    #[error("call stack overflow got {actual} while max is {max}")]
+    CallStackOverflow { max: usize, actual: usize },
 }
 
 impl From<DecodeError> for VMError {

@@ -16,6 +16,13 @@ pub const TRANSACTION_GAS_LIMIT: u64 = 1_000_000;
 /// Maximum cumulative gas allowed for all transactions in a block.
 pub const BLOCK_GAS_LIMIT: u64 = 20_000_000;
 
+/// Maximum depth of the call stack to prevent unbounded recursion.
+const MAX_CALL_STACK_LEN: usize = 1024;
+/// Gas cost per byte when writing to state storage.
+const STORE_BYTE_COST: u64 = 10;
+/// Gas cost per byte when reading from state storage.
+const READ_BYTE_COST: u64 = 5;
+
 /// Runtime value stored in registers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Value {
@@ -296,6 +303,7 @@ pub struct VM {
     gas_used: u64,
 }
 
+/// impl block for basic VM functions
 impl VM {
     /// Creates a new VM instance with the given program and default gas calculator.
     pub fn new(program: Program) -> Self {
@@ -319,10 +327,12 @@ impl VM {
         contract_id: &Hash,
         user_key: &[u8],
     ) -> Result<Hash, VMError> {
-        self.charge_gas(5 + 8 + (HASH_LEN + user_key.len()) as u64)?;
+        let prefix = b"STATE";
+        let id = &chain_id.to_le_bytes();
+        self.charge_gas((prefix.len() + id.len() + HASH_LEN + user_key.len()) as u64)?;
         Ok(Hash::sha3()
-            .chain(b"STATE")
-            .chain(&chain_id.to_le_bytes())
+            .chain(prefix)
+            .chain(id)
             .chain(contract_id.as_slice())
             .chain(user_key)
             .finalize())
@@ -392,6 +402,7 @@ impl VM {
     }
 }
 
+/// impl block for VM wrapper functions to charge gas
 impl VM {
     /// Returns the value in register `idx` with gas charging.
     ///
@@ -459,8 +470,35 @@ impl VM {
         self.charge_gas(HASH_LEN as u64)?;
         self.heap.get_hash(id)
     }
+
+    /// Writes a value to state storage with gas metering.
+    ///
+    /// Charges gas proportional to the key and value size using [`STORE_BYTE_COST`].
+    fn state_push<S: State>(
+        &mut self,
+        state: &mut S,
+        key: Hash,
+        item: Vec<u8>,
+    ) -> Result<(), VMError> {
+        self.charge_gas((HASH_LEN as u64 + item.len() as u64) * STORE_BYTE_COST)?;
+        state.push(key, item);
+        Ok(())
+    }
+
+    /// Reads a value from state storage with gas metering.
+    ///
+    /// Charges gas proportional to the value size using [`READ_BYTE_COST`].
+    /// Returns [`VMError::KeyNotFound`] if the key does not exist.
+    fn state_get<S: State>(&mut self, state: &mut S, key: Hash) -> Result<Vec<u8>, VMError> {
+        let item = state.get(key).ok_or(VMError::KeyNotFound {
+            key: key.to_string(),
+        })?;
+        self.charge_gas(item.len() as u64 * READ_BYTE_COST)?;
+        Ok(item)
+    }
 }
 
+/// impl block for VM execution functions
 impl VM {
     /// Executes the bytecode until completion or error.
     ///
@@ -617,7 +655,7 @@ impl VM {
         let key_str = self.heap_get_string(key_ref)?;
         let val = self.registers_get_int(value, instr)?;
         let key = self.make_state_key(ctx.chain_id, &ctx.contract_id, key_str.as_bytes())?;
-        state.push(key, val.to_le_bytes().to_vec());
+        self.state_push(state, key, val.to_le_bytes().to_vec())?;
         Ok(())
     }
 
@@ -632,15 +670,12 @@ impl VM {
         let key_ref = self.registers_get_ref(key, instr)?;
         let key_str = self.heap_get_string(key_ref)?;
         let state_key = self.make_state_key(ctx.chain_id, &ctx.contract_id, key_str.as_bytes())?;
-        let value = state.get(state_key).ok_or(VMError::KeyNotFound {
-            key: key_str.clone(),
-        })?;
+        let value = self.state_get(state, state_key)?;
         let bytes: [u8; 8] = value.try_into().map_err(|_| VMError::InvalidStateValue {
             key: key_str.clone(),
             expected: "8 bytes for i64",
         })?;
-        self.registers
-            .set(dst, Value::Int(i64::from_le_bytes(bytes)))
+        self.registers_set(dst, Value::Int(i64::from_le_bytes(bytes)))
     }
 
     fn op_load_bool(&mut self, _instr: &'static str, dst: u8, b: bool) -> Result<(), VMError> {
@@ -659,7 +694,7 @@ impl VM {
         let key_str = self.heap_get_string(key_ref)?;
         let val = self.registers_get_bool(value, instr)?;
         let key = self.make_state_key(ctx.chain_id, &ctx.contract_id, key_str.as_bytes())?;
-        state.push(key, [val as u8].into());
+        self.state_push(state, key, [val as u8].into())?;
         Ok(())
     }
 
@@ -674,9 +709,7 @@ impl VM {
         let key_ref = self.registers_get_ref(key, instr)?;
         let key_str = self.heap_get_string(key_ref)?;
         let state_key = self.make_state_key(ctx.chain_id, &ctx.contract_id, key_str.as_bytes())?;
-        let value = state.get(state_key).ok_or(VMError::KeyNotFound {
-            key: key_str.clone(),
-        })?;
+        let value = self.state_get(state, state_key)?;
         if value.len() != 1 {
             return Err(VMError::InvalidStateValue {
                 key: key_str,
@@ -703,7 +736,7 @@ impl VM {
         let val_ref = self.registers_get_ref(value, instr)?;
         let val_str = self.heap_get_string(val_ref)?;
         let key = self.make_state_key(ctx.chain_id, &ctx.contract_id, key_str.as_bytes())?;
-        state.push(key, val_str.into_bytes());
+        self.state_push(state, key, val_str.into_bytes())?;
         Ok(())
     }
 
@@ -747,7 +780,7 @@ impl VM {
         let val_ref = self.registers_get_ref(value, instr)?;
         let val_hash = self.heap_get_hash(val_ref)?;
         let key = self.make_state_key(ctx.chain_id, &ctx.contract_id, key_str.as_bytes())?;
-        state.push(key, val_hash.to_vec());
+        self.state_push(state, key, val_hash.to_vec())?;
         Ok(())
     }
 
@@ -790,9 +823,63 @@ impl VM {
         self.op_load_i64(instr, dst, parse_i64(&str)?)
     }
 
+    /// Returns the number of characters in the decimal string representation of `n`.
+    const fn digits_i64(n: i64) -> u64 {
+        let mut x = n;
+        let mut extra = 0;
+        if x < 0 {
+            extra = 1;
+            x = -x;
+        }
+        let x = x as u64;
+        let d = if x < 10 {
+            1
+        } else if x < 100 {
+            2
+        } else if x < 1_000 {
+            3
+        } else if x < 10_000 {
+            4
+        } else if x < 100_000 {
+            5
+        } else if x < 1_000_000 {
+            6
+        } else if x < 10_000_000 {
+            7
+        } else if x < 100_000_000 {
+            8
+        } else if x < 1_000_000_000 {
+            9
+        } else if x < 10_000_000_000 {
+            10
+        } else if x < 100_000_000_000 {
+            11
+        } else if x < 1_000_000_000_000 {
+            12
+        } else if x < 10_000_000_000_000 {
+            13
+        } else if x < 100_000_000_000_000 {
+            14
+        } else if x < 1_000_000_000_000_000 {
+            15
+        } else if x < 10_000_000_000_000_000 {
+            16
+        } else if x < 100_000_000_000_000_000 {
+            17
+        } else if x < 1_000_000_000_000_000_000 {
+            18
+        } else if x < 10_000_000_000_000_000_000 {
+            19
+        } else {
+            20
+        };
+        (d + extra) as u64
+    }
+
     fn op_i64_to_str(&mut self, instr: &'static str, dst: u8, src: u8) -> Result<(), VMError> {
         let reg = self.registers_get_int(src, instr)?;
-        let str_ref = self.heap_index(reg.to_string().into_bytes())?;
+        self.charge_gas(Self::digits_i64(reg))?; // Charge gas manually before allocation instead of using heap_index()
+        let str_ref = self.heap.index(reg.to_string().into_bytes());
         self.op_load_str(instr, dst, str_ref)
     }
 
@@ -816,8 +903,9 @@ impl VM {
 
     fn op_bool_to_str(&mut self, instr: &'static str, dst: u8, src: u8) -> Result<(), VMError> {
         let reg = self.registers_get_bool(src, instr)?;
+        self.charge_gas(if reg { 4 } else { 5 })?; // Charge gas manually before allocation instead of using heap_index()
         let str = (if reg { "true" } else { "false" }).to_string();
-        let bool_ref = self.heap_index(str.into_bytes())?;
+        let bool_ref = self.heap.index(str.into_bytes());
         self.op_load_str(instr, dst, bool_ref)
     }
 
@@ -882,15 +970,13 @@ impl VM {
     fn op_shl(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
         let va = self.registers_get_int(a, instr)?;
         let vb = self.registers_get_int(b, instr)?;
-        self.registers
-            .set(dst, Value::Int(va.wrapping_shl(vb as u32)))
+        self.registers_set(dst, Value::Int(va.wrapping_shl(vb as u32)))
     }
 
     fn op_shr(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
         let va = self.registers_get_int(a, instr)?;
         let vb = self.registers_get_int(b, instr)?;
-        self.registers
-            .set(dst, Value::Int(va.wrapping_shr(vb as u32)))
+        self.registers_set(dst, Value::Int(va.wrapping_shr(vb as u32)))
     }
 
     fn op_not(&mut self, instr: &'static str, dst: u8, src: u8) -> Result<(), VMError> {
@@ -1035,7 +1121,7 @@ impl VM {
                 let mut result = self.heap.get_raw_ref(ref1)?.clone();
                 result.extend_from_slice(self.heap.get_raw_ref(ref2)?);
 
-                let new_ref = self.heap_index(result)?;
+                let new_ref = self.heap.index(result);
                 self.op_load_str(instr, dst, new_ref)
             }
             k @ "compare" => {
@@ -1061,8 +1147,8 @@ impl VM {
                 let len = match args[0] {
                     Value::Zero => 0,
                     Value::Bool(_) => 1,
-                    Value::Ref(r) => self.heap.get_raw_ref(r)?.len(),
                     Value::Int(_) => 8,
+                    Value::Ref(r) => self.heap.get_raw_ref(r)?.len(),
                 };
                 self.charge_gas(len as u64)?;
 
@@ -1088,6 +1174,13 @@ impl VM {
         _argv: u8,
     ) -> Result<(), VMError> {
         self.charge_call(argc, 5, self.call_stack.len(), 10)?;
+
+        if self.call_stack.len() >= MAX_CALL_STACK_LEN {
+            return Err(VMError::CallStackOverflow {
+                max: MAX_CALL_STACK_LEN,
+                actual: self.call_stack.len(),
+            });
+        }
 
         self.call_stack.push(CallFrame {
             return_addr: self.ip,

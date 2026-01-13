@@ -26,12 +26,6 @@
 use crate::types::bytes::Bytes;
 use crate::types::hash::HashCache;
 use blockchain_derive::Error;
-use std::collections::HashMap;
-
-/// Maximum number of elements allowed when decoding a vector to avoid unbounded allocations.
-pub const MAX_VEC_LEN: usize = 1_000_000;
-/// Maximum total bytes allowed when decoding a vector to avoid OOM.
-pub const MAX_VEC_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
 
 /// Sink for writing encoded bytes.
 ///
@@ -90,16 +84,18 @@ pub trait Encode {
     /// Writes the binary representation to the given sink.
     fn encode<S: EncodeSink>(&self, out: &mut S);
 
+    /// Returns the number of bytes required to encode this value.
+    fn byte_size(&self) -> usize {
+        let mut counter = SizeCounter::new();
+        self.encode(&mut counter);
+        counter.size()
+    }
+
     /// Serializes to a new byte buffer with exact capacity.
     ///
     /// Performs two passes: first to count bytes, then to encode.
     fn to_bytes(&self) -> Bytes {
-        // First pass: count
-        let mut counter = SizeCounter::new();
-        self.encode(&mut counter);
-
-        // Second pass: encode once, with exact capacity
-        let mut out = Bytes::with_capacity(counter.size());
+        let mut out = Bytes::with_capacity(self.byte_size());
         self.encode(&mut out);
         out
     }
@@ -132,8 +128,8 @@ pub enum DecodeError {
     #[error("expected max size of {expected} for {type_name}, got: {actual}")]
     LengthOverflow {
         expected: usize,
-        actual: String,
-        type_name: String,
+        actual: usize,
+        type_name: &'static str,
     },
 }
 
@@ -231,8 +227,8 @@ impl Decode for usize {
         let v = u64::decode(input)?;
         usize::try_from(v).map_err(|_| DecodeError::LengthOverflow {
             expected: usize::MAX,
-            actual: v.to_string(),
-            type_name: "usize".to_string(),
+            actual: v as usize,
+            type_name: "usize",
         })
     }
 }
@@ -258,16 +254,6 @@ impl Decode for bool {
 // Vec<T>
 impl<T: Encode> Encode for Vec<T> {
     fn encode<S: EncodeSink>(&self, out: &mut S) {
-        let elem_bytes = size_of::<T>().max(1);
-        let total_bytes = self.len().saturating_mul(elem_bytes);
-
-        // If the vector is too large, emit an empty vector to avoid panicking or
-        // allocating excessive buffers. The counterpart decode will reject it.
-        if self.len() > MAX_VEC_LEN || total_bytes > MAX_VEC_BYTES {
-            0usize.encode(out);
-            return;
-        }
-
         self.len().encode(out);
         for item in self {
             item.encode(out);
@@ -278,30 +264,6 @@ impl<T: Encode> Encode for Vec<T> {
 impl<T: Decode> Decode for Vec<T> {
     fn decode(input: &mut &[u8]) -> Result<Self, DecodeError> {
         let len = usize::decode(input)?;
-        if len > MAX_VEC_LEN {
-            return Err(DecodeError::LengthOverflow {
-                expected: MAX_VEC_LEN,
-                actual: len.to_string(),
-                type_name: "Vec".to_string(),
-            });
-        }
-
-        let elem_bytes = size_of::<T>().max(1);
-        let total_bytes = len
-            .checked_mul(elem_bytes)
-            .ok_or(DecodeError::LengthOverflow {
-                expected: MAX_VEC_BYTES,
-                actual: "overflow".to_string(),
-                type_name: "Vec".to_string(),
-            })?;
-        if total_bytes > MAX_VEC_BYTES {
-            return Err(DecodeError::LengthOverflow {
-                expected: MAX_VEC_BYTES,
-                actual: total_bytes.to_string(),
-                type_name: "Vec".to_string(),
-            });
-        }
-
         let mut vec = Vec::with_capacity(len);
         for _ in 0..len {
             vec.push(T::decode(input)?);
@@ -339,15 +301,6 @@ impl Decode for String {
     fn decode(input: &mut &[u8]) -> Result<Self, DecodeError> {
         let bytes = Vec::<u8>::decode(input)?;
         String::from_utf8(bytes).map_err(|_| DecodeError::InvalidValue)
-    }
-}
-
-// &str (encode only)
-impl Encode for &str {
-    fn encode<S: EncodeSink>(&self, out: &mut S) {
-        let bytes = self.as_bytes();
-        bytes.len().encode(out);
-        out.write(bytes);
     }
 }
 
@@ -391,73 +344,6 @@ impl<T: Decode, const N: usize> Decode for [T; N] {
             vec.push(T::decode(input)?);
         }
         vec.try_into().map_err(|_| DecodeError::InvalidValue)
-    }
-}
-
-// Tuples
-impl<A: Encode, B: Encode> Encode for (A, B) {
-    fn encode<S: EncodeSink>(&self, out: &mut S) {
-        self.0.encode(out);
-        self.1.encode(out);
-    }
-}
-
-impl<A: Decode, B: Decode> Decode for (A, B) {
-    fn decode(input: &mut &[u8]) -> Result<Self, DecodeError> {
-        Ok((A::decode(input)?, B::decode(input)?))
-    }
-}
-
-impl<A: Encode, B: Encode, C: Encode> Encode for (A, B, C) {
-    fn encode<S: EncodeSink>(&self, out: &mut S) {
-        self.0.encode(out);
-        self.1.encode(out);
-        self.2.encode(out);
-    }
-}
-
-impl<A: Decode, B: Decode, C: Decode> Decode for (A, B, C) {
-    fn decode(input: &mut &[u8]) -> Result<Self, DecodeError> {
-        Ok((A::decode(input)?, B::decode(input)?, C::decode(input)?))
-    }
-}
-
-impl<K: Encode + Decode + Eq + std::hash::Hash, V: Encode + Decode> Encode for HashMap<K, V> {
-    fn encode<S: EncodeSink>(&self, out: &mut S) {
-        let len = self.len();
-
-        if len > MAX_VEC_LEN {
-            0usize.encode(out);
-            return;
-        }
-
-        len.encode(out);
-        for (k, v) in self {
-            k.encode(out);
-            v.encode(out);
-        }
-    }
-}
-
-impl<K: Encode + Decode + Eq + std::hash::Hash, V: Encode + Decode> Decode for HashMap<K, V> {
-    fn decode(input: &mut &[u8]) -> Result<Self, DecodeError> {
-        let len = usize::decode(input)?;
-        if len > MAX_VEC_LEN {
-            return Err(DecodeError::LengthOverflow {
-                expected: MAX_VEC_LEN,
-                actual: len.to_string(),
-                type_name: "HashMap".to_string(),
-            });
-        }
-
-        // Conservative preallocation
-        let mut map = HashMap::with_capacity(len);
-        for _ in 0..len {
-            let k = K::decode(input)?;
-            let v = V::decode(input)?;
-            map.insert(k, v);
-        }
-        Ok(map)
     }
 }
 
@@ -613,39 +499,6 @@ mod tests {
         assert_eq!(Vec::<u8>::from_bytes(&bytes).unwrap(), empty);
     }
 
-    #[test]
-    fn vec_length_overflow() {
-        // Encode a length greater than MAX_VEC_LEN
-        let huge_len: u64 = (MAX_VEC_LEN as u64) + 1;
-        let bytes = huge_len.to_bytes();
-        let result = Vec::<u8>::from_bytes(&bytes);
-        assert!(matches!(
-            result,
-            Err(DecodeError::LengthOverflow {
-                expected: _,
-                actual: _,
-                type_name: _
-            })
-        ));
-    }
-
-    #[test]
-    fn vec_byte_length_overflow() {
-        // len is within MAX_VEC_LEN but exceeds MAX_VEC_BYTES when accounting for element size.
-        let oversized_len: usize = (MAX_VEC_BYTES / size_of::<u32>()) + 1;
-        let mut bytes = Vec::new();
-        (oversized_len as u64).encode(&mut bytes);
-        let result = Vec::<u32>::from_bytes(&bytes);
-        assert!(matches!(
-            result,
-            Err(DecodeError::LengthOverflow {
-                expected: _,
-                actual: _,
-                type_name: _
-            })
-        ));
-    }
-
     // ========== Box<[T]> Tests ==========
 
     #[test]
@@ -683,16 +536,6 @@ mod tests {
 
         let result = String::from_bytes(&bytes);
         assert!(matches!(result, Err(DecodeError::InvalidValue)));
-    }
-
-    // ========== &str Tests ==========
-
-    #[test]
-    fn str_encodes_same_as_string() {
-        let s = "test string";
-        let str_bytes = s.to_bytes();
-        let string_bytes = s.to_string().to_bytes();
-        assert_eq!(str_bytes.as_ref(), string_bytes.as_ref());
     }
 
     // ========== Option<T> Tests ==========
@@ -752,25 +595,6 @@ mod tests {
         let bytes = empty.to_bytes();
         assert!(bytes.is_empty());
         assert_eq!(<[u8; 0]>::from_bytes(&bytes).unwrap(), empty);
-    }
-
-    // ========== Tuple Tests ==========
-
-    #[test]
-    fn tuple2_roundtrip() {
-        let original: (u8, u32) = (0xAB, 0x12345678);
-        let bytes = original.to_bytes();
-        assert_eq!(bytes.len(), 1 + 4);
-        let decoded = <(u8, u32)>::from_bytes(&bytes).unwrap();
-        assert_eq!(original, decoded);
-    }
-
-    #[test]
-    fn tuple3_roundtrip() {
-        let original: (bool, u16, String) = (true, 1000, "test".to_string());
-        let bytes = original.to_bytes();
-        let decoded = <(bool, u16, String)>::from_bytes(&bytes).unwrap();
-        assert_eq!(original, decoded);
     }
 
     // ========== Error Handling Tests ==========

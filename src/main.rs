@@ -202,16 +202,16 @@ async fn main() {
                     JUMP main
 
                     # factorial(n): computes n! iteratively
-                    # input: r1 = n, output: r10 = n!
+                    # input: r1 = n, output: r3 = n!
                     factorial:
-                        LOAD_I64 r10, 1              # result = 1
-                        LOAD_I64 r11, 1              # i = 1
-                        LOAD_I64 r12, 1              # increment
+                        LOAD_I64 r3, 1              # result = 1
+                        LOAD_I64 r4, 1              # i = 1
+                        LOAD_I64 r5, 1              # increment
                     fact_loop:
-                        MUL r10, r10, r11            # result *= i
-                        ADD r11, r11, r12            # i++
-                        BGE r1, r11, fact_loop       # while n >= i
-                        RET r10
+                        MUL r3, r3, r4              # result *= i
+                        ADD r4, r4, r5              # i++
+                        BGE r1, r4, fact_loop       # while n >= i
+                        RET r3
 
                     main:
                         LOAD_I64 r1, 5               # compute 5!

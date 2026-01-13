@@ -28,6 +28,7 @@ impl Bytes {
     }
 
     /// Returns the number of bytes in the buffer.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.0.len()
     }

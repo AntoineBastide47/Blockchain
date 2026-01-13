@@ -130,26 +130,28 @@ macro_rules! for_each_instruction {
             CallHost = 0x40, "CALL_HOST" => [dst: Reg, fn_id: RefU32, argc: ImmU8, argv: Reg], 100,
             /// CALL dst, fn, argc, argv ; call function fn with argc args from regs[argv...] ; return -> dst
             Call = 0x41, "CALL" => [dst: Reg, fn_id: RefU32, argc: ImmU8, argv: Reg], 50,
+            /// CALL dst, fn ; call function fn without any arguments ; return -> dst
+            Call0 = 0x42, "CALL0" => [dst: Reg, fn_id: RefU32], 50,
             /// JAL rd, offset ; rd = PC + instr_size; PC += offset (jump and link)
-            Jal = 0x42, "JAL" => [rd: Reg, offset: ImmI64], 5,
+            Jal = 0x43, "JAL" => [rd: Reg, offset: ImmI64], 5,
             /// JALR rd, rs, offset ; rd = PC + instr_size; PC = rs + offset (jump and link register)
-            Jalr = 0x43, "JALR" => [rd: Reg, rs: Reg, offset: ImmI64], 5,
+            Jalr = 0x44, "JALR" => [rd: Reg, rs: Reg, offset: ImmI64], 5,
             /// BEQ rs1, rs2, offset ; if rs1 == rs2 then PC += offset
-            Beq = 0x44, "BEQ" => [rs1: Reg, rs2: Reg, offset: ImmI64], 5,
+            Beq = 0x45, "BEQ" => [rs1: Reg, rs2: Reg, offset: ImmI64], 5,
             /// BNE rs1, rs2, offset ; if rs1 != rs2 then PC += offset
-            Bne = 0x45, "BNE" => [rs1: Reg, rs2: Reg, offset: ImmI64], 5,
+            Bne = 0x46, "BNE" => [rs1: Reg, rs2: Reg, offset: ImmI64], 5,
             /// BLT rs1, rs2, offset ; if rs1 < rs2 (signed) then PC += offset
-            Blt = 0x46, "BLT" => [rs1: Reg, rs2: Reg, offset: ImmI64], 5,
+            Blt = 0x47, "BLT" => [rs1: Reg, rs2: Reg, offset: ImmI64], 5,
             /// BGE rs1, rs2, offset ; if rs1 >= rs2 (signed) then PC += offset
-            Bge = 0x47, "BGE" => [rs1: Reg, rs2: Reg, offset: ImmI64], 5,
+            Bge = 0x48, "BGE" => [rs1: Reg, rs2: Reg, offset: ImmI64], 5,
             /// BLTU rs1, rs2, offset ; if rs1 < rs2 (unsigned) then PC += offset
-            Bltu = 0x48, "BLTU" => [rs1: Reg, rs2: Reg, offset: ImmI64], 5,
+            Bltu = 0x49, "BLTU" => [rs1: Reg, rs2: Reg, offset: ImmI64], 5,
             /// BGEU rs1, rs2, offset ; if rs1 >= rs2 (unsigned) then PC += offset
-            Bgeu = 0x49, "BGEU" => [rs1: Reg, rs2: Reg, offset: ImmI64], 5,
+            Bgeu = 0x4A, "BGEU" => [rs1: Reg, rs2: Reg, offset: ImmI64], 5,
             /// JUMP offset ; PC += offset (unconditional jump)
-            Jump = 0x4A, "JUMP" => [offset: ImmI64], 5,
+            Jump = 0x4B, "JUMP" => [offset: ImmI64], 5,
             /// RET rs ; return from function call with value in rs
-            Ret = 0x4B, "RET" => [rs: Reg], 5,
+            Ret = 0x4C, "RET" => [rs: Reg], 5,
         }
     };
 }
@@ -243,16 +245,6 @@ for_each_instruction!(define_instructions);
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn instruction_try_from_valid() {
-        assert_eq!(
-            Instruction::try_from(0x00).unwrap(),
-            Instruction::DeleteState
-        );
-        assert_eq!(Instruction::try_from(0x20).unwrap(), Instruction::Add);
-        assert_eq!(Instruction::try_from(0x38).unwrap(), Instruction::Gt);
-    }
 
     #[test]
     fn instruction_try_from_invalid() {

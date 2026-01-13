@@ -17,7 +17,75 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  protected-files-check:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check protected files ownership
+        env:
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          PROTECTED_FILES=(
+            ".github/workflows/CI.yml"
+            "src/virtual_machine/isa_static_check.rs"
+          )
+
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+
+          CHANGED_FILES=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+
+          # Function to get owners for a file from CODEOWNERS
+          get_owners() {
+            local file="$1"
+            local owners=""
+
+            # Read CODEOWNERS and find matching patterns (last match wins)
+            while IFS= read -r line || [[ -n "$line" ]]; do
+              # Skip comments and empty lines
+              [[ "$line" =~ ^[[:space:]]*# ]] && continue
+              [[ -z "${line// }" ]] && continue
+
+              # Extract pattern and owners
+              pattern=$(echo "$line" | awk '{print $1}')
+              line_owners=$(echo "$line" | awk '{$1=""; print $0}' | xargs)
+
+              # Check if file matches pattern
+              if [[ "$pattern" == "*" ]] || [[ "$file" == $pattern ]] || [[ "$file" == *"$pattern"* ]]; then
+                owners="$line_owners"
+              fi
+            done < .github/CODEOWNERS
+
+            # Remove @ prefix from owners
+            echo "$owners" | sed 's/@//g'
+          }
+
+          for protected in "${PROTECTED_FILES[@]}"; do
+            if echo "$CHANGED_FILES" | grep -qx "$protected"; then
+              ALLOWED_USERS=$(get_owners "$protected")
+
+              if [[ -z "$ALLOWED_USERS" ]]; then
+                echo "::warning::No CODEOWNERS found for '$protected', skipping check."
+                continue
+              fi
+
+              if ! echo "$ALLOWED_USERS" | grep -qw "$PR_AUTHOR"; then
+                echo "::error::User '$PR_AUTHOR' is not authorized to modify '$protected'. Only CODEOWNERS ($ALLOWED_USERS) can modify this file."
+                exit 1
+              fi
+            fi
+          done
+
+          echo "Protected files check passed."
+
   ci:
+    needs: protected-files-check
+    if: always() && (needs.protected-files-check.result == 'success' || needs.protected-files-check.result == 'skipped')
     runs-on: ubuntu-latest
 
     steps:

@@ -122,9 +122,6 @@ pub enum DecodeError {
     /// Data does not represent a valid value for the target type.
     #[error("invalid value")]
     InvalidValue,
-    /// Data does not represent a valid value for the target type, adds a specific error message.
-    #[error("invalid value: {0}")]
-    InvalidValueWithMessage(String),
     /// Length prefix exceeds maximum allowed size.
     #[error("expected max size of {expected} for {type_name}, got: {actual}")]
     LengthOverflow {

@@ -546,7 +546,7 @@ mod tests {
     #[test]
     fn assemble_single_instruction() {
         let program = assemble_source("LOAD_I64 r0, 42").unwrap();
-        assert_eq!(program.bytecode[0], 0x01);
+        assert_eq!(program.bytecode[0], Instruction::LoadI64 as u8);
         assert_eq!(program.bytecode[1], 0);
         assert_eq!(
             i64::from_le_bytes(program.bytecode[2..10].try_into().unwrap()),
@@ -602,7 +602,7 @@ mod tests {
     fn assemble_string_literal() {
         let program = assemble_source(r#"LOAD_STR r0, "hello""#).unwrap();
         assert_eq!(program.items, vec!["hello".as_bytes().to_vec()]);
-        assert_eq!(program.bytecode[0], 0x07);
+        assert_eq!(program.bytecode[0], Instruction::LoadStr as u8);
     }
 
     #[test]
@@ -639,11 +639,11 @@ mod tests {
     #[test]
     fn assemble_bool_literal() {
         let program = assemble_source("LOAD_BOOL r0, true").unwrap();
-        assert_eq!(program.bytecode[0], 0x04);
+        assert_eq!(program.bytecode[0], Instruction::LoadBool as u8);
         assert_eq!(program.bytecode[2], 1);
 
         let program = assemble_source("LOAD_BOOL r0, false").unwrap();
-        assert_eq!(program.bytecode[0], 0x04);
+        assert_eq!(program.bytecode[0], Instruction::LoadBool as u8);
         assert_eq!(program.bytecode[2], 0);
 
         let err = assemble_source("LOAD_BOOL r0, 1").unwrap_err();
@@ -742,7 +742,7 @@ mod tests {
         let instr = AsmInstr::LoadI64 { rd: 3, imm: -1 };
         let mut out = Vec::new();
         instr.assemble(&mut out);
-        assert_eq!(out[0], 0x01);
+        assert_eq!(out[0], Instruction::LoadI64 as u8);
         assert_eq!(out[1], 3);
         assert_eq!(i64::from_le_bytes(out[2..10].try_into().unwrap()), -1);
     }
@@ -756,7 +756,7 @@ mod tests {
         };
         let mut out = Vec::new();
         instr.assemble(&mut out);
-        assert_eq!(out, vec![0x21, 10, 20, 30]);
+        assert_eq!(out, vec![Instruction::Sub as u8, 10, 20, 30]);
     }
 
     #[test]
@@ -764,7 +764,7 @@ mod tests {
         let instr = AsmInstr::Neg { rd: 1, rs: 2 };
         let mut out = Vec::new();
         instr.assemble(&mut out);
-        assert_eq!(out, vec![0x25, 1, 2]);
+        assert_eq!(out, vec![Instruction::Neg as u8, 1, 2]);
     }
 
     #[test]
@@ -772,7 +772,7 @@ mod tests {
         let instr = AsmInstr::LoadBool { rd: 0, bool: true };
         let mut out = Vec::new();
         instr.assemble(&mut out);
-        assert_eq!(out, vec![0x04, 0, 1]);
+        assert_eq!(out, vec![Instruction::LoadBool as u8, 0, 1]);
     }
 
     #[test]
@@ -780,7 +780,7 @@ mod tests {
         let instr = AsmInstr::LoadStr { rd: 1, str: 0x1234 };
         let mut out = Vec::new();
         instr.assemble(&mut out);
-        assert_eq!(out[0], 0x07);
+        assert_eq!(out[0], Instruction::LoadStr as u8);
         assert_eq!(out[1], 1);
         assert_eq!(u32::from_le_bytes(out[2..6].try_into().unwrap()), 0x1234);
     }
@@ -899,7 +899,7 @@ mod tests {
     fn assemble_call_host_argc_u8() {
         // CALL_HOST: opcode(1) + dst(1) + fn_id(4) + argc(1) + argv(1) = 8 bytes
         let program = assemble_source(r#"CALL_HOST r0, "test_fn", 3, r1"#).unwrap();
-        assert_eq!(program.bytecode[0], 0x40); // CallHost opcode
+        assert_eq!(program.bytecode[0], Instruction::CallHost as u8);
         assert_eq!(program.bytecode[1], 0); // dst = r0
         assert_eq!(program.bytecode[6], 3); // argc = 3 (single byte)
         assert_eq!(program.bytecode[7], 1); // argv = r1
@@ -910,7 +910,7 @@ mod tests {
     fn assemble_call_argc_u8() {
         // CALL: opcode(1) + dst(1) + fn_id(4) + argc(1) + argv(1) = 8 bytes
         let program = assemble_source(r#"CALL r0, "my_func", 5, r2"#).unwrap();
-        assert_eq!(program.bytecode[0], 0x41); // Call opcode
+        assert_eq!(program.bytecode[0], Instruction::Call as u8);
         assert_eq!(program.bytecode[1], 0); // dst = r0
         assert_eq!(program.bytecode[6], 5); // argc = 5 (single byte)
         assert_eq!(program.bytecode[7], 2); // argv = r2

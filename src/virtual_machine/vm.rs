@@ -4,7 +4,6 @@
 //! registers. All arithmetic uses wrapping semantics to prevent overflow panics.
 
 use crate::error;
-use crate::types::bytes::Bytes;
 use crate::types::hash::{HASH_LEN, Hash};
 use crate::virtual_machine::assembler::parse_i64;
 use crate::virtual_machine::errors::VMError;
@@ -285,7 +284,7 @@ struct CallFrame {
 /// 8) 🔴 Add an LSP for smoother smart contract writing experience
 pub struct VM {
     /// Bytecode to execute.
-    data: Bytes,
+    data: Vec<u8>,
     /// Instruction pointer (current position in bytecode).
     ip: usize,
     /// Register file (256 max registers).
@@ -304,7 +303,7 @@ impl VM {
     /// Creates a new VM instance with the given program and default gas calculator.
     pub fn new(program: Program) -> Self {
         Self {
-            data: program.bytecode.into(),
+            data: program.bytecode,
             ip: 0,
             registers: Registers::new(program.max_register as usize + 1),
             heap: Heap::new(program.items),
@@ -572,6 +571,7 @@ impl VM {
                 // Control Flow
                 CallHost => op_call_host(dst: Reg, fn_id: RefU32, argc: ImmU8, argv: Reg),
                 Call => op_call(dst: Reg, fn_id: RefU32, argc: ImmU8, argv: Reg),
+                Call0 => op_call0(dst: Reg, fn_id: RefU32),
                 Jal => op_jal(rd: Reg, offset: ImmI64),
                 Jalr => op_jalr(rd: Reg, rs: Reg, offset: ImmI64),
                 Beq => op_beq(rs1: Reg, rs2: Reg, offset: ImmI64),
@@ -1102,9 +1102,13 @@ impl VM {
         Ok(())
     }
 
-    fn op_jal(&mut self, _instr: &'static str, rd: u8, offset: i64) -> Result<(), VMError> {
+    fn op_call0(&mut self, instr: &'static str, dst: u8, fn_id: u32) -> Result<(), VMError> {
+        self.op_call(instr, dst, fn_id, 0, 0)
+    }
+
+    fn op_jal(&mut self, instr: &'static str, rd: u8, offset: i64) -> Result<(), VMError> {
         self.registers_set(rd, Value::Int(self.ip as i64))?;
-        self.op_jump(_instr, offset)?;
+        self.op_jump(instr, offset)?;
         Ok(())
     }
 

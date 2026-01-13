@@ -28,9 +28,13 @@ impl Bytes {
     }
 
     /// Returns the number of bytes in the buffer.
-    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.0.len()
+    }
+
+    /// Returns true if the buffer is empty.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 
     /// Returns the buffer contents as a byte slice.

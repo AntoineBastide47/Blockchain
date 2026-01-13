@@ -56,8 +56,14 @@ impl SizeCounter {
     }
 
     /// Returns the total number of bytes counted.
-    pub fn len(&self) -> usize {
+    pub fn size(&self) -> usize {
         self.len
+    }
+}
+
+impl Default for SizeCounter {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -93,7 +99,7 @@ pub trait Encode {
         self.encode(&mut counter);
 
         // Second pass: encode once, with exact capacity
-        let mut out = Bytes::with_capacity(counter.len());
+        let mut out = Bytes::with_capacity(counter.size());
         self.encode(&mut out);
         out
     }
@@ -107,7 +113,7 @@ pub trait Encode {
         self.encode(&mut counter);
 
         // Second pass: encode once, with exact capacity
-        let mut out = Vec::<u8>::with_capacity(counter.len());
+        let mut out = Vec::<u8>::with_capacity(counter.size());
         self.encode(&mut out);
         out
     }
@@ -476,13 +482,13 @@ mod tests {
     #[test]
     fn size_counter_accumulates() {
         let mut counter = SizeCounter::new();
-        assert_eq!(counter.len(), 0);
+        assert_eq!(counter.size(), 0);
 
         counter.write(&[1, 2, 3]);
-        assert_eq!(counter.len(), 3);
+        assert_eq!(counter.size(), 3);
 
         counter.write(&[4, 5]);
-        assert_eq!(counter.len(), 5);
+        assert_eq!(counter.size(), 5);
     }
 
     #[test]

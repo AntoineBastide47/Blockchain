@@ -3,29 +3,6 @@
 version = 4
 
 [[package]]
-name = "Blockchain"
-version = "0.13.5"
-dependencies = [
- "argon2",
- "blockchain_derive",
- "chacha20poly1305",
- "dashmap",
- "dirs",
- "fs2",
- "futures",
- "k256",
- "libp2p",
- "rand_core 0.6.4",
- "rpassword",
- "sha3",
- "sparse-merkle-tree",
- "tempfile",
- "termcolor",
- "tokio",
- "zeroize",
-]
-
-[[package]]
 name = "aead"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -267,6 +244,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
 dependencies = [
  "generic-array",
+]
+
+[[package]]
+name = "blockchain"
+version = "0.13.7"
+dependencies = [
+ "argon2",
+ "blockchain_derive",
+ "chacha20poly1305",
+ "dashmap",
+ "dirs",
+ "fs2",
+ "futures",
+ "k256",
+ "libp2p",
+ "rand_core 0.6.4",
+ "rpassword",
+ "sha3",
+ "sparse-merkle-tree",
+ "tempfile",
+ "termcolor",
+ "tokio",
+ "zeroize",
 ]
 
 [[package]]

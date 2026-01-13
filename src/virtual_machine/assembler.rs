@@ -82,6 +82,12 @@ impl AsmContext {
     }
 }
 
+impl Default for AsmContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Token {
     text: String,
@@ -464,13 +470,11 @@ pub fn assemble_source(source: impl Into<String>) -> Result<Program, VMError> {
     Ok(Program {
         max_register: asm_context.max_register,
         items: asm_context.items,
-        labels: asm_context.labels,
         bytecode,
     })
 }
 
 /// Convenience: assemble directly from file path
-#[allow(dead_code)]
 pub fn assemble_file<P: AsRef<Path>>(path: P) -> Result<Program, VMError> {
     let path_ref = path.as_ref();
     let source = fs::read_to_string(path_ref).map_err(|e| VMError::IoError {
@@ -788,65 +792,6 @@ mod tests {
     // ==================== Labels ====================
 
     #[test]
-    fn label_definition() {
-        let source = "start: LOAD_I64 r0, 42";
-        let program = assemble_source(source).unwrap();
-        assert_eq!(program.labels.get("start"), Some(&0));
-    }
-
-    #[test]
-    fn label_on_separate_line() {
-        let source = "start:\n    LOAD_I64 r0, 42";
-        let program = assemble_source(source).unwrap();
-        assert_eq!(program.labels.get("start"), Some(&0));
-    }
-
-    #[test]
-    fn multiple_labels() {
-        let source = r#"
-            first: LOAD_I64 r0, 1
-            second: LOAD_I64 r1, 2
-        "#;
-        let program = assemble_source(source).unwrap();
-        assert_eq!(program.labels.get("first"), Some(&0));
-        // LOAD_I64 is 1 (opcode) + 1 (reg) + 8 (imm) = 10 bytes
-        assert_eq!(program.labels.get("second"), Some(&10));
-    }
-
-    #[test]
-    fn label_forward_reference() {
-        // JAL r0, end should jump forward
-        // JAL is 1 (opcode) + 1 (reg) + 8 (offset) = 10 bytes
-        // LOAD_I64 is 10 bytes
-        let source = r#"
-            JAL r0, end
-            LOAD_I64 r1, 99
-            end: LOAD_I64 r2, 0
-        "#;
-        let program = assemble_source(source).unwrap();
-        assert_eq!(program.labels.get("end"), Some(&20));
-        // Offset in JAL should be 20 - 10 = 10 (target - after_instr)
-        let offset = i64::from_le_bytes(program.bytecode[2..10].try_into().unwrap());
-        assert_eq!(offset, 10);
-    }
-
-    #[test]
-    fn label_backward_reference() {
-        // BEQ should jump backward
-        // BEQ is 1 (opcode) + 1 (rs1) + 1 (rs2) + 8 (offset) = 11 bytes
-        let source = r#"
-            loop: LOAD_I64 r0, 1
-            BEQ r0, r0, loop
-        "#;
-        let program = assemble_source(source).unwrap();
-        assert_eq!(program.labels.get("loop"), Some(&0));
-        // BEQ starts at offset 10: opcode[10], rs1[11], rs2[12], offset[13..20]
-        // Offset should be 0 - 21 = -21
-        let offset = i64::from_le_bytes(program.bytecode[13..21].try_into().unwrap());
-        assert_eq!(offset, -21);
-    }
-
-    #[test]
     fn duplicate_label_error() {
         let source = "dup: LOAD_I64 r0, 1\ndup: LOAD_I64 r1, 2";
         let err = assemble_source(source).unwrap_err();
@@ -909,12 +854,12 @@ mod tests {
     #[test]
     fn assemble_call_argc_u8() {
         // CALL: opcode(1) + dst(1) + fn_id(4) + argc(1) + argv(1) = 8 bytes
-        let program = assemble_source(r#"CALL r0, "my_func", 5, r2"#).unwrap();
+        let program = assemble_source("my_func:\nCALL r0, my_func, 5, r2").unwrap();
         assert_eq!(program.bytecode[0], Instruction::Call as u8);
         assert_eq!(program.bytecode[1], 0); // dst = r0
-        assert_eq!(program.bytecode[6], 5); // argc = 5 (single byte)
-        assert_eq!(program.bytecode[7], 2); // argv = r2
-        assert_eq!(program.bytecode.len(), 8);
+        assert_eq!(program.bytecode[10], 5); // argc = 5 (single byte)
+        assert_eq!(program.bytecode[11], 2); // argv = r2
+        assert_eq!(program.bytecode.len(), 12);
     }
 
     #[test]

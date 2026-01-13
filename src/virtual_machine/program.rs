@@ -7,7 +7,6 @@ use crate::types::bytes::Bytes;
 use crate::types::encoding::{Decode, Encode};
 use crate::virtual_machine::errors::VMError;
 use blockchain_derive::BinaryCodec;
-use std::collections::HashMap;
 
 /// Magic bytes identifying a serialized VM program.
 const MAGIC: &[u8; 5] = b"VM_BC";
@@ -47,8 +46,6 @@ pub struct Program {
     pub bytecode: Vec<u8>,
     /// Interned string literals referenced by index.
     pub items: Vec<Vec<u8>>,
-    /// Label definitions mapping names to bytecode offsets.
-    pub labels: HashMap<String, usize>,
 }
 
 impl Program {
@@ -106,7 +103,6 @@ pub mod tests {
             Self {
                 max_register: 255,
                 items: strings,
-                labels: HashMap::new(),
                 bytecode,
             }
         }

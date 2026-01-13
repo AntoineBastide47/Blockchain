@@ -21,15 +21,16 @@
 //!
 //! The passphrase is read from `NODE_PASSPHRASE` env var, or prompted if not set.
 
-use crate::core::transaction::Transaction;
-use crate::crypto::key_pair::{PrivateKey, load_or_generate_validator_key};
-use crate::network::libp2p_transport::Libp2pTransport;
-use crate::network::message::{Message, MessageType};
-use crate::network::rpc::Rpc;
-use crate::network::server::{DEV_CHAIN_ID, Server};
-use crate::network::transport::Transport;
-use crate::types::encoding::Encode;
-use crate::virtual_machine::assembler::assemble_source;
+use blockchain::core::transaction::Transaction;
+use blockchain::crypto::key_pair::{PrivateKey, load_or_generate_validator_key};
+use blockchain::network::libp2p_transport::Libp2pTransport;
+use blockchain::network::message::{Message, MessageType};
+use blockchain::network::rpc::Rpc;
+use blockchain::network::server::{DEV_CHAIN_ID, Server};
+use blockchain::network::transport::Transport;
+use blockchain::types::encoding::Encode;
+use blockchain::virtual_machine::assembler::assemble_file;
+use blockchain::{error, info, warn};
 use rpassword::prompt_password;
 use std::env;
 use std::net::SocketAddr;
@@ -39,14 +40,6 @@ use tokio::sync::mpsc::channel;
 use tokio::sync::oneshot;
 use tokio::time::sleep;
 use zeroize::Zeroizing;
-
-mod core;
-mod crypto;
-mod network;
-mod storage;
-mod types;
-mod utils;
-mod virtual_machine;
 
 #[tokio::main]
 async fn main() {
@@ -58,7 +51,6 @@ async fn main() {
     }
 
     let listen_arg = &args[1];
-
     let listen_addr = match listen_arg.parse().ok() {
         Some(addr) => addr,
         None => {
@@ -74,19 +66,19 @@ async fn main() {
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
-            "--name" => {
+            k @ ("--name" | "-n") => {
                 i += 1;
                 if i >= args.len() {
-                    eprintln!("--name requires an argument");
+                    eprintln!("{k} requires an argument");
                     process::exit(1);
                 }
                 node_name = Some(&args[i]);
                 i += 1;
             }
-            "--peer" => {
+            k @ ("--peer" | "-p") => {
                 i += 1;
                 if i >= args.len() {
-                    eprintln!("--peer requires an argument");
+                    eprintln!("{k} requires an argument");
                     process::exit(1);
                 }
                 peer_addr = args[i].parse().ok();
@@ -96,7 +88,7 @@ async fn main() {
                 }
                 i += 1;
             }
-            "--validator" => {
+            "--validator" | "-v" => {
                 validator_mode = true;
                 i += 1;
             }
@@ -197,30 +189,9 @@ async fn main() {
         let server_for_txs = server.clone();
         tokio::spawn(async move {
             loop {
-                // Compute factorial of 5 using a loop and function call
-                let source = r#"
-                    JUMP main
-
-                    # factorial(n): computes n! iteratively
-                    # input: r1 = n, output: r3 = n!
-                    factorial:
-                        LOAD_I64 r3, 1              # result = 1
-                        LOAD_I64 r4, 1              # i = 1
-                        LOAD_I64 r5, 1              # increment
-                    fact_loop:
-                        MUL r3, r3, r4              # result *= i
-                        ADD r4, r4, r5              # i++
-                        BGE r1, r4, fact_loop       # while n >= i
-                        RET r3
-
-                    main:
-                        LOAD_I64 r1, 5               # compute 5!
-                        CALL r2, "factorial", 0, r0  # r2 now contains 120 (5!)
-                        CALL_HOST r2, "hash", 1, r2  # hash the value
-                        LOAD_STR r1, "hash"
-                        STORE_HASH r1, r2            # Store the hashes value at key "hash"
-                "#;
-                let data = assemble_source(source).expect("assembly failed").to_bytes();
+                let data = assemble_file("main.asm")
+                    .expect("assembly failed")
+                    .to_bytes();
 
                 // Build a fully populated transaction for the demo.
                 let tx = Transaction::builder(data, PrivateKey::new(), DEV_CHAIN_ID)
@@ -270,13 +241,13 @@ ARGS:
     <listen_addr>    Local address to bind (e.g., 127.0.0.1:3000)
 
 OPTIONS:
-    --name <name>    Node identifier (defaults to listen address)
-    --peer <addr>    Peer address to connect to on startup
-    --validator      Start as a validator node with a new keypair
-    -h, --help       Print this help message
+    -n, --name <name>    Node identifier (defaults to listen address)
+    -p, --peer <addr>    Peer address to connect to on startup
+    -v, --validator      Start as a validator node with a new keypair
+    -h, --help           Print this help message
 
 ENVIRONMENT:
-    NODE_PASSPHRASE    Passphrase for identity key encryption (prompted interactively if not set)
+    NODE_PASSPHRASE      Passphrase for identity key encryption (prompted interactively if not set)
 
 EXAMPLES:
     # Start a single node
@@ -286,7 +257,7 @@ EXAMPLES:
     {program} 127.0.0.1:3001 --peer 127.0.0.1:3000 --validator
 
     # Run multiple nodes on same machine
-    {program} 127.0.0.1:3000 --name node-a
+    {program} 127.0.0.1:3000 --name node-a &
     {program} 127.0.0.1:3001 --name node-b --peer 127.0.0.1:3000
 
 FILES:

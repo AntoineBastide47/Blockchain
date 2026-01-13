@@ -87,6 +87,12 @@ pub mod tests {
         }
     }
 
+    impl Default for TestState {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl State for TestState {
         fn get(&self, key: Hash) -> Option<Vec<u8>> {
             self.data.get(&key).cloned()

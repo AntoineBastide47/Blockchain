@@ -78,6 +78,12 @@ impl PrivateKey {
     }
 }
 
+impl Default for PrivateKey {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PublicKey {
     /// Derives a public key from a private key.
     ///

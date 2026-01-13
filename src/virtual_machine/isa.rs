@@ -129,9 +129,9 @@ macro_rules! for_each_instruction {
             /// CALL_HOST dst, fn, argc, argv ; call host function fn with argc args from regs[argv...] ; return -> dst
             CallHost = 0x40, "CALL_HOST" => [dst: Reg, fn_id: RefU32, argc: ImmU8, argv: Reg], 100,
             /// CALL dst, fn, argc, argv ; call function fn with argc args from regs[argv...] ; return -> dst
-            Call = 0x41, "CALL" => [dst: Reg, fn_id: RefU32, argc: ImmU8, argv: Reg], 50,
+            Call = 0x41, "CALL" => [dst: Reg, fn_id: ImmI64, argc: ImmU8, argv: Reg], 50,
             /// CALL dst, fn ; call function fn without any arguments ; return -> dst
-            Call0 = 0x42, "CALL0" => [dst: Reg, fn_id: RefU32], 50,
+            Call0 = 0x42, "CALL0" => [dst: Reg, fn_id: ImmI64], 50,
             /// JAL rd, offset ; rd = PC + instr_size; PC += offset (jump and link)
             Jal = 0x43, "JAL" => [rd: Reg, offset: ImmI64], 5,
             /// JALR rd, rs, offset ; rd = PC + instr_size; PC = rs + offset (jump and link register)

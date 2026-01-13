@@ -10,7 +10,6 @@ use crate::virtual_machine::errors::VMError;
 use crate::virtual_machine::isa::Instruction;
 use crate::virtual_machine::program::Program;
 use crate::virtual_machine::state::State;
-use std::collections::HashMap;
 
 /// Maximum gas allowed for a single transaction execution.
 pub const TRANSACTION_GAS_LIMIT: u64 = 1_000_000;
@@ -19,7 +18,7 @@ pub const BLOCK_GAS_LIMIT: u64 = 20_000_000;
 
 /// Runtime value stored in registers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Value {
+enum Value {
     Zero,
     /// Boolean value.
     Bool(bool),
@@ -291,8 +290,6 @@ pub struct VM {
     registers: Registers,
     /// Heap for string pool and future allocations.
     heap: Heap,
-    /// Function labels mapping names to bytecode offsets.
-    labels: HashMap<String, usize>,
     /// Call stack for function calls.
     call_stack: Vec<CallFrame>,
     /// Total gas consumed during execution.
@@ -307,7 +304,6 @@ impl VM {
             ip: 0,
             registers: Registers::new(program.max_register as usize + 1),
             heap: Heap::new(program.items),
-            labels: program.labels,
             call_stack: Vec::new(),
             gas_used: 0,
         }
@@ -395,7 +391,7 @@ impl VM {
     /// Returns the value in register `idx` with gas charging.
     ///
     /// Returns [`VMError::InvalidRegisterIndex`] if `idx` is out of bounds.
-    pub fn registers_set(&mut self, idx: u8, v: Value) -> Result<(), VMError> {
+    fn registers_set(&mut self, idx: u8, v: Value) -> Result<(), VMError> {
         self.charge_register(idx)?;
         self.registers.set(idx, v)
     }
@@ -403,7 +399,7 @@ impl VM {
     /// Returns the value in register `idx` with gas charging.
     ///
     /// Returns [`VMError::InvalidRegisterIndex`] if `idx` is out of bounds.
-    pub fn registers_get(&mut self, idx: u8) -> Result<&Value, VMError> {
+    fn registers_get(&mut self, idx: u8) -> Result<&Value, VMError> {
         self.charge_register(idx)?;
         self.registers.get(idx)
     }
@@ -411,7 +407,7 @@ impl VM {
     /// Returns the boolean value in register `idx` with gas charging.
     ///
     /// Returns [`VMError::TypeMismatch`] if the value is not a boolean.
-    pub fn registers_get_bool(&mut self, idx: u8, instr: &'static str) -> Result<bool, VMError> {
+    fn registers_get_bool(&mut self, idx: u8, instr: &'static str) -> Result<bool, VMError> {
         self.charge_register(idx)?;
         self.registers.get_bool(idx, instr)
     }
@@ -419,7 +415,7 @@ impl VM {
     /// Returns the reference value in register `idx` with gas charging.
     ///
     /// Returns [`VMError::TypeMismatch`] if the value is not a reference.
-    pub fn registers_get_ref(&mut self, idx: u8, instr: &'static str) -> Result<u32, VMError> {
+    fn registers_get_ref(&mut self, idx: u8, instr: &'static str) -> Result<u32, VMError> {
         self.charge_register(idx)?;
         self.registers.get_ref(idx, instr)
     }
@@ -427,7 +423,7 @@ impl VM {
     /// Returns the integer value in register `idx` with gas charging.
     ///
     /// Returns [`VMError::TypeMismatch`] if the value is not an integer.
-    pub fn registers_get_int(&mut self, idx: u8, instr: &'static str) -> Result<i64, VMError> {
+    fn registers_get_int(&mut self, idx: u8, instr: &'static str) -> Result<i64, VMError> {
         self.charge_register(idx)?;
         self.registers.get_int(idx, instr)
     }
@@ -435,7 +431,7 @@ impl VM {
     /// Stores an item on the heap and returns its reference index.
     ///
     /// Charges gas proportional to the item's byte length.
-    pub fn heap_index(&mut self, item: Vec<u8>) -> Result<u32, VMError> {
+    fn heap_index(&mut self, item: Vec<u8>) -> Result<u32, VMError> {
         self.charge_gas(item.len() as u64)?;
         Ok(self.heap.index(item))
     }
@@ -444,7 +440,7 @@ impl VM {
     ///
     /// Charges gas proportional to the string's byte length.
     /// Returns [`VMError::InvalidUtf8`] if the bytes are not valid UTF-8.
-    pub fn heap_get_string(&mut self, id: u32) -> Result<String, VMError> {
+    fn heap_get_string(&mut self, id: u32) -> Result<String, VMError> {
         let size = self.heap.get_raw_ref(id)?.len();
         self.charge_gas(size as u64)?;
         self.heap.get_string(id)
@@ -454,7 +450,7 @@ impl VM {
     ///
     /// Charges gas proportional to the string's byte length.
     /// Returns [`VMError::InvalidUtf8`] if the bytes are not valid UTF-8.
-    pub fn heap_get_hash(&mut self, id: u32) -> Result<Hash, VMError> {
+    fn heap_get_hash(&mut self, id: u32) -> Result<Hash, VMError> {
         self.charge_gas(HASH_LEN as u64)?;
         self.heap.get_hash(id)
     }
@@ -570,8 +566,8 @@ impl VM {
                 Ge => op_ge(rd: Reg, rs1: Reg, rs2: Reg),
                 // Control Flow
                 CallHost => op_call_host(dst: Reg, fn_id: RefU32, argc: ImmU8, argv: Reg),
-                Call => op_call(dst: Reg, fn_id: RefU32, argc: ImmU8, argv: Reg),
-                Call0 => op_call0(dst: Reg, fn_id: RefU32),
+                Call => op_call(dst: Reg, offset: ImmI64, argc: ImmU8, argv: Reg),
+                Call0 => op_call0(dst: Reg, fn_id: ImmI64),
                 Jal => op_jal(rd: Reg, offset: ImmI64),
                 Jalr => op_jalr(rd: Reg, rs: Reg, offset: ImmI64),
                 Beq => op_beq(rs1: Reg, rs2: Reg, offset: ImmI64),
@@ -1080,29 +1076,23 @@ impl VM {
 
     fn op_call(
         &mut self,
-        _instr: &'static str,
+        instr: &'static str,
         dst: u8,
-        fn_id: u32,
+        offset: i64,
         argc: u8,
         _argv: u8,
     ) -> Result<(), VMError> {
         self.charge_call(argc, 5, self.call_stack.len(), 10)?;
-        let fn_name = self.heap_get_string(fn_id)?;
-        let target = *self
-            .labels
-            .get(&fn_name)
-            .ok_or(VMError::UndefinedFunction { function: fn_name })?;
 
         self.call_stack.push(CallFrame {
             return_addr: self.ip,
             dst_reg: dst,
         });
 
-        self.ip = target;
-        Ok(())
+        self.op_jump(instr, offset)
     }
 
-    fn op_call0(&mut self, instr: &'static str, dst: u8, fn_id: u32) -> Result<(), VMError> {
+    fn op_call0(&mut self, instr: &'static str, dst: u8, fn_id: i64) -> Result<(), VMError> {
         self.op_call(instr, dst, fn_id, 0, 0)
     }
 
@@ -1269,7 +1259,10 @@ mod tests {
     }
 
     fn run_expect_err(source: &str) -> VMError {
-        let program = assemble_source(source).expect("assembly failed");
+        let program = match assemble_source(source) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
         let mut vm = VM::new(program);
         vm.run(&mut TestState::new(), EXECUTION_CONTEXT)
             .expect_err("expected error")
@@ -2205,7 +2198,7 @@ LOAD_HASH_STATE r2, r0"#,
         let source = r#"
             JAL r0, main
             main:
-            CALL r1, "double", 0, r0
+            CALL0 r1, double
             JAL r0, end
             double:
             LOAD_I64 r10, 42
@@ -2222,10 +2215,10 @@ LOAD_HASH_STATE r2, r0"#,
         let source = r#"
             JAL r0, main
             main:
-            CALL r1, "outer", 0, r0
+            CALL0 r1, outer
             JAL r0, end
             outer:
-            CALL r2, "inner", 0, r0
+            CALL0 r2, inner
             RET r2
             inner:
             LOAD_I64 r10, 99
@@ -2238,9 +2231,9 @@ LOAD_HASH_STATE r2, r0"#,
 
     #[test]
     fn call_undefined_function() {
-        let source = r#"CALL r0, "nonexistent", 0, r0"#;
+        let source = r#"CALL0 r0, nonexistent"#;
         let err = run_expect_err(source);
-        assert!(matches!(err, VMError::UndefinedFunction { .. }));
+        assert!(matches!(err, VMError::AssemblyError { .. }));
     }
 
     #[test]
@@ -2256,7 +2249,7 @@ LOAD_HASH_STATE r2, r0"#,
             JAL r0, main
             main:
             LOAD_I64 r5, 100
-            CALL r1, "func", 0, r0
+            CALL0 r1, func
             ADD r2, r1, r5
             JAL r0, end
             func:
@@ -2327,19 +2320,19 @@ LOAD_HASH_STATE r2, r0"#,
         let source = r#"
             JAL r0, main
             main:
-            CALL r1, "f1", 0, r0
+            CALL0 r1, f1
             JAL r0, end
             f1:
-            CALL r2, "f2", 0, r0
+            CALL0 r2, f2
             RET r2
             f2:
-            CALL r3, "f3", 0, r0
+            CALL0 r3, f3
             RET r3
             f3:
-            CALL r4, "f4", 0, r0
+            CALL0 r4, f4
             RET r4
             f4:
-            CALL r5, "f5", 0, r0
+            CALL0 r5, f5
             RET r5
             f5:
             LOAD_I64 r10, 777
@@ -2357,9 +2350,9 @@ LOAD_HASH_STATE r2, r0"#,
             JAL r0, main
             main:
             LOAD_I64 r10, 1
-            CALL r1, "add_ten", 0, r0
-            CALL r2, "add_ten", 0, r0
-            CALL r3, "add_ten", 0, r0
+            CALL0 r1, add_ten
+            CALL0 r2, add_ten
+            CALL0 r3, add_ten
             ADD r4, r1, r2
             ADD r4, r4, r3
             JAL r0, end
@@ -2380,7 +2373,7 @@ LOAD_HASH_STATE r2, r0"#,
             JAL r0, main
             main:
             LOAD_I64 r5, 999
-            CALL r5, "get_42", 0, r0
+            CALL0 r5, get_42
             JAL r0, end
             get_42:
             LOAD_I64 r10, 42
@@ -2399,7 +2392,7 @@ LOAD_HASH_STATE r2, r0"#,
             JAL r0, main
             main:
             LOAD_I64 r1, 3
-            CALL r2, "countdown", 0, r0
+            CALL0 r2, countdown
             JAL r0, end
 
             countdown:
@@ -2407,7 +2400,7 @@ LOAD_HASH_STATE r2, r0"#,
             LOAD_I64 r11, 1
             BEQ r1, r10, done
             SUB r1, r1, r11
-            CALL r12, "countdown", 0, r0
+            CALL0 r12, countdown
             done:
             RET r1
 
@@ -2424,7 +2417,7 @@ LOAD_HASH_STATE r2, r0"#,
         let source = r#"
             JAL r0, main
             main:
-            CALL r1, "func", 0, r0
+            CALL0 r1, func
             JAL r0, end
             func:
             LOAD_I64 r10, 1
@@ -2451,7 +2444,7 @@ LOAD_HASH_STATE r2, r0"#,
         let source = r#"
             JAL r0, main
             main:
-            CALL r1, "func", 0, r0
+            CALL0 r1, func
             JAL r0, end
             func:
             JAL r0, escape
@@ -2471,9 +2464,9 @@ LOAD_HASH_STATE r2, r0"#,
         let source = r#"
             JAL r0, main
             main:
-            CALL r1, "ret_10", 0, r0
-            CALL r2, "ret_20", 0, r0
-            CALL r3, "ret_30", 0, r0
+            CALL0 r1, ret_10
+            CALL0 r2, ret_20
+            CALL0 r3, ret_30
             JAL r0, end
             ret_10:
             LOAD_I64 r10, 10
@@ -2498,7 +2491,7 @@ LOAD_HASH_STATE r2, r0"#,
         let source = r#"
             JAL r0, main
             main:
-            CALL r10, "func", 0, r0
+            CALL0 r10, func
             JAL r0, end
             func:
             LOAD_I64 r10, 42
@@ -2516,15 +2509,15 @@ LOAD_HASH_STATE r2, r0"#,
         let source = r#"
             JAL r0, main
             main:
-            CALL r1, "outer", 0, r0
+            CALL0 r1, outer
             JAL r0, end
             outer:
-            CALL r2, "middle", 0, r0
+            CALL0 r2, middle
             LOAD_I64 r3, 1
             ADD r2, r2, r3
             RET r2
             middle:
-            CALL r4, "inner", 0, r0
+            CALL0 r4, inner
             LOAD_I64 r5, 1
             ADD r4, r4, r5
             RET r4
@@ -2544,8 +2537,8 @@ LOAD_HASH_STATE r2, r0"#,
         let source = r#"
             JAL r0, main
             main:
-            CALL r1, "a", 0, r0
-            CALL r2, "b", 0, r0
+            CALL0 r1, a
+            CALL0 r2, b
             JAL r0, end
             a:
             LOAD_I64 r10, 1
@@ -2566,7 +2559,7 @@ LOAD_HASH_STATE r2, r0"#,
         let source = r#"
             JAL r0, main
             main:
-            CALL r1, "ret_zero", 0, r0
+            CALL0 r1, ret_zero
             JAL r0, end
             ret_zero:
             RET r50
@@ -2582,7 +2575,7 @@ LOAD_HASH_STATE r2, r0"#,
         let source = r#"
             JAL r0, main
             main:
-            CALL r1, "ret_bool", 0, r0
+            CALL0 r1, ret_bool
             JAL r0, end
             ret_bool:
             LOAD_BOOL r10, true
@@ -2599,7 +2592,7 @@ LOAD_HASH_STATE r2, r0"#,
         let source = r#"
             JAL r0, main
             main:
-            CALL r1, "ret_str", 0, r0
+            CALL0 r1, ret_str
             JAL r0, end
             ret_str:
             LOAD_STR r10, "hello"

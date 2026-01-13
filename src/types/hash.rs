@@ -98,6 +98,12 @@ impl HashBuilder {
     }
 }
 
+impl Default for HashBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EncodeSink for HashBuilder {
     fn write(&mut self, bytes: &[u8]) {
         self.hasher.update(bytes);

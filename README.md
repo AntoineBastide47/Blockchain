@@ -3,7 +3,8 @@
 Minimal, safety-first blockchain in Rust, focused on pedagogy and clarity across consensus, networking, and VM layers.
 
 > [!NOTE]
-> Edition 2024; tuned for Rust 1.84+. Node identities live at `~/.blockchain/{chain_id}/{node_name}/identity.key`, encrypted via Argon2id + XChaCha20-Poly1305; passphrase comes from `NODE_PASSPHRASE` or an interactive prompt.
+> Edition 2024; tuned for Rust 1.84+.
+> Node identities live at `~/.blockchain/{chain_id}/{node_name}/identity.key`, encrypted via Argon2id + XChaCha20-Poly1305.
 
 ## Highlights
 - Deterministic binary codec for all hashes/keys/blocks/txs
@@ -14,43 +15,54 @@ Minimal, safety-first blockchain in Rust, focused on pedagogy and clarity across
 
 ## Quickstart
 
-| Action | Command |
-| --- | --- |
-| Build (release) | `cargo build --release` |
-| Run node | `cargo run` |
-| Test | `cargo test` |
-| Format + lint + test | `./check` |
+| Action               | Command                                                   |
+|----------------------|-----------------------------------------------------------|
+| Build (release)      | `cargo build --release`                                   |
+| Run node             | `cargo run -- <listen_addr>`                              |
+| Compile assembly     | `cargo run --bin assembler -- program.asm -o program.bin` |
+| Test                 | `cargo test`                                              |
+| Format + lint + test | `./check`                                                 |
 
 ## CLI Usage
 - `cargo run <listen_addr> [--name <id>] [--peer <addr>] [--validator]`
 - `listen_addr`: e.g., `127.0.0.1:3000`
 - `--name`: optional node identifier (also used for key storage path)
 - `--peer`: optional peer to connect on startup
-- `--validator`: start with a fresh validator key (in-memory)
-- Passphrase: `NODE_PASSPHRASE` env var or interactive prompt
+- `--validator`: start block production with a validator key on disk
+- Passphrase: `NODE_PASSPHRASE` env var or interactive prompt (used to decrypt node keys)
 
 ## Repo Map
 ```
 src/
-├── core/           # Blocks, txs, validation, blockchain state
-├── network/        # P2P server, transport abstraction, RPC messages
-├── crypto/         # Keys, signing, address derivation
-├── types/          # Hash, Address, Bytes, binary encoding
-└── utils/          # Logging helpers
+├── bin/                # Assembler CLI
+├── core/               # Blocks, transactions, blockchain orchestration, validator rules
+├── crypto/             # Schnorr keys + encrypted disk persistence
+├── network/            # P2P server, libp2p transport, message framing, RPC types
+├── storage/            # In-memory block store, sparse Merkle state, tx pool
+├── types/              # Hash/Bytes, deterministic binary codec, Merkle helpers
+├── utils/              # Logging and test helpers
+└── virtual_machine/    # 256-register VM, assembler, ISA, gas metering
 
 blockchain_derive/  # Procedural macros (BinaryCodec, Error)
 ```
 
 ## Architecture
 
+### Node pipeline
+- Transport: libp2p (Noise + Yamux) with request/response RPC and identify; 16 MiB message cap.
+- Server: gossips transactions/blocks, maintains tx pool, and syncs via status + block range RPCs.
+- Storage: in-memory block/index storage plus sparse Merkle tree for state and read-only views.
+- Execution: register-based VM executes transaction bytecode in per-tx overlays; block overlay merged into canonical SMT.
+- Validation: `BlockValidator` checks heights, parents, signatures, nonces/balances, gas limit; applies blocks into storage.
+
 ### Data Structures
 
-| Type | Size      | Notes |
-| --- |-----------| --- |
-| Header | 120 bytes | Version, height, timestamp, previous/merkle/state hashes |
-| Hash | 32 bytes  | SHA3-256 output |
-| Address | 20 bytes  | Derived from public key |
-| PublicKey | 52 bytes  | secp256k1 verifying key + cached address |
+| Type      | Size      | Notes                                                    |
+|-----------|-----------|----------------------------------------------------------|
+| Header    | 120 bytes | Version, height, timestamp, previous/merkle/state hashes |
+| Hash      | 32 bytes  | SHA3-256 output                                          |
+| Address   | 32 bytes  | Domain-separated SHA3 of verifying key                   |
+| PublicKey | 64 bytes  | secp256k1 Schnorr verifying key (cached address)         |
 
 > [!WARNING]
 > Sizes and layouts may evolve as the consensus/state model firms up.
@@ -61,50 +73,53 @@ blockchain_derive/  # Procedural macros (BinaryCodec, Error)
 - Domain-separated hashing for replay protection
 
 ### Networking
-- libp2p RPC over request-response with identify; 16 MiB message cap
+- libp2p RPC over request-response with identify; bidirectional address learning for peers
 - Encrypted identity key material on disk; single-process lock per node directory
 
 ### Limits
 
-| Resource | Limit |
-| --- | --- |
+| Resource         | Limit                |
+|------------------|----------------------|
 | Transaction pool | 100,000 transactions |
-| Block size | 20,000 transactions |
-| Vector decode | 1,000,000 elements |
-| Bytes decode | 8 MiB |
+| Block size       | 20,000 transactions  |
+| Vector decode    | 1,000,000 elements   |
+| Bytes decode     | 8 MiB                |
+| RPC payload      | 16 MiB               |
+| Transaction gas  | 1,000,000            |
+| Block gas        | 20,000,000           |
 
 ### Virtual Machine
-- 256-register bytecode VM with string pool
-- Per-tx overlay state merged into block overlay; state_root covers all writes
-- Host calls stubbed (no externals yet)
+- 256-register bytecode VM with string/hash/boolean/int types and a string pool
+- Host calls: `len`, `slice`, `concat`, `compare`, `hash`
+- Per-tx overlay state merged into block overlay; state_root covers all writes (sparse Merkle backing store)
 
 ### Dependencies
 
-| Crate | Purpose |
-| --- | --- |
-| tokio | Async runtime |
-| sha3 | SHA3-256 hashing |
-| k256 | secp256k1 Schnorr signatures |
-| dashmap | Concurrent hash map (mempool) |
-| libp2p | Networking transport and protocols |
-| argon2, chacha20poly1305, zeroize | Encrypted identity key storage |
+| Crate                             | Purpose                            |
+|-----------------------------------|------------------------------------|
+| tokio                             | Async runtime                      |
+| sha3                              | SHA3-256 hashing                   |
+| k256                              | secp256k1 Schnorr signatures       |
+| dashmap                           | Concurrent hash map (mempool)      |
+| libp2p                            | Networking transport and protocols |
+| argon2, chacha20poly1305, zeroize | Encrypted identity key storage     |
 
 ## Status
 
 **Implemented**
-- Canonical wire format with deterministic hashes and signatures
-- Block production/broadcasting with signed validator blocks
+- Deterministic binary codec and chain-separated hashing/signing
+- Block production/broadcasting with signed validator blocks and genesis bootstrap
 - Transaction pool with deduplication and hard caps
-- In-memory storage backend
-- Minimal register-based VM
-- Encrypted on-disk node identity with single-process locking
+- In-memory block store backed by sparse Merkle tree state + read-only views
+- Register-based VM, assembler CLI, and host functions (`len`, `slice`, `concat`, `compare`, `hash`)
+- Encrypted on-disk node identity + validator keys with single-process locking
+- libp2p transport (Noise + Yamux) with request/response RPC and tests using local in-memory transport
 
 **Missing / TODO**
-- State model (accounts vs UTXO) and fee rules
-- Stateful tx/block validation and block size/gas limits
-- Persistence and recovery
-- Fork tracking and reorg handling
-- Full sync/handshake protocol and fee-aware mempool
+- Disk persistence and fast recovery (blocks/state)
+- Economic rules (fees/gas pricing), fork choice, and reorg handling
+- Robust mempool policies and gossip; stronger sync/handshake and block request caps
+- Storage pruning/snapshotting and production-ready database backend
 
 See `checklist.md` for detailed progress.
 

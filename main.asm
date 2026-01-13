@@ -14,7 +14,7 @@ factorial:
 
 main:
     LOAD_I64 r1, 5               # compute 5!
-    CALL r2, factorial, 0, r0  # r2 now contains 120 (5!)
+    CALL r2, factorial, 1, r1    # r2 now contains 120 (5!)
     CALL_HOST r2, "hash", 1, r2  # hash the value
     LOAD_STR r1, "hash"
     STORE_HASH r1, r2            # Store the hashes value at key "hash"

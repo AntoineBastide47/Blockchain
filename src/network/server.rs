@@ -91,7 +91,7 @@ pub struct Server<T: Transport> {
 
 impl<T: Transport> Server<T> {
     /// The genesis block, lazily initialized once and shared across all server instances.
-    pub fn genesis_block(chain_id: u64) -> Arc<Block> {
+    pub fn genesis_block(chain_id: u64) -> Block {
         let header = Header {
             version: 1,
             height: 0,
@@ -220,26 +220,26 @@ impl<T: Transport> Server<T> {
     }
 
     async fn create_new_block(&self) {
-        match self.chain.build_block(
+        let block = match self.chain.build_block(
             self.private_key.clone().unwrap(),
             self.tx_pool.transactions(),
         ) {
-            Ok(block) => match self.chain.apply_block(block.clone()) {
-                Ok(_) => {
-                    if let Err(e) = self
-                        .broadcast(
-                            self.transport.peer_id(),
-                            block.to_bytes(),
-                            MessageType::Block,
-                        )
-                        .await
-                    {
-                        warn!("could not broadcast block: {e}");
-                    }
-                }
-                Err(err) => warn!("could not add newly built block: {err}"),
-            },
-            Err(e) => warn!("build block failed: {e}"),
+            Ok(b) => b,
+            Err(e) => {
+                warn!("{e}");
+                return;
+            }
+        };
+
+        if let Err(e) = self
+            .broadcast(
+                self.transport.peer_id(),
+                block.to_bytes(),
+                MessageType::Block,
+            )
+            .await
+        {
+            warn!("could not broadcast block: {e}");
         }
     }
 
@@ -305,26 +305,25 @@ impl<T: Transport> Server<T> {
     /// Returns `Ok` if the block was successfully added, or an error if
     /// validation failed or the block was already present.
     async fn process_block(self: Arc<Self>, from: PeerId, block: Block) -> Result<(), ServerError> {
-        let arc_block = Arc::new(block);
-        self.chain
-            .apply_block(arc_block.clone())
-            .map_err(|e| ServerError::BlockRejected {
-                hash: arc_block.header_hash(self.chain.id),
-                source: e,
-            })?;
+        let bytes = block.to_bytes();
+        let header_hash = block.header_hash(self.chain.id);
 
-        let hashes: Vec<Hash> = arc_block
+        let hashes: Vec<Hash> = block
             .transactions
             .iter()
             .map(|tx| tx.id(self.chain.id))
             .collect();
         self.tx_pool.remove_batch(&hashes);
 
+        self.chain
+            .apply_block(block)
+            .map_err(|e| ServerError::BlockRejected {
+                hash: header_hash,
+                source: e,
+            })?;
+
         // Gossip to all peers except origin
-        tokio::spawn(async move {
-            self.broadcast(from, arc_block.to_bytes(), MessageType::Block)
-                .await
-        });
+        tokio::spawn(async move { self.broadcast(from, bytes, MessageType::Block).await });
         Ok(())
     }
 
@@ -440,7 +439,7 @@ impl<T: Transport> Server<T> {
     ) -> Result<(), ServerError> {
         for block in response.blocks {
             self.chain
-                .apply_block(Arc::new(block))
+                .apply_block(block)
                 .map_err(ServerError::Storage)?;
         }
 
@@ -544,7 +543,7 @@ mod tests {
     use crate::crypto::key_pair::PrivateKey;
     use crate::network::local_transport::tests::LocalTransport;
     use crate::network::rpc::Rpc;
-    use crate::utils::test_utils::utils::test_rpc;
+    use crate::utils::test_utils::utils::{new_tx, test_rpc};
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicU16, Ordering};
     use tokio::sync::mpsc::channel;
@@ -572,7 +571,7 @@ mod tests {
     }
 
     fn build_tx(data: &[u8], key: PrivateKey) -> Transaction {
-        Transaction::builder(Bytes::new(data), key, TEST_CHAIN_ID).build()
+        new_tx(Bytes::new(data), key, TEST_CHAIN_ID)
     }
 
     #[tokio::test]
@@ -665,7 +664,7 @@ mod tests {
         assert!(matches!(result, Err(RpcError::Transaction { .. })));
     }
 
-    fn create_test_block(transactions: Vec<Transaction>) -> Arc<Block> {
+    fn create_test_block(transactions: Vec<Transaction>) -> Block {
         let header = Header {
             version: 1,
             height: 1,
@@ -918,11 +917,10 @@ mod tests {
         .await;
 
         // Add a block to server_a so its height is 1
-        let block = server_a
+        server_a
             .chain
             .build_block(PrivateKey::new(), vec![])
             .expect("build_block failed");
-        server_a.chain.apply_block(block).unwrap();
 
         // Peer reports height 0, behind our chain (height 1)
         let status = SendStatusMessage {
@@ -1041,12 +1039,11 @@ mod tests {
             .chain
             .build_block(PrivateKey::new(), vec![])
             .expect("build_block failed");
-        server_builder.chain.apply_block(block.clone()).unwrap();
 
         assert_eq!(server_a.chain.height(), 0);
 
         let response = SendBlocksMessage {
-            blocks: vec![(*block).clone()],
+            blocks: vec![block],
         };
 
         server_a
@@ -1074,17 +1071,15 @@ mod tests {
             .chain
             .build_block(PrivateKey::new(), vec![])
             .expect("build_block 1 failed");
-        server_builder.chain.apply_block(block1.clone()).unwrap();
 
         // Build block 2
         let block2 = server_builder
             .chain
             .build_block(PrivateKey::new(), vec![])
             .expect("build_block 2 failed");
-        server_builder.chain.apply_block(block2.clone()).unwrap();
 
         let response = SendBlocksMessage {
-            blocks: vec![(*block1).clone(), (*block2).clone()],
+            blocks: vec![block1, block2],
         };
 
         server_a
@@ -1114,11 +1109,10 @@ mod tests {
 
         // Build 3 blocks on the established server
         for _ in 0..3 {
-            let block = server_established
+            server_established
                 .chain
                 .build_block(validator_key.clone(), vec![])
                 .expect("build_block failed");
-            server_established.chain.apply_block(block).unwrap();
         }
         assert_eq!(server_established.chain.height(), 3);
 
@@ -1311,11 +1305,10 @@ mod tests {
 
         // Add 2 blocks
         for _ in 0..2 {
-            let block = server_a
+            server_a
                 .chain
                 .build_block(validator_key.clone(), vec![])
                 .expect("build_block failed");
-            server_a.chain.apply_block(block).unwrap();
         }
 
         let mut rx_b = tr_b.consume().await;
@@ -1383,11 +1376,10 @@ mod tests {
 
         // Add 3 blocks
         for _ in 0..3 {
-            let block = server_a
+            server_a
                 .chain
                 .build_block(validator_key.clone(), vec![])
                 .expect("build_block failed");
-            server_a.chain.apply_block(block).unwrap();
         }
 
         let mut rx_b = tr_b.consume().await;

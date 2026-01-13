@@ -247,11 +247,11 @@ macro_rules! exec_vm {
 ///
 /// Contains chain and contract identifiers used to namespace storage keys,
 /// as well as gas metering configuration.
-pub struct ExecContext<'a> {
+pub struct ExecContext {
     /// Chain identifier for storage key derivation.
     pub chain_id: u64,
     /// Contract identifier for storage key derivation.
-    pub contract_id: &'a [u8],
+    pub contract_id: Hash,
 }
 
 /// Call stack frame storing return address and destination register.
@@ -316,16 +316,21 @@ impl VM {
     fn make_state_key(
         &mut self,
         chain_id: u64,
-        contract_id: &[u8],
+        contract_id: &Hash,
         user_key: &[u8],
     ) -> Result<Hash, VMError> {
-        self.charge_gas(5 + 8 + (contract_id.len() + user_key.len()) as u64)?;
+        self.charge_gas(5 + 8 + (HASH_LEN + user_key.len()) as u64)?;
         Ok(Hash::sha3()
             .chain(b"STATE")
             .chain(&chain_id.to_le_bytes())
-            .chain(contract_id)
+            .chain(contract_id.as_slice())
             .chain(user_key)
             .finalize())
+    }
+
+    /// Returns the total gas consumed during execution.
+    pub fn gas_used(&self) -> u64 {
+        self.gas_used
     }
 
     /// Adds gas to the running total and checks against the transaction limit.
@@ -591,7 +596,7 @@ impl VM {
     ) -> Result<(), VMError> {
         let key_ref = self.registers_get_ref(key, instr)?;
         let key_str = self.heap_get_string(key_ref)?;
-        let key = self.make_state_key(ctx.chain_id, ctx.contract_id, key_str.as_bytes())?;
+        let key = self.make_state_key(ctx.chain_id, &ctx.contract_id, key_str.as_bytes())?;
         state.delete(key);
         Ok(())
     }
@@ -611,7 +616,7 @@ impl VM {
         let key_ref = self.registers_get_ref(key, instr)?;
         let key_str = self.heap_get_string(key_ref)?;
         let val = self.registers_get_int(value, instr)?;
-        let key = self.make_state_key(ctx.chain_id, ctx.contract_id, key_str.as_bytes())?;
+        let key = self.make_state_key(ctx.chain_id, &ctx.contract_id, key_str.as_bytes())?;
         state.push(key, val.to_le_bytes().to_vec());
         Ok(())
     }
@@ -626,7 +631,7 @@ impl VM {
     ) -> Result<(), VMError> {
         let key_ref = self.registers_get_ref(key, instr)?;
         let key_str = self.heap_get_string(key_ref)?;
-        let state_key = self.make_state_key(ctx.chain_id, ctx.contract_id, key_str.as_bytes())?;
+        let state_key = self.make_state_key(ctx.chain_id, &ctx.contract_id, key_str.as_bytes())?;
         let value = state.get(state_key).ok_or(VMError::KeyNotFound {
             key: key_str.clone(),
         })?;
@@ -653,7 +658,7 @@ impl VM {
         let key_ref = self.registers_get_ref(key, instr)?;
         let key_str = self.heap_get_string(key_ref)?;
         let val = self.registers_get_bool(value, instr)?;
-        let key = self.make_state_key(ctx.chain_id, ctx.contract_id, key_str.as_bytes())?;
+        let key = self.make_state_key(ctx.chain_id, &ctx.contract_id, key_str.as_bytes())?;
         state.push(key, [val as u8].into());
         Ok(())
     }
@@ -668,7 +673,7 @@ impl VM {
     ) -> Result<(), VMError> {
         let key_ref = self.registers_get_ref(key, instr)?;
         let key_str = self.heap_get_string(key_ref)?;
-        let state_key = self.make_state_key(ctx.chain_id, ctx.contract_id, key_str.as_bytes())?;
+        let state_key = self.make_state_key(ctx.chain_id, &ctx.contract_id, key_str.as_bytes())?;
         let value = state.get(state_key).ok_or(VMError::KeyNotFound {
             key: key_str.clone(),
         })?;
@@ -697,7 +702,7 @@ impl VM {
         let key_str = self.heap_get_string(key_ref)?;
         let val_ref = self.registers_get_ref(value, instr)?;
         let val_str = self.heap_get_string(val_ref)?;
-        let key = self.make_state_key(ctx.chain_id, ctx.contract_id, key_str.as_bytes())?;
+        let key = self.make_state_key(ctx.chain_id, &ctx.contract_id, key_str.as_bytes())?;
         state.push(key, val_str.into_bytes());
         Ok(())
     }
@@ -712,7 +717,7 @@ impl VM {
     ) -> Result<(), VMError> {
         let key_ref = self.registers_get_ref(key, instr)?;
         let key_str = self.heap_get_string(key_ref)?;
-        let state_key = self.make_state_key(ctx.chain_id, ctx.contract_id, key_str.as_bytes())?;
+        let state_key = self.make_state_key(ctx.chain_id, &ctx.contract_id, key_str.as_bytes())?;
         let value = state
             .get(state_key)
             .ok_or(VMError::KeyNotFound { key: key_str })?;
@@ -741,7 +746,7 @@ impl VM {
         let key_str = self.heap_get_string(key_ref)?;
         let val_ref = self.registers_get_ref(value, instr)?;
         let val_hash = self.heap_get_hash(val_ref)?;
-        let key = self.make_state_key(ctx.chain_id, ctx.contract_id, key_str.as_bytes())?;
+        let key = self.make_state_key(ctx.chain_id, &ctx.contract_id, key_str.as_bytes())?;
         state.push(key, val_hash.to_vec());
         Ok(())
     }
@@ -756,7 +761,7 @@ impl VM {
     ) -> Result<(), VMError> {
         let key_ref = self.registers_get_ref(key, instr)?;
         let key_str = self.heap_get_string(key_ref)?;
-        let state_key = self.make_state_key(ctx.chain_id, ctx.contract_id, key_str.as_bytes())?;
+        let state_key = self.make_state_key(ctx.chain_id, &ctx.contract_id, key_str.as_bytes())?;
         let value = state
             .get(state_key)
             .ok_or(VMError::KeyNotFound { key: key_str })?;
@@ -1233,7 +1238,7 @@ mod tests {
 
     const EXECUTION_CONTEXT: &ExecContext = &ExecContext {
         chain_id: 62845383663927,
-        contract_id: &[3, 5, 2, 3, 9, 1],
+        contract_id: Hash::zero(),
     };
 
     fn run_vm(source: &str) -> VM {
@@ -1716,7 +1721,7 @@ mod tests {
     fn make_test_key(user_key: &[u8]) -> Result<Hash, VMError> {
         VM::new(Program::new(Vec::new(), Vec::new())).make_state_key(
             EXECUTION_CONTEXT.chain_id,
-            EXECUTION_CONTEXT.contract_id,
+            &EXECUTION_CONTEXT.contract_id,
             user_key,
         )
     }
@@ -2290,14 +2295,14 @@ LOAD_HASH_STATE r2, r0"#,
         let key_counter = vm
             .make_state_key(
                 EXECUTION_CONTEXT.chain_id,
-                EXECUTION_CONTEXT.contract_id,
+                &EXECUTION_CONTEXT.contract_id,
                 b"counter",
             )
             .unwrap();
         let key_steps = vm
             .make_state_key(
                 EXECUTION_CONTEXT.chain_id,
-                EXECUTION_CONTEXT.contract_id,
+                &EXECUTION_CONTEXT.contract_id,
                 b"steps",
             )
             .unwrap();

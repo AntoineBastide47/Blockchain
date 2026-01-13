@@ -1,14 +1,13 @@
 //! Blockchain block and header structures with memory-optimized layouts.
 
 use crate::core::transaction::Transaction;
+use crate::core::validator::BlockValidatorError;
 use crate::crypto::key_pair::{PrivateKey, PublicKey};
 use crate::types::encoding::Encode;
 use crate::types::hash::{Hash, HashCache};
 use crate::types::merkle_tree::MerkleTree;
 use crate::types::serializable_signature::SerializableSignature;
-use crate::warn;
 use blockchain_derive::BinaryCodec;
-use std::sync::Arc;
 
 /// Block header containing metadata and cryptographic commitments.
 ///
@@ -56,19 +55,6 @@ fn block_sign_data(chain_id: u64, hash: &Hash) -> Vec<u8> {
     buf
 }
 
-/// Intermediate block storage before signing.
-///
-/// Used during block construction to hold all block data before
-/// the validator signature is computed and attached.
-struct UnsignedBlock {
-    /// Block metadata and cryptographic commitments.
-    pub header: Header,
-    /// Public key of the validator producing this block.
-    pub validator: PublicKey,
-    /// Transactions included in this block.
-    pub transactions: Box<[Transaction]>,
-}
-
 /// Immutable block containing header and transactions.
 ///
 /// Blocks are validated once upon receipt and never modified.
@@ -96,22 +82,15 @@ impl Block {
         validator: PrivateKey,
         transactions: Vec<Transaction>,
         chain_id: u64,
-    ) -> Arc<Self> {
-        let unsigned = UnsignedBlock {
-            header,
+    ) -> Self {
+        Self {
+            header: header.clone(),
             validator: validator.public_key(),
+            signature: validator
+                .sign(block_sign_data(chain_id, &header.compute_hash(chain_id)).as_slice()),
             transactions: transactions.into_boxed_slice(),
-        };
-
-        Arc::new(Block {
-            header: unsigned.header.clone(),
-            validator: unsigned.validator,
-            signature: validator.sign(
-                block_sign_data(chain_id, &unsigned.header.compute_hash(chain_id)).as_slice(),
-            ),
-            transactions: unsigned.transactions,
             cached_header_hash: HashCache::new(),
-        })
+        }
     }
 
     /// Returns the chain-specific header hash, computing and caching it on first call.
@@ -133,29 +112,26 @@ impl Block {
     /// correct chain, preventing cross-chain replay attacks.
     ///
     /// Logs warnings for any verification failures.
-    pub fn verify(&self, chain_id: u64) -> bool {
+    pub fn verify(&self, chain_id: u64) -> Result<(), BlockValidatorError> {
         let hash = self.header_hash(chain_id);
         if !self
             .validator
             .verify(block_sign_data(chain_id, &hash).as_slice(), self.signature)
         {
-            warn!("invalid block signature: block={}", hash);
-            return false;
+            return Err(BlockValidatorError::InvalidSignature(hash));
         }
 
         for t in &self.transactions {
             if !t.verify(chain_id) {
-                warn!("invalid transaction signature in block: block={}", hash);
-                return false;
+                return Err(BlockValidatorError::InvalidTransactionSignature(hash));
             }
         }
 
         if MerkleTree::from_transactions(&self.transactions, chain_id) != self.header.merkle_root {
-            warn!("invalid merkle root in block: block={}", hash);
-            return false;
+            return Err(BlockValidatorError::InvalidMerkleRoot(hash));
         }
 
-        true
+        Ok(())
     }
 }
 
@@ -165,13 +141,13 @@ mod tests {
     use crate::crypto::key_pair::PrivateKey;
     use crate::types::bytes::Bytes;
     use crate::types::encoding::Decode;
-    use crate::utils::test_utils::utils::random_hash;
+    use crate::utils::test_utils::utils::{new_tx, random_hash};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     const TEST_CHAIN_ID: u64 = 832489;
 
     fn build_tx(data: &[u8], key: PrivateKey) -> Transaction {
-        Transaction::builder(Bytes::new(data), key, TEST_CHAIN_ID).build()
+        new_tx(Bytes::new(data), key, TEST_CHAIN_ID)
     }
 
     fn create_header(height: u64, transactions: &[Transaction]) -> Header {
@@ -188,7 +164,7 @@ mod tests {
         }
     }
 
-    fn create_block(header: Header, transactions: Vec<Transaction>) -> Arc<Block> {
+    fn create_block(header: Header, transactions: Vec<Transaction>) -> Block {
         let key = PrivateKey::new();
         Block::new(header, key, transactions, TEST_CHAIN_ID)
     }
@@ -274,14 +250,14 @@ mod tests {
     #[test]
     fn new_creates_verifiable_block() {
         let block = create_block(create_header(1, &[]), vec![]);
-        assert!(block.verify(TEST_CHAIN_ID));
+        assert!(block.verify(TEST_CHAIN_ID).is_ok());
     }
 
     #[test]
     fn verify_fails_with_wrong_validator() {
-        let mut block = Arc::try_unwrap(create_block(create_header(1, &[]), vec![])).unwrap();
+        let mut block = create_block(create_header(1, &[]), vec![]);
         block.validator = PrivateKey::new().public_key();
-        assert!(!block.verify(TEST_CHAIN_ID));
+        assert!(block.verify(TEST_CHAIN_ID).is_err());
     }
 
     #[test]
@@ -291,7 +267,7 @@ mod tests {
 
         let block = create_block(create_header(1, std::slice::from_ref(&tx)), vec![tx]);
         assert_eq!(block.transactions.len(), 1);
-        assert!(block.verify(TEST_CHAIN_ID));
+        assert!(block.verify(TEST_CHAIN_ID).is_ok());
     }
 
     #[test]
@@ -299,13 +275,9 @@ mod tests {
         let key = PrivateKey::new();
         let tx = build_tx(b"data", key);
 
-        let mut block = Arc::try_unwrap(create_block(
-            create_header(1, std::slice::from_ref(&tx)),
-            vec![tx],
-        ))
-        .unwrap();
+        let mut block = create_block(create_header(1, std::slice::from_ref(&tx)), vec![tx]);
         block.header.merkle_root = random_hash();
-        assert!(!block.verify(TEST_CHAIN_ID));
+        assert!(block.verify(TEST_CHAIN_ID).is_err());
     }
 
     #[test]
@@ -313,16 +285,12 @@ mod tests {
         let key = PrivateKey::new();
         let tx = build_tx(b"original", key.clone());
 
-        let mut block = Arc::try_unwrap(create_block(
-            create_header(1, std::slice::from_ref(&tx)),
-            vec![tx],
-        ))
-        .unwrap();
+        let mut block = create_block(create_header(1, std::slice::from_ref(&tx)), vec![tx]);
 
         let tampered_tx = build_tx(b"tampered", key);
         block.transactions = vec![tampered_tx].into_boxed_slice();
 
-        assert!(!block.verify(TEST_CHAIN_ID));
+        assert!(block.verify(TEST_CHAIN_ID).is_err());
     }
 
     #[test]
@@ -337,7 +305,7 @@ mod tests {
         let validator = PrivateKey::new();
         let block = Block::new(header, validator, vec![tx], TEST_CHAIN_ID);
 
-        assert!(!block.verify(TEST_CHAIN_ID));
+        assert!(block.verify(TEST_CHAIN_ID).is_err());
     }
 
     #[test]
@@ -351,7 +319,7 @@ mod tests {
         let block = Block::new(header, validator, vec![tx1, tx2], TEST_CHAIN_ID);
 
         assert_ne!(block.header.merkle_root, Hash::zero());
-        assert!(block.verify(TEST_CHAIN_ID));
+        assert!(block.verify(TEST_CHAIN_ID).is_ok());
     }
 
     #[test]
@@ -365,7 +333,7 @@ mod tests {
 
         let block = create_block(create_header(1, &txs), txs);
         assert_eq!(block.transactions.len(), 10);
-        assert!(block.verify(TEST_CHAIN_ID));
+        assert!(block.verify(TEST_CHAIN_ID).is_ok());
     }
 
     #[test]
@@ -374,6 +342,6 @@ mod tests {
         let validator = PrivateKey::new();
         let block = Block::new(header, validator, vec![], TEST_CHAIN_ID);
 
-        assert!(block.verify(TEST_CHAIN_ID));
+        assert!(block.verify(TEST_CHAIN_ID).is_ok());
     }
 }

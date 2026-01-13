@@ -21,7 +21,7 @@
 //!
 //! The passphrase is read from `NODE_PASSPHRASE` env var, or prompted if not set.
 
-use blockchain::core::transaction::Transaction;
+use blockchain::core::transaction::{Transaction, TransactionType};
 use blockchain::crypto::key_pair::{PrivateKey, load_or_generate_validator_key};
 use blockchain::network::libp2p_transport::Libp2pTransport;
 use blockchain::network::message::{Message, MessageType};
@@ -30,6 +30,7 @@ use blockchain::network::server::{DEV_CHAIN_ID, Server};
 use blockchain::network::transport::Transport;
 use blockchain::types::encoding::Encode;
 use blockchain::virtual_machine::assembler::assemble_file;
+use blockchain::virtual_machine::vm::TRANSACTION_GAS_LIMIT;
 use blockchain::{error, info, warn};
 use rpassword::prompt_password;
 use std::env;
@@ -194,15 +195,19 @@ async fn main() {
                     .to_bytes();
 
                 // Build a fully populated transaction for the demo.
-                let tx = Transaction::builder(data, PrivateKey::new(), DEV_CHAIN_ID)
-                    .with_recipient(PrivateKey::new().public_key().address())
-                    .with_amount(0)
-                    .with_fee(0)
-                    .with_gas_price(1)
-                    .with_gas_limit(50_000)
-                    .with_nonce(0)
-                    .with_gas_sponsor(PrivateKey::new().public_key().address())
-                    .build();
+                let tx = Transaction::new(
+                    PrivateKey::new().public_key().address(),
+                    None,
+                    data,
+                    0,
+                    0,
+                    0,
+                    TRANSACTION_GAS_LIMIT,
+                    0,
+                    PrivateKey::new(),
+                    DEV_CHAIN_ID,
+                    TransactionType::DeployContract,
+                );
                 let msg = Message::new(MessageType::Transaction, tx.to_bytes());
 
                 if let Err(e) = server_for_txs.add_to_pool(tx) {

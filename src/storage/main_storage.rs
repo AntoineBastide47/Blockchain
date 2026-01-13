@@ -55,7 +55,7 @@ pub struct MainStorage {
 }
 
 impl Storage for MainStorage {
-    fn new(genesis: Arc<Block>, chain_id: u64) -> Self {
+    fn new(genesis: Block, chain_id: u64) -> Self {
         let mut headers = HashMap::new();
         let mut blocks = HashMap::new();
 
@@ -63,7 +63,7 @@ impl Storage for MainStorage {
         let state_root = genesis.header.state_root;
 
         headers.insert(genesis_hash, genesis.header.clone());
-        blocks.insert(genesis_hash, genesis);
+        blocks.insert(genesis_hash, Arc::new(genesis));
 
         let inner = Inner {
             headers,
@@ -93,7 +93,7 @@ impl Storage for MainStorage {
         inner.blocks.get(&hash).cloned()
     }
 
-    fn append_block(&self, block: Arc<Block>, chain_id: u64) -> Result<(), StorageError> {
+    fn append_block(&self, block: Block, chain_id: u64) -> Result<(), StorageError> {
         let mut inner = self.inner.lock().unwrap();
 
         let expected_tip = inner.tip;
@@ -107,7 +107,7 @@ impl Storage for MainStorage {
         let hash = block.header_hash(chain_id);
 
         inner.headers.insert(hash, block.header.clone());
-        inner.blocks.insert(hash, block);
+        inner.blocks.insert(hash, Arc::new(block));
         inner.tip = hash;
 
         Ok(())
@@ -222,25 +222,11 @@ impl StateViewProvider for MainStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::block::Header;
-    use crate::crypto::key_pair::PrivateKey;
     use crate::storage::state_store::{IterableState, VmStorage};
-    use crate::utils::test_utils::utils::{create_genesis, random_hash};
+    use crate::utils::test_utils::utils::{create_genesis, create_test_block, random_hash};
     use std::thread;
 
     const TEST_CHAIN_ID: u64 = 78909876543;
-
-    fn create_block_at(height: u64, previous: Hash) -> Arc<Block> {
-        let header = Header {
-            version: 1,
-            height,
-            timestamp: 0,
-            previous_block: previous,
-            merkle_root: Hash::zero(),
-            state_root: Hash::zero(),
-        };
-        Block::new(header, PrivateKey::new(), vec![], TEST_CHAIN_ID)
-    }
 
     fn h(s: &[u8]) -> Hash {
         let mut h = Hash::sha3();
@@ -264,7 +250,7 @@ mod tests {
         let genesis = create_genesis(TEST_CHAIN_ID);
         let storage = MainStorage::new(genesis.clone(), TEST_CHAIN_ID);
 
-        let block1 = create_block_at(1, genesis.header_hash(TEST_CHAIN_ID));
+        let block1 = create_test_block(1, genesis.header_hash(TEST_CHAIN_ID), TEST_CHAIN_ID);
         assert!(storage.append_block(block1.clone(), TEST_CHAIN_ID).is_ok());
 
         assert_eq!(storage.height(), 1);
@@ -301,7 +287,7 @@ mod tests {
         let genesis = create_genesis(TEST_CHAIN_ID);
         let storage = MainStorage::new(genesis, TEST_CHAIN_ID);
 
-        let orphan = create_block_at(1, random_hash());
+        let orphan = create_test_block(1, random_hash(), TEST_CHAIN_ID);
         assert!(storage.append_block(orphan, TEST_CHAIN_ID).is_err());
     }
 
@@ -312,7 +298,7 @@ mod tests {
 
         let mut prev_hash = genesis.header_hash(TEST_CHAIN_ID);
         for i in 1..=10 {
-            let block = create_block_at(i, prev_hash);
+            let block = create_test_block(i, prev_hash, TEST_CHAIN_ID);
             prev_hash = block.header_hash(TEST_CHAIN_ID);
             assert!(storage.append_block(block, TEST_CHAIN_ID).is_ok());
         }

@@ -81,6 +81,7 @@ mod tests {
     use super::*;
     use crate::crypto::key_pair::PrivateKey;
     use crate::types::bytes::Bytes;
+    use crate::utils::test_utils::utils::new_tx;
 
     fn hash_leaf(data: &[u8]) -> Hash {
         let mut h = Hash::sha3();
@@ -132,8 +133,8 @@ mod tests {
         let key2 = PrivateKey::from_bytes(&[2u8; 32]).expect("valid key");
 
         let txs = vec![
-            Transaction::builder(Bytes::new(b"alpha"), key1, chain_id).build(),
-            Transaction::builder(Bytes::new(b"beta"), key2, chain_id).build(),
+            new_tx(Bytes::new(b"alpha"), key1, chain_id),
+            new_tx(Bytes::new(b"beta"), key2, chain_id),
         ];
 
         let ids: Vec<Hash> = txs.iter().map(|tx| tx.id(chain_id)).collect();

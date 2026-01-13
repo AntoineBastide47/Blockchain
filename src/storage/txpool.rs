@@ -104,6 +104,7 @@ mod tests {
     use super::*;
     use crate::crypto::key_pair::PrivateKey;
     use crate::types::bytes::Bytes;
+    use crate::utils::test_utils::utils::new_tx;
 
     const TEST_CHAIN_ID: u64 = 284528;
 
@@ -112,7 +113,7 @@ mod tests {
     }
 
     fn build_tx(data: &[u8], key: PrivateKey) -> Transaction {
-        Transaction::builder(Bytes::new(data), key, TEST_CHAIN_ID).build()
+        new_tx(Bytes::new(data), key, TEST_CHAIN_ID)
     }
 
     #[test]

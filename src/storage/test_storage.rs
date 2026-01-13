@@ -2,74 +2,81 @@
 pub mod test {
     use crate::core::account::Account;
     use crate::core::block::{Block, Header};
-    use crate::crypto::key_pair::{Address, PrivateKey};
+    use crate::crypto::key_pair::Address;
     use crate::storage::state_store::{AccountStorage, IterableState, StateStore, VmStorage};
     use crate::storage::state_view::{StateView, StateViewProvider};
     use crate::storage::storage_trait::{Storage, StorageError};
     use crate::types::encoding::{Decode, Encode};
     use crate::types::hash::Hash;
-    use crate::utils::test_utils::utils::{create_genesis, random_hash};
+    use crate::utils::test_utils::utils::{create_genesis, create_test_block, random_hash};
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::RwLock;
-
-    pub trait StorageExtForTests {
-        /// Appends a block to storage and updates the chain tip (requires mutable access).
-        ///
-        /// # Panics
-        /// Panics if not implemented for this storage type.
-        #[cfg(test)]
-        fn append_block_mut(&mut self, block: Arc<Block>, chain_id: u64);
-    }
 
     /// In-memory storage for testing and development.
     ///
     /// Stores blocks and headers in hash maps with O(1) lookup.
     /// Not suitable for production due to memory constraints and being thread unsafe.
     pub struct TestStorage {
-        /// Block headers indexed by hash.
-        headers: HashMap<Hash, Header>,
-        /// Full blocks indexed by hash.
-        blocks: HashMap<Hash, Arc<Block>>,
-        /// Hash of the current chain tip.
-        tip: Hash,
+        headers: RwLock<HashMap<Hash, Header>>,
+        blocks: RwLock<HashMap<Hash, Arc<Block>>>,
+        tip: RwLock<Hash>,
         state: RwLock<HashMap<Hash, Vec<u8>>>,
         state_root: RwLock<Hash>,
     }
 
     impl Storage for TestStorage {
-        fn new(genesis: Arc<Block>, chain_id: u64) -> Self {
-            let mut storage = Self {
-                headers: HashMap::new(),
-                blocks: HashMap::new(),
-                tip: Hash::zero(),
+        fn new(genesis: Block, chain_id: u64) -> Self {
+            let storage = Self {
+                headers: RwLock::new(HashMap::new()),
+                blocks: RwLock::new(HashMap::new()),
+                tip: RwLock::new(Hash::zero()),
                 state: RwLock::new(HashMap::new()),
                 state_root: RwLock::new(Hash::zero()),
             };
-            storage.append_block_mut(genesis, chain_id);
+            storage
+                .append_block(genesis, chain_id)
+                .expect("append_block failed");
             storage
         }
 
         fn has_block(&self, hash: Hash) -> bool {
-            self.blocks.contains_key(&hash)
+            self.blocks.read().unwrap().contains_key(&hash)
         }
 
         fn get_header(&self, hash: Hash) -> Option<Header> {
-            self.headers.get(&hash).cloned()
+            self.headers.read().unwrap().get(&hash).cloned()
         }
 
         fn get_block(&self, hash: Hash) -> Option<Arc<Block>> {
-            self.blocks.get(&hash).cloned()
+            self.blocks.read().unwrap().get(&hash).cloned()
         }
 
-        fn append_block(&self, _: Arc<Block>, _: u64) -> Result<(), StorageError> {
-            panic!(
-                "TestStorage::append_block is not supported. Use append_block_mut from StorageExtForTests trait instead."
-            )
+        fn append_block(&self, block: Block, chain_id: u64) -> Result<(), StorageError> {
+            let current_tip = *self.tip.read().unwrap();
+            if block.header.previous_block != current_tip {
+                panic!(
+                    "Block does not build on current tip: {} != {}",
+                    block.header.previous_block, current_tip
+                );
+            }
+
+            let hash = block.header_hash(chain_id);
+
+            self.headers
+                .write()
+                .unwrap()
+                .insert(hash, block.header.clone());
+            self.blocks.write().unwrap().insert(hash, Arc::new(block));
+            *self.tip.write().unwrap() = hash;
+
+            Ok(())
         }
 
         fn height(&self) -> u64 {
             self.headers
+                .read()
+                .unwrap()
                 .len()
                 .saturating_sub(1)
                 .try_into()
@@ -77,7 +84,7 @@ pub mod test {
         }
 
         fn tip(&self) -> Hash {
-            self.tip
+            *self.tip.read().unwrap()
         }
     }
 
@@ -154,24 +161,6 @@ pub mod test {
         }
     }
 
-    impl StorageExtForTests for TestStorage {
-        fn append_block_mut(&mut self, block: Arc<Block>, chain_id: u64) {
-            if block.header.previous_block != self.tip {
-                panic!(
-                    "Block does not build on current tip: {} != {}",
-                    block.header.previous_block, self.tip
-                );
-            }
-
-            let hash = block.header_hash(chain_id);
-
-            self.headers.insert(hash, block.header.clone());
-            self.blocks.insert(hash, block);
-
-            self.tip = hash;
-        }
-    }
-
     impl StateViewProvider for TestStorage {
         fn state_view(&self) -> StateView<'_, Self>
         where
@@ -181,83 +170,66 @@ pub mod test {
         }
     }
 
-    #[cfg(test)]
-    mod tests {
-        use super::*;
+    const TEST_CHAIN_ID: u64 = 78909876543;
 
-        const TEST_CHAIN_ID: u64 = 78909876543;
+    #[test]
+    fn new_initializes_with_genesis() {
+        let genesis = create_genesis(TEST_CHAIN_ID);
+        let hash = genesis.header_hash(TEST_CHAIN_ID);
+        let storage = TestStorage::new(genesis, TEST_CHAIN_ID);
 
-        fn create_block_at(height: u64, previous: Hash) -> Arc<Block> {
-            let header = Header {
-                version: 1,
-                height,
-                timestamp: 0,
-                previous_block: previous,
-                merkle_root: Hash::zero(),
-                state_root: Hash::zero(),
-            };
-            Block::new(header, PrivateKey::new(), vec![], TEST_CHAIN_ID)
-        }
+        assert_eq!(storage.height(), 0);
+        assert_eq!(storage.tip(), hash);
+        assert!(storage.has_block(hash));
+    }
 
-        #[test]
-        fn new_initializes_with_genesis() {
-            let genesis = create_genesis(TEST_CHAIN_ID);
-            let hash = genesis.header_hash(TEST_CHAIN_ID);
-            let storage = TestStorage::new(genesis, TEST_CHAIN_ID);
+    #[test]
+    fn append_and_retrieve() {
+        let genesis = create_genesis(TEST_CHAIN_ID);
+        let storage = TestStorage::new(genesis.clone(), TEST_CHAIN_ID);
 
-            assert_eq!(storage.height(), 0);
-            assert_eq!(storage.tip(), hash);
-            assert!(storage.has_block(hash));
-        }
+        let block1 = create_test_block(1, genesis.header_hash(TEST_CHAIN_ID), TEST_CHAIN_ID);
+        storage.append_block(block1.clone(), TEST_CHAIN_ID).unwrap();
 
-        #[test]
-        fn append_and_retrieve() {
-            let genesis = create_genesis(TEST_CHAIN_ID);
-            let mut storage = TestStorage::new(genesis.clone(), TEST_CHAIN_ID);
+        assert_eq!(storage.height(), 1);
+        assert_eq!(storage.tip(), block1.header_hash(TEST_CHAIN_ID));
+        assert!(storage.has_block(block1.header_hash(TEST_CHAIN_ID)));
+        assert_eq!(
+            storage
+                .get_block(block1.header_hash(TEST_CHAIN_ID))
+                .unwrap()
+                .header_hash(TEST_CHAIN_ID),
+            block1.header_hash(TEST_CHAIN_ID)
+        );
+    }
 
-            let block1 = create_block_at(1, genesis.header_hash(TEST_CHAIN_ID));
-            storage.append_block_mut(block1.clone(), TEST_CHAIN_ID);
+    #[test]
+    fn get_header() {
+        let genesis = create_genesis(TEST_CHAIN_ID);
+        let storage = TestStorage::new(genesis.clone(), TEST_CHAIN_ID);
 
-            assert_eq!(storage.height(), 1);
-            assert_eq!(storage.tip(), block1.header_hash(TEST_CHAIN_ID));
-            assert!(storage.has_block(block1.header_hash(TEST_CHAIN_ID)));
-            assert_eq!(
-                storage
-                    .get_block(block1.header_hash(TEST_CHAIN_ID))
-                    .unwrap()
-                    .header_hash(TEST_CHAIN_ID),
-                block1.header_hash(TEST_CHAIN_ID)
-            );
-        }
+        let header = storage
+            .get_header(genesis.header_hash(TEST_CHAIN_ID))
+            .unwrap();
+        assert_eq!(header.height, 0);
+    }
 
-        #[test]
-        fn get_header() {
-            let genesis = create_genesis(TEST_CHAIN_ID);
-            let storage = TestStorage::new(genesis.clone(), TEST_CHAIN_ID);
+    #[test]
+    fn get_nonexistent_block() {
+        let genesis = create_genesis(TEST_CHAIN_ID);
+        let storage = TestStorage::new(genesis, TEST_CHAIN_ID);
 
-            let header = storage
-                .get_header(genesis.header_hash(TEST_CHAIN_ID))
-                .unwrap();
-            assert_eq!(header.height, 0);
-        }
+        assert!(storage.get_block(random_hash()).is_none());
+        assert!(storage.get_header(random_hash()).is_none());
+    }
 
-        #[test]
-        fn get_nonexistent_block() {
-            let genesis = create_genesis(TEST_CHAIN_ID);
-            let storage = TestStorage::new(genesis, TEST_CHAIN_ID);
+    #[test]
+    #[should_panic(expected = "Block does not build on current tip")]
+    fn rejects_block_not_on_tip() {
+        let genesis = create_genesis(TEST_CHAIN_ID);
+        let storage = TestStorage::new(genesis, TEST_CHAIN_ID);
 
-            assert!(storage.get_block(random_hash()).is_none());
-            assert!(storage.get_header(random_hash()).is_none());
-        }
-
-        #[test]
-        #[should_panic(expected = "Block does not build on current tip")]
-        fn rejects_block_not_on_tip() {
-            let genesis = create_genesis(TEST_CHAIN_ID);
-            let mut storage = TestStorage::new(genesis, TEST_CHAIN_ID);
-
-            let orphan = create_block_at(1, random_hash());
-            storage.append_block_mut(orphan, TEST_CHAIN_ID);
-        }
+        let orphan = create_test_block(1, random_hash(), TEST_CHAIN_ID);
+        storage.append_block(orphan, TEST_CHAIN_ID).unwrap();
     }
 }

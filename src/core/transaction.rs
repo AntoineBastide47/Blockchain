@@ -6,6 +6,17 @@ use crate::types::encoding::Encode;
 use crate::types::hash::{Hash, HashCache};
 use blockchain_derive::BinaryCodec;
 
+/// Specifies the type of operation a transaction performs.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, BinaryCodec)]
+pub enum TransactionType {
+    /// Native token transfer between accounts.
+    TransferFunds,
+    /// Smart contract deployment with bytecode in the data field.
+    DeployContract,
+    /// Invokes an existing smart contract.
+    InvokeContract,
+}
+
 /// A blockchain transaction containing arbitrary data.
 ///
 /// Uses `Bytes` for zero-copy sharing - transactions are immutable after creation
@@ -37,6 +48,9 @@ pub struct Transaction {
     pub gas_limit: u64,
     /// Monotonic counter preventing replay for this sender.
     pub nonce: u64,
+
+    /// Operation type determining how the transaction is processed.
+    pub tx_type: TransactionType,
 }
 
 impl Transaction {
@@ -56,6 +70,7 @@ impl Transaction {
         nonce: u64,
         key: PrivateKey,
         chain_id: u64,
+        tx_type: TransactionType,
     ) -> Self {
         let data = data.into();
         let from = key.public_key();
@@ -71,6 +86,7 @@ impl Transaction {
             gas_price,
             gas_limit,
             nonce,
+            tx_type,
         );
 
         Transaction {
@@ -85,6 +101,7 @@ impl Transaction {
             gas_price,
             gas_limit,
             nonce,
+            tx_type,
         }
     }
 
@@ -103,6 +120,7 @@ impl Transaction {
             self.gas_price,
             self.gas_limit,
             self.nonce,
+            self.tx_type,
         )
     }
 
@@ -128,14 +146,6 @@ impl Transaction {
         self.from.verify(hash.as_slice(), self.signature)
     }
 
-    /// Starts building a transaction with required signing context.
-    /// Begins building a transaction with the given payload, signing key, and chain ID.
-    ///
-    /// Use the fluent `with_*` setters to populate fields, then call `build` to sign.
-    pub fn builder(data: impl Into<Bytes>, key: PrivateKey, chain_id: u64) -> TransactionBuilder {
-        TransactionBuilder::new(data.into(), key, chain_id)
-    }
-
     /// Computes the chain-bound signing hash from raw parts without allocations.
     #[allow(clippy::too_many_arguments)]
     fn signing_hash_from_parts(
@@ -149,6 +159,7 @@ impl Transaction {
         gas_price: u128,
         gas_limit: u64,
         nonce: u64,
+        tx_type: TransactionType,
     ) -> Hash {
         let mut buf = Hash::sha3();
         buf.update(b"TX");
@@ -162,88 +173,8 @@ impl Transaction {
         gas_price.encode(&mut buf);
         gas_limit.encode(&mut buf);
         nonce.encode(&mut buf);
+        tx_type.encode(&mut buf);
         buf.finalize()
-    }
-}
-
-/// Fluent builder for constructing and signing transactions.
-pub struct TransactionBuilder {
-    data: Bytes,
-    key: PrivateKey,
-    chain_id: u64,
-    recipient: Address,
-    gas_sponsor: Option<Address>,
-    amount: u128,
-    fee: u128,
-    gas_price: u128,
-    gas_limit: u64,
-    nonce: u64,
-}
-
-impl TransactionBuilder {
-    fn new(data: Bytes, key: PrivateKey, chain_id: u64) -> Self {
-        Self {
-            data,
-            key,
-            chain_id,
-            recipient: Address::zero(),
-            gas_sponsor: None,
-            amount: 0,
-            fee: 0,
-            gas_price: 0,
-            gas_limit: 0,
-            nonce: 0,
-        }
-    }
-
-    pub fn with_recipient(mut self, recipient: Address) -> Self {
-        self.recipient = recipient;
-        self
-    }
-
-    pub fn with_gas_sponsor(mut self, sponsor: Address) -> Self {
-        self.gas_sponsor = Some(sponsor);
-        self
-    }
-
-    pub fn with_amount(mut self, amount: u128) -> Self {
-        self.amount = amount;
-        self
-    }
-
-    pub fn with_fee(mut self, fee: u128) -> Self {
-        self.fee = fee;
-        self
-    }
-
-    pub fn with_gas_price(mut self, gas_price: u128) -> Self {
-        self.gas_price = gas_price;
-        self
-    }
-
-    pub fn with_gas_limit(mut self, gas_limit: u64) -> Self {
-        self.gas_limit = gas_limit;
-        self
-    }
-
-    pub fn with_nonce(mut self, nonce: u64) -> Self {
-        self.nonce = nonce;
-        self
-    }
-
-    pub fn build(self) -> Transaction {
-        Transaction::new(
-            self.recipient,
-            self.gas_sponsor,
-            self.data,
-            self.amount,
-            self.fee,
-            self.gas_price,
-            self.gas_limit,
-            self.nonce,
-            self.key,
-            self.chain_id,
-        )
     }
 }
 
@@ -251,6 +182,7 @@ impl TransactionBuilder {
 mod tests {
     use super::*;
     use crate::types::encoding::Decode;
+    use crate::utils::test_utils::utils::new_tx;
 
     const TEST_CHAIN_ID: u64 = 32;
 
@@ -258,7 +190,7 @@ mod tests {
     fn new_creates_valid_transaction() {
         let key = PrivateKey::new();
         let data = Bytes::new(b"test data");
-        let tx = Transaction::builder(data.clone(), key, TEST_CHAIN_ID).build();
+        let tx = new_tx(data.clone(), key, TEST_CHAIN_ID);
 
         assert_eq!(tx.data, data);
         assert!(tx.verify(TEST_CHAIN_ID));
@@ -270,9 +202,7 @@ mod tests {
         let key2 = PrivateKey::new();
         let data = Bytes::new(b"payload");
 
-        let tx = Transaction::builder(data, key1, TEST_CHAIN_ID)
-            .with_recipient(Address::zero())
-            .build();
+        let tx = new_tx(data, key1, TEST_CHAIN_ID);
         let mut tampered = tx.clone();
         tampered.from = key2.public_key();
 
@@ -282,7 +212,7 @@ mod tests {
     #[test]
     fn verify_fails_with_tampered_data() {
         let key = PrivateKey::new();
-        let tx = Transaction::builder(Bytes::new(b"original"), key, TEST_CHAIN_ID).build();
+        let tx = new_tx(Bytes::new(b"original"), key, TEST_CHAIN_ID);
         let mut tampered = tx.clone();
         tampered.data = Bytes::new(b"tampered");
 
@@ -292,7 +222,7 @@ mod tests {
     #[test]
     fn verify_succeeds_with_empty_data() {
         let key = PrivateKey::new();
-        let tx = Transaction::builder(Bytes::new(b""), key, TEST_CHAIN_ID).build();
+        let tx = new_tx(Bytes::new(b""), key, TEST_CHAIN_ID);
         assert!(tx.verify(TEST_CHAIN_ID));
     }
 
@@ -300,7 +230,7 @@ mod tests {
     fn verify_succeeds_with_large_data() {
         let key = PrivateKey::new();
         let large_data = vec![0xAB; 100_000];
-        let tx = Transaction::builder(Bytes::new(large_data), key, TEST_CHAIN_ID).build();
+        let tx = new_tx(Bytes::new(large_data), key, TEST_CHAIN_ID);
         assert!(tx.verify(TEST_CHAIN_ID));
     }
 
@@ -308,7 +238,7 @@ mod tests {
     fn serialize_deserialize_roundtrip() {
         let key = PrivateKey::new();
         let binary_data: Vec<u8> = (0..=255).collect();
-        let tx = Transaction::builder(Bytes::new(binary_data), key, TEST_CHAIN_ID).build();
+        let tx = new_tx(Bytes::new(binary_data), key, TEST_CHAIN_ID);
 
         let encoded: Bytes = tx.to_bytes();
         let decoded = Transaction::from_bytes(encoded.as_slice()).expect("deserialization failed");
@@ -320,7 +250,7 @@ mod tests {
     #[test]
     fn hash_is_deterministic() {
         let key = PrivateKey::new();
-        let tx = Transaction::builder(Bytes::new(b"hash test"), key, TEST_CHAIN_ID).build();
+        let tx = new_tx(Bytes::new(b"hash test"), key, TEST_CHAIN_ID);
 
         let hash1 = tx.id(TEST_CHAIN_ID);
         let hash2 = tx.id(TEST_CHAIN_ID);
@@ -336,8 +266,8 @@ mod tests {
         let key2 = PrivateKey::new();
         let data = b"identical data";
 
-        let tx1 = Transaction::builder(Bytes::new(data), key1, TEST_CHAIN_ID).build();
-        let tx2 = Transaction::builder(Bytes::new(data), key2, TEST_CHAIN_ID).build();
+        let tx1 = new_tx(Bytes::new(data), key1, TEST_CHAIN_ID);
+        let tx2 = new_tx(Bytes::new(data), key2, TEST_CHAIN_ID);
 
         let hash1 = tx1.id(TEST_CHAIN_ID);
         let hash2 = tx2.id(TEST_CHAIN_ID);

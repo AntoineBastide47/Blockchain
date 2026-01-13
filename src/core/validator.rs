@@ -8,6 +8,7 @@ use crate::core::transaction::Transaction;
 use crate::crypto::key_pair::Address;
 use crate::storage::state_store::AccountStorage;
 use crate::storage::storage_trait::Storage;
+use crate::types::hash::Hash;
 use blockchain_derive::Error;
 use std::error::Error;
 use std::fmt::Debug;
@@ -54,10 +55,12 @@ pub enum BlockValidatorError {
     PreviousHashMismatch,
     #[error("block already exists")]
     BlockExists,
-    #[error("invalid block signature")]
-    InvalidSignature,
-    #[error("invalid transaction signature")]
-    InvalidTransactionSignature,
+    #[error("invalid block signature: block={0}")]
+    InvalidSignature(Hash),
+    #[error("invalid transaction signature in block: block={0}")]
+    InvalidTransactionSignature(Hash),
+    #[error("invalid merkle root in block: block={0}")]
+    InvalidMerkleRoot(Hash),
     #[error("nonce mismatch: expected {expected}, got {actual}")]
     NonceMismatch { expected: u64, actual: u64 },
     #[error("insufficient balance: balance={balance}, required={required}")]
@@ -86,7 +89,9 @@ impl Validator for BlockValidator {
         chain_id: u64,
     ) -> Result<(), Self::Error> {
         if !transaction.verify(chain_id) {
-            return Err(BlockValidatorError::InvalidTransactionSignature);
+            return Err(BlockValidatorError::InvalidTransactionSignature(
+                transaction.id(chain_id),
+            ));
         }
 
         if transaction.gas_limit == 0 {
@@ -137,11 +142,7 @@ impl Validator for BlockValidator {
             return Err(BlockValidatorError::BlockExists);
         }
 
-        if !block.verify(chain_id) {
-            return Err(BlockValidatorError::InvalidSignature);
-        }
-
-        Ok(())
+        block.verify(chain_id)
     }
 }
 
@@ -150,28 +151,16 @@ mod tests {
     use super::*;
     use crate::core::account::Account;
     use crate::core::block::{Block, Header};
-    use crate::core::transaction::Transaction;
+    use crate::core::transaction::TransactionType;
     use crate::crypto::key_pair::PrivateKey;
     use crate::storage::storage_trait::StorageError;
     use crate::storage::test_storage::test::TestStorage;
     use crate::types::bytes::Bytes;
     use crate::types::hash::Hash;
-    use crate::utils::test_utils::utils::{create_genesis, random_hash};
+    use crate::utils::test_utils::utils::{create_genesis, create_test_block, new_tx, random_hash};
     use std::sync::Arc;
 
     const TEST_CHAIN_ID: u64 = 872539;
-
-    fn create_block(height: u64, previous: Hash) -> Arc<Block> {
-        let header = Header {
-            version: 1,
-            height,
-            timestamp: 0,
-            previous_block: previous,
-            merkle_root: Hash::zero(),
-            state_root: random_hash(),
-        };
-        Block::new(header, PrivateKey::new(), vec![], TEST_CHAIN_ID)
-    }
 
     #[test]
     fn valid_block_accepted() {
@@ -179,7 +168,7 @@ mod tests {
         let storage = TestStorage::new(genesis.clone(), TEST_CHAIN_ID);
         let validator = BlockValidator;
 
-        let block = create_block(1, genesis.header_hash(TEST_CHAIN_ID));
+        let block = create_test_block(1, genesis.header_hash(TEST_CHAIN_ID), TEST_CHAIN_ID);
         assert!(
             validator
                 .validate_block(&block, &storage, TEST_CHAIN_ID)
@@ -193,7 +182,7 @@ mod tests {
         let storage = TestStorage::new(genesis.clone(), TEST_CHAIN_ID);
         let validator = BlockValidator;
 
-        let block = create_block(5, genesis.header_hash(TEST_CHAIN_ID));
+        let block = create_test_block(5, genesis.header_hash(TEST_CHAIN_ID), TEST_CHAIN_ID);
         assert!(
             validator
                 .validate_block(&block, &storage, TEST_CHAIN_ID)
@@ -207,7 +196,7 @@ mod tests {
         let storage = TestStorage::new(genesis.clone(), TEST_CHAIN_ID);
         let validator = BlockValidator;
 
-        let block = create_block(1, random_hash());
+        let block = create_test_block(1, random_hash(), TEST_CHAIN_ID);
         assert!(
             validator
                 .validate_block(&block, &storage, TEST_CHAIN_ID)
@@ -220,7 +209,7 @@ mod tests {
         let storage = EmptyStorage;
         let validator = BlockValidator;
 
-        let block = create_block(0, Hash::zero());
+        let block = create_test_block(0, Hash::zero(), TEST_CHAIN_ID);
         assert!(
             validator
                 .validate_block(&block, &storage, TEST_CHAIN_ID)
@@ -235,12 +224,19 @@ mod tests {
         let sender = key.public_key().address();
         storage.set_account(sender, Account::new(10_000));
 
-        let tx = Transaction::builder(Bytes::new(b"ok"), key, TEST_CHAIN_ID)
-            .with_gas_limit(1)
-            .with_fee(1)
-            .with_amount(5)
-            .build();
-
+        let tx = Transaction::new(
+            Address::zero(),
+            None,
+            Bytes::new(b"ok"),
+            5,
+            1,
+            0,
+            1,
+            0,
+            key,
+            TEST_CHAIN_ID,
+            TransactionType::TransferFunds,
+        );
         let validator = BlockValidator;
         assert!(validator.validate_tx(&tx, &storage, TEST_CHAIN_ID).is_ok());
     }
@@ -250,8 +246,7 @@ mod tests {
         let storage = TestStorage::new(create_genesis(TEST_CHAIN_ID), TEST_CHAIN_ID);
         let key1 = PrivateKey::new();
         let key2 = PrivateKey::new();
-        let mut tx = Transaction::builder(Bytes::new(b"bad"), key1, TEST_CHAIN_ID).build();
-        // Break the signature by swapping the public key.
+        let mut tx = new_tx(Bytes::new(b"bad"), key1, TEST_CHAIN_ID);
         tx.from = key2.public_key();
 
         let validator = BlockValidator;
@@ -260,7 +255,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            BlockValidatorError::InvalidTransactionSignature
+            BlockValidatorError::InvalidTransactionSignature(..)
         ));
     }
 
@@ -271,10 +266,19 @@ mod tests {
         let sender = key.public_key().address();
         storage.set_account(sender, Account::new(100));
 
-        let tx = Transaction::builder(Bytes::new(b"payload"), key, TEST_CHAIN_ID)
-            .with_nonce(1)
-            .with_gas_limit(1)
-            .build();
+        let tx = Transaction::new(
+            Address::zero(),
+            None,
+            Bytes::new(b"payload"),
+            0,
+            0,
+            0,
+            1,
+            1,
+            key,
+            TEST_CHAIN_ID,
+            TransactionType::TransferFunds,
+        );
 
         let validator = BlockValidator;
         let err = validator
@@ -290,11 +294,19 @@ mod tests {
         let sender = key.public_key().address();
         storage.set_account(sender, Account::new(5));
 
-        let tx = Transaction::builder(Bytes::new(b"pay"), key, TEST_CHAIN_ID)
-            .with_amount(10)
-            .with_fee(1)
-            .with_gas_limit(1)
-            .build();
+        let tx = Transaction::new(
+            Address::zero(),
+            None,
+            Bytes::new(b"pay"),
+            10,
+            1,
+            0,
+            1,
+            0,
+            key,
+            TEST_CHAIN_ID,
+            TransactionType::TransferFunds,
+        );
 
         let validator = BlockValidator;
         let err = validator
@@ -313,10 +325,7 @@ mod tests {
         let sender = key.public_key().address();
         storage.set_account(sender, Account::new(100));
 
-        let tx = Transaction::builder(Bytes::new(b"gasless"), key, TEST_CHAIN_ID)
-            .with_gas_limit(0)
-            .build();
-
+        let tx = new_tx(Bytes::new(b"gasless"), key, TEST_CHAIN_ID);
         let validator = BlockValidator;
         let err = validator
             .validate_tx(&tx, &storage, TEST_CHAIN_ID)
@@ -326,7 +335,7 @@ mod tests {
 
     struct EmptyStorage;
     impl Storage for EmptyStorage {
-        fn new(_genesis: Arc<Block>, _chain_id: u64) -> Self {
+        fn new(_genesis: Block, _chain_id: u64) -> Self {
             Self
         }
 
@@ -339,7 +348,7 @@ mod tests {
         fn get_block(&self, _: Hash) -> Option<Arc<Block>> {
             None
         }
-        fn append_block(&self, _: Arc<Block>, _: u64) -> Result<(), StorageError> {
+        fn append_block(&self, _: Block, _: u64) -> Result<(), StorageError> {
             Ok(())
         }
         fn height(&self) -> u64 {

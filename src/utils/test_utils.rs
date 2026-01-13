@@ -3,13 +3,13 @@
 #[cfg(test)]
 pub mod utils {
     use crate::core::block::{Block, Header};
-    use crate::crypto::key_pair::PrivateKey;
+    use crate::core::transaction::{Transaction, TransactionType};
+    use crate::crypto::key_pair::{Address, PrivateKey};
     use crate::network::rpc::Rpc;
     use crate::types::bytes::Bytes;
     use crate::types::hash::{HASH_LEN, Hash};
     use libp2p::Multiaddr;
     use std::net::{IpAddr, SocketAddr};
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -31,7 +31,7 @@ pub mod utils {
     ///
     /// Uses a random validator key and random data hash to ensure
     /// test isolation between runs.
-    pub fn create_genesis(chain_id: u64) -> Arc<Block> {
+    pub fn create_genesis(chain_id: u64) -> Block {
         let header = Header {
             version: 1,
             height: 0,
@@ -82,5 +82,39 @@ pub mod utils {
         };
         multiaddr.push(libp2p::multiaddr::Protocol::Tcp(addr.port()));
         multiaddr
+    }
+
+    /// Creates a minimal transaction for testing with zero values.
+    ///
+    /// Uses [`TransactionType::TransferFunds`] with zero amount, fee, gas, and nonce.
+    pub fn new_tx(data: Bytes, key: PrivateKey, chain_id: u64) -> Transaction {
+        Transaction::new(
+            Address::zero(),
+            None,
+            data,
+            0,
+            0,
+            0,
+            0,
+            0,
+            key,
+            chain_id,
+            TransactionType::TransferFunds,
+        )
+    }
+
+    /// Creates an empty block at the specified height for testing.
+    ///
+    /// Uses a random validator key and fixed timestamp with zero merkle and state roots.
+    pub fn create_test_block(height: u64, previous: Hash, chain_id: u64) -> Block {
+        let header = Header {
+            version: 1,
+            height,
+            timestamp: 1234567890,
+            previous_block: previous,
+            merkle_root: Hash::zero(),
+            state_root: Hash::zero(),
+        };
+        Block::new(header, PrivateKey::new(), vec![], chain_id)
     }
 }

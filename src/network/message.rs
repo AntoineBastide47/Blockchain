@@ -76,10 +76,9 @@ pub struct SendBlocksMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::block::Header;
-    use crate::crypto::key_pair::PrivateKey;
     use crate::types::encoding::{Decode, Encode};
     use crate::types::hash::Hash;
+    use crate::utils::test_utils::utils::create_test_block;
 
     const TEST_CHAIN_ID: u64 = 10;
 
@@ -183,23 +182,10 @@ mod tests {
         assert!(decoded.blocks.is_empty());
     }
 
-    fn create_test_block(height: u64, previous: Hash) -> Block {
-        let header = Header {
-            version: 1,
-            height,
-            timestamp: 1234567890,
-            previous_block: previous,
-            merkle_root: Hash::zero(),
-            state_root: Hash::zero(),
-        };
-        let block = Block::new(header, PrivateKey::new(), vec![], TEST_CHAIN_ID);
-        (*block).clone()
-    }
-
     #[test]
     fn send_blocks_message_with_blocks() {
-        let block1 = create_test_block(1, Hash::zero());
-        let block2 = create_test_block(2, block1.header_hash(TEST_CHAIN_ID));
+        let block1 = create_test_block(1, Hash::zero(), TEST_CHAIN_ID);
+        let block2 = create_test_block(2, block1.header_hash(TEST_CHAIN_ID), TEST_CHAIN_ID);
 
         let msg = SendBlocksMessage {
             blocks: vec![block1.clone(), block2.clone()],

@@ -1,7 +1,7 @@
 //! Core blockchain data structure and block management.
 
 use crate::core::block::{Block, Header};
-use crate::core::transaction::Transaction;
+use crate::core::transaction::{Transaction, TransactionType};
 use crate::core::validator::{BlockValidator, Validator};
 use crate::crypto::key_pair::PrivateKey;
 use crate::info;
@@ -12,7 +12,6 @@ use crate::storage::storage_trait::{Storage, StorageError};
 use crate::types::encoding::Encode;
 use crate::types::hash::Hash;
 use crate::types::merkle_tree::MerkleTree;
-use crate::virtual_machine::errors::VMError;
 use crate::virtual_machine::program::Program;
 use crate::virtual_machine::state::{OverlayState, State};
 use crate::virtual_machine::vm::{ExecContext, VM};
@@ -39,7 +38,7 @@ impl Blockchain<BlockValidator, MainStorage> {
     ///
     /// The `id` parameter is the chain identifier used for transaction signing
     /// and verification, preventing replay attacks across different chains.
-    pub fn new(id: u64, genesis: Arc<Block>) -> Self {
+    pub fn new(id: u64, genesis: Block) -> Self {
         info!(
             "initializing blockchain with genesis block: height={} hash={} transactions={}",
             genesis.header.height,
@@ -78,51 +77,17 @@ impl<V: Validator, S: Storage + VmStorage + AccountStorage + IterableState + Sta
         self.storage.get_block(hash)
     }
 
-    /// Builds a new block linked to the current tip.
+    /// Computes a deterministic contract identifier from a deployment transaction.
     ///
-    /// Automatically sets the correct `previous_block` hash and `height`.
-    pub fn build_block(
-        &self,
-        validator: PrivateKey,
-        transactions: Vec<Transaction>,
-    ) -> Result<Arc<Block>, VMError> {
-        let base_state = self.storage.state_view();
-        let mut overlay = OverlayState::new(&base_state);
-
-        for tx in &transactions {
-            self.execute_tx(tx, &mut overlay)?;
-        }
-
-        let header = Header {
-            version: 1,
-            height: self.storage.height() + 1,
-            timestamp: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0),
-            previous_block: self.storage.tip(),
-            merkle_root: MerkleTree::from_transactions(&transactions, self.id),
-            state_root: Self::compute_state_root(&self.storage, &overlay),
-        };
-
-        Ok(Block::new(header, validator, transactions, self.id))
-    }
-
-    fn execute_tx<T: State>(
-        &self,
-        transaction: &Transaction,
-        tx_overlay: &mut OverlayState<T>,
-    ) -> Result<(), VMError> {
-        let program = Program::from_bytes(transaction.data.as_slice())?;
-        let mut vm = VM::new(program);
-        let contract_bytes = transaction.from.to_bytes();
-        let ctx = ExecContext {
-            chain_id: self.id,
-            contract_id: contract_bytes.as_slice(), // TODO: use real smart contract id
-        };
-
-        // Execute tx in its own overlay, reading from current block overlay
-        vm.run(tx_overlay, &ctx)
+    /// The ID is derived from the sender, nonce, and bytecode, ensuring each
+    /// deployment produces a unique address even with identical code.
+    fn contract_id(transaction: &Transaction) -> Hash {
+        let mut h = Hash::sha3();
+        h.update(b"SMART_CONTRACT");
+        transaction.from.encode(&mut h);
+        transaction.nonce.encode(&mut h);
+        transaction.data.encode(&mut h);
+        h.finalize()
     }
 
     /// Validates and executes a single transaction into the provided block overlay.
@@ -140,8 +105,25 @@ impl<V: Validator, S: Storage + VmStorage + AccountStorage + IterableState + Sta
             .map_err(|e| StorageError::ValidationFailed(e.to_string()))?;
 
         let mut tx_overlay = OverlayState::new(block_overlay);
-        self.execute_tx(transaction, &mut tx_overlay)
-            .map_err(|e| StorageError::VMError(e.to_string()))?;
+        let _gas = match transaction.tx_type {
+            // TODO: charge gas
+            TransactionType::TransferFunds => Ok(0), // TODO
+            TransactionType::DeployContract => {
+                let program = Program::from_bytes(transaction.data.as_slice())
+                    .map_err(|e| StorageError::VMError(e.to_string()))?;
+                let mut vm = VM::new(program);
+                let ctx = ExecContext {
+                    chain_id: self.id,
+                    contract_id: Self::contract_id(transaction),
+                };
+
+                // Execute tx in its own overlay, reading from current block overlay
+                vm.run(&mut tx_overlay, &ctx)
+                    .map_err(|e| StorageError::VMError(e.to_string()))?;
+                Ok(vm.gas_used())
+            }
+            TransactionType::InvokeContract => Ok(0), // TODO
+        }?;
 
         // Merge tx writes into block overlay
         for (k, v) in tx_overlay.into_writes() {
@@ -154,12 +136,72 @@ impl<V: Validator, S: Storage + VmStorage + AccountStorage + IterableState + Sta
         Ok(())
     }
 
+    /// Executes all transactions in a block and computes the resulting state root.
+    ///
+    /// Returns the block overlay containing all state changes and the computed
+    /// state root hash for inclusion in the block header.
+    fn execute_block<'a>(
+        &self,
+        base: &'a StateView<'a, S>,
+        txs: &[Transaction],
+    ) -> Result<(OverlayState<'a, StateView<'a, S>>, Hash), StorageError> {
+        let mut block_overlay = OverlayState::new(base);
+
+        for tx in txs {
+            self.apply_tx(tx, &mut block_overlay)?;
+        }
+
+        let root = Self::compute_state_root(&self.storage, &block_overlay);
+        Ok((block_overlay, root))
+    }
+
+    /// Builds, executes, and commits a new block linked to the current tip.
+    ///
+    /// Executes all transactions, computes the state root, signs the block,
+    /// commits state changes to storage, and appends the block to the chain.
+    pub fn build_block(
+        &self,
+        validator: PrivateKey,
+        transactions: Vec<Transaction>,
+    ) -> Result<Block, StorageError> {
+        let base = self.storage.state_view();
+        let (block_overlay, state_root) = self.execute_block(&base, &transactions)?;
+
+        let header = Header {
+            version: 1,
+            height: self.storage.height() + 1,
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0),
+            previous_block: self.storage.tip(),
+            merkle_root: MerkleTree::from_transactions(&transactions, self.id),
+            state_root,
+        };
+
+        let block = Block::new(header, validator, transactions, self.id);
+
+        info!(
+            "adding a new block to the chain: height={} hash={} transactions={}",
+            block.header.height,
+            block.header_hash(self.id),
+            block.transactions.len()
+        );
+
+        // Commit writes to canonical storage store
+        self.storage.apply_batch(block_overlay.into_writes());
+        self.storage.set_state_root(state_root);
+        self.storage.append_block(block.clone(), self.id)?;
+
+        Ok(block)
+    }
+
     /// Validates and applies an entire block to the chain state.
     ///
     /// Performs block-level validation, executes each transaction into a block
     /// overlay (after per-tx validation), checks the resulting state_root, then
     /// commits the writes and appends the block.
-    pub fn apply_block(&self, block: Arc<Block>) -> Result<(), StorageError> {
+    pub fn apply_block(&self, block: Block) -> Result<(), StorageError> {
         let hash = block.header_hash(self.id);
         if self.has_block(hash) {
             return Err(StorageError::ValidationFailed(
@@ -195,7 +237,6 @@ impl<V: Validator, S: Storage + VmStorage + AccountStorage + IterableState + Sta
         // Commit writes to canonical storage store
         self.storage.apply_batch(block_overlay.into_writes());
         self.storage.set_state_root(computed_root);
-
         self.storage.append_block(block, self.id)
     }
 
@@ -239,12 +280,11 @@ mod tests {
     use super::*;
     use crate::core::block::Header;
     use crate::crypto::key_pair::PrivateKey;
-    use crate::storage::test_storage::test::{StorageExtForTests, TestStorage};
+    use crate::storage::test_storage::test::TestStorage;
     use crate::types::bytes::Bytes;
     use crate::types::hash::Hash;
     use crate::types::merkle_tree::MerkleTree;
-    use crate::utils::test_utils::utils::{create_genesis, random_hash};
-    use crate::warn;
+    use crate::utils::test_utils::utils::{create_genesis, new_tx, random_hash};
     use blockchain_derive::Error;
 
     const TEST_CHAIN_ID: u64 = 93;
@@ -267,39 +307,17 @@ mod tests {
 
     pub fn add_block_mut<
         V: Validator,
-        S: Storage
-            + VmStorage
-            + AccountStorage
-            + IterableState
-            + StorageExtForTests
-            + StateViewProvider,
+        S: Storage + VmStorage + AccountStorage + IterableState + StateViewProvider,
     >(
         chain: &mut Blockchain<V, S>,
-        block: Arc<Block>,
+        block: Block,
     ) -> Result<(), StorageError> {
         match chain
             .validator
             .validate_block(&block, &chain.storage, TEST_CHAIN_ID)
         {
-            Ok(_) => {
-                info!(
-                    "adding a new block to the chain: height={} hash={} transactions={}",
-                    block.header.height,
-                    block.header_hash(chain.id),
-                    block.transactions.len()
-                );
-
-                chain.storage.append_block_mut(block, chain.id);
-                Ok(())
-            }
-            Err(err) => {
-                warn!(
-                    "block rejected: hash={} error={}",
-                    block.header_hash(chain.id),
-                    err
-                );
-                Err(StorageError::ValidationFailed(err.to_string()))
-            }
+            Ok(_) => chain.storage.append_block(block, chain.id),
+            Err(err) => Err(StorageError::ValidationFailed(err.to_string())),
         }
     }
 
@@ -420,7 +438,7 @@ mod tests {
     #[test]
     fn add_blocks() {
         let genesis = create_genesis(TEST_CHAIN_ID);
-        let mut bc = with_validator_and_storage(
+        let bc = with_validator_and_storage(
             TEST_CHAIN_ID,
             AcceptAllValidator,
             TestStorage::new(genesis.clone(), TEST_CHAIN_ID),
@@ -428,14 +446,14 @@ mod tests {
 
         let block_count = 100;
         for _i in 1..=block_count {
-            let block = bc.build_block(PrivateKey::new(), vec![]).expect("VMError:");
-            assert!(add_block_mut(&mut bc, block).is_ok());
+            bc.build_block(PrivateKey::new(), vec![])
+                .expect("build_block failed");
         }
 
         assert_eq!(bc.height(), block_count);
 
-        let block = bc.build_block(PrivateKey::new(), vec![]).expect("VMError:");
-        assert!(add_block_mut(&mut bc, block).is_ok());
+        bc.build_block(PrivateKey::new(), vec![])
+            .expect("build_block failed");
         assert_eq!(bc.height(), block_count + 1);
     }
 
@@ -472,7 +490,7 @@ mod tests {
         let storage = TestStorage::new(genesis.clone(), TEST_CHAIN_ID);
         let bc = with_validator_and_storage(TEST_CHAIN_ID, RejectingTxValidator, storage);
 
-        let tx = Transaction::builder(Bytes::new(b"any"), PrivateKey::new(), TEST_CHAIN_ID).build();
+        let tx = new_tx(Bytes::new(b"any"), PrivateKey::new(), TEST_CHAIN_ID);
         let header = Header {
             version: 1,
             height: 1,

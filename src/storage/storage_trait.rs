@@ -28,7 +28,7 @@ pub enum StorageError {
 /// concurrent access from multiple network handlers.
 pub trait Storage: Send + Sync {
     /// Creates a new storage instance initialized with the genesis block.
-    fn new(genesis: Arc<Block>, chain_id: u64) -> Self;
+    fn new(genesis: Block, chain_id: u64) -> Self;
 
     /// Returns `true` if a block with the given hash exists.
     fn has_block(&self, hash: Hash) -> bool;
@@ -40,7 +40,7 @@ pub trait Storage: Send + Sync {
     fn get_block(&self, hash: Hash) -> Option<Arc<Block>>;
 
     /// Appends a block to storage and updates the chain tip (thread-safe).
-    fn append_block(&self, block: Arc<Block>, chain_id: u64) -> Result<(), StorageError>;
+    fn append_block(&self, block: Block, chain_id: u64) -> Result<(), StorageError>;
 
     /// Returns the current chain height (genesis = 0).
     fn height(&self) -> u64;

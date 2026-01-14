@@ -21,14 +21,17 @@
 //!
 //! The passphrase is read from `NODE_PASSPHRASE` env var, or prompted if not set.
 
+use blockchain::core::account::Account;
 use blockchain::core::transaction::{Transaction, TransactionType};
-use blockchain::crypto::key_pair::{PrivateKey, load_or_generate_validator_key};
+use blockchain::crypto::key_pair::{
+    Address, PrivateKey, PublicKey, load_or_generate_validator_key,
+};
 use blockchain::network::libp2p_transport::Libp2pTransport;
 use blockchain::network::message::{Message, MessageType};
 use blockchain::network::rpc::Rpc;
 use blockchain::network::server::{DEV_CHAIN_ID, Server};
 use blockchain::network::transport::Transport;
-use blockchain::types::encoding::Encode;
+use blockchain::types::encoding::{Decode, Encode};
 use blockchain::virtual_machine::assembler::assemble_file;
 use blockchain::virtual_machine::vm::TRANSACTION_GAS_LIMIT;
 use blockchain::{error, info, warn};
@@ -36,11 +39,21 @@ use rpassword::prompt_password;
 use std::env;
 use std::net::SocketAddr;
 use std::process;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc::channel;
 use tokio::sync::oneshot;
 use tokio::time::sleep;
 use zeroize::Zeroizing;
+
+// Add your public key here to test as a validator
+const GENESIS_VALIDATORS: &[(&[u8], u128)] = &[(
+    &[
+        95, 169, 138, 128, 215, 203, 132, 243, 127, 227, 2, 228, 236, 243, 221, 50, 71, 174, 227,
+        201, 119, 121, 236, 243, 230, 151, 10, 172, 44, 10, 250, 59,
+    ],
+    10u128.pow(20),
+)];
 
 #[tokio::main]
 async fn main() {
@@ -138,9 +151,30 @@ async fn main() {
         None
     };
 
-    // Start server
-    let server = Server::new(transport, Duration::new(5, 0), validator_key, None).await;
+    let validators: Vec<(Address, Account)> = GENESIS_VALIDATORS
+        .iter()
+        .map(|(pub_key_bytes, balance)| {
+            let pubkey = PublicKey::from_bytes(pub_key_bytes).expect("invalid public key");
+            (pubkey.address(), Account::new(*balance))
+        })
+        .collect();
+
+    warn!("Validator list:");
+    for (addr, acc) in &validators {
+        warn!(" - {}: {}", addr, acc.balance());
+    }
+
+    let server = Server::new(
+        transport,
+        Duration::new(5, 0),
+        validator_key.clone(),
+        None,
+        &validators,
+    )
+    .await;
     let server_clone = server.clone();
+
+    // Start server
     let (sx, rx) = channel::<Rpc>(1024);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let server_handle = tokio::spawn(async move {
@@ -187,12 +221,16 @@ async fn main() {
 
     // If validator: periodically craft and broadcast a dummy transaction.
     if validator_mode {
+        static TX_NONCE: AtomicU64 = AtomicU64::new(0);
+
         let server_for_txs = server.clone();
         tokio::spawn(async move {
             loop {
                 let data = assemble_file("main.asm")
                     .expect("assembly failed")
                     .to_bytes();
+
+                let nonce = TX_NONCE.fetch_add(1, Ordering::Relaxed);
 
                 // Build a fully populated transaction for the demo.
                 let tx = Transaction::new(
@@ -201,10 +239,10 @@ async fn main() {
                     data,
                     0,
                     0,
-                    0,
+                    10u128.pow(9),
                     TRANSACTION_GAS_LIMIT,
-                    0,
-                    PrivateKey::new(),
+                    nonce,
+                    validator_key.clone().unwrap(),
                     DEV_CHAIN_ID,
                     TransactionType::DeployContract,
                 );

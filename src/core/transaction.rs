@@ -43,6 +43,7 @@ pub struct Transaction {
     pub amount: u128,
     /// Max fee the sender is willing to pay for inclusion.
     pub fee: u128,
+
     /// Price per gas unit offered by the sender.
     pub gas_price: u128,
     /// Maximum gas the sender authorizes for execution.
@@ -111,16 +112,16 @@ impl Transaction {
         gas_price: u128,
         gas_limit: u64,
         nonce: u64,
-        key: PrivateKey,
+        from: PrivateKey,
         chain_id: u64,
         tx_type: TransactionType,
     ) -> Self {
         let data = data.into();
-        let from = key.public_key();
+        let from_pk = from.public_key();
 
         let signing_hash = Transaction::signing_hash_from_parts(
             chain_id,
-            &from,
+            &from_pk,
             &recipient,
             &gas_sponsor,
             &data,
@@ -133,8 +134,8 @@ impl Transaction {
         );
 
         Transaction {
-            from,
-            signature: key.sign(signing_hash.as_slice()),
+            from: from_pk,
+            signature: from.sign(signing_hash.as_slice()),
             cached_id: HashCache::new(),
             recipient,
             gas_sponsor,

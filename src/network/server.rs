@@ -2,17 +2,18 @@
 //!
 //! Processes incoming RPCs from the server's transport in a unified event loop.
 
+use crate::core::account::Account;
 use crate::core::block::{Block, Header};
 use crate::core::blockchain::Blockchain;
 use crate::core::transaction::Transaction;
 use crate::core::validator::BlockValidator;
-use crate::crypto::key_pair::PrivateKey;
+use crate::crypto::key_pair::{Address, PrivateKey};
 use crate::network::message::{
     GetBlocksMessage, Message, MessageType, SendBlocksMessage, SendStatusMessage,
 };
 use crate::network::rpc::{DecodedMessage, DecodedMessageData, Rpc, RpcError, RpcProcessor};
 use crate::network::transport::{Multiaddr, PeerId, Transport, TransportError};
-use crate::storage::main_storage::MainStorage;
+use crate::storage::main_storage::{MainStorage, Smt, SmtValue, h256_to_hash, hash_to_h256};
 use crate::storage::storage_trait::StorageError;
 use crate::storage::txpool::TxPool;
 use crate::types::bytes::Bytes;
@@ -20,6 +21,8 @@ use crate::types::encoding::{Decode, Encode};
 use crate::types::hash::Hash;
 use crate::types::wrapper_types::BoxFuture;
 use crate::{error, info, warn};
+use sparse_merkle_tree::H256;
+use sparse_merkle_tree::default_store::DefaultStore;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
@@ -91,14 +94,21 @@ pub struct Server<T: Transport> {
 
 impl<T: Transport> Server<T> {
     /// The genesis block, lazily initialized once and shared across all server instances.
-    pub fn genesis_block(chain_id: u64) -> Block {
+    pub fn genesis_block(chain_id: u64, initial_accounts: &[(Address, Account)]) -> Block {
+        let mut state = Smt::new(H256::zero(), DefaultStore::default());
+        for (addr, account) in initial_accounts {
+            state
+                .update(hash_to_h256(addr), SmtValue(account.to_bytes().to_vec()))
+                .expect("smt update failed");
+        }
+
         let header = Header {
             version: 1,
             height: 0,
             timestamp: 0,
             previous_block: Hash::zero(),
             merkle_root: Hash::zero(),
-            state_root: Hash::zero(),
+            state_root: h256_to_hash(state.root()),
         };
 
         let genesis_key = PrivateKey::from_bytes(&GENESIS_PRIVATE_KEY_BYTES)
@@ -115,6 +125,7 @@ impl<T: Transport> Server<T> {
         block_time: Duration,
         private_key: Option<PrivateKey>,
         transaction_pool_capacity: Option<usize>,
+        initial_accounts: &[(Address, Account)],
     ) -> Arc<Self> {
         let is_validator = private_key.is_some();
         let chain_id = DEV_CHAIN_ID;
@@ -125,7 +136,11 @@ impl<T: Transport> Server<T> {
             is_validator,
             tx_pool: TxPool::new(transaction_pool_capacity),
             block_time,
-            chain: Blockchain::new(chain_id, Self::genesis_block(chain_id)),
+            chain: Blockchain::new(
+                chain_id,
+                Self::genesis_block(chain_id, initial_accounts),
+                initial_accounts,
+            ),
         })
     }
 
@@ -555,7 +570,7 @@ mod tests {
         transport: Arc<T>,
         block_time: Duration,
     ) -> Arc<Server<T>> {
-        Server::new(transport, block_time, None, None).await
+        Server::new(transport, block_time, None, None, &[]).await
     }
 
     /// Atomic port counter to ensure unique ports across parallel tests.
@@ -582,6 +597,7 @@ mod tests {
             Duration::from_secs(10),
             Some(PrivateKey::new()),
             None,
+            &[],
         )
         .await;
         assert!(server.is_validator);
@@ -602,6 +618,7 @@ mod tests {
             Duration::from_secs(10),
             Some(PrivateKey::new()),
             None,
+            &[],
         )
         .await;
 
@@ -913,6 +930,7 @@ mod tests {
             Duration::from_secs(10),
             Some(PrivateKey::new()),
             None,
+            &[],
         )
         .await;
 
@@ -1032,8 +1050,14 @@ mod tests {
 
         // Use a builder server to create valid blocks with correct state_root
         let peer_b = tr_b.peer_id();
-        let server_builder =
-            Server::new(tr_b, Duration::from_secs(10), Some(PrivateKey::new()), None).await;
+        let server_builder = Server::new(
+            tr_b,
+            Duration::from_secs(10),
+            Some(PrivateKey::new()),
+            None,
+            &[],
+        )
+        .await;
 
         let block = server_builder
             .chain
@@ -1063,8 +1087,14 @@ mod tests {
 
         // Use a builder server to create valid blocks with correct state_root
         let peer_b = tr_b.peer_id();
-        let server_builder =
-            Server::new(tr_b, Duration::from_secs(10), Some(PrivateKey::new()), None).await;
+        let server_builder = Server::new(
+            tr_b,
+            Duration::from_secs(10),
+            Some(PrivateKey::new()),
+            None,
+            &[],
+        )
+        .await;
 
         // Build block 1
         let block1 = server_builder
@@ -1104,6 +1134,7 @@ mod tests {
             Duration::from_secs(10),
             Some(validator_key.clone()),
             None,
+            &[],
         )
         .await;
 
@@ -1300,6 +1331,7 @@ mod tests {
             Duration::from_secs(10),
             Some(validator_key.clone()),
             None,
+            &[],
         )
         .await;
 
@@ -1371,6 +1403,7 @@ mod tests {
             Duration::from_secs(10),
             Some(validator_key.clone()),
             None,
+            &[],
         )
         .await;
 

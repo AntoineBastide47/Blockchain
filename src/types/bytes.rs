@@ -1,6 +1,7 @@
 //! Reference-counted byte buffer with copy-on-write semantics.
 
 use crate::types::encoding::{Decode, DecodeError, Encode, EncodeSink};
+use std::fmt::{Display, Formatter};
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -91,6 +92,12 @@ impl Decode for Bytes {
             vec.push(u8::decode(input)?);
         }
         Ok(Bytes::from_vec(vec))
+    }
+}
+
+impl Display for Bytes {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.0)
     }
 }
 

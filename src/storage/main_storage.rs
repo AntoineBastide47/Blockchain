@@ -1,7 +1,7 @@
 use crate::core::account::Account;
 use crate::core::block::{Block, Header};
 use crate::crypto::key_pair::Address;
-use crate::storage::state_store::{AccountStorage, IterableState, StateStore, VmStorage};
+use crate::storage::state_store::{AccountStorage, StateStore, VmStorage};
 use crate::storage::state_view::{StateView, StateViewProvider};
 use crate::storage::storage_trait::{Storage, StorageError};
 use crate::types::encoding::{Decode, Encode};
@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 
 /// Wrapper type for byte vectors stored in the sparse Merkle tree.
 #[derive(Default, Clone)]
-struct SmtValue(Vec<u8>);
+pub struct SmtValue(pub Vec<u8>);
 
 impl Value for SmtValue {
     fn to_h256(&self) -> H256 {
@@ -32,6 +32,8 @@ impl Value for SmtValue {
     }
 }
 
+pub type Smt = SparseMerkleTree<Blake2bHasher, SmtValue, DefaultStore<SmtValue>>;
+
 struct Inner {
     /// Block headers indexed by hash.
     headers: HashMap<Hash, Header>,
@@ -40,7 +42,7 @@ struct Inner {
     /// Hash of the current chain tip.
     tip: Hash,
     /// Key-value storage for VM execution.
-    state: SparseMerkleTree<Blake2bHasher, SmtValue, DefaultStore<SmtValue>>,
+    state: Smt,
     /// Root hash of the current storage.
     state_root: Hash,
 }
@@ -55,13 +57,29 @@ pub struct MainStorage {
 }
 
 impl Storage for MainStorage {
-    fn new(genesis: Block, chain_id: u64) -> Self {
+    fn new(genesis: Block, chain_id: u64, initial_accounts: &[(Address, Account)]) -> Self {
         let mut headers = HashMap::new();
         let mut blocks = HashMap::new();
 
-        let genesis_hash = genesis.header_hash(chain_id);
-        let state_root = genesis.header.state_root;
+        let mut state = Smt::new(H256::zero(), DefaultStore::default());
+        for (addr, account) in initial_accounts {
+            state
+                .update(hash_to_h256(addr), SmtValue(account.to_bytes().to_vec()))
+                .expect("smt update failed");
+        }
 
+        let state_root = h256_to_hash(state.root());
+        if state_root != genesis.header.state_root {
+            panic!(
+                "Creating storage failed: {}",
+                StorageError::ValidationFailed(format!(
+                    "state_root mismatch: expected {} and got {state_root}",
+                    genesis.header.state_root,
+                ))
+            )
+        }
+
+        let genesis_hash = genesis.header_hash(chain_id);
         headers.insert(genesis_hash, genesis.header.clone());
         blocks.insert(genesis_hash, Arc::new(genesis));
 
@@ -69,7 +87,7 @@ impl Storage for MainStorage {
             headers,
             blocks,
             tip: genesis_hash,
-            state: SparseMerkleTree::default(),
+            state,
             state_root,
         };
 
@@ -130,25 +148,43 @@ impl Storage for MainStorage {
     }
 }
 
-fn hash_to_h256(hash: &Hash) -> H256 {
+pub fn hash_to_h256(hash: &Hash) -> H256 {
     H256::from(hash.0)
 }
 
-fn h256_to_hash(h256: &H256) -> Hash {
+pub fn h256_to_hash(h256: &H256) -> Hash {
     Hash::from_slice(h256.as_slice()).unwrap_or_else(Hash::zero)
 }
 
 impl StateStore for MainStorage {
+    fn preview_root(&self, writes: &[(Hash, Option<Vec<u8>>)]) -> Hash {
+        let inner = self.inner.lock().unwrap();
+        let clone = inner.state.store().clone();
+        let mut state = Smt::new(*inner.state.root(), clone);
+
+        for (key, value_opt) in writes {
+            let val = match value_opt {
+                Some(v) => SmtValue(v.clone()),
+                None => SmtValue::zero(),
+            };
+            state
+                .update(hash_to_h256(key), val)
+                .expect("SMT update failed");
+        }
+        h256_to_hash(state.root())
+    }
+
     fn apply_batch(&self, writes: Vec<(Hash, Option<Vec<u8>>)>) {
         let mut inner = self.inner.lock().unwrap();
 
         for (key, value_opt) in writes {
-            let new_root = inner
+            inner
                 .state
                 .update(hash_to_h256(&key), SmtValue(value_opt.unwrap_or_default()))
                 .expect("SMT update failed");
-            inner.state_root = h256_to_hash(new_root);
         }
+
+        inner.state_root = h256_to_hash(inner.state.root());
     }
 
     fn state_root(&self) -> Hash {
@@ -166,10 +202,6 @@ impl VmStorage for MainStorage {
             .filter(|v| !v.0.is_empty())
             .map(|v| v.0)
     }
-
-    fn set_state_root(&self, root: Hash) {
-        self.inner.lock().unwrap().state_root = root;
-    }
 }
 
 impl AccountStorage for MainStorage {
@@ -183,30 +215,12 @@ impl AccountStorage for MainStorage {
             .and_then(|v| Account::decode(&mut v.0.as_slice()).ok())
     }
 
-    fn set_account(&mut self, addr: Address, account: Account) {
+    fn set_account(&self, addr: Address, account: Account) {
         self.apply_batch(vec![(addr, Some(account.to_vec()))]);
     }
 
-    fn delete_account(&mut self, addr: Address) {
+    fn delete_account(&self, addr: Address) {
         self.apply_batch(vec![(addr, None)]);
-    }
-}
-
-impl IterableState for MainStorage {
-    fn iter_all(&self) -> Box<dyn Iterator<Item = (Hash, Vec<u8>)> + '_> {
-        let snapshot: Vec<(Hash, Vec<u8>)> = {
-            let inner = self.inner.lock().unwrap();
-            inner
-                .state
-                .store()
-                .leaves_map()
-                .iter()
-                .filter(|(_, v)| !v.0.is_empty())
-                .map(|(k, v)| (h256_to_hash(k), v.0.clone()))
-                .collect()
-        };
-
-        Box::new(snapshot.into_iter())
     }
 }
 
@@ -222,7 +236,7 @@ impl StateViewProvider for MainStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::state_store::{IterableState, VmStorage};
+    use crate::storage::state_store::VmStorage;
     use crate::utils::test_utils::utils::{create_genesis, create_test_block, random_hash};
     use std::thread;
 
@@ -234,11 +248,15 @@ mod tests {
         h.finalize()
     }
 
+    fn main_storage(block: Block) -> MainStorage {
+        MainStorage::new(block, TEST_CHAIN_ID, &[])
+    }
+
     #[test]
     fn new_initializes_with_genesis() {
         let genesis = create_genesis(TEST_CHAIN_ID);
         let hash = genesis.header_hash(TEST_CHAIN_ID);
-        let storage = MainStorage::new(genesis, TEST_CHAIN_ID);
+        let storage = main_storage(genesis);
 
         assert_eq!(storage.height(), 0);
         assert_eq!(storage.tip(), hash);
@@ -248,7 +266,7 @@ mod tests {
     #[test]
     fn append_and_retrieve() {
         let genesis = create_genesis(TEST_CHAIN_ID);
-        let storage = MainStorage::new(genesis.clone(), TEST_CHAIN_ID);
+        let storage = main_storage(genesis.clone());
 
         let block1 = create_test_block(1, genesis.header_hash(TEST_CHAIN_ID), TEST_CHAIN_ID);
         assert!(storage.append_block(block1.clone(), TEST_CHAIN_ID).is_ok());
@@ -261,7 +279,7 @@ mod tests {
     #[test]
     fn concurrent_reads() {
         let genesis = create_genesis(TEST_CHAIN_ID);
-        let storage = Arc::new(MainStorage::new(genesis.clone(), TEST_CHAIN_ID));
+        let storage = Arc::new(main_storage(genesis.clone()));
         let hash = genesis.header_hash(TEST_CHAIN_ID);
 
         let handles: Vec<_> = (0..10)
@@ -285,7 +303,7 @@ mod tests {
     #[test]
     fn rejects_block_not_on_tip() {
         let genesis = create_genesis(TEST_CHAIN_ID);
-        let storage = MainStorage::new(genesis, TEST_CHAIN_ID);
+        let storage = main_storage(genesis);
 
         let orphan = create_test_block(1, random_hash(), TEST_CHAIN_ID);
         assert!(storage.append_block(orphan, TEST_CHAIN_ID).is_err());
@@ -294,7 +312,7 @@ mod tests {
     #[test]
     fn chain_of_blocks() {
         let genesis = create_genesis(TEST_CHAIN_ID);
-        let storage = MainStorage::new(genesis.clone(), TEST_CHAIN_ID);
+        let storage = main_storage(genesis.clone());
 
         let mut prev_hash = genesis.header_hash(TEST_CHAIN_ID);
         for i in 1..=10 {
@@ -310,14 +328,14 @@ mod tests {
     #[test]
     fn state_store_get_returns_none_for_missing_key() {
         let genesis = create_genesis(TEST_CHAIN_ID);
-        let storage = MainStorage::new(genesis, TEST_CHAIN_ID);
+        let storage = main_storage(genesis);
         assert_eq!(VmStorage::get(&storage, h(b"missing")), None);
     }
 
     #[test]
     fn state_store_apply_batch_inserts_and_deletes() {
         let genesis = create_genesis(TEST_CHAIN_ID);
-        let storage = MainStorage::new(genesis, TEST_CHAIN_ID);
+        let storage = main_storage(genesis);
 
         let key1 = h(b"key1");
         let key2 = h(b"key2");
@@ -333,36 +351,5 @@ mod tests {
         storage.apply_batch(vec![(key1, None)]);
         assert_eq!(VmStorage::get(&storage, key1), None);
         assert_eq!(VmStorage::get(&storage, key2), Some(b"value2".to_vec()));
-    }
-
-    #[test]
-    fn state_store_state_root_operations() {
-        let genesis = create_genesis(TEST_CHAIN_ID);
-        let storage = MainStorage::new(genesis.clone(), TEST_CHAIN_ID);
-
-        assert_eq!(storage.state_root(), genesis.header.state_root);
-
-        let new_root = random_hash();
-        storage.set_state_root(new_root);
-        assert_eq!(storage.state_root(), new_root);
-    }
-
-    #[test]
-    fn iterable_state_iter_all() {
-        let genesis = create_genesis(TEST_CHAIN_ID);
-        let storage = MainStorage::new(genesis, TEST_CHAIN_ID);
-
-        let key_a = h(b"a");
-        let key_b = h(b"b");
-
-        storage.apply_batch(vec![
-            (key_a, Some(b"1".to_vec())),
-            (key_b, Some(b"2".to_vec())),
-        ]);
-
-        let entries: Vec<_> = storage.iter_all().collect();
-        assert_eq!(entries.len(), 2);
-        assert!(entries.contains(&(key_a, b"1".to_vec())));
-        assert!(entries.contains(&(key_b, b"2".to_vec())));
     }
 }

@@ -3,7 +3,7 @@ pub mod test {
     use crate::core::account::Account;
     use crate::core::block::{Block, Header};
     use crate::crypto::key_pair::Address;
-    use crate::storage::state_store::{AccountStorage, IterableState, StateStore, VmStorage};
+    use crate::storage::state_store::{AccountStorage, StateStore, VmStorage};
     use crate::storage::state_view::{StateView, StateViewProvider};
     use crate::storage::storage_trait::{Storage, StorageError};
     use crate::types::encoding::{Decode, Encode};
@@ -26,7 +26,7 @@ pub mod test {
     }
 
     impl Storage for TestStorage {
-        fn new(genesis: Block, chain_id: u64) -> Self {
+        fn new(genesis: Block, chain_id: u64, _initial_accounts: &[(Address, Account)]) -> Self {
             let storage = Self {
                 headers: RwLock::new(HashMap::new()),
                 blocks: RwLock::new(HashMap::new()),
@@ -34,6 +34,9 @@ pub mod test {
                 state: RwLock::new(HashMap::new()),
                 state_root: RwLock::new(Hash::zero()),
             };
+            for (addr, acc) in _initial_accounts {
+                storage.set_account(*addr, acc.clone())
+            }
             storage
                 .append_block(genesis, chain_id)
                 .expect("append_block failed");
@@ -89,6 +92,35 @@ pub mod test {
     }
 
     impl StateStore for TestStorage {
+        fn preview_root(&self, writes: &[(Hash, Option<Vec<u8>>)]) -> Hash {
+            let mut state = self.state.write().unwrap().clone();
+            for (key, value) in writes {
+                match value {
+                    Some(v) => {
+                        state.insert(*key, v.clone());
+                    }
+                    None => {
+                        state.remove(key);
+                    }
+                }
+            }
+
+            // Recompute root deterministically from sorted entries.
+            let mut sorted = std::collections::BTreeMap::new();
+            for (k, v) in state.iter() {
+                sorted.insert(*k, v.clone());
+            }
+
+            let mut h = Hash::sha3();
+            h.update(b"STATE_ROOT");
+            for (k, v) in sorted {
+                k.encode(&mut h);
+                v.encode(&mut h);
+            }
+
+            h.finalize()
+        }
+
         fn apply_batch(&self, writes: Vec<(Hash, Option<Vec<u8>>)>) {
             let mut state = self.state.write().unwrap();
             for (key, value) in writes {
@@ -126,10 +158,6 @@ pub mod test {
         fn get(&self, key: Hash) -> Option<Vec<u8>> {
             self.state.read().unwrap().get(&key).cloned()
         }
-
-        fn set_state_root(&self, root: Hash) {
-            *self.state_root.write().unwrap() = root;
-        }
     }
 
     impl AccountStorage for TestStorage {
@@ -138,26 +166,12 @@ pub mod test {
                 .and_then(|bytes| Account::decode(&mut bytes.as_slice()).ok())
         }
 
-        fn set_account(&mut self, addr: Address, account: Account) {
+        fn set_account(&self, addr: Address, account: Account) {
             self.apply_batch(vec![(addr, Some(account.to_vec()))]);
         }
 
-        fn delete_account(&mut self, addr: Address) {
+        fn delete_account(&self, addr: Address) {
             self.apply_batch(vec![(addr, None)]);
-        }
-    }
-
-    impl IterableState for TestStorage {
-        fn iter_all(&self) -> Box<dyn Iterator<Item = (Hash, Vec<u8>)> + '_> {
-            let snapshot: Vec<(Hash, Vec<u8>)> = self
-                .state
-                .read()
-                .unwrap()
-                .iter()
-                .map(|(k, v)| (*k, v.clone()))
-                .collect();
-
-            Box::new(snapshot.into_iter())
         }
     }
 
@@ -172,11 +186,15 @@ pub mod test {
 
     const TEST_CHAIN_ID: u64 = 78909876543;
 
+    fn test_storage(block: Block) -> TestStorage {
+        TestStorage::new(block, TEST_CHAIN_ID, &[])
+    }
+
     #[test]
     fn new_initializes_with_genesis() {
         let genesis = create_genesis(TEST_CHAIN_ID);
         let hash = genesis.header_hash(TEST_CHAIN_ID);
-        let storage = TestStorage::new(genesis, TEST_CHAIN_ID);
+        let storage = test_storage(genesis);
 
         assert_eq!(storage.height(), 0);
         assert_eq!(storage.tip(), hash);
@@ -186,7 +204,7 @@ pub mod test {
     #[test]
     fn append_and_retrieve() {
         let genesis = create_genesis(TEST_CHAIN_ID);
-        let storage = TestStorage::new(genesis.clone(), TEST_CHAIN_ID);
+        let storage = test_storage(genesis.clone());
 
         let block1 = create_test_block(1, genesis.header_hash(TEST_CHAIN_ID), TEST_CHAIN_ID);
         storage.append_block(block1.clone(), TEST_CHAIN_ID).unwrap();
@@ -206,7 +224,7 @@ pub mod test {
     #[test]
     fn get_header() {
         let genesis = create_genesis(TEST_CHAIN_ID);
-        let storage = TestStorage::new(genesis.clone(), TEST_CHAIN_ID);
+        let storage = test_storage(genesis.clone());
 
         let header = storage
             .get_header(genesis.header_hash(TEST_CHAIN_ID))
@@ -217,7 +235,7 @@ pub mod test {
     #[test]
     fn get_nonexistent_block() {
         let genesis = create_genesis(TEST_CHAIN_ID);
-        let storage = TestStorage::new(genesis, TEST_CHAIN_ID);
+        let storage = test_storage(genesis);
 
         assert!(storage.get_block(random_hash()).is_none());
         assert!(storage.get_header(random_hash()).is_none());
@@ -227,9 +245,69 @@ pub mod test {
     #[should_panic(expected = "Block does not build on current tip")]
     fn rejects_block_not_on_tip() {
         let genesis = create_genesis(TEST_CHAIN_ID);
-        let storage = TestStorage::new(genesis, TEST_CHAIN_ID);
+        let storage = test_storage(genesis);
 
         let orphan = create_test_block(1, random_hash(), TEST_CHAIN_ID);
         storage.append_block(orphan, TEST_CHAIN_ID).unwrap();
+    }
+
+    fn h(data: &[u8]) -> Hash {
+        Hash::sha3().chain(data).finalize()
+    }
+
+    #[test]
+    fn preview_root_computes_without_modifying_state() {
+        let genesis = create_genesis(TEST_CHAIN_ID);
+        let storage = test_storage(genesis);
+
+        let key = h(b"test_key");
+        let writes = vec![(key, Some(b"value".to_vec()))];
+
+        let preview = storage.preview_root(&writes);
+        assert_ne!(preview, storage.state_root());
+        assert!(VmStorage::get(&storage, key).is_none());
+    }
+
+    #[test]
+    fn preview_root_matches_apply_batch_result() {
+        let genesis = create_genesis(TEST_CHAIN_ID);
+        let storage = test_storage(genesis.clone());
+
+        let key = h(b"test_key");
+        let writes = vec![(key, Some(b"value".to_vec()))];
+
+        let preview = storage.preview_root(&writes);
+
+        let storage2 = test_storage(genesis);
+        storage2.apply_batch(writes);
+
+        assert_eq!(preview, storage2.state_root());
+    }
+
+    #[test]
+    fn preview_root_handles_deletions() {
+        let genesis = create_genesis(TEST_CHAIN_ID);
+        let storage = test_storage(genesis);
+
+        let key = h(b"to_delete");
+        storage.apply_batch(vec![(key, Some(b"existing".to_vec()))]);
+        let root_with_key = storage.state_root();
+
+        let writes = vec![(key, None)];
+        let preview = storage.preview_root(&writes);
+
+        assert_ne!(preview, root_with_key);
+    }
+
+    #[test]
+    fn preview_root_with_empty_writes_matches_apply_batch() {
+        let genesis = create_genesis(TEST_CHAIN_ID);
+        let storage = test_storage(genesis);
+
+        storage.apply_batch(vec![]);
+        let root_after_empty_batch = storage.state_root();
+
+        let preview = storage.preview_root(&[]);
+        assert_eq!(preview, root_after_empty_batch);
     }
 }

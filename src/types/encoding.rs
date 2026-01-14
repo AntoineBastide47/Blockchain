@@ -100,7 +100,7 @@ pub trait Encode {
         out
     }
 
-    /// Serializes to a new Vec<u8> buffer with exact capacity.
+    /// Serializes to a new [`Vec<u8>`] buffer with exact capacity.
     ///
     /// Performs two passes: first to count bytes, then to encode.
     fn to_vec(&self) -> Vec<u8> {

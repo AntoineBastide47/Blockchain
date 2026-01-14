@@ -1,10 +1,13 @@
 //! Blockchain storage abstractions and implementations.
 //!
-//! Defines the [`Storage`] trait for persisting blocks and headers,
-//! along with [`InMemoryStorage`] for testing and development.
+//! Defines the [`Storage`] trait for persisting blocks and headers.
 
+use crate::core::account::Account;
 use crate::core::block::{Block, Header};
+use crate::crypto::key_pair::Address;
+use crate::types::encoding::DecodeError;
 use crate::types::hash::Hash;
+use crate::virtual_machine::errors::VMError;
 use blockchain_derive::Error;
 use std::sync::Arc;
 
@@ -20,6 +23,34 @@ pub enum StorageError {
     /// Virtual machine execution failed while processing transactions.
     #[error("{0}")]
     VMError(String),
+    /// Failed to decode data from storage.
+    #[error("{0}")]
+    DecodeError(String),
+    /// Account lookup failed for the given address.
+    #[error("no account exist for the given public_key={0}")]
+    MissingAccount(Hash),
+    /// Gas cost computation overflowed u128.
+    #[error(
+        "error computing gas cost in transaction, gas_used={gas_used} * gas_price={gas_price} > u128::MAX"
+    )]
+    ArithmeticOverflow { gas_used: u64, gas_price: u128 },
+    /// Account balance insufficient to cover gas costs.
+    #[error("insufficient balance in expected at least {expected} but got {actual}")]
+    InsufficientBalance { actual: u128, expected: u128 },
+    #[error("transaction gas limit and gas price can not be set to 0")]
+    InvalidTransactionGasParams,
+}
+
+impl From<VMError> for StorageError {
+    fn from(value: VMError) -> Self {
+        StorageError::VMError(value.to_string())
+    }
+}
+
+impl From<DecodeError> for StorageError {
+    fn from(value: DecodeError) -> Self {
+        StorageError::DecodeError(value.to_string())
+    }
 }
 
 /// Storage backend for blockchain data.
@@ -28,7 +59,7 @@ pub enum StorageError {
 /// concurrent access from multiple network handlers.
 pub trait Storage: Send + Sync {
     /// Creates a new storage instance initialized with the genesis block.
-    fn new(genesis: Block, chain_id: u64) -> Self;
+    fn new(genesis: Block, chain_id: u64, initial_accounts: &[(Address, Account)]) -> Self;
 
     /// Returns `true` if a block with the given hash exists.
     fn has_block(&self, hash: Hash) -> bool;

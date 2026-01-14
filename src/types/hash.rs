@@ -67,7 +67,7 @@ impl fmt::Display for Hash {
 
 /// Incremental SHA3-256 hash builder.
 ///
-/// Allows feeding data in chunks and finalizing to produce a [`Hash`].
+/// Allows feeding data in chunks and finalizing to produce a [`struct@Hash`].
 /// Implements [`EncodeSink`] so encodable types can be hashed directly
 /// without intermediate byte buffers.
 pub struct HashBuilder {
@@ -160,6 +160,11 @@ impl HashCache {
             Some((cached_chain_id, hash)) if cached_chain_id == chain_id => Some(hash),
             _ => None,
         }
+    }
+
+    /// Invalidates the cached hash, requiring it to be recomputed.
+    pub fn invalidate(&self) {
+        *self.cached.lock().unwrap() = None;
     }
 }
 
@@ -350,5 +355,45 @@ mod tests {
 
         assert!(cache.get(1).is_none());
         assert_eq!(cache.get(2), Some(make_hash(20)));
+    }
+
+    #[test]
+    fn hash_cache_invalidate_clears_cached_value() {
+        let cache = HashCache::new();
+        cache.get_or_compute(1, || make_hash(42));
+
+        assert!(cache.get(1).is_some());
+
+        cache.invalidate();
+
+        assert!(cache.get(1).is_none());
+    }
+
+    #[test]
+    fn hash_cache_invalidate_allows_recomputation() {
+        let cache = HashCache::new();
+        let mut call_count = 0;
+
+        cache.get_or_compute(1, || {
+            call_count += 1;
+            make_hash(10)
+        });
+
+        cache.invalidate();
+
+        cache.get_or_compute(1, || {
+            call_count += 1;
+            make_hash(20)
+        });
+
+        assert_eq!(call_count, 2);
+        assert_eq!(cache.get(1), Some(make_hash(20)));
+    }
+
+    #[test]
+    fn hash_cache_invalidate_on_empty_cache_is_noop() {
+        let cache = HashCache::new();
+        cache.invalidate();
+        assert!(cache.get(1).is_none());
     }
 }

@@ -3,10 +3,9 @@
 //! Provides the [`Validator`] trait for custom validation strategies
 //! and [`BlockValidator`] as the default implementation.
 
+use crate::core::account::Account;
 use crate::core::block::Block;
 use crate::core::transaction::Transaction;
-use crate::crypto::key_pair::Address;
-use crate::storage::state_store::AccountStorage;
 use crate::storage::storage_trait::Storage;
 use crate::types::encoding::Encode;
 use crate::types::hash::Hash;
@@ -20,10 +19,10 @@ use std::fmt::Debug;
 pub trait Validator: Send + Sync {
     type Error: Debug + Error;
 
-    fn validate_tx<S: AccountStorage>(
+    fn validate_tx(
         &self,
         transaction: &Transaction,
-        storage: &S,
+        account: &Account,
         chain_id: u64,
     ) -> Result<(), Self::Error>;
 
@@ -88,10 +87,10 @@ pub const MAX_TX_BYTE_SIZE: usize = 100_000;
 impl Validator for BlockValidator {
     type Error = BlockValidatorError;
 
-    fn validate_tx<S: AccountStorage>(
+    fn validate_tx(
         &self,
         transaction: &Transaction,
-        storage: &S,
+        account: &Account,
         chain_id: u64,
     ) -> Result<(), Self::Error> {
         if transaction.gas_limit == 0 {
@@ -112,13 +111,7 @@ impl Validator for BlockValidator {
             ));
         }
 
-        let sender: Address = transaction.from.address();
-        let account = storage.get_account(sender);
-        let (balance, expected_nonce) = match account {
-            Some(acc) => (acc.balance(), acc.nonce()),
-            None => (0, 0),
-        };
-
+        let expected_nonce = account.nonce();
         if transaction.nonce != expected_nonce {
             return Err(BlockValidatorError::NonceMismatch {
                 expected: expected_nonce,
@@ -126,6 +119,7 @@ impl Validator for BlockValidator {
             });
         }
 
+        let balance = account.balance();
         let required = transaction.amount.saturating_add(transaction.fee);
         if balance < required {
             return Err(BlockValidatorError::InsufficientBalance { balance, required });
@@ -166,7 +160,7 @@ mod tests {
     use crate::core::account::Account;
     use crate::core::block::{Block, Header};
     use crate::core::transaction::TransactionType;
-    use crate::crypto::key_pair::PrivateKey;
+    use crate::crypto::key_pair::{Address, PrivateKey};
     use crate::storage::storage_trait::StorageError;
     use crate::storage::test_storage::test::TestStorage;
     use crate::types::bytes::Bytes;
@@ -176,10 +170,14 @@ mod tests {
 
     const TEST_CHAIN_ID: u64 = 872539;
 
+    fn test_storage(block: Block) -> TestStorage {
+        TestStorage::new(block, TEST_CHAIN_ID, &[])
+    }
+
     #[test]
     fn valid_block_accepted() {
         let genesis = create_genesis(TEST_CHAIN_ID);
-        let storage = TestStorage::new(genesis.clone(), TEST_CHAIN_ID);
+        let storage = test_storage(genesis.clone());
         let validator = BlockValidator;
 
         let block = create_test_block(1, genesis.header_hash(TEST_CHAIN_ID), TEST_CHAIN_ID);
@@ -193,7 +191,7 @@ mod tests {
     #[test]
     fn wrong_height_rejected() {
         let genesis = create_genesis(TEST_CHAIN_ID);
-        let storage = TestStorage::new(genesis.clone(), TEST_CHAIN_ID);
+        let storage = test_storage(genesis.clone());
         let validator = BlockValidator;
 
         let block = create_test_block(5, genesis.header_hash(TEST_CHAIN_ID), TEST_CHAIN_ID);
@@ -207,7 +205,7 @@ mod tests {
     #[test]
     fn wrong_previous_hash_rejected() {
         let genesis = create_genesis(TEST_CHAIN_ID);
-        let storage = TestStorage::new(genesis.clone(), TEST_CHAIN_ID);
+        let storage = test_storage(genesis.clone());
         let validator = BlockValidator;
 
         let block = create_test_block(1, random_hash(), TEST_CHAIN_ID);
@@ -233,10 +231,8 @@ mod tests {
 
     #[test]
     fn validate_tx_accepts_valid_signature() {
-        let mut storage = TestStorage::new(create_genesis(TEST_CHAIN_ID), TEST_CHAIN_ID);
         let key = PrivateKey::new();
-        let sender = key.public_key().address();
-        storage.set_account(sender, Account::new(10_000));
+        let account = Account::new(10_000);
 
         let tx = Transaction::new(
             Address::zero(),
@@ -252,21 +248,21 @@ mod tests {
             TransactionType::TransferFunds,
         );
         let validator = BlockValidator;
-        assert!(validator.validate_tx(&tx, &storage, TEST_CHAIN_ID).is_ok());
+        assert!(validator.validate_tx(&tx, &account, TEST_CHAIN_ID).is_ok());
     }
 
     #[test]
     fn validate_tx_rejects_invalid_signature() {
-        let storage = TestStorage::new(create_genesis(TEST_CHAIN_ID), TEST_CHAIN_ID);
         let key1 = PrivateKey::new();
         let key2 = PrivateKey::new();
+        let account = Account::new(100);
         let mut tx = new_tx(Bytes::new(b"bad"), key1, TEST_CHAIN_ID);
         tx.gas_limit = 1;
         tx.from = key2.public_key();
 
         let validator = BlockValidator;
         let err = validator
-            .validate_tx(&tx, &storage, TEST_CHAIN_ID)
+            .validate_tx(&tx, &account, TEST_CHAIN_ID)
             .unwrap_err();
         assert!(matches!(
             err,
@@ -276,10 +272,8 @@ mod tests {
 
     #[test]
     fn validate_tx_rejects_nonce_mismatch() {
-        let mut storage = TestStorage::new(create_genesis(TEST_CHAIN_ID), TEST_CHAIN_ID);
         let key = PrivateKey::new();
-        let sender = key.public_key().address();
-        storage.set_account(sender, Account::new(100));
+        let account = Account::new(100);
 
         let tx = Transaction::new(
             Address::zero(),
@@ -297,17 +291,15 @@ mod tests {
 
         let validator = BlockValidator;
         let err = validator
-            .validate_tx(&tx, &storage, TEST_CHAIN_ID)
+            .validate_tx(&tx, &account, TEST_CHAIN_ID)
             .unwrap_err();
         assert!(matches!(err, BlockValidatorError::NonceMismatch { .. }));
     }
 
     #[test]
     fn validate_tx_rejects_insufficient_balance() {
-        let mut storage = TestStorage::new(create_genesis(TEST_CHAIN_ID), TEST_CHAIN_ID);
         let key = PrivateKey::new();
-        let sender = key.public_key().address();
-        storage.set_account(sender, Account::new(5));
+        let account = Account::new(5);
 
         let tx = Transaction::new(
             Address::zero(),
@@ -325,7 +317,7 @@ mod tests {
 
         let validator = BlockValidator;
         let err = validator
-            .validate_tx(&tx, &storage, TEST_CHAIN_ID)
+            .validate_tx(&tx, &account, TEST_CHAIN_ID)
             .unwrap_err();
         assert!(matches!(
             err,
@@ -335,22 +327,20 @@ mod tests {
 
     #[test]
     fn validate_tx_rejects_zero_gas_limit() {
-        let mut storage = TestStorage::new(create_genesis(TEST_CHAIN_ID), TEST_CHAIN_ID);
         let key = PrivateKey::new();
-        let sender = key.public_key().address();
-        storage.set_account(sender, Account::new(100));
+        let account = Account::new(100);
 
         let tx = new_tx(Bytes::new(b"gasless"), key, TEST_CHAIN_ID);
         let validator = BlockValidator;
         let err = validator
-            .validate_tx(&tx, &storage, TEST_CHAIN_ID)
+            .validate_tx(&tx, &account, TEST_CHAIN_ID)
             .unwrap_err();
         assert!(matches!(err, BlockValidatorError::InvalidGasLimit));
     }
 
     struct EmptyStorage;
     impl Storage for EmptyStorage {
-        fn new(_genesis: Block, _chain_id: u64) -> Self {
+        fn new(_genesis: Block, _chain_id: u64, _: &[(Address, Account)]) -> Self {
             Self
         }
 

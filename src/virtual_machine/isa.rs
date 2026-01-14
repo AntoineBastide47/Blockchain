@@ -1,6 +1,6 @@
 //! Instruction Set Architecture (ISA) definitions.
 //!
-//! Defines the VM's instruction set. The [`for_each_instruction!`] macro holds
+//! Defines the VM's instruction set. The [`for_each_instruction!`](crate::for_each_instruction) macro holds
 //! the canonical instruction definitions and invokes a callback macro for code
 //! generation. This enables multiple modules to generate instruction-related
 //! code without duplicating definitions.
@@ -200,9 +200,6 @@ macro_rules! define_instructions {
             }
 
             /// Returns the base gas cost for this instruction.
-            ///
-            /// For dynamic gas calculation, use a [`GasCalculator`] implementation
-            /// which combines this base cost with runtime context.
             pub const fn base_gas(&self) -> u64 {
                 match self {
                     $( Instruction::$name => $gas, )*

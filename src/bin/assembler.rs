@@ -12,14 +12,25 @@
 //!
 //! # Options
 //! - `-o, --output <file>`: Output file path (defaults to `<input>.bin`)
+//! - `-p, --predict <price>`: Estimate deployment gas cost with given gas price
 //!
 //! # Examples
 //! ```text
 //! assembler program.asm
 //! assembler program.asm -o output.bin
+//! assembler program.asm -p true 100
 //! ```
 
+use blockchain::network::libp2p_transport::Libp2pTransport;
+use blockchain::network::server::Server;
+use blockchain::storage::main_storage::MainStorage;
+use blockchain::storage::state_view::StateViewProvider;
+use blockchain::storage::storage_trait::Storage;
+use blockchain::types::hash::Hash;
 use blockchain::virtual_machine::assembler::assemble_file;
+use blockchain::virtual_machine::state::OverlayState;
+use blockchain::virtual_machine::vm::{ExecContext, TRANSACTION_GAS_LIMIT, VM};
+use blockchain::{error, info, warn};
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -35,6 +46,8 @@ fn main() {
 
     let input_path = &args[1];
     let mut output_path: Option<String> = None;
+    let mut predict = false;
+    let mut gas_price = 0u64;
 
     let mut i = 2;
     while i < args.len() {
@@ -42,14 +55,27 @@ fn main() {
             k @ ("--output" | "-o") => {
                 i += 1;
                 if i >= args.len() {
-                    eprintln!("{k} requires an argument");
+                    error!("{k} requires an argument");
                     process::exit(1);
                 }
                 output_path = Some(args[i].clone());
                 i += 1;
             }
+            k @ ("--predict" | "-p") => {
+                i += 1;
+                if i >= args.len() {
+                    error!("{k} requires an argument");
+                    process::exit(1);
+                }
+                predict = true;
+                gas_price = args[i].parse::<u64>().unwrap_or_else(|_| {
+                    error!("Invalid gas price: '{}' is not a valid number", args[i]);
+                    process::exit(1);
+                });
+                i += 1;
+            }
             other => {
-                eprintln!("Unexpected argument: {}\n", other);
+                error!("Unexpected argument: {}\n", other);
                 print_usage(&args[0]);
                 process::exit(1);
             }
@@ -57,7 +83,7 @@ fn main() {
     }
 
     if !Path::new(input_path).exists() {
-        eprintln!("Input file does not exist: {}", input_path);
+        error!("Input file does not exist: {}", input_path);
         process::exit(1);
     }
 
@@ -75,14 +101,14 @@ fn main() {
         && !parent.as_os_str().is_empty()
         && !parent.exists()
     {
-        eprintln!("Output directory does not exist: {}", parent.display());
+        error!("Output directory does not exist: {}", parent.display());
         process::exit(1);
     }
 
     let program = match assemble_file(input_path) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("Assembly failed: {}", e);
+            error!("Assembly failed: {}", e);
             process::exit(1);
         }
     };
@@ -90,16 +116,112 @@ fn main() {
     let bytecode = program.to_bytes();
 
     if let Err(e) = fs::write(&output_path, bytecode.to_vec()) {
-        eprintln!("Failed to write output file: {}", e);
+        error!("Failed to write output file: {}", e);
         process::exit(1);
     }
 
-    println!(
+    info!(
         "Compiled {} -> {} ({} bytes)",
         input_path,
         output_path,
         bytecode.len()
     );
+
+    if predict {
+        let mut vm = VM::new(program, TRANSACTION_GAS_LIMIT).unwrap_or_else(|e| {
+            error!("{e}");
+            process::exit(1)
+        });
+
+        let ms = MainStorage::new(Server::<Libp2pTransport>::genesis_block(0, &[]), 0, &[]);
+        let base = ms.state_view();
+        let mut overlay = OverlayState::new(&base);
+
+        let ctx = ExecContext {
+            chain_id: 0,
+            contract_id: Hash::zero(),
+        };
+
+        vm.run(&mut overlay, &ctx).unwrap_or_else(|e| {
+            error!("{e}");
+            process::exit(1)
+        });
+
+        let profile = vm.gas_profile();
+        let total_u = profile.total();
+        let total = total_u as f64;
+
+        let cat_w = 2 + profile
+            .iter()
+            .map(|(c, _)| c.as_str().chars().count())
+            .max()
+            .unwrap_or(0)
+            .max("total".chars().count());
+
+        let amt_w = profile
+            .iter()
+            .map(|(_, a)| format_with_commas(a).chars().count())
+            .max()
+            .unwrap_or(0)
+            .max(format_with_commas(total_u).chars().count());
+
+        let dash_w = cat_w + 1 + amt_w + 2 + "( 100.0%)".len();
+
+        println!("Gas Profile:");
+        println!("{}", "-".repeat(dash_w));
+
+        for (category, amount) in profile.iter() {
+            if amount == 0 {
+                continue;
+            }
+
+            let percent = if total > 0.0 {
+                (amount as f64 / total) * 100.0
+            } else {
+                0.0
+            };
+
+            let line = format!(
+                "{:<cat_w$} {:>amt_w$} ({:>5.1}%)",
+                category.as_str(),
+                format_with_commas(amount),
+                percent,
+                cat_w = cat_w,
+                amt_w = amt_w,
+            );
+            println!("{line}");
+        }
+
+        println!("{}", "-".repeat(dash_w));
+
+        let total_line = format!(
+            "{:<cat_w$} {:>amt_w$} ({:>5.1}%)",
+            "total",
+            format_with_commas(total_u),
+            100.0,
+            cat_w = cat_w,
+            amt_w = amt_w,
+        );
+        println!("{total_line}");
+
+        info!(
+            "Estimated deployment cost: {}",
+            format_with_commas(vm.gas_used() * gas_price)
+        );
+        warn!("Actual cost will depend on chain state.");
+    }
+}
+
+fn format_with_commas(n: u64) -> String {
+    let s = n.to_string();
+    let mut result = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            result.push(',');
+        }
+        result.push(c);
+    }
+    result
 }
 
 const USAGE: &str = "\
@@ -113,6 +235,7 @@ ARGS:
 
 OPTIONS:
     -o, --output <file>    Output file path (defaults to <input>.bin)
+    -p, --predict <price>  Estimate deployment gas cost (requires gas price)
     -h, --help             Print this help message
 
 EXAMPLES:
@@ -121,8 +244,11 @@ EXAMPLES:
 
     # Compile with explicit output
     {program} program.asm -o output.bin
+
+    # Compile and estimate gas cost
+    {program} program.asm -p 100
 ";
 
 fn print_usage(program: &str) {
-    eprintln!("{}", USAGE.replace("{program}", program));
+    info!("{}", USAGE.replace("{program}", program));
 }

@@ -155,6 +155,10 @@ pub mod test {
     }
 
     impl VmStorage for TestStorage {
+        fn contains_key(&self, key: Hash) -> bool {
+            self.state.read().unwrap().contains_key(&key)
+        }
+
         fn get(&self, key: Hash) -> Option<Vec<u8>> {
             self.state.read().unwrap().get(&key).cloned()
         }

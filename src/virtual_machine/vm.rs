@@ -10,6 +10,123 @@ use crate::virtual_machine::isa::Instruction;
 use crate::virtual_machine::program::Program;
 use crate::virtual_machine::state::State;
 
+/// Categories of gas consumption for profiling and debugging.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum GasCategory {
+    /// Initial contract deployment cost (base + bytecode size).
+    Deploy,
+    /// Base cost for executing opcodes.
+    OpcodeBase,
+    /// Cost for accessing registers (tiered by register index).
+    RegisterAccess,
+    /// Cost for deriving state storage keys.
+    StateKeyDerivation,
+    /// Cost for writing to state storage.
+    StateStore,
+    /// Cost for reading from state storage.
+    StateRead,
+    /// Cost for heap allocations (strings, hashes).
+    HeapAllocation,
+    /// Cost for function call overhead (arguments, stack depth).
+    CallOverhead,
+    /// Cost for host function execution.
+    HostFunction,
+}
+
+impl GasCategory {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            GasCategory::Deploy => "Deployment",
+            GasCategory::OpcodeBase => "Opcode Base",
+            GasCategory::RegisterAccess => "Register Access",
+            GasCategory::StateKeyDerivation => "State Key Derivation",
+            GasCategory::StateStore => "State Store",
+            GasCategory::StateRead => "State Read",
+            GasCategory::HeapAllocation => "Heap Allocation",
+            GasCategory::CallOverhead => "Call Overhead",
+            GasCategory::HostFunction => "Host Function",
+        }
+    }
+}
+
+/// Gas consumption profile for debugging and optimization.
+///
+/// Tracks how gas is distributed across different execution categories,
+/// enabling developers to identify expensive operations in their contracts.
+#[derive(Clone, Debug, Default)]
+pub struct GasProfile {
+    deploy: u64,
+    opcode_base: u64,
+    register_access: u64,
+    state_key_derivation: u64,
+    state_store: u64,
+    state_read: u64,
+    heap_allocation: u64,
+    call_overhead: u64,
+    host_function: u64,
+}
+
+impl GasProfile {
+    /// Creates a new empty gas profile.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds gas to the specified category.
+    fn add(&mut self, category: GasCategory, amount: u64) {
+        match category {
+            GasCategory::Deploy => self.deploy = self.deploy.saturating_add(amount),
+            GasCategory::OpcodeBase => self.opcode_base = self.opcode_base.saturating_add(amount),
+            GasCategory::RegisterAccess => {
+                self.register_access = self.register_access.saturating_add(amount)
+            }
+            GasCategory::StateKeyDerivation => {
+                self.state_key_derivation = self.state_key_derivation.saturating_add(amount)
+            }
+            GasCategory::StateStore => self.state_store = self.state_store.saturating_add(amount),
+            GasCategory::StateRead => self.state_read = self.state_read.saturating_add(amount),
+            GasCategory::HeapAllocation => {
+                self.heap_allocation = self.heap_allocation.saturating_add(amount)
+            }
+            GasCategory::CallOverhead => {
+                self.call_overhead = self.call_overhead.saturating_add(amount)
+            }
+            GasCategory::HostFunction => {
+                self.host_function = self.host_function.saturating_add(amount)
+            }
+        }
+    }
+
+    /// Returns the total gas across all categories.
+    pub fn total(&self) -> u64 {
+        self.deploy
+            .saturating_add(self.opcode_base)
+            .saturating_add(self.register_access)
+            .saturating_add(self.state_key_derivation)
+            .saturating_add(self.state_store)
+            .saturating_add(self.state_read)
+            .saturating_add(self.heap_allocation)
+            .saturating_add(self.call_overhead)
+            .saturating_add(self.host_function)
+    }
+
+    /// Returns an iterator over all categories and their gas costs.
+    pub fn iter(&self) -> impl Iterator<Item = (GasCategory, u64)> {
+        [
+            (GasCategory::Deploy, self.deploy),
+            (GasCategory::OpcodeBase, self.opcode_base),
+            (GasCategory::RegisterAccess, self.register_access),
+            (GasCategory::StateKeyDerivation, self.state_key_derivation),
+            (GasCategory::StateStore, self.state_store),
+            (GasCategory::StateRead, self.state_read),
+            (GasCategory::HeapAllocation, self.heap_allocation),
+            (GasCategory::CallOverhead, self.call_overhead),
+            (GasCategory::HostFunction, self.host_function),
+        ]
+        .into_iter()
+    }
+}
+
 /// Maximum gas allowed for a single transaction execution.
 pub const TRANSACTION_GAS_LIMIT: u64 = 1_000_000;
 /// Maximum cumulative gas allowed for all transactions in a block.
@@ -302,14 +419,17 @@ pub struct VM {
     gas_used: u64,
     /// Maximum gas allowed for this execution; exceeding it triggers `OutOfGas`.
     max_gas: u64,
+    /// Gas consumption breakdown by category.
+    gas_profile: GasProfile,
 }
 
 /// impl block for basic VM functions
 impl VM {
     /// Creates a new VM instance with the given program and gas limits.
     ///
-    /// Immediately charges `init_cost` gas. Returns `OutOfGas` if `init_cost` exceeds `max_gas`.
-    pub fn new(program: Program, init_cost: u64, max_gas: u64) -> Result<Self, VMError> {
+    /// Returns `OutOfGas` if the base cost of creating the smart contract exceeds `max_gas`.
+    pub fn new(program: Program, max_gas: u64) -> Result<Self, VMError> {
+        let bytes = program.bytecode.len();
         let mut vm = Self {
             data: program.bytecode,
             ip: 0,
@@ -318,9 +438,10 @@ impl VM {
             call_stack: Vec::new(),
             gas_used: 0,
             max_gas,
+            gas_profile: GasProfile::new(),
         };
 
-        vm.charge_gas(init_cost)?;
+        vm.charge_gas_categorized(20_000 + bytes as u64 * 200, GasCategory::Deploy)?;
         Ok(vm)
     }
 
@@ -336,7 +457,10 @@ impl VM {
     ) -> Result<Hash, VMError> {
         let prefix = b"STATE";
         let id = &chain_id.to_le_bytes();
-        self.charge_gas((prefix.len() + id.len() + HASH_LEN + user_key.len()) as u64)?;
+        self.charge_gas_categorized(
+            (prefix.len() + id.len() + HASH_LEN + user_key.len()) as u64,
+            GasCategory::StateKeyDerivation,
+        )?;
         Ok(Hash::sha3()
             .chain(prefix)
             .chain(id)
@@ -350,12 +474,22 @@ impl VM {
         self.gas_used
     }
 
-    /// Adds gas to the running total and checks against the transaction limit.
+    /// Returns a reference to the gas profile for this execution.
+    pub fn gas_profile(&self) -> &GasProfile {
+        &self.gas_profile
+    }
+
+    /// Adds gas to the running total with category tracking.
     ///
     /// Returns [`VMError::OutOfGas`] if the cumulative usage exceeds self.max_gas.
-    fn charge_gas(&mut self, increment: u64) -> Result<(), VMError> {
-        self.gas_used = self.gas_used.saturating_add(increment);
+    fn charge_gas_categorized(
+        &mut self,
+        increment: u64,
+        category: GasCategory,
+    ) -> Result<(), VMError> {
+        self.gas_profile.add(category, increment);
 
+        self.gas_used = self.gas_used.saturating_add(increment);
         if self.gas_used > self.max_gas {
             return Err(VMError::OutOfGas {
                 used: self.gas_used,
@@ -368,7 +502,7 @@ impl VM {
 
     /// Charges the base gas cost for the given instruction.
     fn charge_base(&mut self, instruction: Instruction) -> Result<(), VMError> {
-        self.charge_gas(instruction.base_gas())
+        self.charge_gas_categorized(instruction.base_gas(), GasCategory::OpcodeBase)
     }
 
     /// Charges gas for a function call based on argument count and call stack depth.
@@ -381,7 +515,10 @@ impl VM {
         call_depth: usize,
         depth_gas_cost: u64,
     ) -> Result<(), VMError> {
-        self.charge_gas(argc as u64 * arg_gas_cost + call_depth as u64 * depth_gas_cost)
+        self.charge_gas_categorized(
+            argc as u64 * arg_gas_cost + call_depth as u64 * depth_gas_cost,
+            GasCategory::CallOverhead,
+        )
     }
 
     /// Returns the gas cost for accessing a register based on its index tier.
@@ -405,7 +542,10 @@ impl VM {
 
     /// Charges gas for accessing the specified register.
     fn charge_register(&mut self, register: u8) -> Result<(), VMError> {
-        self.charge_gas(Self::register_gas_fee(register))
+        self.charge_gas_categorized(
+            Self::register_gas_fee(register),
+            GasCategory::RegisterAccess,
+        )
     }
 }
 
@@ -455,7 +595,7 @@ impl VM {
     ///
     /// Charges gas proportional to the item's byte length.
     fn heap_index(&mut self, item: Vec<u8>) -> Result<u32, VMError> {
-        self.charge_gas(item.len() as u64)?;
+        self.charge_gas_categorized(item.len() as u64, GasCategory::HeapAllocation)?;
         Ok(self.heap.index(item))
     }
 
@@ -465,16 +605,15 @@ impl VM {
     /// Returns [`VMError::InvalidUtf8`] if the bytes are not valid UTF-8.
     fn heap_get_string(&mut self, id: u32) -> Result<String, VMError> {
         let size = self.heap.get_raw_ref(id)?.len();
-        self.charge_gas(size as u64)?;
+        self.charge_gas_categorized(size as u64, GasCategory::HeapAllocation)?;
         self.heap.get_string(id)
     }
 
-    /// Retrieves a string from the heap by reference index with gas charging.
+    /// Retrieves a hash from the heap by reference index with gas charging.
     ///
-    /// Charges gas proportional to the string's byte length.
-    /// Returns [`VMError::InvalidUtf8`] if the bytes are not valid UTF-8.
+    /// Charges gas proportional to the hash's byte length.
     fn heap_get_hash(&mut self, id: u32) -> Result<Hash, VMError> {
-        self.charge_gas(HASH_LEN as u64)?;
+        self.charge_gas_categorized(HASH_LEN as u64, GasCategory::HeapAllocation)?;
         self.heap.get_hash(id)
     }
 
@@ -487,7 +626,20 @@ impl VM {
         key: Hash,
         item: Vec<u8>,
     ) -> Result<(), VMError> {
-        self.charge_gas((HASH_LEN as u64 + item.len() as u64) * STORE_BYTE_COST)?;
+        // Charge extra gas for creating a new state key
+        self.charge_gas_categorized(
+            20_000 * (!state.contains_key(key)) as u64,
+            GasCategory::StateStore,
+        )?;
+
+        let byte_cost = (HASH_LEN as u64 + item.len() as u64)
+            .checked_mul(STORE_BYTE_COST)
+            .ok_or(VMError::OutOfGas {
+                used: self.gas_used,
+                limit: self.max_gas,
+            })?;
+        self.charge_gas_categorized(byte_cost, GasCategory::StateStore)?;
+
         state.push(key, item);
         Ok(())
     }
@@ -500,7 +652,7 @@ impl VM {
         let item = state.get(key).ok_or(VMError::KeyNotFound {
             key: key.to_string(),
         })?;
-        self.charge_gas(item.len() as u64 * READ_BYTE_COST)?;
+        self.charge_gas_categorized(item.len() as u64 * READ_BYTE_COST, GasCategory::StateRead)?;
         Ok(item)
     }
 }
@@ -880,7 +1032,8 @@ impl VM {
 
     fn op_i64_to_str(&mut self, instr: &'static str, dst: u8, src: u8) -> Result<(), VMError> {
         let reg = self.registers_get_int(src, instr)?;
-        self.charge_gas(Self::digits_i64(reg))?; // Charge gas manually before allocation instead of using heap_index()
+        // Charge gas manually before allocation instead of using heap_index()
+        self.charge_gas_categorized(Self::digits_i64(reg), GasCategory::HeapAllocation)?;
         let str_ref = self.heap.index(reg.to_string().into_bytes());
         self.op_load_str(instr, dst, str_ref)
     }
@@ -905,7 +1058,8 @@ impl VM {
 
     fn op_bool_to_str(&mut self, instr: &'static str, dst: u8, src: u8) -> Result<(), VMError> {
         let reg = self.registers_get_bool(src, instr)?;
-        self.charge_gas(if reg { 4 } else { 5 })?; // Charge gas manually before allocation instead of using heap_index()
+        // Charge gas manually before allocation instead of using heap_index()
+        self.charge_gas_categorized(if reg { 4 } else { 5 }, GasCategory::HeapAllocation)?;
         let str = (if reg { "true" } else { "false" }).to_string();
         let bool_ref = self.heap.index(str.into_bytes());
         self.op_load_str(instr, dst, bool_ref)
@@ -1091,7 +1245,7 @@ impl VM {
                 arg_len_check(1, args.len(), k)?;
                 let str_ref = get_ref(args[0])?;
                 let len = self.heap.get_raw_ref(str_ref)?.len();
-                self.charge_gas(len as u64)?;
+                self.charge_gas_categorized(len as u64, GasCategory::HostFunction)?;
                 self.op_load_i64(instr, dst, self.heap.get_raw_ref(str_ref)?.len() as i64)
             }
             k @ "slice" => {
@@ -1101,7 +1255,7 @@ impl VM {
                 let end = get_i64(args[2])? as usize;
 
                 let len = self.heap.get_raw_ref(str_ref)?.len();
-                self.charge_gas(len as u64)?;
+                self.charge_gas_categorized(len as u64, GasCategory::HostFunction)?;
 
                 let bytes = self.heap.get_raw_ref(str_ref)?;
                 let end = end.min(bytes.len());
@@ -1118,7 +1272,7 @@ impl VM {
 
                 let mut result = self.heap.get_raw_ref(ref1)?.len();
                 result += self.heap.get_raw_ref(ref2)?.len();
-                self.charge_gas(result as u64)?;
+                self.charge_gas_categorized(result as u64, GasCategory::HostFunction)?;
 
                 let mut result = self.heap.get_raw_ref(ref1)?.clone();
                 result.extend_from_slice(self.heap.get_raw_ref(ref2)?);
@@ -1133,7 +1287,7 @@ impl VM {
 
                 let l1 = self.heap.get_raw_ref(ref1)?.len();
                 let l2 = self.heap.get_raw_ref(ref2)?.len();
-                self.charge_gas((l1 + l2) as u64)?;
+                self.charge_gas_categorized((l1 + l2) as u64, GasCategory::HostFunction)?;
 
                 let s1 = self.heap.get_raw_ref(ref1)?;
                 let s2 = self.heap.get_raw_ref(ref2)?;
@@ -1152,7 +1306,7 @@ impl VM {
                     Value::Int(_) => 8,
                     Value::Ref(r) => self.heap.get_raw_ref(r)?.len(),
                 };
-                self.charge_gas(len as u64)?;
+                self.charge_gas_categorized(len as u64, GasCategory::HostFunction)?;
 
                 let hash = match args[0] {
                     Value::Zero => Hash::sha3().chain(&[]).finalize(),
@@ -1331,6 +1485,31 @@ mod tests {
     use crate::virtual_machine::assembler::assemble_source;
     use crate::virtual_machine::state::tests::TestState;
 
+    impl VM {
+        /// Creates a new VM instance with the given program and gas limits.
+        ///
+        /// Immediately charges `init_cost` gas. Returns `OutOfGas` if `init_cost` exceeds `max_gas`.
+        pub fn new_with_init(
+            program: Program,
+            init_cost: u64,
+            max_gas: u64,
+        ) -> Result<Self, VMError> {
+            let mut vm = Self {
+                data: program.bytecode,
+                ip: 0,
+                registers: Registers::new(program.max_register as usize + 1),
+                heap: Heap::new(program.items),
+                call_stack: Vec::new(),
+                gas_used: 0,
+                max_gas,
+                gas_profile: GasProfile::new(),
+            };
+
+            vm.charge_gas_categorized(init_cost, GasCategory::Deploy)?;
+            Ok(vm)
+        }
+    }
+
     const EXECUTION_CONTEXT: &ExecContext = &ExecContext {
         chain_id: 62845383663927,
         contract_id: Hash::zero(),
@@ -1338,7 +1517,7 @@ mod tests {
 
     fn run_vm(source: &str) -> VM {
         let program = assemble_source(source).expect("assembly failed");
-        let mut vm = VM::new(program, 0, TRANSACTION_GAS_LIMIT).expect("vm new failed");
+        let mut vm = VM::new_with_init(program, 0, TRANSACTION_GAS_LIMIT).expect("vm new failed");
         vm.run(&mut TestState::new(), EXECUTION_CONTEXT)
             .expect("vm run failed");
         vm
@@ -1363,14 +1542,14 @@ mod tests {
             Ok(p) => p,
             Err(e) => return e,
         };
-        let mut vm = VM::new(program, 0, TRANSACTION_GAS_LIMIT).expect("vm new failed");
+        let mut vm = VM::new_with_init(program, 0, TRANSACTION_GAS_LIMIT).expect("vm new failed");
         vm.run(&mut TestState::new(), EXECUTION_CONTEXT)
             .expect_err("expected error")
     }
 
     fn run_vm_with_state(source: &str) -> TestState {
         let program = assemble_source(source).expect("assembly failed");
-        let mut vm = VM::new(program, 0, TRANSACTION_GAS_LIMIT).expect("vm new failed");
+        let mut vm = VM::new_with_init(program, 0, TRANSACTION_GAS_LIMIT).expect("vm new failed");
         let mut state = TestState::new();
         vm.run(&mut state, EXECUTION_CONTEXT)
             .expect("vm run failed");
@@ -1795,7 +1974,7 @@ mod tests {
 
     #[test]
     fn invalid_opcode() {
-        let mut vm = VM::new(Program::new(vec![], vec![0xFF]), 0, TRANSACTION_GAS_LIMIT)
+        let mut vm = VM::new_with_init(Program::new(vec![], vec![0xFF]), 0, TRANSACTION_GAS_LIMIT)
             .expect("vm new failed");
         assert!(matches!(
             vm.run(&mut TestState::new(), EXECUTION_CONTEXT),
@@ -1805,7 +1984,7 @@ mod tests {
 
     #[test]
     fn truncated_bytecode() {
-        let mut vm = VM::new(
+        let mut vm = VM::new_with_init(
             Program::new(vec![], vec![0x01, 0x00]),
             0,
             TRANSACTION_GAS_LIMIT,
@@ -1821,13 +2000,14 @@ mod tests {
 
     #[test]
     fn vm_new_charges_init_cost() {
-        let vm = VM::new(Program::new(vec![], vec![]), 100, TRANSACTION_GAS_LIMIT).unwrap();
+        let vm =
+            VM::new_with_init(Program::new(vec![], vec![]), 100, TRANSACTION_GAS_LIMIT).unwrap();
         assert_eq!(vm.gas_used(), 100);
     }
 
     #[test]
     fn vm_new_fails_when_init_cost_exceeds_max_gas() {
-        let result = VM::new(Program::new(vec![], vec![]), 1000, 500);
+        let result = VM::new_with_init(Program::new(vec![], vec![]), 1000, 500);
         assert!(matches!(
             result,
             Err(VMError::OutOfGas {
@@ -1839,7 +2019,7 @@ mod tests {
 
     #[test]
     fn vm_new_succeeds_when_init_cost_equals_max_gas() {
-        let vm = VM::new(Program::new(vec![], vec![]), 500, 500).unwrap();
+        let vm = VM::new_with_init(Program::new(vec![], vec![]), 500, 500).unwrap();
         assert_eq!(vm.gas_used(), 500);
     }
 
@@ -1855,7 +2035,7 @@ mod tests {
         )
         .expect("assembly failed");
 
-        let mut vm = VM::new(program, 0, 5).unwrap();
+        let mut vm = VM::new_with_init(program, 0, 5).unwrap();
         let result = vm.run(&mut TestState::new(), EXECUTION_CONTEXT);
 
         assert!(matches!(result, Err(VMError::OutOfGas { .. })));
@@ -1864,7 +2044,7 @@ mod tests {
     // ==================== Stores ====================
 
     fn make_test_key(user_key: &[u8]) -> Result<Hash, VMError> {
-        VM::new(
+        VM::new_with_init(
             Program::new(Vec::new(), Vec::new()),
             0,
             TRANSACTION_GAS_LIMIT,
@@ -1944,7 +2124,7 @@ STORE_I64 r0, r2"#,
 
     fn run_vm_on_state(source: &str, state: &mut TestState) -> VM {
         let program = assemble_source(source).expect("assembly failed");
-        let mut vm = VM::new(program, 0, TRANSACTION_GAS_LIMIT).expect("vm new failed");
+        let mut vm = VM::new_with_init(program, 0, TRANSACTION_GAS_LIMIT).expect("vm new failed");
         vm.run(state, EXECUTION_CONTEXT).expect("vm run failed");
         vm
     }
@@ -1980,7 +2160,7 @@ LOAD_I64_STATE r1, r0"#,
 LOAD_I64_STATE r1, r0"#,
         )
         .expect("assembly failed");
-        let mut vm = VM::new(program, 0, TRANSACTION_GAS_LIMIT).expect("vm new failed");
+        let mut vm = VM::new_with_init(program, 0, TRANSACTION_GAS_LIMIT).expect("vm new failed");
         let err = vm
             .run(&mut TestState::new(), EXECUTION_CONTEXT)
             .expect_err("expected error");
@@ -2018,7 +2198,7 @@ LOAD_BOOL_STATE r1, r0"#,
 LOAD_BOOL_STATE r1, r0"#,
         )
         .expect("assembly failed");
-        let mut vm = VM::new(program, 0, TRANSACTION_GAS_LIMIT).expect("vm new failed");
+        let mut vm = VM::new_with_init(program, 0, TRANSACTION_GAS_LIMIT).expect("vm new failed");
         let err = vm
             .run(&mut TestState::new(), EXECUTION_CONTEXT)
             .expect_err("expected error");
@@ -2072,7 +2252,7 @@ LOAD_HASH_STATE r1, r0"#,
 LOAD_STR_STATE r1, r0"#,
         )
         .expect("assembly failed");
-        let mut vm = VM::new(program, 0, TRANSACTION_GAS_LIMIT).expect("vm new failed");
+        let mut vm = VM::new_with_init(program, 0, TRANSACTION_GAS_LIMIT).expect("vm new failed");
         let err = vm
             .run(&mut TestState::new(), EXECUTION_CONTEXT)
             .expect_err("expected error");
@@ -2441,7 +2621,7 @@ LOAD_HASH_STATE r2, r0"#,
 
         let mut state = TestState::new();
         let program = assemble_source(prog).expect("assembly failed");
-        let mut vm = VM::new(program, 0, TRANSACTION_GAS_LIMIT).expect("vm new failed");
+        let mut vm = VM::new_with_init(program, 0, TRANSACTION_GAS_LIMIT).expect("vm new failed");
 
         let key_counter = vm
             .make_state_key(

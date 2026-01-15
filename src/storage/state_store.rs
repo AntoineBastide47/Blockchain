@@ -29,6 +29,8 @@ pub trait AccountStorage: StateStore {
 /// Provides key-value storage operations and storage root management.
 /// Implementations must be thread-safe.
 pub trait VmStorage: StateStore {
+    /// Return `true` if the state contains the given key, `false` if not
+    fn contains_key(&self, key: Hash) -> bool;
     /// Retrieves a value by key from the storage store.
     fn get(&self, key: Hash) -> Option<Vec<u8>>;
 }

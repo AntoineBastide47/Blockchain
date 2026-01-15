@@ -24,6 +24,10 @@ pub trait StateViewProvider {
 }
 
 impl<'a, S: VmStorage> State for StateView<'a, S> {
+    fn contains_key(&self, key: Hash) -> bool {
+        self.storage.contains_key(key)
+    }
+
     fn get(&self, key: Hash) -> Option<Vec<u8>> {
         self.storage.get(key)
     }

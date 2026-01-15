@@ -13,6 +13,8 @@ use std::collections::BTreeMap;
 /// during smart contract execution. Keys are always hashes to ensure uniform
 /// distribution and fixed-size indexing.
 pub trait State {
+    /// Return `true` if the state contains the given key, `false` if not
+    fn contains_key(&self, key: Hash) -> bool;
     /// Retrieves a value by key, returning `None` if the key does not exist.
     fn get(&self, key: Hash) -> Option<Vec<u8>>;
     /// Stores a key-value pair, overwriting any existing value.
@@ -49,6 +51,10 @@ impl<'a, S: State> OverlayState<'a, S> {
 }
 
 impl<'a, S: State> State for OverlayState<'a, S> {
+    fn contains_key(&self, key: Hash) -> bool {
+        self.writes.contains_key(&key)
+    }
+
     fn get(&self, key: Hash) -> Option<Vec<u8>> {
         if let Some(v) = self.writes.get(&key) {
             return v.clone();
@@ -94,6 +100,10 @@ pub mod tests {
     }
 
     impl State for TestState {
+        fn contains_key(&self, key: Hash) -> bool {
+            self.data.contains_key(&key)
+        }
+
         fn get(&self, key: Hash) -> Option<Vec<u8>> {
             self.data.get(&key).cloned()
         }

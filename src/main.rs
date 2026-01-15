@@ -159,11 +159,6 @@ async fn main() {
         })
         .collect();
 
-    warn!("Validator list:");
-    for (addr, acc) in &validators {
-        warn!(" - {}: {}", addr, acc.balance());
-    }
-
     let server = Server::new(
         transport,
         Duration::new(5, 0),

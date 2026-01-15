@@ -108,9 +108,10 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
         match transaction.tx_type {
             TransactionType::TransferFunds => Err(VMError::OutOfGas { used: 0, limit: 0 }), // TODO
             TransactionType::DeployContract => {
-                // TODO: this isn't a deployment just a run of the contract and then the contract is discarded
+                // TODO:
+                // this isn't a deployment just a run of the contract and then the contract is discarded
+                // So it needs to be stored on chain and the run data needs to be discarded (not account mutation)
                 let program = Program::from_bytes(transaction.data.as_slice())?;
-                let bytes = program.bytecode.len();
 
                 // Make sure the maximum gas allowed by the user is in the correct range
                 let max_gas = transaction.gas_limit;
@@ -121,16 +122,7 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
                     });
                 }
 
-                // Make sure the initial cost of storing the contract does not overwhelm the gas limit
-                let init_cost = 20_000 + bytes as u64 * 200; // Cannot overflow due to constrain: 0 <= bytes <= 100_000
-                if init_cost > max_gas {
-                    return Err(VMError::OutOfGas {
-                        used: init_cost,
-                        limit: max_gas,
-                    });
-                }
-
-                let mut vm = VM::new(program, init_cost, max_gas)?;
+                let mut vm = VM::new(program, max_gas)?;
                 let contract_id = Self::contract_id(transaction);
                 let ctx = ExecContext {
                     chain_id: self.id,

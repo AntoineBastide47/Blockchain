@@ -193,6 +193,11 @@ impl StateStore for MainStorage {
 }
 
 impl VmStorage for MainStorage {
+    fn contains_key(&self, key: Hash) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.state.get(&hash_to_h256(&key)).is_ok()
+    }
+
     fn get(&self, key: Hash) -> Option<Vec<u8>> {
         let inner = self.inner.lock().unwrap();
         inner

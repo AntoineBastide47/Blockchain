@@ -26,7 +26,7 @@ pub mod test {
     }
 
     impl Storage for TestStorage {
-        fn new(genesis: Block, chain_id: u64, _initial_accounts: &[(Address, Account)]) -> Self {
+        fn new(genesis: Block, chain_id: u64, initial_accounts: &[(Address, Account)]) -> Self {
             let storage = Self {
                 headers: RwLock::new(HashMap::new()),
                 blocks: RwLock::new(HashMap::new()),
@@ -34,7 +34,7 @@ pub mod test {
                 state: RwLock::new(HashMap::new()),
                 state_root: RwLock::new(Hash::zero()),
             };
-            for (addr, acc) in _initial_accounts {
+            for (addr, acc) in initial_accounts {
                 storage.set_account(*addr, acc.clone())
             }
             storage

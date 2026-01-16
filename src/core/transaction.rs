@@ -1,6 +1,6 @@
 //! Transaction structure with reference-counted data storage.
 
-use crate::core::validator::MAX_TX_BYTE_SIZE;
+use crate::core::validator::TRANSACTION_MAX_BYTES;
 use crate::crypto::key_pair::{Address, PrivateKey, PublicKey, SerializableSignature};
 use crate::types::bytes::Bytes;
 use crate::types::encoding::{Decode, DecodeError, Encode, EncodeSink, SizeCounter};
@@ -73,9 +73,9 @@ impl Encode for Transaction {
 impl Decode for Transaction {
     fn decode(input: &mut &[u8]) -> Result<Self, DecodeError> {
         let len = usize::decode(input)?;
-        if len > MAX_TX_BYTE_SIZE {
+        if len > TRANSACTION_MAX_BYTES {
             return Err(DecodeError::LengthOverflow {
-                expected: MAX_TX_BYTE_SIZE,
+                expected: TRANSACTION_MAX_BYTES,
                 actual: len,
                 type_name: "Transaction",
             });
@@ -85,9 +85,9 @@ impl Decode for Transaction {
         let decoded = Self::decode_inner(input)?;
         let consumed = before - input.len();
 
-        if consumed > MAX_TX_BYTE_SIZE {
+        if consumed > TRANSACTION_MAX_BYTES {
             return Err(DecodeError::LengthOverflow {
-                expected: MAX_TX_BYTE_SIZE,
+                expected: TRANSACTION_MAX_BYTES,
                 actual: consumed,
                 type_name: "Transaction",
             });
@@ -274,7 +274,7 @@ impl Transaction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::validator::MAX_TX_BYTE_SIZE;
+    use crate::core::validator::TRANSACTION_MAX_BYTES;
     use crate::types::encoding::Decode;
     use crate::utils::test_utils::utils::new_tx;
 
@@ -393,7 +393,7 @@ mod tests {
         let mut encoded = tx.to_bytes().to_vec();
 
         // Replace length prefix with value exceeding MAX_TX_BYTE_SIZE
-        let fake_len = (MAX_TX_BYTE_SIZE + 1) as u64;
+        let fake_len = (TRANSACTION_MAX_BYTES + 1) as u64;
         encoded[..8].copy_from_slice(&fake_len.to_le_bytes());
 
         let result = Transaction::from_bytes(&encoded);

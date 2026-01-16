@@ -7,8 +7,8 @@ pub enum VMError {
     /// Unknown opcode encountered in bytecode.
     #[error("invalid instruction opcode 0x{opcode:02X} at byte offset {offset}")]
     InvalidInstruction { opcode: u8, offset: usize },
-    /// Unrecognized instruction mnemonic during assembly.
-    #[error("unknown instruction mnemonic '{name}' during assembly")]
+    /// Unrecognized instruction mnemonic.
+    #[error("unknown instruction mnemonic '{name}'")]
     InvalidInstructionName { name: String },
     /// Wrong number of operands for an instruction.
     #[error("operand count mismatch for {instruction}: expected {expected}, got {actual}")]

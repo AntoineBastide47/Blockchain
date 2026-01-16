@@ -3,20 +3,21 @@
 use crate::core::account::Account;
 use crate::core::block::{Block, Header};
 use crate::core::transaction::{Transaction, TransactionType};
-use crate::core::validator::{BlockValidator, Validator};
+use crate::core::validator::{BLOCK_MAX_BYTES, BlockValidator, Validator};
 use crate::crypto::key_pair::{Address, PrivateKey};
-use crate::info;
 use crate::storage::main_storage::MainStorage;
 use crate::storage::state_store::{AccountStorage, VmStorage};
-use crate::storage::state_view::{StateView, StateViewProvider};
+use crate::storage::state_view::StateViewProvider;
 use crate::storage::storage_trait::{Storage, StorageError};
+use crate::storage::txpool::TxPool;
 use crate::types::encoding::{Decode, Encode};
 use crate::types::hash::Hash;
 use crate::types::merkle_tree::MerkleTree;
 use crate::virtual_machine::errors::VMError;
 use crate::virtual_machine::program::Program;
 use crate::virtual_machine::state::{OverlayState, State};
-use crate::virtual_machine::vm::{ExecContext, TRANSACTION_GAS_LIMIT, VM};
+use crate::virtual_machine::vm::{BLOCK_GAS_LIMIT, ExecContext, TRANSACTION_GAS_LIMIT, VM};
+use crate::{info, warn};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -79,6 +80,10 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
     /// Returns the block with the given hash, if it exists.
     pub fn get_block(&self, hash: Hash) -> Option<Arc<Block>> {
         self.storage.get_block(hash)
+    }
+
+    pub fn get_account(&self, address: Address) -> Option<Account> {
+        self.storage.get_account(address)
     }
 
     /// Computes a deterministic contract identifier from a deployment transaction.
@@ -159,11 +164,12 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
     /// Runs validator checks (signature, nonce, balance, gas) before decoding the
     /// program bytes and executing them in a per-tx overlay. The per-tx writes are
     /// merged into `block_overlay` only after successful execution.
-    fn apply_tx(
+    fn apply_tx<T: State>(
         &self,
         transaction: &Transaction,
-        block_overlay: &mut OverlayState<StateView<S>>,
-    ) -> Result<(), StorageError> {
+        block_overlay: &OverlayState<T>,
+        tx_overlay: &mut OverlayState<OverlayState<T>>,
+    ) -> Result<((Address, Vec<u8>), u64), StorageError> {
         if transaction.gas_price == 0 || transaction.gas_limit == 0 {
             return Err(StorageError::InvalidTransactionGasParams);
         }
@@ -200,8 +206,7 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
 
         // Execute and compute gas usage
         let mut gas_used: u64 = 0;
-        let mut tx_overlay = OverlayState::new(block_overlay);
-        let transaction_result = self.execute_tx(transaction, &mut tx_overlay, &mut gas_used);
+        let transaction_result = self.execute_tx(transaction, tx_overlay, &mut gas_used);
 
         // If the transaction failed: charge gas and skip the tx_overlay states
         account.increment_nonce();
@@ -212,20 +217,8 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
             },
         )?)?;
 
-        // Consume the writes so that block_overlay can be mutated
-        let tx_writes = tx_overlay.into_writes();
-        block_overlay.push(a_hash, account.to_bytes().to_vec());
         transaction_result?;
-
-        // Merge tx writes into block overlay
-        for (k, v) in tx_writes {
-            match v {
-                Some(val) => block_overlay.push(k, val),
-                None => block_overlay.delete(k),
-            }
-        }
-
-        Ok(())
+        Ok(((a_hash, account.to_bytes().to_vec()), gas_used))
     }
 
     /// Appends a block to storage and updates the chain tip (thread-safe).
@@ -251,15 +244,40 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
     pub fn build_block(
         &self,
         validator: PrivateKey,
-        transactions: Vec<Transaction>,
+        tx_pool: &TxPool,
     ) -> Result<Block, StorageError> {
         // Executes all transactions in the block and computes the resulting state root.
+        let mut gas_left = BLOCK_GAS_LIMIT;
+        let mut size_left = BLOCK_MAX_BYTES;
         let base = self.storage.state_view();
         let mut block_overlay = OverlayState::new(&base);
-        for tx in &transactions {
-            self.apply_tx(tx, &mut block_overlay)?;
+
+        let mut hashes = Vec::<Hash>::new();
+        let mut transactions = Vec::<Transaction>::new();
+
+        // Take transactions from the pool while the block gas limit is not reached
+        while let (Some(tx), size) = tx_pool.take_one(gas_left, size_left) {
+            let hash = tx.id(self.id);
+            let mut tx_overlay = OverlayState::new(&block_overlay);
+
+            // Try and apply the transaction to the current state
+            match self.apply_tx(&tx, &block_overlay, &mut tx_overlay) {
+                Ok((account, gas_used)) => {
+                    tx_overlay
+                        .into_writes()
+                        .apply_to(account, &mut block_overlay);
+                    gas_left -= gas_used;
+                    size_left -= size;
+                    hashes.push(hash);
+                    transactions.push(tx);
+                }
+                Err(e) => warn!("{e}"),
+            }
         }
-        self.storage.apply_batch(block_overlay.into_writes());
+
+        // Apply the block state changes to the chain
+        self.storage.apply_batch(block_overlay.into_writes().0);
+        tx_pool.remove_batch(&hashes);
 
         let header = Header {
             version: 1,
@@ -268,6 +286,7 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_nanos() as u64)
                 .unwrap_or(0),
+            gas_used: BLOCK_GAS_LIMIT - gas_left,
             previous_block: self.storage.tip(),
             merkle_root: MerkleTree::from_transactions(&transactions, self.id),
             state_root: self.storage.state_root(),
@@ -299,12 +318,20 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
         let mut block_overlay = OverlayState::new(&base);
 
         for tx in &block.transactions {
-            self.apply_tx(tx, &mut block_overlay)?;
+            let mut tx_overlay = OverlayState::new(&block_overlay);
+            match self.apply_tx(tx, &block_overlay, &mut tx_overlay) {
+                Ok((account, _)) => {
+                    tx_overlay
+                        .into_writes()
+                        .apply_to(account, &mut block_overlay);
+                }
+                Err(e) => Err(e)?,
+            }
         }
 
         // Compute expected post-storage root deterministically
         let writes = block_overlay.into_writes();
-        let computed_root = self.storage.preview_root(&writes);
+        let computed_root = self.storage.preview_root(&writes.0);
         if computed_root != block.header.state_root {
             return Err(StorageError::ValidationFailed(format!(
                 "state_root mismatch: expected {} and got {computed_root}",
@@ -312,7 +339,7 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
             )));
         }
 
-        self.storage.apply_batch(writes);
+        self.storage.apply_batch(writes.0);
         self.append_block(&block)
     }
 }
@@ -397,6 +424,7 @@ mod tests {
             version: 1,
             height,
             timestamp: 0,
+            gas_used: BLOCK_GAS_LIMIT,
             previous_block: previous,
             merkle_root: Hash::zero(),
             state_root: random_hash(),
@@ -469,13 +497,13 @@ mod tests {
 
         let block_count = 100;
         for _i in 1..=block_count {
-            bc.build_block(PrivateKey::new(), vec![])
+            bc.build_block(PrivateKey::new(), &TxPool::new(Some(1), TEST_CHAIN_ID))
                 .expect("build_block failed");
         }
 
         assert_eq!(bc.height(), block_count);
 
-        bc.build_block(PrivateKey::new(), vec![])
+        bc.build_block(PrivateKey::new(), &TxPool::new(Some(1), TEST_CHAIN_ID))
             .expect("build_block failed");
         assert_eq!(bc.height(), block_count + 1);
     }
@@ -522,6 +550,7 @@ mod tests {
             version: 1,
             height: 1,
             timestamp: 0,
+            gas_used: BLOCK_GAS_LIMIT,
             previous_block: genesis.header_hash(TEST_CHAIN_ID),
             merkle_root: MerkleTree::from_transactions(std::slice::from_ref(&tx), TEST_CHAIN_ID),
             state_root: random_hash(),
@@ -544,9 +573,10 @@ mod tests {
         tx.gas_limit = 1;
         tx.gas_price = 1;
         let base = bc.storage.state_view();
-        let mut overlay = OverlayState::new(&base);
+        let overlay = OverlayState::new(&base);
+        let mut tx_overlay = OverlayState::new(&overlay);
 
-        let result = bc.apply_tx(&tx, &mut overlay);
+        let result = bc.apply_tx(&tx, &overlay, &mut tx_overlay);
         assert!(matches!(result, Err(StorageError::MissingAccount(_))));
     }
 
@@ -566,9 +596,10 @@ mod tests {
         tx.gas_price = 1;
 
         let base = bc.storage.state_view();
-        let mut overlay = OverlayState::new(&base);
+        let overlay = OverlayState::new(&base);
+        let mut tx_overlay = OverlayState::new(&overlay);
 
-        let result = bc.apply_tx(&tx, &mut overlay);
+        let result = bc.apply_tx(&tx, &overlay, &mut tx_overlay);
         assert!(matches!(
             result,
             Err(StorageError::InsufficientBalance { .. })
@@ -591,9 +622,10 @@ mod tests {
         tx.gas_price = u128::MAX;
 
         let base = bc.storage.state_view();
-        let mut overlay = OverlayState::new(&base);
+        let overlay = OverlayState::new(&base);
+        let mut tx_overlay = OverlayState::new(&overlay);
 
-        let result = bc.apply_tx(&tx, &mut overlay);
+        let result = bc.apply_tx(&tx, &overlay, &mut tx_overlay);
         assert!(matches!(
             result,
             Err(StorageError::ArithmeticOverflow { .. })
@@ -656,6 +688,7 @@ mod tests {
             version: 1,
             height: 1,
             timestamp: 0,
+            gas_used: BLOCK_GAS_LIMIT,
             previous_block: genesis.header_hash(TEST_CHAIN_ID),
             merkle_root: MerkleTree::from_transactions(&[], TEST_CHAIN_ID),
             state_root: random_hash(),
@@ -696,8 +729,12 @@ mod tests {
 
         let base = bc.storage.state_view();
         let mut overlay = OverlayState::new(&base);
+        let mut tx_overlay = OverlayState::new(&overlay);
 
-        bc.apply_tx(&tx, &mut overlay).expect("apply_tx failed");
+        let (account, _) = bc
+            .apply_tx(&tx, &overlay, &mut tx_overlay)
+            .expect("apply_tx failed");
+        tx_overlay.into_writes().apply_to(account, &mut overlay);
 
         let account_bytes = overlay
             .get(sender)
@@ -722,8 +759,12 @@ mod tests {
 
         let base = bc.storage.state_view();
         let mut overlay = OverlayState::new(&base);
+        let mut tx_overlay = OverlayState::new(&overlay);
 
-        bc.apply_tx(&tx, &mut overlay).expect("apply_tx failed");
+        let (account, _) = bc
+            .apply_tx(&tx, &overlay, &mut tx_overlay)
+            .expect("apply_tx failed");
+        tx_overlay.into_writes().apply_to(account, &mut overlay);
 
         let account_bytes = overlay.get(sender).expect("account should exist");
         let account = Account::from_bytes(&account_bytes).unwrap();
@@ -749,8 +790,12 @@ mod tests {
 
         let base = bc.storage.state_view();
         let mut overlay = OverlayState::new(&base);
+        let mut tx_overlay = OverlayState::new(&overlay);
 
-        bc.apply_tx(&tx, &mut overlay).expect("apply_tx failed");
+        let (account, _) = bc
+            .apply_tx(&tx, &overlay, &mut tx_overlay)
+            .expect("apply_tx failed");
+        tx_overlay.into_writes().apply_to(account, &mut overlay);
 
         let account_bytes = overlay.get(sender).expect("account should exist");
         let account = Account::from_bytes(&account_bytes).unwrap();
@@ -778,7 +823,12 @@ mod tests {
             let mut tx = make_deploy_tx(key.clone(), TEST_CHAIN_ID);
             tx.nonce = i;
 
-            bc.apply_tx(&tx, &mut overlay).expect("apply_tx failed");
+            let mut tx_overlay = OverlayState::new(&overlay);
+            let (account, _) = bc
+                .apply_tx(&tx, &overlay, &mut tx_overlay)
+                .expect("apply_tx failed");
+
+            tx_overlay.into_writes().apply_to(account, &mut overlay);
         }
 
         let account_bytes = overlay.get(sender).expect("account should exist");

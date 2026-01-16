@@ -106,6 +106,7 @@ impl<T: Transport> Server<T> {
             version: 1,
             height: 0,
             timestamp: 0,
+            gas_used: 0,
             previous_block: Hash::zero(),
             merkle_root: Hash::zero(),
             state_root: h256_to_hash(state.root()),
@@ -134,7 +135,7 @@ impl<T: Transport> Server<T> {
             transport,
             private_key,
             is_validator,
-            tx_pool: TxPool::new(transaction_pool_capacity),
+            tx_pool: TxPool::new(transaction_pool_capacity, chain_id),
             block_time,
             chain: Blockchain::new(
                 chain_id,
@@ -235,10 +236,10 @@ impl<T: Transport> Server<T> {
     }
 
     async fn create_new_block(&self) {
-        let block = match self.chain.build_block(
-            self.private_key.clone().unwrap(),
-            self.tx_pool.transactions(),
-        ) {
+        let block = match self
+            .chain
+            .build_block(self.private_key.clone().unwrap(), &self.tx_pool)
+        {
             Ok(b) => b,
             Err(e) => {
                 warn!("{e}");
@@ -265,7 +266,13 @@ impl<T: Transport> Server<T> {
                 transaction.id(self.chain.id),
             ));
         }
-        self.tx_pool.append(transaction, self.chain.id);
+
+        let hash = transaction.from.address();
+        let account = self
+            .chain
+            .get_account(hash)
+            .ok_or(ServerError::Storage(StorageError::MissingAccount(hash)))?;
+        self.tx_pool.append(&account, transaction);
         Ok(())
     }
 
@@ -307,10 +314,16 @@ impl<T: Transport> Server<T> {
         }
 
         let bytes = transaction.to_bytes();
-        self.tx_pool.append(transaction, self.chain.id);
-
-        // Gossip to all peers except origin
-        tokio::spawn(async move { self.broadcast(from, bytes, MessageType::Transaction).await });
+        let hash = transaction.from.address();
+        let account = self
+            .chain
+            .get_account(hash)
+            .ok_or(ServerError::Storage(StorageError::MissingAccount(hash)))?;
+        if self.tx_pool.append(&account, transaction) {
+            tokio::spawn(
+                async move { self.broadcast(from, bytes, MessageType::Transaction).await },
+            );
+        }
 
         Ok(())
     }
@@ -559,6 +572,7 @@ mod tests {
     use crate::network::local_transport::tests::LocalTransport;
     use crate::network::rpc::Rpc;
     use crate::utils::test_utils::utils::{new_tx, test_rpc};
+    use crate::virtual_machine::vm::BLOCK_GAS_LIMIT;
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicU16, Ordering};
     use tokio::sync::mpsc::channel;
@@ -686,6 +700,7 @@ mod tests {
             version: 1,
             height: 1,
             timestamp: 1234567890,
+            gas_used: BLOCK_GAS_LIMIT,
             previous_block: Hash::zero(),
             merkle_root: Hash::zero(),
             state_root: Hash::zero(),
@@ -937,7 +952,7 @@ mod tests {
         // Add a block to server_a so its height is 1
         server_a
             .chain
-            .build_block(PrivateKey::new(), vec![])
+            .build_block(PrivateKey::new(), &TxPool::new(Some(1), TEST_CHAIN_ID))
             .expect("build_block failed");
 
         // Peer reports height 0, behind our chain (height 1)
@@ -1061,7 +1076,7 @@ mod tests {
 
         let block = server_builder
             .chain
-            .build_block(PrivateKey::new(), vec![])
+            .build_block(PrivateKey::new(), &TxPool::new(Some(1), TEST_CHAIN_ID))
             .expect("build_block failed");
 
         assert_eq!(server_a.chain.height(), 0);
@@ -1099,13 +1114,13 @@ mod tests {
         // Build block 1
         let block1 = server_builder
             .chain
-            .build_block(PrivateKey::new(), vec![])
+            .build_block(PrivateKey::new(), &TxPool::new(Some(1), TEST_CHAIN_ID))
             .expect("build_block 1 failed");
 
         // Build block 2
         let block2 = server_builder
             .chain
-            .build_block(PrivateKey::new(), vec![])
+            .build_block(PrivateKey::new(), &TxPool::new(Some(1), TEST_CHAIN_ID))
             .expect("build_block 2 failed");
 
         let response = SendBlocksMessage {
@@ -1142,7 +1157,7 @@ mod tests {
         for _ in 0..3 {
             server_established
                 .chain
-                .build_block(validator_key.clone(), vec![])
+                .build_block(validator_key.clone(), &TxPool::new(Some(1), TEST_CHAIN_ID))
                 .expect("build_block failed");
         }
         assert_eq!(server_established.chain.height(), 3);
@@ -1339,7 +1354,7 @@ mod tests {
         for _ in 0..2 {
             server_a
                 .chain
-                .build_block(validator_key.clone(), vec![])
+                .build_block(validator_key.clone(), &TxPool::new(Some(1), TEST_CHAIN_ID))
                 .expect("build_block failed");
         }
 
@@ -1411,7 +1426,7 @@ mod tests {
         for _ in 0..3 {
             server_a
                 .chain
-                .build_block(validator_key.clone(), vec![])
+                .build_block(validator_key.clone(), &TxPool::new(Some(1), TEST_CHAIN_ID))
                 .expect("build_block failed");
         }
 

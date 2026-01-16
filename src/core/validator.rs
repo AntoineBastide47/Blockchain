@@ -9,6 +9,7 @@ use crate::core::transaction::Transaction;
 use crate::storage::storage_trait::Storage;
 use crate::types::encoding::Encode;
 use crate::types::hash::Hash;
+use crate::virtual_machine::vm::BLOCK_GAS_LIMIT;
 use blockchain_derive::Error;
 use std::error::Error;
 use std::fmt::Debug;
@@ -69,6 +70,8 @@ pub enum BlockValidatorError {
     InvalidGasLimit,
     #[error("transaction size exceeds max value: {actual} > {max}")]
     TransactionTooLarge { max: usize, actual: usize },
+    #[error("block gas used exceeds max value: {actual} > {max}")]
+    BlockToMuchGas { max: u64, actual: u64 },
 }
 
 /// Default block validator implementing consensus rules.
@@ -82,7 +85,9 @@ pub enum BlockValidatorError {
 pub struct BlockValidator;
 
 /// Maximum allowed size for a single transaction in bytes.
-pub const MAX_TX_BYTE_SIZE: usize = 100_000;
+pub const TRANSACTION_MAX_BYTES: usize = 100_000;
+/// Maximum allowed size for a single block in bytes.
+pub const BLOCK_MAX_BYTES: usize = 2_000_000;
 
 impl Validator for BlockValidator {
     type Error = BlockValidatorError;
@@ -98,9 +103,9 @@ impl Validator for BlockValidator {
         }
 
         let size = transaction.byte_size();
-        if size > MAX_TX_BYTE_SIZE {
+        if size > TRANSACTION_MAX_BYTES {
             return Err(BlockValidatorError::TransactionTooLarge {
-                max: MAX_TX_BYTE_SIZE,
+                max: TRANSACTION_MAX_BYTES,
                 actual: size,
             });
         }
@@ -150,6 +155,21 @@ impl Validator for BlockValidator {
             return Err(BlockValidatorError::BlockExists);
         }
 
+        if block.header.gas_used > BLOCK_GAS_LIMIT {
+            return Err(BlockValidatorError::BlockToMuchGas {
+                max: BLOCK_GAS_LIMIT,
+                actual: block.header.gas_used,
+            });
+        }
+
+        let size = block.byte_size();
+        if size > TRANSACTION_MAX_BYTES {
+            return Err(BlockValidatorError::TransactionTooLarge {
+                max: TRANSACTION_MAX_BYTES,
+                actual: size,
+            });
+        }
+
         block.verify(chain_id)
     }
 }
@@ -165,7 +185,9 @@ mod tests {
     use crate::storage::test_storage::test::TestStorage;
     use crate::types::bytes::Bytes;
     use crate::types::hash::Hash;
-    use crate::utils::test_utils::utils::{create_genesis, create_test_block, new_tx, random_hash};
+    use crate::utils::test_utils::utils::{
+        create_genesis, create_test_block, new_tx, new_tx_zero_gas, random_hash,
+    };
     use std::sync::Arc;
 
     const TEST_CHAIN_ID: u64 = 872539;
@@ -330,7 +352,7 @@ mod tests {
         let key = PrivateKey::new();
         let account = Account::new(100);
 
-        let tx = new_tx(Bytes::new(b"gasless"), key, TEST_CHAIN_ID);
+        let tx = new_tx_zero_gas(Bytes::new(b"gasless"), key, TEST_CHAIN_ID);
         let validator = BlockValidator;
         let err = validator
             .validate_tx(&tx, &account, TEST_CHAIN_ID)

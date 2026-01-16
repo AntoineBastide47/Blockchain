@@ -21,6 +21,8 @@ pub struct Header {
     pub height: u64,
     /// Unix timestamp in nanoseconds for temporal ordering
     pub timestamp: u64,
+    /// How much gas this block used
+    pub gas_used: u64,
     /// Hash of parent block, forming the chain
     pub previous_block: Hash,
     /// Root of merkle tree of transactions
@@ -142,6 +144,7 @@ mod tests {
     use crate::types::bytes::Bytes;
     use crate::types::encoding::Decode;
     use crate::utils::test_utils::utils::{new_tx, random_hash};
+    use crate::virtual_machine::vm::BLOCK_GAS_LIMIT;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     const TEST_CHAIN_ID: u64 = 832489;
@@ -158,6 +161,7 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos() as u64,
+            gas_used: BLOCK_GAS_LIMIT,
             previous_block: random_hash(),
             merkle_root: MerkleTree::from_transactions(transactions, TEST_CHAIN_ID),
             state_root: random_hash(),
@@ -199,6 +203,7 @@ mod tests {
             version: 0,
             height: 0,
             timestamp: 0,
+            gas_used: BLOCK_GAS_LIMIT,
             previous_block: Hash::zero(),
             merkle_root: Hash::zero(),
             state_root: Hash::zero(),
@@ -225,6 +230,7 @@ mod tests {
             version: u32::MAX,
             height: u64::MAX,
             timestamp: u64::MAX,
+            gas_used: BLOCK_GAS_LIMIT,
             previous_block: random_hash(),
             merkle_root: random_hash(),
             state_root: random_hash(),

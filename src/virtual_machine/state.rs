@@ -4,6 +4,7 @@
 //! The [`State`] trait defines the interface for key-value storage, while
 //! [`OverlayState`] enables transactional writes that can be committed or discarded.
 
+use crate::crypto::key_pair::Address;
 use crate::types::hash::Hash;
 use std::collections::BTreeMap;
 
@@ -36,7 +37,7 @@ pub struct OverlayState<'a, S: State> {
 }
 
 impl<'a, S: State> OverlayState<'a, S> {
-    /// Creates a new overlay backed by the given base storage.
+    /// Creates a new overlay backed by the given base state.
     pub fn new(base: &'a S) -> Self {
         Self {
             _base: base,
@@ -45,8 +46,36 @@ impl<'a, S: State> OverlayState<'a, S> {
     }
 
     /// Consumes the overlay and returns the pending writes as a vector.
-    pub fn into_writes(self) -> Vec<(Hash, Option<Vec<u8>>)> {
-        self.writes.into_iter().collect()
+    pub fn into_writes(self) -> OverlayWrites {
+        OverlayWrites(self.writes.into_iter().collect())
+    }
+}
+
+/// Collected writes from an [`OverlayState`] ready for batch application.
+///
+/// Wraps a vector of key-value pairs where `Some(value)` represents an insertion
+/// and `None` represents a deletion. Created by [`OverlayState::into_writes`].
+pub struct OverlayWrites(pub Vec<(Hash, Option<Vec<u8>>)>);
+
+impl OverlayWrites {
+    /// Applies the collected writes to a target overlay, merging transaction state.
+    ///
+    /// First inserts the account state at the given address, then replays all
+    /// buffered writes (insertions and deletions) into the target overlay. This
+    /// enables hierarchical state composition where a child overlay's changes are
+    /// merged into a parent overlay.
+    pub fn apply_to<S: State>(
+        self,
+        (addr, account): (Address, Vec<u8>),
+        overlay: &mut OverlayState<S>,
+    ) {
+        overlay.push(addr, account);
+        for (k, v) in self.0 {
+            match v {
+                Some(val) => overlay.push(k, val),
+                None => overlay.delete(k),
+            }
+        }
     }
 }
 
@@ -156,10 +185,10 @@ pub mod tests {
         overlay.delete(h(b"c"));
 
         let writes = overlay.into_writes();
-        assert_eq!(writes.len(), 3);
-        assert!(writes.contains(&(h(b"a"), Some(b"1".to_vec()))));
-        assert!(writes.contains(&(h(b"b"), Some(b"2".to_vec()))));
-        assert!(writes.contains(&(h(b"c"), None)));
+        assert_eq!(writes.0.len(), 3);
+        assert!(writes.0.contains(&(h(b"a"), Some(b"1".to_vec()))));
+        assert!(writes.0.contains(&(h(b"b"), Some(b"2".to_vec()))));
+        assert!(writes.0.contains(&(h(b"c"), None)));
     }
 
     #[test]
@@ -170,5 +199,61 @@ pub mod tests {
         overlay.delete(h(b"key"));
         overlay.push(h(b"key"), b"second".to_vec());
         assert_eq!(overlay.get(h(b"key")), Some(b"second".to_vec()));
+    }
+
+    #[test]
+    fn apply_to_merges_writes_into_target() {
+        let base = TestState::new();
+        let mut parent = OverlayState::new(&base);
+
+        // Create child overlay with some writes
+        let mut child = OverlayState::new(&parent);
+        child.push(h(b"k1"), b"v1".to_vec());
+        child.push(h(b"k2"), b"v2".to_vec());
+
+        // Apply to parent
+        let addr = Hash([1u8; 32]);
+        child
+            .into_writes()
+            .apply_to((addr, b"acc".to_vec()), &mut parent);
+
+        assert_eq!(parent.get(addr), Some(b"acc".to_vec()));
+        assert_eq!(parent.get(h(b"k1")), Some(b"v1".to_vec()));
+        assert_eq!(parent.get(h(b"k2")), Some(b"v2".to_vec()));
+    }
+
+    #[test]
+    fn apply_to_propagates_deletions() {
+        let base = TestState::with_data(vec![(h(b"existing"), b"val".to_vec())]);
+        let mut parent = OverlayState::new(&base);
+
+        let mut child = OverlayState::new(&parent);
+        child.delete(h(b"existing"));
+
+        let addr = Hash([2u8; 32]);
+        child
+            .into_writes()
+            .apply_to((addr, b"acc".to_vec()), &mut parent);
+
+        assert_eq!(parent.get(h(b"existing")), None);
+    }
+
+    #[test]
+    fn apply_to_handles_mixed_operations() {
+        let base = TestState::with_data(vec![(h(b"to_delete"), b"old".to_vec())]);
+        let mut parent = OverlayState::new(&base);
+
+        let mut child = OverlayState::new(&parent);
+        child.push(h(b"new_key"), b"new_val".to_vec());
+        child.delete(h(b"to_delete"));
+
+        let addr = Hash([3u8; 32]);
+        child
+            .into_writes()
+            .apply_to((addr, b"account_data".to_vec()), &mut parent);
+
+        assert_eq!(parent.get(addr), Some(b"account_data".to_vec()));
+        assert_eq!(parent.get(h(b"new_key")), Some(b"new_val".to_vec()));
+        assert_eq!(parent.get(h(b"to_delete")), None);
     }
 }

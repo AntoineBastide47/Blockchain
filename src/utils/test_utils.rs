@@ -8,6 +8,7 @@ pub mod utils {
     use crate::network::rpc::Rpc;
     use crate::types::bytes::Bytes;
     use crate::types::hash::{HASH_LEN, Hash};
+    use crate::virtual_machine::vm::BLOCK_GAS_LIMIT;
     use libp2p::Multiaddr;
     use std::net::{IpAddr, SocketAddr};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -36,6 +37,7 @@ pub mod utils {
             version: 1,
             height: 0,
             timestamp: 0,
+            gas_used: BLOCK_GAS_LIMIT,
             previous_block: Hash::zero(),
             merkle_root: Hash::zero(),
             state_root: Hash::zero(),
@@ -84,10 +86,28 @@ pub mod utils {
         multiaddr
     }
 
-    /// Creates a minimal transaction for testing with zero values.
+    /// Creates a minimal transaction for testing.
     ///
-    /// Uses [`TransactionType::TransferFunds`] with zero amount, fee, gas, and nonce.
+    /// Uses [`TransactionType::TransferFunds`] with zero amount, fee, and nonce.
+    /// Gas price and limit are set to 1 to pass validation.
     pub fn new_tx(data: Bytes, key: PrivateKey, chain_id: u64) -> Transaction {
+        Transaction::new(
+            Address::zero(),
+            None,
+            data,
+            0,
+            0,
+            1,
+            1,
+            0,
+            key,
+            chain_id,
+            TransactionType::TransferFunds,
+        )
+    }
+
+    /// Creates a transaction with zero gas values for testing validation rejection.
+    pub fn new_tx_zero_gas(data: Bytes, key: PrivateKey, chain_id: u64) -> Transaction {
         Transaction::new(
             Address::zero(),
             None,
@@ -111,6 +131,7 @@ pub mod utils {
             version: 1,
             height,
             timestamp: 1234567890,
+            gas_used: BLOCK_GAS_LIMIT,
             previous_block: previous,
             merkle_root: Hash::zero(),
             state_root: Hash::zero(),

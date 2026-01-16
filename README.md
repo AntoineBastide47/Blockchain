@@ -31,6 +31,43 @@ Minimal, safety-first blockchain in Rust, focused on pedagogy and clarity across
 - `--validator`: start block production with a validator key on disk
 - Passphrase: `NODE_PASSPHRASE` env var or interactive prompt (used to decrypt node keys)
 
+## Recommended git `pre-commit` hook
+It is recommended to set your git pre-commit to the following code to reduce CI failures:  
+```bash
+#!/bin/sh
+set -e
+
+echo "[pre-commit] Formatting + Linting + Running Tests"
+./check
+
+echo "[pre-commit] Staging format changes"
+git add -u
+
+exit 0
+```
+<details>
+
+<summary>Full command to set it</summary>
+
+```bash
+cat > .git/hooks/pre-commit <<'EOF'
+#!/bin/sh
+set -e
+
+echo "[pre-commit] Formatting + Linting + Running Tests"
+./check
+
+echo "[pre-commit] Staging format changes"
+git add -u
+
+exit 0
+EOF
+
+chmod +x .git/hooks/pre-commit
+```
+
+</details>
+
 ## Repo Map
 ```
 src/
@@ -59,7 +96,7 @@ blockchain_derive/  # Procedural macros (BinaryCodec, Error)
 
 | Type      | Size      | Notes                                                    |
 |-----------|-----------|----------------------------------------------------------|
-| Header    | 120 bytes | Version, height, timestamp, previous/merkle/state hashes |
+| Header    | 128 bytes | Version, height, timestamp, previous/merkle/state hashes |
 | Hash      | 32 bytes  | SHA3-256 output                                          |
 | Address   | 32 bytes  | Domain-separated SHA3 of verifying key                   |
 | PublicKey | 64 bytes  | secp256k1 Schnorr verifying key (cached address)         |
@@ -81,12 +118,12 @@ blockchain_derive/  # Procedural macros (BinaryCodec, Error)
 | Resource         | Limit                |
 |------------------|----------------------|
 | Transaction pool | 100,000 transactions |
-| Block size       | 20,000 transactions  |
-| Vector decode    | 1,000,000 elements   |
 | Bytes decode     | 8 MiB                |
 | RPC payload      | 16 MiB               |
-| Transaction gas  | 1,000,000            |
-| Block gas        | 20,000,000           |
+| Transaction size | 100,000 B            |
+| Block size       | 2,000,000 B          |
+| Transaction gas  | 1,000,000 gas        |
+| Block gas        | 20,000,000 gas       |
 
 ### Virtual Machine
 - 256-register bytecode VM with string/hash/boolean/int types and a string pool

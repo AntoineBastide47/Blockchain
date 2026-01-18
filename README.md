@@ -11,7 +11,7 @@ Minimal, safety-first blockchain in Rust, focused on pedagogy and clarity across
 - SHA3-256 hashing with chain-id separation
 - Schnorr signatures on `k256`
 - libp2p transport (Noise + Yamux) plus local in-memory transport for tests
-- Lock-free mempool with fixed caps, plus register-based VM with hashed state keys
+- Concurrent mempool with fixed caps/eviction (DashMap + heap), plus register-based VM with hashed state keys
 
 ## Quickstart
 
@@ -118,7 +118,6 @@ blockchain_derive/  # Procedural macros (BinaryCodec, Error)
 | Resource         | Limit                |
 |------------------|----------------------|
 | Transaction pool | 100,000 transactions |
-| Bytes decode     | 8 MiB                |
 | RPC payload      | 16 MiB               |
 | Transaction size | 100,000 B            |
 | Block size       | 2,000,000 B          |

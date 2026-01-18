@@ -3,7 +3,7 @@
 use crate::core::account::Account;
 use crate::core::block::{Block, Header};
 use crate::core::transaction::{Transaction, TransactionType};
-use crate::core::validator::{BLOCK_MAX_BYTES, BlockValidator, Validator};
+use crate::core::validator::{BLOCK_MAX_BYTES, BlockValidator, BlockValidatorError, Validator};
 use crate::crypto::key_pair::{Address, PrivateKey};
 use crate::storage::main_storage::MainStorage;
 use crate::storage::state_store::{AccountStorage, VmStorage};
@@ -20,6 +20,8 @@ use crate::virtual_machine::vm::{BLOCK_GAS_LIMIT, ExecContext, TRANSACTION_GAS_L
 use crate::{info, warn};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+const MAX_BLOCK_TIME_DRIFT: u64 = 15;
 
 /// Combined storage trait for blockchain operations.
 ///
@@ -303,8 +305,28 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
     /// overlay (after per-tx validation), checks the resulting state_root, then
     /// commits the writes and appends the block.
     pub fn apply_block(&self, block: Block) -> Result<(), StorageError> {
+        // Make sure new blocks don't drift to far in the future in date creation
+        if block.header_hash(self.id) == self.storage.tip() {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+
+            let max = now + MAX_BLOCK_TIME_DRIFT;
+            if block.header.timestamp > max {
+                return Err(StorageError::ValidationFailed(
+                    BlockValidatorError::TimestampTooFarInFuture {
+                        now,
+                        max_allowed: max,
+                        block: block.header.timestamp,
+                    }
+                    .to_string(),
+                ));
+            }
+        }
+
         let hash = block.header_hash(self.id);
-        if self.has_block(hash) {
+        if self.storage.has_block(hash) {
             return Err(StorageError::ValidationFailed(
                 "block already exists".into(),
             ));

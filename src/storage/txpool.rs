@@ -18,8 +18,6 @@ use std::sync::{Mutex, MutexGuard};
 
 /// Default transaction pool capacity.
 pub const TXPOOL_CAPACITY: usize = 100_000;
-/// Maximum number of transactions returned for block building.
-pub const MAX_TRANSACTION_PER_BLOCK: usize = 20_000;
 
 /// Per-account transaction queue with ready and future partitions.
 struct AccountQueue {
@@ -177,7 +175,7 @@ impl TxPool {
             q.next_nonce = account.nonce();
 
             // Promote future transactions that are now contiguous
-            while let Some(n) = Some(q.next_nonce)
+            while let n = q.next_nonce
                 && let Some(t) = q.future.remove(&n)
             {
                 self.insert_ready(&mut ready, &mut q.ready, t);
@@ -236,7 +234,7 @@ impl TxPool {
             q.next_nonce += 1;
 
             // Try promoting future transactions now contiguous
-            while let Some(n) = Some(q.next_nonce)
+            while let n = q.next_nonce
                 && let Some(t) = q.future.remove(&n)
             {
                 self.insert_ready(&mut ready, &mut q.ready, t);
@@ -402,7 +400,7 @@ impl TxPool {
     /// Removes the account queue if both ready and future become empty.
     fn promote_contiguous(&self, addr: Address, ready: &mut MutexGuard<BinaryHeap<PoolEntry>>) {
         if let Some(mut entry) = self.accounts.get_mut(&addr) {
-            while let Some(n) = Some(entry.next_nonce)
+            while let n = entry.next_nonce
                 && let Some(tx) = entry.future.remove(&n)
             {
                 self.insert_ready(ready, &mut entry.ready, tx);

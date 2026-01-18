@@ -1,6 +1,7 @@
 //! Blockchain block and header structures with memory-optimized layouts.
 
 use crate::core::transaction::Transaction;
+use crate::core::validator::BLOCK_MAX_BYTES;
 use crate::core::validator::BlockValidatorError;
 use crate::crypto::key_pair::{PrivateKey, PublicKey};
 use crate::types::encoding::Encode;
@@ -10,9 +11,6 @@ use crate::types::serializable_signature::SerializableSignature;
 use blockchain_derive::BinaryCodec;
 
 /// Block header containing metadata and cryptographic commitments.
-///
-/// This type is `Copy` (120 bytes) for performance - headers are passed constantly
-/// during validation, and stack allocation avoids heap allocations and pointer chasing.
 #[derive(Clone, Debug, PartialEq, Eq, BinaryCodec)]
 pub struct Header {
     /// Protocol version for future upgrades
@@ -62,6 +60,7 @@ fn block_sign_data(chain_id: u64, hash: &Hash) -> Vec<u8> {
 /// Blocks are validated once upon receipt and never modified.
 /// The header hash is lazily computed and cached for O(1) subsequent lookups.
 #[derive(Debug, PartialEq, Eq, Clone, BinaryCodec)]
+#[binary_codec(max_size = BLOCK_MAX_BYTES)]
 pub struct Block {
     pub header: Header,
     pub validator: PublicKey,
@@ -142,7 +141,7 @@ mod tests {
     use super::*;
     use crate::crypto::key_pair::PrivateKey;
     use crate::types::bytes::Bytes;
-    use crate::types::encoding::Decode;
+    use crate::types::encoding::{Decode, DecodeError};
     use crate::utils::test_utils::utils::{new_tx, random_hash};
     use crate::virtual_machine::vm::BLOCK_GAS_LIMIT;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -349,5 +348,139 @@ mod tests {
         let block = Block::new(header, validator, vec![], TEST_CHAIN_ID);
 
         assert!(block.verify(TEST_CHAIN_ID).is_ok());
+    }
+
+    #[test]
+    fn serialize_deserialize_roundtrip() {
+        let key = PrivateKey::new();
+        let tx = build_tx(b"roundtrip test", key);
+        let block = create_block(create_header(1, std::slice::from_ref(&tx)), vec![tx]);
+
+        let encoded = block.to_bytes();
+        let decoded = Block::from_bytes(encoded.as_slice()).expect("deserialization failed");
+
+        assert_eq!(block, decoded);
+        assert!(decoded.verify(TEST_CHAIN_ID).is_ok());
+    }
+
+    #[test]
+    fn decode_rejects_oversized_length_prefix() {
+        let block = create_block(create_header(1, &[]), vec![]);
+
+        let mut encoded = block.to_bytes().to_vec();
+
+        // Replace length prefix with value exceeding BLOCK_MAX_BYTES
+        let fake_len = (BLOCK_MAX_BYTES + 1) as u64;
+        encoded[..8].copy_from_slice(&fake_len.to_le_bytes());
+
+        let result = Block::from_bytes(&encoded);
+        assert!(matches!(
+            result,
+            Err(DecodeError::LengthOverflow {
+                type_name: "Block",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_trailing_bytes() {
+        let block = create_block(create_header(1, &[]), vec![]);
+
+        let mut encoded = block.to_bytes().to_vec();
+        encoded.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+
+        // from_bytes requires all bytes to be consumed
+        let result = Block::from_bytes(&encoded);
+        assert!(matches!(result, Err(DecodeError::InvalidValue)));
+    }
+
+    #[test]
+    fn decode_fails_on_truncated_input() {
+        let block = create_block(create_header(1, &[]), vec![]);
+
+        let encoded = block.to_bytes();
+
+        // Try decoding with progressively shorter input
+        for truncate_at in [0, 4, 8, encoded.len() / 2, encoded.len() - 1] {
+            let truncated = &encoded[..truncate_at];
+            let result = Block::from_bytes(truncated);
+            assert!(
+                result.is_err(),
+                "should fail at truncation point {truncate_at}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_fails_on_empty_input() {
+        let result = Block::from_bytes(&[]);
+        assert!(matches!(result, Err(DecodeError::UnexpectedEof)));
+    }
+
+    #[test]
+    fn encoding_is_deterministic() {
+        let key = PrivateKey::new();
+        let tx = build_tx(b"determinism test", key);
+        let block = create_block(create_header(1, std::slice::from_ref(&tx)), vec![tx]);
+
+        let encoded1 = block.to_bytes();
+        let encoded2 = block.to_bytes();
+        let encoded3 = block.to_bytes();
+
+        assert_eq!(encoded1, encoded2);
+        assert_eq!(encoded2, encoded3);
+    }
+
+    #[test]
+    fn roundtrip_with_empty_transactions() {
+        let block = create_block(create_header(1, &[]), vec![]);
+
+        let encoded = block.to_bytes();
+        let decoded = Block::from_bytes(encoded.as_slice()).expect("decode failed");
+
+        assert_eq!(block, decoded);
+    }
+
+    #[test]
+    fn multiple_blocks_decode_sequentially() {
+        let key = PrivateKey::new();
+        let tx1 = build_tx(b"first", key.clone());
+        let tx2 = build_tx(b"second", key.clone());
+        let tx3 = build_tx(b"third", key);
+
+        let block1 = create_block(create_header(1, std::slice::from_ref(&tx1)), vec![tx1]);
+        let block2 = create_block(create_header(2, std::slice::from_ref(&tx2)), vec![tx2]);
+        let block3 = create_block(create_header(3, std::slice::from_ref(&tx3)), vec![tx3]);
+
+        let mut buffer = Vec::new();
+        block1.encode(&mut buffer);
+        block2.encode(&mut buffer);
+        block3.encode(&mut buffer);
+
+        let mut slice = buffer.as_slice();
+        let decoded1 = Block::decode(&mut slice).expect("block1 decode failed");
+        let decoded2 = Block::decode(&mut slice).expect("block2 decode failed");
+        let decoded3 = Block::decode(&mut slice).expect("block3 decode failed");
+
+        assert!(slice.is_empty(), "all bytes should be consumed");
+        assert_eq!(block1, decoded1);
+        assert_eq!(block2, decoded2);
+        assert_eq!(block3, decoded3);
+    }
+
+    #[test]
+    fn decode_preserves_all_fields() {
+        let key = PrivateKey::new();
+        let tx = build_tx(b"field preservation test", key);
+        let original = create_block(create_header(42, std::slice::from_ref(&tx)), vec![tx]);
+
+        let encoded = original.to_bytes();
+        let decoded = Block::from_bytes(encoded.as_slice()).expect("decode failed");
+
+        assert_eq!(original.header, decoded.header);
+        assert_eq!(original.validator, decoded.validator);
+        assert_eq!(original.signature, decoded.signature);
+        assert_eq!(original.transactions, decoded.transactions);
     }
 }

@@ -1,6 +1,6 @@
 //! 32-byte SHA3-256 hash type with zero-allocation operations.
 
-use crate::types::encoding::EncodeSink;
+use crate::types::encoding::{Decode, DecodeError, Encode, EncodeSink};
 use blockchain_derive::BinaryCodec;
 use sha3::{Digest, Sha3_256};
 use std::fmt;
@@ -184,12 +184,26 @@ impl Clone for HashCache {
 }
 
 impl PartialEq for HashCache {
-    fn eq(&self, other: &Self) -> bool {
-        *self.cached.lock().unwrap() == *other.cached.lock().unwrap()
+    /// Caches are semantically equal regardless of internal state.
+    /// The cache is an optimization layer and should not affect value identity.
+    fn eq(&self, _other: &Self) -> bool {
+        true
     }
 }
 
 impl Eq for HashCache {}
+
+/// Empty encoding and decoding for HashCache this allows types that require
+/// internal hash caching to derive from BinaryCodec and not need explicit impl blocks
+impl Encode for HashCache {
+    fn encode<S: EncodeSink>(&self, _: &mut S) {}
+}
+
+impl Decode for HashCache {
+    fn decode(_: &mut &[u8]) -> Result<Self, DecodeError> {
+        Ok(HashCache::new())
+    }
+}
 
 #[cfg(test)]
 mod tests {

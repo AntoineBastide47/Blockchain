@@ -72,6 +72,18 @@ pub enum BlockValidatorError {
     TransactionTooLarge { max: usize, actual: usize },
     #[error("block gas used exceeds max value: {actual} > {max}")]
     BlockToMuchGas { max: u64, actual: u64 },
+    #[error(
+        "block timestamp is not greater than parent timestamp (parent={parent}, block={current})"
+    )]
+    TimestampNotMonotonic { parent: u64, current: u64 },
+    #[error(
+        "block timestamp is too far in the future (now={now}, max_allowed={max_allowed}, block={block})"
+    )]
+    TimestampTooFarInFuture {
+        now: u64,
+        max_allowed: u64,
+        block: u64,
+    },
 }
 
 /// Default block validator implementing consensus rules.
@@ -151,10 +163,6 @@ impl Validator for BlockValidator {
             return Err(BlockValidatorError::PreviousHashMismatch);
         }
 
-        if storage.has_block(block.header_hash(chain_id)) {
-            return Err(BlockValidatorError::BlockExists);
-        }
-
         if block.header.gas_used > BLOCK_GAS_LIMIT {
             return Err(BlockValidatorError::BlockToMuchGas {
                 max: BLOCK_GAS_LIMIT,
@@ -162,10 +170,26 @@ impl Validator for BlockValidator {
             });
         }
 
+        match storage.get_header(block.header.previous_block) {
+            None => return Err(BlockValidatorError::PreviousHashMismatch),
+            Some(header) => {
+                if header.timestamp >= block.header.timestamp {
+                    return Err(BlockValidatorError::TimestampNotMonotonic {
+                        parent: header.timestamp,
+                        current: block.header.timestamp,
+                    });
+                }
+            }
+        }
+
+        if storage.has_block(block.header_hash(chain_id)) {
+            return Err(BlockValidatorError::BlockExists);
+        }
+
         let size = block.byte_size();
-        if size > TRANSACTION_MAX_BYTES {
+        if size > BLOCK_MAX_BYTES {
             return Err(BlockValidatorError::TransactionTooLarge {
-                max: TRANSACTION_MAX_BYTES,
+                max: BLOCK_MAX_BYTES,
                 actual: size,
             });
         }

@@ -10,7 +10,7 @@ mod error;
 use proc_macro::TokenStream;
 
 /// Automatically implements `Encode` and `Decode` traits for binary serialization.
-#[proc_macro_derive(BinaryCodec)]
+#[proc_macro_derive(BinaryCodec, attributes(binary_codec))]
 pub fn derive_binary_codec(input: TokenStream) -> TokenStream {
     binary_codec::derive_binary_codec(input)
 }

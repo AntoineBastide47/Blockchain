@@ -24,7 +24,6 @@
 //! ```
 
 use crate::types::bytes::Bytes;
-use crate::types::hash::HashCache;
 use blockchain_derive::Error;
 
 /// Sink for writing encoded bytes.
@@ -347,21 +346,10 @@ impl<T: Decode, const N: usize> Decode for [T; N] {
     }
 }
 
-/// Empty encoding and decoding for HashCache this allows types that require
-/// internal hash caching to derive from BinaryCodec and not need explicit impl blocks
-impl Encode for HashCache {
-    fn encode<S: EncodeSink>(&self, _: &mut S) {}
-}
-
-impl Decode for HashCache {
-    fn decode(_: &mut &[u8]) -> Result<Self, DecodeError> {
-        Ok(HashCache::new())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::hash::HashCache;
 
     // ========== SizeCounter Tests ==========
 

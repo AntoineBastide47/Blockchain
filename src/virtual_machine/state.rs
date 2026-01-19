@@ -57,19 +57,26 @@ impl<'a, S: State> OverlayState<'a, S> {
 /// and `None` represents a deletion. Created by [`OverlayState::into_writes`].
 pub struct OverlayWrites(pub Vec<(Hash, Option<Vec<u8>>)>);
 
+/// Serialized account states for the sender and recipient of a transaction.
+///
+/// Contains `[(from_address, from_bytes), (to_address, to_bytes)]` representing
+/// the updated account data after transaction execution.
+pub type TxAccountChanges = [(Address, Vec<u8>); 2];
+
 impl OverlayWrites {
-    /// Applies the collected writes to a target overlay, merging transaction state.
+    /// Applies the collected writes per transaction to a target overlay, merging transaction state.
     ///
-    /// First inserts the account state at the given address, then replays all
+    /// First inserts the account states (transaction.from and transaction.to), then replays all
     /// buffered writes (insertions and deletions) into the target overlay. This
     /// enables hierarchical state composition where a child overlay's changes are
     /// merged into a parent overlay.
-    pub fn apply_to<S: State>(
+    pub fn apply_tx_overlay<S: State>(
         self,
-        (addr, account): (Address, Vec<u8>),
+        [(from_hash, from), (to_hash, to)]: TxAccountChanges,
         overlay: &mut OverlayState<S>,
     ) {
-        overlay.push(addr, account);
+        overlay.push(from_hash, from);
+        overlay.push(to_hash, to);
         for (k, v) in self.0 {
             match v {
                 Some(val) => overlay.push(k, val),
@@ -212,12 +219,18 @@ pub mod tests {
         child.push(h(b"k2"), b"v2".to_vec());
 
         // Apply to parent
-        let addr = Hash([1u8; 32]);
-        child
-            .into_writes()
-            .apply_to((addr, b"acc".to_vec()), &mut parent);
+        let from_addr = Hash([1u8; 32]);
+        let to_addr = Hash([2u8; 32]);
+        child.into_writes().apply_tx_overlay(
+            [
+                (from_addr, b"from_account".to_vec()),
+                (to_addr, b"to_account".to_vec()),
+            ],
+            &mut parent,
+        );
 
-        assert_eq!(parent.get(addr), Some(b"acc".to_vec()));
+        assert_eq!(parent.get(from_addr), Some(b"from_account".to_vec()));
+        assert_eq!(parent.get(to_addr), Some(b"to_account".to_vec()));
         assert_eq!(parent.get(h(b"k1")), Some(b"v1".to_vec()));
         assert_eq!(parent.get(h(b"k2")), Some(b"v2".to_vec()));
     }
@@ -230,11 +243,18 @@ pub mod tests {
         let mut child = OverlayState::new(&parent);
         child.delete(h(b"existing"));
 
-        let addr = Hash([2u8; 32]);
-        child
-            .into_writes()
-            .apply_to((addr, b"acc".to_vec()), &mut parent);
+        let from_addr = Hash([3u8; 32]);
+        let to_addr = Hash([4u8; 32]);
+        child.into_writes().apply_tx_overlay(
+            [
+                (from_addr, b"from_account".to_vec()),
+                (to_addr, b"to_account".to_vec()),
+            ],
+            &mut parent,
+        );
 
+        assert_eq!(parent.get(from_addr), Some(b"from_account".to_vec()));
+        assert_eq!(parent.get(to_addr), Some(b"to_account".to_vec()));
         assert_eq!(parent.get(h(b"existing")), None);
     }
 
@@ -247,12 +267,18 @@ pub mod tests {
         child.push(h(b"new_key"), b"new_val".to_vec());
         child.delete(h(b"to_delete"));
 
-        let addr = Hash([3u8; 32]);
-        child
-            .into_writes()
-            .apply_to((addr, b"account_data".to_vec()), &mut parent);
+        let from_addr = Hash([5u8; 32]);
+        let to_addr = Hash([6u8; 32]);
+        child.into_writes().apply_tx_overlay(
+            [
+                (from_addr, b"from_account".to_vec()),
+                (to_addr, b"to_account".to_vec()),
+            ],
+            &mut parent,
+        );
 
-        assert_eq!(parent.get(addr), Some(b"account_data".to_vec()));
+        assert_eq!(parent.get(from_addr), Some(b"from_account".to_vec()));
+        assert_eq!(parent.get(to_addr), Some(b"to_account".to_vec()));
         assert_eq!(parent.get(h(b"new_key")), Some(b"new_val".to_vec()));
         assert_eq!(parent.get(h(b"to_delete")), None);
     }

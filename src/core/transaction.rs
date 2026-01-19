@@ -34,7 +34,7 @@ pub struct Transaction {
     cached_id: HashCache,
 
     /// Recipient account (EOA or contract) for value or call execution.
-    pub recipient: Address,
+    pub to: Address,
     /// Optional sponsor that pays gas on behalf of the sender.
     pub gas_sponsor: Option<Address>,
     /// Arbitrary transaction payload (e.g., contract call data or bytecode).
@@ -63,7 +63,7 @@ impl Transaction {
     /// to the specified chain to prevent cross-chain replay attacks.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        recipient: Address,
+        to: Address,
         gas_sponsor: Option<Address>,
         data: impl Into<Bytes>,
         amount: u128,
@@ -81,7 +81,7 @@ impl Transaction {
         let signing_hash = Transaction::signing_hash_from_parts(
             chain_id,
             &from_pk,
-            &recipient,
+            &to,
             &gas_sponsor,
             &data,
             amount,
@@ -96,7 +96,7 @@ impl Transaction {
             from: from_pk,
             signature: from.sign(signing_hash.as_slice()),
             cached_id: HashCache::new(),
-            recipient,
+            to,
             gas_sponsor,
             data,
             amount,
@@ -115,7 +115,7 @@ impl Transaction {
         Self::signing_hash_from_parts(
             chain_id,
             &self.from,
-            &self.recipient,
+            &self.to,
             &self.gas_sponsor,
             &self.data,
             self.amount,
@@ -386,7 +386,7 @@ mod tests {
 
         assert_eq!(original.from, decoded.from);
         assert_eq!(original.signature, decoded.signature);
-        assert_eq!(original.recipient, decoded.recipient);
+        assert_eq!(original.to, decoded.to);
         assert_eq!(original.gas_sponsor, decoded.gas_sponsor);
         assert_eq!(original.data, decoded.data);
         assert_eq!(original.amount, decoded.amount);

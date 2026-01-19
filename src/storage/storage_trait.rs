@@ -37,8 +37,16 @@ pub enum StorageError {
     /// Account balance insufficient to cover gas costs.
     #[error("insufficient balance in expected at least {expected} but got {actual}")]
     InsufficientBalance { actual: u128, expected: u128 },
-    #[error("transaction gas limit and gas price can not be set to 0")]
+    /// Transaction rejected due to zero gas limit or gas price.
+    #[error("transaction gas limit and gas price must be non-zero")]
     InvalidTransactionGasParams,
+    /// Credit to account would exceed the maximum representable balance.
+    #[error("balance overflow: adding {increment} to {current} would exceed max balance {max}")]
+    BalanceOverflow {
+        current: u128,
+        increment: u128,
+        max: u128,
+    },
 }
 
 impl From<VMError> for StorageError {

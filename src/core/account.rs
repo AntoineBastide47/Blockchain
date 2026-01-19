@@ -91,6 +91,23 @@ impl Account {
         Ok(())
     }
 
+    /// Credits the specified amount to the account balance.
+    ///
+    /// Returns [`StorageError::BalanceOverflow`] if the addition would exceed `u128::MAX`.
+    /// Invalidates the cached hash on success.
+    pub fn transfer(&mut self, amount: u128) -> Result<(), StorageError> {
+        self.balance = self
+            .balance
+            .checked_add(amount)
+            .ok_or(StorageError::BalanceOverflow {
+                current: self.balance,
+                increment: amount,
+                max: u128::MAX,
+            })?;
+        self.cached_hash.invalidate();
+        Ok(())
+    }
+
     /// Increments the nonce of this account
     pub fn increment_nonce(&mut self) {
         self.nonce += 1;
@@ -286,6 +303,40 @@ mod tests {
 
         let mut account = account;
         account.increment_nonce();
+
+        assert_ne!(account.value_hash(1), hash_before);
+    }
+
+    #[test]
+    fn transfer_adds_to_balance() {
+        let mut account = Account::new(1000);
+        assert!(account.transfer(500).is_ok());
+        assert_eq!(account.balance(), 1500);
+    }
+
+    #[test]
+    fn transfer_to_max_succeeds() {
+        let mut account = Account::new(u128::MAX - 100);
+        assert!(account.transfer(100).is_ok());
+        assert_eq!(account.balance(), u128::MAX);
+    }
+
+    #[test]
+    fn transfer_overflow_fails() {
+        let mut account = Account::new(u128::MAX);
+        let result = account.transfer(1);
+
+        assert!(matches!(result, Err(StorageError::BalanceOverflow { .. })));
+        assert_eq!(account.balance(), u128::MAX);
+    }
+
+    #[test]
+    fn transfer_invalidates_hash_cache() {
+        let account = Account::new(100);
+        let hash_before = account.value_hash(1);
+
+        let mut account = account;
+        account.transfer(50).unwrap();
 
         assert_ne!(account.value_hash(1), hash_before);
     }

@@ -15,7 +15,7 @@ use crate::types::hash::Hash;
 use crate::types::merkle_tree::MerkleTree;
 use crate::virtual_machine::errors::VMError;
 use crate::virtual_machine::program::Program;
-use crate::virtual_machine::state::{OverlayState, State};
+use crate::virtual_machine::state::{OverlayState, State, TxAccountChanges};
 use crate::virtual_machine::vm::{BLOCK_GAS_LIMIT, ExecContext, TRANSACTION_GAS_LIMIT, VM};
 use crate::{info, warn};
 use std::sync::Arc;
@@ -101,6 +101,23 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
         h.finalize()
     }
 
+    /// Computes the base gas cost for a transaction before execution.
+    ///
+    /// The intrinsic cost includes a fixed base of 21,000 gas units plus a per-byte
+    /// charge on the data field that varies by transaction type:
+    /// - `TransferFunds`: 0 gas per byte (data ignored)
+    /// - `DeployContract`: 200 gas per byte (bytecode storage)
+    /// - `InvokeContract`: 20 gas per byte (call data processing)
+    fn intrinsic_gas_units(transaction: &Transaction) -> u64 {
+        21_000
+            + transaction.data.len() as u64
+                * match transaction.tx_type {
+                    TransactionType::TransferFunds => 0,
+                    TransactionType::DeployContract => 200,
+                    TransactionType::InvokeContract => 20,
+                }
+    }
+
     /// Executes a transaction based on its type and updates gas usage.
     ///
     /// Handles different transaction types: fund transfers, contract deployment, and
@@ -111,9 +128,18 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
         transaction: &Transaction,
         tx_overlay: &mut OverlayState<T>,
         gas_used: &mut u64,
-    ) -> Result<(), VMError> {
+        from: (Address, &mut Account),
+        to: (Address, &mut Account),
+    ) -> Result<(), StorageError> {
         match transaction.tx_type {
-            TransactionType::TransferFunds => Err(VMError::OutOfGas { used: 0, limit: 0 }), // TODO
+            TransactionType::TransferFunds => {
+                if from.0 == to.0 {
+                    return Ok(());
+                }
+
+                from.1.charge(transaction.amount)?;
+                to.1.transfer(transaction.amount)
+            }
             TransactionType::DeployContract => {
                 // TODO:
                 // this isn't a deployment just a run of the contract and then the contract is discarded
@@ -126,7 +152,8 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
                     return Err(VMError::OutOfGas {
                         used: max_gas,
                         limit: TRANSACTION_GAS_LIMIT,
-                    });
+                    }
+                    .into());
                 }
 
                 let mut vm = VM::new(program, max_gas)?;
@@ -138,7 +165,7 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
 
                 // Execute tx in its own overlay, reading from current block overlay
                 let result = vm.run(tx_overlay, &ctx);
-                *gas_used = vm.gas_used();
+                *gas_used += vm.gas_used();
                 match result {
                     Ok(_) => {
                         tx_overlay.push(
@@ -154,10 +181,10 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
                         // TODO: persist contract in storage
                         Ok(())
                     }
-                    Err(e) => Err(e),
+                    Err(e) => Err(e.into()),
                 }
             }
-            TransactionType::InvokeContract => Err(VMError::OutOfGas { used: 0, limit: 0 }), // TODO
+            TransactionType::InvokeContract => Err(VMError::OutOfGas { used: 0, limit: 0 }.into()), // TODO
         }
     }
 
@@ -171,20 +198,38 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
         transaction: &Transaction,
         block_overlay: &OverlayState<T>,
         tx_overlay: &mut OverlayState<OverlayState<T>>,
-    ) -> Result<((Address, Vec<u8>), u64), StorageError> {
+    ) -> Result<(TxAccountChanges, u64), StorageError> {
         if transaction.gas_price == 0 || transaction.gas_limit == 0 {
             return Err(StorageError::InvalidTransactionGasParams);
         }
 
-        // Make sure an account exists for the sender
-        let a_hash = transaction.from.address();
-        let mut account = match block_overlay.get(a_hash) {
-            Some(b) => Account::from_bytes(&b)?,
-            None => self
-                .storage
-                .get_account(a_hash)
-                .ok_or(StorageError::MissingAccount(a_hash))?,
+        // Charge base transaction cost: covers processing + broadcasting
+        let intrinsic = Self::intrinsic_gas_units(transaction);
+        if transaction.gas_limit < intrinsic {
+            return Err(VMError::OutOfGas {
+                used: intrinsic,
+                limit: transaction.gas_limit,
+            }
+            .into());
+        }
+
+        let get_account = |address: Address| -> Result<Account, StorageError> {
+            match block_overlay.get(address) {
+                Some(b) => {
+                    Account::from_bytes(&b).map_err(|e| StorageError::DecodeError(e.to_string()))
+                }
+                None => self
+                    .storage
+                    .get_account(address)
+                    .ok_or(StorageError::MissingAccount(address)),
+            }
         };
+
+        // Make sure an account exists for the transaction sender and receiver
+        let from_hash = transaction.from.address();
+        let mut from = get_account(from_hash)?;
+        let to_hash = transaction.to;
+        let mut to = get_account(to_hash)?;
 
         // Make sure the account has enough funds if the gas limit is attained
         let user_total = transaction
@@ -193,26 +238,37 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
             .ok_or(StorageError::ArithmeticOverflow {
                 gas_used: transaction.gas_limit,
                 gas_price: transaction.gas_price,
+            })?
+            .checked_add(transaction.amount)
+            .ok_or(StorageError::ArithmeticOverflow {
+                gas_used: transaction.gas_limit,
+                gas_price: transaction.gas_price,
             })?;
-        if account.balance() < user_total {
+        if from.balance() < user_total {
             return Err(StorageError::InsufficientBalance {
-                actual: account.balance(),
+                actual: from.balance(),
                 expected: user_total,
             });
         }
 
         // Validate the transaction
         self.validator
-            .validate_tx(transaction, &account, self.id)
+            .validate_tx(transaction, &from, self.id)
             .map_err(|e| StorageError::ValidationFailed(e.to_string()))?;
 
         // Execute and compute gas usage
-        let mut gas_used: u64 = 0;
-        let transaction_result = self.execute_tx(transaction, tx_overlay, &mut gas_used);
+        let mut gas_used: u64 = intrinsic;
+        let transaction_result = self.execute_tx(
+            transaction,
+            tx_overlay,
+            &mut gas_used,
+            (from_hash, &mut from),
+            (to_hash, &mut to),
+        );
 
         // If the transaction failed: charge gas and skip the tx_overlay states
-        account.increment_nonce();
-        account.charge(transaction.gas_price.checked_mul(gas_used as u128).ok_or(
+        from.increment_nonce();
+        from.charge(transaction.gas_price.checked_mul(gas_used as u128).ok_or(
             StorageError::ArithmeticOverflow {
                 gas_used,
                 gas_price: transaction.gas_price,
@@ -220,7 +276,13 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
         )?)?;
 
         transaction_result?;
-        Ok(((a_hash, account.to_bytes().to_vec()), gas_used))
+
+        let accounts: TxAccountChanges = if from_hash == to_hash {
+            [(from_hash, from.to_vec()), (from_hash, from.to_vec())]
+        } else {
+            [(from_hash, from.to_vec()), (to_hash, to.to_vec())]
+        };
+        Ok((accounts, gas_used))
     }
 
     /// Appends a block to storage and updates the chain tip (thread-safe).
@@ -264,10 +326,10 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
 
             // Try and apply the transaction to the current state
             match self.apply_tx(&tx, &block_overlay, &mut tx_overlay) {
-                Ok((account, gas_used)) => {
+                Ok((accounts, gas_used)) => {
                     tx_overlay
                         .into_writes()
-                        .apply_to(account, &mut block_overlay);
+                        .apply_tx_overlay(accounts, &mut block_overlay);
                     gas_left -= gas_used;
                     size_left -= size;
                     hashes.push(hash);
@@ -342,10 +404,10 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
         for tx in &block.transactions {
             let mut tx_overlay = OverlayState::new(&block_overlay);
             match self.apply_tx(tx, &block_overlay, &mut tx_overlay) {
-                Ok((account, _)) => {
+                Ok((accounts, _)) => {
                     tx_overlay
                         .into_writes()
-                        .apply_to(account, &mut block_overlay);
+                        .apply_tx_overlay(accounts, &mut block_overlay);
                 }
                 Err(e) => Err(e)?,
             }
@@ -561,11 +623,12 @@ mod tests {
         let key = PrivateKey::new();
         let sender = key.public_key().address();
         storage.set_account(sender, Account::new(10_000_000));
+        storage.set_account(Address::zero(), Account::new(0));
 
         let bc = with_validator_and_storage(TEST_CHAIN_ID, RejectingTxValidator, storage);
 
         let mut tx = new_tx(Bytes::new(b"any"), key, TEST_CHAIN_ID);
-        tx.gas_limit = 1;
+        tx.gas_limit = 50_000;
         tx.gas_price = 1;
 
         let header = Header {
@@ -592,7 +655,7 @@ mod tests {
         let bc = with_validator_and_storage(TEST_CHAIN_ID, AcceptAllValidator, storage);
 
         let mut tx = new_tx(Bytes::new(b"data"), PrivateKey::new(), TEST_CHAIN_ID);
-        tx.gas_limit = 1;
+        tx.gas_limit = 25_000;
         tx.gas_price = 1;
         let base = bc.storage.state_view();
         let overlay = OverlayState::new(&base);
@@ -610,11 +673,12 @@ mod tests {
         let key = PrivateKey::new();
         let sender = key.public_key().address();
         storage.set_account(sender, Account::new(100));
+        storage.set_account(Address::zero(), Account::new(0));
 
         let bc = with_validator_and_storage(TEST_CHAIN_ID, AcceptAllValidator, storage);
 
         let mut tx = new_tx(Bytes::new(b"data"), key, TEST_CHAIN_ID);
-        tx.gas_limit = 1000;
+        tx.gas_limit = 25_000;
         tx.gas_price = 1;
 
         let base = bc.storage.state_view();
@@ -636,6 +700,7 @@ mod tests {
         let key = PrivateKey::new();
         let sender = key.public_key().address();
         storage.set_account(sender, Account::new(u128::MAX));
+        storage.set_account(Address::zero(), Account::new(0));
 
         let bc = with_validator_and_storage(TEST_CHAIN_ID, AcceptAllValidator, storage);
 
@@ -744,6 +809,7 @@ mod tests {
         let sender = key.public_key().address();
         let initial_balance = 10_000_000u128;
         storage.set_account(sender, Account::new(initial_balance));
+        storage.set_account(Address::zero(), Account::new(0));
 
         let bc = with_validator_and_storage(TEST_CHAIN_ID, AcceptAllValidator, storage);
 
@@ -756,7 +822,9 @@ mod tests {
         let (account, _) = bc
             .apply_tx(&tx, &overlay, &mut tx_overlay)
             .expect("apply_tx failed");
-        tx_overlay.into_writes().apply_to(account, &mut overlay);
+        tx_overlay
+            .into_writes()
+            .apply_tx_overlay(account, &mut overlay);
 
         let account_bytes = overlay
             .get(sender)
@@ -774,6 +842,7 @@ mod tests {
         let key = PrivateKey::new();
         let sender = key.public_key().address();
         storage.set_account(sender, Account::new(10_000_000));
+        storage.set_account(Address::zero(), Account::new(0));
 
         let bc = with_validator_and_storage(TEST_CHAIN_ID, AcceptAllValidator, storage);
 
@@ -786,7 +855,9 @@ mod tests {
         let (account, _) = bc
             .apply_tx(&tx, &overlay, &mut tx_overlay)
             .expect("apply_tx failed");
-        tx_overlay.into_writes().apply_to(account, &mut overlay);
+        tx_overlay
+            .into_writes()
+            .apply_tx_overlay(account, &mut overlay);
 
         let account_bytes = overlay.get(sender).expect("account should exist");
         let account = Account::from_bytes(&account_bytes).unwrap();
@@ -804,6 +875,7 @@ mod tests {
         let initial_balance = 10_000_000u128;
         let gas_price = 10u128;
         storage.set_account(sender, Account::new(initial_balance));
+        storage.set_account(Address::zero(), Account::new(0));
 
         let bc = with_validator_and_storage(TEST_CHAIN_ID, AcceptAllValidator, storage);
 
@@ -817,7 +889,9 @@ mod tests {
         let (account, _) = bc
             .apply_tx(&tx, &overlay, &mut tx_overlay)
             .expect("apply_tx failed");
-        tx_overlay.into_writes().apply_to(account, &mut overlay);
+        tx_overlay
+            .into_writes()
+            .apply_tx_overlay(account, &mut overlay);
 
         let account_bytes = overlay.get(sender).expect("account should exist");
         let account = Account::from_bytes(&account_bytes).unwrap();
@@ -835,6 +909,7 @@ mod tests {
         let key = PrivateKey::new();
         let sender = key.public_key().address();
         storage.set_account(sender, Account::new(100_000_000));
+        storage.set_account(Address::zero(), Account::new(0));
 
         let bc = with_validator_and_storage(TEST_CHAIN_ID, AcceptAllValidator, storage);
 
@@ -850,12 +925,194 @@ mod tests {
                 .apply_tx(&tx, &overlay, &mut tx_overlay)
                 .expect("apply_tx failed");
 
-            tx_overlay.into_writes().apply_to(account, &mut overlay);
+            tx_overlay
+                .into_writes()
+                .apply_tx_overlay(account, &mut overlay);
         }
 
         let account_bytes = overlay.get(sender).expect("account should exist");
         let account = Account::from_bytes(&account_bytes).unwrap();
 
         assert_eq!(account.nonce(), 3);
+    }
+
+    #[test]
+    fn apply_tx_rejects_gas_limit_below_intrinsic() {
+        let genesis = create_genesis(TEST_CHAIN_ID);
+        let storage = test_storage(genesis);
+
+        let key = PrivateKey::new();
+        let sender = key.public_key().address();
+        storage.set_account(sender, Account::new(10_000_000));
+
+        let bc = with_validator_and_storage(TEST_CHAIN_ID, AcceptAllValidator, storage);
+
+        let mut tx = new_tx(Bytes::new(b""), key, TEST_CHAIN_ID);
+        tx.gas_limit = 1000; // Below 21_000 intrinsic
+        tx.gas_price = 1;
+
+        let base = bc.storage.state_view();
+        let overlay = OverlayState::new(&base);
+        let mut tx_overlay = OverlayState::new(&overlay);
+
+        let result = bc.apply_tx(&tx, &overlay, &mut tx_overlay);
+        assert!(matches!(result, Err(StorageError::VMError(_))));
+    }
+
+    fn make_transfer_tx(
+        from_key: PrivateKey,
+        to: Address,
+        amount: u128,
+        chain_id: u64,
+    ) -> Transaction {
+        Transaction::new(
+            to,
+            None,
+            Bytes::new(b""),
+            amount,
+            0,
+            1,
+            25_000,
+            0,
+            from_key,
+            chain_id,
+            TransactionType::TransferFunds,
+        )
+    }
+
+    #[test]
+    fn apply_tx_transfer_funds_moves_balance() {
+        let genesis = create_genesis(TEST_CHAIN_ID);
+        let storage = test_storage(genesis);
+
+        let sender_key = PrivateKey::new();
+        let sender = sender_key.public_key().address();
+        let receiver = PrivateKey::new().public_key().address();
+
+        let sender_initial = 1_000_000u128;
+        let receiver_initial = 500u128;
+        let transfer_amount = 10_000u128;
+
+        storage.set_account(sender, Account::new(sender_initial));
+        storage.set_account(receiver, Account::new(receiver_initial));
+
+        let bc = with_validator_and_storage(TEST_CHAIN_ID, AcceptAllValidator, storage);
+
+        let tx = make_transfer_tx(sender_key, receiver, transfer_amount, TEST_CHAIN_ID);
+
+        let base = bc.storage.state_view();
+        let mut overlay = OverlayState::new(&base);
+        let mut tx_overlay = OverlayState::new(&overlay);
+
+        let (accounts, gas_used) = bc
+            .apply_tx(&tx, &overlay, &mut tx_overlay)
+            .expect("apply_tx failed");
+        tx_overlay
+            .into_writes()
+            .apply_tx_overlay(accounts, &mut overlay);
+
+        let sender_account = Account::from_bytes(&overlay.get(sender).unwrap()).unwrap();
+        let receiver_account = Account::from_bytes(&overlay.get(receiver).unwrap()).unwrap();
+
+        let gas_cost = gas_used as u128 * tx.gas_price;
+        assert_eq!(
+            sender_account.balance(),
+            sender_initial - transfer_amount - gas_cost
+        );
+        assert_eq!(
+            receiver_account.balance(),
+            receiver_initial + transfer_amount
+        );
+    }
+
+    #[test]
+    fn apply_tx_transfer_funds_insufficient_balance_fails() {
+        let genesis = create_genesis(TEST_CHAIN_ID);
+        let storage = test_storage(genesis);
+
+        let sender_key = PrivateKey::new();
+        let sender = sender_key.public_key().address();
+        let receiver = PrivateKey::new().public_key().address();
+
+        // Only enough for gas, not for transfer
+        storage.set_account(sender, Account::new(30_000));
+        storage.set_account(receiver, Account::new(0));
+
+        let bc = with_validator_and_storage(TEST_CHAIN_ID, AcceptAllValidator, storage);
+
+        let tx = make_transfer_tx(sender_key, receiver, 50_000, TEST_CHAIN_ID);
+
+        let base = bc.storage.state_view();
+        let overlay = OverlayState::new(&base);
+        let mut tx_overlay = OverlayState::new(&overlay);
+
+        let result = bc.apply_tx(&tx, &overlay, &mut tx_overlay);
+        assert!(matches!(
+            result,
+            Err(StorageError::InsufficientBalance { .. })
+        ));
+    }
+
+    #[test]
+    fn intrinsic_gas_varies_by_tx_type_and_data() {
+        let key = PrivateKey::new();
+        let data = Bytes::new(vec![0u8; 100]);
+
+        let transfer_tx = Transaction::new(
+            Address::zero(),
+            None,
+            data.clone(),
+            0,
+            0,
+            1,
+            100_000,
+            0,
+            key.clone(),
+            TEST_CHAIN_ID,
+            TransactionType::TransferFunds,
+        );
+
+        let deploy_tx = Transaction::new(
+            Address::zero(),
+            None,
+            data.clone(),
+            0,
+            0,
+            1,
+            100_000,
+            0,
+            key.clone(),
+            TEST_CHAIN_ID,
+            TransactionType::DeployContract,
+        );
+
+        let invoke_tx = Transaction::new(
+            Address::zero(),
+            None,
+            data,
+            0,
+            0,
+            1,
+            100_000,
+            0,
+            key,
+            TEST_CHAIN_ID,
+            TransactionType::InvokeContract,
+        );
+
+        // TransferFunds: 21_000 + 0 * 100 = 21_000
+        let transfer_intrinsic =
+            Blockchain::<AcceptAllValidator, TestStorage>::intrinsic_gas_units(&transfer_tx);
+        assert_eq!(transfer_intrinsic, 21_000);
+
+        // DeployContract: 21_000 + 200 * 100 = 41_000
+        let deploy_intrinsic =
+            Blockchain::<AcceptAllValidator, TestStorage>::intrinsic_gas_units(&deploy_tx);
+        assert_eq!(deploy_intrinsic, 41_000);
+
+        // InvokeContract: 21_000 + 20 * 100 = 23_000
+        let invoke_intrinsic =
+            Blockchain::<AcceptAllValidator, TestStorage>::intrinsic_gas_units(&invoke_tx);
+        assert_eq!(invoke_intrinsic, 23_000);
     }
 }

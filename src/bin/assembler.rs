@@ -12,15 +12,19 @@
 //!
 //! # Options
 //! - `-o, --output <file>`: Output file path (defaults to `<input>.bin`)
-//! - `-p, --predict <price>`: Estimate deployment gas cost with given gas price
+//! - `-p, --predict [price]`: Estimate deployment gas cost (price defaults to 1)
 //!
 //! # Examples
 //! ```text
 //! assembler program.asm
 //! assembler program.asm -o output.bin
-//! assembler program.asm -p true 100
+//! assembler program.asm -p
+//! assembler program.asm -p 100
 //! ```
 
+use blockchain::core::blockchain::Blockchain;
+use blockchain::core::transaction::TransactionType;
+use blockchain::core::validator::BlockValidator;
 use blockchain::network::libp2p_transport::Libp2pTransport;
 use blockchain::network::server::Server;
 use blockchain::storage::main_storage::MainStorage;
@@ -29,7 +33,7 @@ use blockchain::storage::storage_trait::Storage;
 use blockchain::types::hash::Hash;
 use blockchain::virtual_machine::assembler::assemble_file;
 use blockchain::virtual_machine::state::OverlayState;
-use blockchain::virtual_machine::vm::{ExecContext, TRANSACTION_GAS_LIMIT, VM};
+use blockchain::virtual_machine::vm::{ExecContext, GasCategory, TRANSACTION_GAS_LIMIT, VM};
 use blockchain::{error, info, warn};
 use std::env;
 use std::fs;
@@ -61,17 +65,22 @@ fn main() {
                 output_path = Some(args[i].clone());
                 i += 1;
             }
-            k @ ("--predict" | "-p") => {
-                i += 1;
-                if i >= args.len() {
-                    error!("{k} requires an argument");
-                    process::exit(1);
-                }
+            "--predict" | "-p" => {
                 predict = true;
-                gas_price = args[i].parse::<u64>().unwrap_or_else(|_| {
-                    error!("Invalid gas price: '{}' is not a valid number", args[i]);
-                    process::exit(1);
-                });
+                // Check if next arg exists and is a valid number (not another flag)
+                if i + 1 < args.len() && !args[i + 1].starts_with('-') {
+                    i += 1;
+                    gas_price = args[i].parse::<u64>().unwrap_or_else(|_| {
+                        error!("Invalid gas price: '{}' is not a valid number", args[i]);
+                        process::exit(1);
+                    });
+                    if gas_price == 0 {
+                        error!("Gas price must be greater than 0");
+                        process::exit(1);
+                    }
+                } else {
+                    gas_price = 1;
+                }
                 i += 1;
             }
             other => {
@@ -128,7 +137,20 @@ fn main() {
     );
 
     if predict {
-        let mut vm = VM::new(program, TRANSACTION_GAS_LIMIT).unwrap_or_else(|e| {
+        let intrinsic = Blockchain::<BlockValidator, MainStorage>::intrinsic_gas_units(
+            TransactionType::DeployContract,
+            &program.to_bytes(),
+        );
+
+        if intrinsic > TRANSACTION_GAS_LIMIT {
+            error!(
+                "Intrinsic gas ({}) exceeds transaction limit ({})",
+                intrinsic, TRANSACTION_GAS_LIMIT
+            );
+            process::exit(1);
+        }
+
+        let mut vm = VM::new(program, TRANSACTION_GAS_LIMIT - intrinsic).unwrap_or_else(|e| {
             error!("{e}");
             process::exit(1)
         });
@@ -147,7 +169,9 @@ fn main() {
             process::exit(1)
         });
 
-        let profile = vm.gas_profile();
+        let mut profile = vm.gas_profile();
+        profile.add(GasCategory::Intrinsic, intrinsic);
+
         let total_u = profile.total();
         let total = total_u as f64;
 
@@ -206,7 +230,7 @@ fn main() {
 
         info!(
             "Estimated deployment cost: {}",
-            format_with_commas(vm.gas_used() * gas_price)
+            format_with_commas(total_u * gas_price)
         );
         warn!("Actual cost will depend on chain state.");
     }
@@ -234,9 +258,9 @@ ARGS:
     <input.asm>    Assembly source file to compile
 
 OPTIONS:
-    -o, --output <file>    Output file path (defaults to <input>.bin)
-    -p, --predict <price>  Estimate deployment gas cost (requires gas price)
-    -h, --help             Print this help message
+    -o, --output <file>     Output file path (defaults to <input>.bin)
+    -p, --predict [price]   Estimate deployment gas cost (price defaults to 1)
+    -h, --help              Print this help message
 
 EXAMPLES:
     # Compile to default output name
@@ -245,7 +269,10 @@ EXAMPLES:
     # Compile with explicit output
     {program} program.asm -o output.bin
 
-    # Compile and estimate gas cost
+    # Compile and estimate gas cost (price = 1)
+    {program} program.asm -p
+
+    # Compile and estimate gas cost with custom price
     {program} program.asm -p 100
 ";
 

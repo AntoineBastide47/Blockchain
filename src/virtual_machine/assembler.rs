@@ -29,6 +29,19 @@ use std::path::Path;
 
 const COMMENT_CHAR: char = '#';
 const LABEL_SUFFIX: char = ':';
+const SECTION_INIT: &str = "[ init code ]";
+const SECTION_RUNTIME: &str = "[ runtime code ]";
+
+/// Represents which section of the assembly we're currently parsing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Section {
+    /// Before any section marker - code goes to runtime by default.
+    None,
+    /// Inside `[ init code ]` section.
+    Init,
+    /// Inside `[ runtime code ]` section.
+    Runtime,
+}
 
 /// Assembly context for heap items interning and label tracking during compilation.
 ///
@@ -244,6 +257,18 @@ fn label_name(tok: &str) -> &str {
     &tok[..tok.len() - 1]
 }
 
+/// Checks if a line is a section marker and returns the section type if so.
+fn parse_section_marker(line: &str) -> Option<Section> {
+    let trimmed = line.trim();
+    if trimmed.eq_ignore_ascii_case(SECTION_INIT) {
+        Some(Section::Init)
+    } else if trimmed.eq_ignore_ascii_case(SECTION_RUNTIME) {
+        Some(Section::Runtime)
+    } else {
+        None
+    }
+}
+
 macro_rules! define_parse_instruction {
     (
         $(
@@ -334,14 +359,9 @@ macro_rules! define_parse_instruction {
                             });
                         }
 
-                        let mut it = tokens.iter().skip(1);
-                        Ok(AsmInstr::$name {
-                            $(
-                                $field: define_parse_instruction!(
-                                    @parse_operand $kind, it.next().unwrap(), ctx, offset
-                                )?,
-                            )*
-                        })
+                        define_parse_instruction!(
+                            @construct ctx offset tokens; $name $( $field : $kind ),*
+                        )
                     }
                 ),*
             }
@@ -363,6 +383,21 @@ macro_rules! define_parse_instruction {
     (@size ImmI64) => { 8usize };
 
     // ---------- parsing ----------
+    (@construct $ctx:ident $offset:ident $tokens:ident; $name:ident) => {
+        Ok(AsmInstr::$name { })
+    };
+
+    (@construct $ctx:ident $offset:ident $tokens:ident; $name:ident $( $field:ident : $kind:ident ),+ ) => {{
+        let mut it = $tokens.iter().skip(1);
+        Ok(AsmInstr::$name {
+            $(
+                $field: define_parse_instruction!(
+                    @parse_operand $kind, it.next().unwrap(), $ctx, $offset
+                )?,
+            )*
+        })
+    }};
+
     (@parse_operand Reg, $tok:expr, $ctx:expr, $current_offset:expr) => {{
           let reg = parse_reg(&$tok.text)?;
           if reg > $ctx.max_register {
@@ -398,32 +433,68 @@ for_each_instruction!(define_parse_instruction);
 /// Assemble a full source string into bytecode.
 ///
 /// Uses two-pass assembly:
-/// 1. First pass: tokenize lines, record label positions
+/// 1. First pass: tokenize lines, record label positions, detect sections
 /// 2. Second pass: parse instructions with label resolution, emit bytecode
+///
+/// Section markers `[ init code ]` and `[ runtime code ]` split the source:
+/// - Code between `[ init code ]` and `[ runtime code ]` goes to `init_code`
+/// - Code after `[ runtime code ]` goes to `runtime_code`
+/// - Code before any section marker goes to `runtime_code` by default
+///
+/// Labels are computed for a concatenated view (init_code + runtime_code) so that
+/// init_code can call into runtime_code. The VM should run the concatenated bytecode,
+/// starting at ip=0 for deployment and ip=init_code.len() for runtime calls.
 pub fn assemble_source(source: impl Into<String>) -> Result<Program, VMError> {
     let source = source.into();
     let mut asm_context = AsmContext::new();
 
-    // First pass: tokenize all lines and collect label definitions
-    let mut parsed_lines: Vec<(usize, Vec<Token>)> = Vec::new();
-    let mut offset = 0usize;
+    // First pass: tokenize all lines, detect sections, compute section sizes
+    // We track (line_no, tokens, section) for each instruction line
+    // Labels are stored with section info for later adjustment
+    let mut parsed_lines: Vec<(usize, Vec<Token>, Section)> = Vec::new();
+    let mut current_section = Section::None;
+
+    // Track sizes separately for init and runtime sections
+    let mut init_size = 0usize;
+    let mut runtime_size = 0usize;
+
+    // Temporary label storage: (name, section, local_offset)
+    let mut pending_labels: Vec<(String, Section, usize, usize, usize)> = Vec::new();
 
     for (line_no, line) in source.lines().enumerate() {
+        // Check for section markers first
+        if let Some(section) = parse_section_marker(line) {
+            current_section = section;
+            continue;
+        }
+
         let tokens = tokenize(line_no + 1, line)?;
         if tokens.is_empty() {
             continue;
         }
 
+        // Determine which section this code belongs to
+        let effective_section = match current_section {
+            Section::None | Section::Runtime => Section::Runtime,
+            Section::Init => Section::Init,
+        };
+
+        // Get the offset pointer for the current section
+        let local_offset = match effective_section {
+            Section::Init => &mut init_size,
+            Section::Runtime | Section::None => &mut runtime_size,
+        };
+
         // Check if first token is a label definition
         if is_label_def(&tokens[0].text) {
             let name = label_name(&tokens[0].text).to_string();
-            asm_context
-                .define_label(name, offset)
-                .map_err(|e| VMError::AssemblyError {
-                    line: line_no + 1,
-                    offset: tokens[0].offset,
-                    source: e.to_string(),
-                })?;
+            pending_labels.push((
+                name,
+                effective_section,
+                *local_offset,
+                line_no + 1,
+                tokens[0].offset,
+            ));
 
             // If there are more tokens after the label, treat them as an instruction
             if tokens.len() > 1 {
@@ -435,8 +506,8 @@ pub fn assemble_source(source: impl Into<String>) -> Result<Program, VMError> {
                         source: e.to_string(),
                     }
                 })?;
-                offset += instruction_size(instr);
-                parsed_lines.push((line_no, instr_tokens));
+                *local_offset += instruction_size(instr);
+                parsed_lines.push((line_no, instr_tokens, effective_section));
             }
         } else {
             let instr =
@@ -445,16 +516,41 @@ pub fn assemble_source(source: impl Into<String>) -> Result<Program, VMError> {
                     offset: tokens[0].offset,
                     source: e.to_string(),
                 })?;
-            offset += instruction_size(instr);
-            parsed_lines.push((line_no, tokens));
+            *local_offset += instruction_size(instr);
+            parsed_lines.push((line_no, tokens, effective_section));
         }
     }
 
-    // Second pass: parse instructions and emit bytecode
-    let mut bytecode = Vec::new();
+    // Now register all labels with their concatenated offsets
+    // init_code labels: local_offset
+    // runtime_code labels: init_size + local_offset
+    for (name, section, local_offset, line_no, tok_offset) in pending_labels {
+        let global_offset = match section {
+            Section::Init => local_offset,
+            Section::Runtime | Section::None => init_size + local_offset,
+        };
+        asm_context
+            .define_label(name, global_offset)
+            .map_err(|e| VMError::AssemblyError {
+                line: line_no,
+                offset: tok_offset,
+                source: e.to_string(),
+            })?;
+    }
 
-    for (line_no, tokens) in parsed_lines {
-        let current_offset = bytecode.len();
+    // Second pass: parse instructions and emit bytecode to separate vectors
+    // Offsets are computed in concatenated view for correct label resolution
+    let mut init_bytecode = Vec::new();
+    let mut runtime_bytecode = Vec::new();
+
+    for (line_no, tokens, section) in parsed_lines {
+        let (bytecode, base_offset) = match section {
+            Section::Init => (&mut init_bytecode, 0),
+            Section::Runtime | Section::None => (&mut runtime_bytecode, init_size),
+        };
+
+        // current_offset in concatenated view
+        let current_offset = base_offset + bytecode.len();
         let instr = parse_instruction(&mut asm_context, &tokens, current_offset).map_err(|e| {
             VMError::AssemblyError {
                 line: line_no + 1,
@@ -462,13 +558,14 @@ pub fn assemble_source(source: impl Into<String>) -> Result<Program, VMError> {
                 source: e.to_string(),
             }
         })?;
-        instr.assemble(&mut bytecode);
+        instr.assemble(bytecode);
     }
 
     Ok(Program {
         max_register: asm_context.max_register,
         items: asm_context.items,
-        bytecode,
+        init_code: init_bytecode,
+        runtime_code: runtime_bytecode,
     })
 }
 
@@ -522,7 +619,7 @@ mod tests {
     #[test]
     fn assemble_empty_source() {
         let program = assemble_source("").unwrap();
-        assert!(program.bytecode.is_empty());
+        assert!(program.runtime_code.is_empty());
     }
 
     #[test]
@@ -535,23 +632,23 @@ mod tests {
         "#
         );
         let program = assemble_source(source).unwrap();
-        assert!(program.bytecode.is_empty());
+        assert!(program.runtime_code.is_empty());
     }
 
     #[test]
     fn assemble_inline_comment() {
         let source = format!("LOAD_I64 r0, 42 {COMMENT_CHAR} load value");
         let program = assemble_source(source).unwrap();
-        assert_eq!(program.bytecode.len(), 10); // opcode(1) + reg(1) + i64(8)
+        assert_eq!(program.runtime_code.len(), 10); // opcode(1) + reg(1) + i64(8)
     }
 
     #[test]
     fn assemble_single_instruction() {
         let program = assemble_source("LOAD_I64 r0, 42").unwrap();
-        assert_eq!(program.bytecode[0], Instruction::LoadI64 as u8);
-        assert_eq!(program.bytecode[1], 0);
+        assert_eq!(program.runtime_code[0], Instruction::LoadI64 as u8);
+        assert_eq!(program.runtime_code[1], 0);
         assert_eq!(
-            i64::from_le_bytes(program.bytecode[2..10].try_into().unwrap()),
+            i64::from_le_bytes(program.runtime_code[2..10].try_into().unwrap()),
             42
         );
     }
@@ -604,7 +701,7 @@ mod tests {
     fn assemble_string_literal() {
         let program = assemble_source(r#"LOAD_STR r0, "hello""#).unwrap();
         assert_eq!(program.items, vec!["hello".as_bytes().to_vec()]);
-        assert_eq!(program.bytecode[0], Instruction::LoadStr as u8);
+        assert_eq!(program.runtime_code[0], Instruction::LoadStr as u8);
     }
 
     #[test]
@@ -641,12 +738,12 @@ mod tests {
     #[test]
     fn assemble_bool_literal() {
         let program = assemble_source("LOAD_BOOL r0, true").unwrap();
-        assert_eq!(program.bytecode[0], Instruction::LoadBool as u8);
-        assert_eq!(program.bytecode[2], 1);
+        assert_eq!(program.runtime_code[0], Instruction::LoadBool as u8);
+        assert_eq!(program.runtime_code[2], 1);
 
         let program = assemble_source("LOAD_BOOL r0, false").unwrap();
-        assert_eq!(program.bytecode[0], Instruction::LoadBool as u8);
-        assert_eq!(program.bytecode[2], 0);
+        assert_eq!(program.runtime_code[0], Instruction::LoadBool as u8);
+        assert_eq!(program.runtime_code[2], 0);
 
         let err = assemble_source("LOAD_BOOL r0, 1").unwrap_err();
         assert!(matches!(err, VMError::AssemblyError { .. }));
@@ -842,28 +939,28 @@ mod tests {
     fn assemble_call_host_argc_u8() {
         // CALL_HOST: opcode(1) + dst(1) + fn_id(4) + argc(1) + argv(1) = 8 bytes
         let program = assemble_source(r#"CALL_HOST r0, "test_fn", 3, r1"#).unwrap();
-        assert_eq!(program.bytecode[0], Instruction::CallHost as u8);
-        assert_eq!(program.bytecode[1], 0); // dst = r0
-        assert_eq!(program.bytecode[6], 3); // argc = 3 (single byte)
-        assert_eq!(program.bytecode[7], 1); // argv = r1
-        assert_eq!(program.bytecode.len(), 8);
+        assert_eq!(program.runtime_code[0], Instruction::CallHost as u8);
+        assert_eq!(program.runtime_code[1], 0); // dst = r0
+        assert_eq!(program.runtime_code[6], 3); // argc = 3 (single byte)
+        assert_eq!(program.runtime_code[7], 1); // argv = r1
+        assert_eq!(program.runtime_code.len(), 8);
     }
 
     #[test]
     fn assemble_call_argc_u8() {
         // CALL: opcode(1) + dst(1) + fn_id(4) + argc(1) + argv(1) = 8 bytes
         let program = assemble_source("my_func:\nCALL r0, my_func, 5, r2").unwrap();
-        assert_eq!(program.bytecode[0], Instruction::Call as u8);
-        assert_eq!(program.bytecode[1], 0); // dst = r0
-        assert_eq!(program.bytecode[10], 5); // argc = 5 (single byte)
-        assert_eq!(program.bytecode[11], 2); // argv = r2
-        assert_eq!(program.bytecode.len(), 12);
+        assert_eq!(program.runtime_code[0], Instruction::Call as u8);
+        assert_eq!(program.runtime_code[1], 0); // dst = r0
+        assert_eq!(program.runtime_code[10], 5); // argc = 5 (single byte)
+        assert_eq!(program.runtime_code[11], 2); // argv = r2
+        assert_eq!(program.runtime_code.len(), 12);
     }
 
     #[test]
     fn assemble_call_argc_max_u8() {
         let program = assemble_source(r#"CALL_HOST r0, "fn", 255, r0"#).unwrap();
-        assert_eq!(program.bytecode[6], 255); // max u8 value
+        assert_eq!(program.runtime_code[6], 255); // max u8 value
     }
 
     #[test]
@@ -871,5 +968,104 @@ mod tests {
         // 256 exceeds u8 range
         let err = assemble_source(r#"CALL_HOST r0, "fn", 256, r0"#).unwrap_err();
         assert!(matches!(err, VMError::AssemblyError { .. }));
+    }
+
+    // ==================== Sections ====================
+
+    #[test]
+    fn parse_section_marker_valid() {
+        assert_eq!(parse_section_marker("[ init code ]"), Some(Section::Init));
+        assert_eq!(
+            parse_section_marker("[ runtime code ]"),
+            Some(Section::Runtime)
+        );
+        assert_eq!(
+            parse_section_marker("  [ init code ]  "),
+            Some(Section::Init)
+        );
+        assert_eq!(parse_section_marker("[ INIT CODE ]"), Some(Section::Init));
+    }
+
+    #[test]
+    fn parse_section_marker_invalid() {
+        assert_eq!(parse_section_marker("init code"), None);
+        assert_eq!(parse_section_marker("[init code]"), None);
+        assert_eq!(parse_section_marker("[ unknown ]"), None);
+        assert_eq!(parse_section_marker("LOAD_I64 r0, 1"), None);
+    }
+
+    #[test]
+    fn assemble_no_sections_defaults_to_runtime() {
+        let program = assemble_source("LOAD_I64 r0, 1").unwrap();
+        assert!(program.init_code.is_empty());
+        assert!(!program.runtime_code.is_empty());
+    }
+
+    #[test]
+    fn assemble_init_section_only() {
+        let source = "[ init code ]\nLOAD_I64 r0, 42";
+        let program = assemble_source(source).unwrap();
+        assert_eq!(program.init_code.len(), 10);
+        assert!(program.runtime_code.is_empty());
+    }
+
+    #[test]
+    fn assemble_runtime_section_only() {
+        let source = "[ runtime code ]\nLOAD_I64 r0, 42";
+        let program = assemble_source(source).unwrap();
+        assert!(program.init_code.is_empty());
+        assert_eq!(program.runtime_code.len(), 10);
+    }
+
+    #[test]
+    fn assemble_both_sections() {
+        let source = r#"
+[ init code ]
+LOAD_I64 r0, 1
+LOAD_I64 r1, 2
+
+[ runtime code ]
+LOAD_I64 r2, 3
+"#;
+        let program = assemble_source(source).unwrap();
+        assert_eq!(program.init_code.len(), 20); // 2 LOAD_I64 instructions
+        assert_eq!(program.runtime_code.len(), 10); // 1 LOAD_I64 instruction
+    }
+
+    #[test]
+    fn assemble_labels_within_sections() {
+        let source = r#"
+[ init code ]
+start: LOAD_I64 r0, 1
+
+[ runtime code ]
+func: LOAD_I64 r1, 2
+"#;
+        let program = assemble_source(source).unwrap();
+        assert!(!program.init_code.is_empty());
+        assert!(!program.runtime_code.is_empty());
+    }
+
+    #[test]
+    fn assemble_empty_init_section() {
+        let source = "[ init code ]\n[ runtime code ]\nLOAD_I64 r0, 1";
+        let program = assemble_source(source).unwrap();
+        assert!(program.init_code.is_empty());
+        assert_eq!(program.runtime_code.len(), 10);
+    }
+
+    #[test]
+    fn assemble_strings_across_sections() {
+        let source = r#"
+[ init code ]
+LOAD_STR r0, "init"
+
+[ runtime code ]
+LOAD_STR r1, "runtime"
+"#;
+        let program = assemble_source(source).unwrap();
+        assert_eq!(program.items.len(), 2);
+        assert_eq!(program.items[0], b"init");
+        assert_eq!(program.items[1], b"runtime");
     }
 }

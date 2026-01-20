@@ -140,6 +140,7 @@ mod tests {
         assert_eq!(Instruction::Bgeu.mnemonic(), "BGEU");
         assert_eq!(Instruction::Jump.mnemonic(), "JUMP");
         assert_eq!(Instruction::Ret.mnemonic(), "RET");
+        assert_eq!(Instruction::Halt.mnemonic(), "HALT");
     }
 
     /// Verifies that all instruction base gas costs match their expected values.
@@ -207,12 +208,13 @@ mod tests {
         assert_eq!(Instruction::Bgeu.base_gas(), 5);
         assert_eq!(Instruction::Jump.base_gas(), 5);
         assert_eq!(Instruction::Ret.base_gas(), 5);
+        assert_eq!(Instruction::Halt.base_gas(), 1);
     }
 
     /// Verifies the total instruction count has not changed.
     #[test]
     fn instruction_count_unchanged() {
-        const EXPECTED_COUNT: usize = 53;
+        const EXPECTED_COUNT: usize = 54;
 
         // Count by verifying TryFrom succeeds for expected opcodes
         let mut count = 0;

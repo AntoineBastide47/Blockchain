@@ -23,9 +23,7 @@
 
 use blockchain::core::account::Account;
 use blockchain::core::transaction::{Transaction, TransactionType};
-use blockchain::crypto::key_pair::{
-    Address, PrivateKey, PublicKey, load_or_generate_validator_key,
-};
+use blockchain::crypto::key_pair::{Address, PublicKey, load_or_generate_validator_key};
 use blockchain::network::libp2p_transport::Libp2pTransport;
 use blockchain::network::message::{Message, MessageType};
 use blockchain::network::rpc::Rpc;
@@ -229,7 +227,7 @@ async fn main() {
 
                 // Build a fully populated transaction for the demo.
                 let tx = Transaction::new(
-                    PrivateKey::new().public_key().address(),
+                    validator_key.clone().unwrap().public_key().address(),
                     None,
                     data,
                     0,

@@ -67,6 +67,13 @@ impl Account {
         self.code_hash != Self::EMPTY_CODE_HASH
     }
 
+    /// Returns the hash of the contract's runtime bytecode.
+    ///
+    /// For EOAs (externally owned accounts), returns [`EMPTY_CODE_HASH`](Self::EMPTY_CODE_HASH).
+    pub fn code_hash(&self) -> Hash {
+        self.code_hash
+    }
+
     /// Computes (and caches) a chain-specific hash of the encoded account value.
     pub fn value_hash(&self, chain_id: u64) -> Hash {
         self.cached_hash.get_or_compute(chain_id, || {

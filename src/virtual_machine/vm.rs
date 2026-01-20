@@ -13,6 +13,8 @@ use crate::virtual_machine::state::State;
 /// Categories of gas consumption for profiling and debugging.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum GasCategory {
+    /// Intrinsic cost of the transaction
+    Intrinsic,
     /// Initial contract deployment cost (base + bytecode size).
     Deploy,
     /// Base cost for executing opcodes.
@@ -36,6 +38,7 @@ pub enum GasCategory {
 impl GasCategory {
     pub const fn as_str(&self) -> &'static str {
         match self {
+            GasCategory::Intrinsic => "Intrinsic",
             GasCategory::Deploy => "Deployment",
             GasCategory::OpcodeBase => "Opcode Base",
             GasCategory::RegisterAccess => "Register Access",
@@ -55,6 +58,7 @@ impl GasCategory {
 /// enabling developers to identify expensive operations in their contracts.
 #[derive(Clone, Debug, Default)]
 pub struct GasProfile {
+    intrinsic: u64,
     deploy: u64,
     opcode_base: u64,
     register_access: u64,
@@ -73,8 +77,9 @@ impl GasProfile {
     }
 
     /// Adds gas to the specified category.
-    fn add(&mut self, category: GasCategory, amount: u64) {
+    pub fn add(&mut self, category: GasCategory, amount: u64) {
         match category {
+            GasCategory::Intrinsic => self.intrinsic = self.intrinsic.saturating_add(amount),
             GasCategory::Deploy => self.deploy = self.deploy.saturating_add(amount),
             GasCategory::OpcodeBase => self.opcode_base = self.opcode_base.saturating_add(amount),
             GasCategory::RegisterAccess => {
@@ -100,6 +105,7 @@ impl GasProfile {
     /// Returns the total gas across all categories.
     pub fn total(&self) -> u64 {
         self.deploy
+            .saturating_add(self.intrinsic)
             .saturating_add(self.opcode_base)
             .saturating_add(self.register_access)
             .saturating_add(self.state_key_derivation)
@@ -113,6 +119,7 @@ impl GasProfile {
     /// Returns an iterator over all categories and their gas costs.
     pub fn iter(&self) -> impl Iterator<Item = (GasCategory, u64)> {
         [
+            (GasCategory::Intrinsic, self.intrinsic),
             (GasCategory::Deploy, self.deploy),
             (GasCategory::OpcodeBase, self.opcode_base),
             (GasCategory::RegisterAccess, self.register_access),
@@ -391,22 +398,24 @@ struct CallFrame {
 /// Executes compiled bytecode sequentially, reading instructions from the
 /// instruction pointer until the end of the bytecode is reached.
 ///
-/// # TODO for 0.14.0:
-/// 1) 🟢 Add full control flow for function support
-/// 2) 🟢 Add string and hash support
+/// The VM stores concatenated init_code + runtime_code. During deployment,
+/// execution starts at ip=0 (init_code). For runtime calls, execution starts
+/// at ip=init_size (runtime_code). This allows init_code to call into runtime_code.
 ///
 /// # TODO potential before 1.0.0:
-/// 3) 🔴 Add arithmetic op codes that take in immediate instead of register
-/// 4) 🔴 Add list and map support
-/// 5) 🔴 Add a deterministic optimizer do make the assembly code more performant
+/// 1) 🔴 Add arithmetic op codes that take in immediate instead of register
+/// 2) 🔴 Add list and map support
+/// 3) 🔴 Add a deterministic optimizer do make the assembly code more performant
 ///
 /// # TODO after 1.0.0:
-/// 6) 🔴 Add a smart contract language to not require assembly written smart contracts
-/// 7) 🔴 Add a deterministic compiler to convert the language to assembly
-/// 8) 🔴 Add an LSP for smoother smart contract writing experience
+/// 4) 🔴 Add a smart contract language to not require assembly written smart contracts
+/// 5) 🔴 Add a deterministic compiler to convert the language to assembly
+/// 6) 🔴 Add an LSP for smoother smart contract writing experience
 pub struct VM {
-    /// Bytecode to execute.
+    /// Concatenated bytecode (init_code + runtime_code).
     data: Vec<u8>,
+    /// Byte offset where runtime_code begins (i.e., init_code.len()).
+    init_size: usize,
     /// Instruction pointer (current position in bytecode).
     ip: usize,
     /// Register file (256 max registers).
@@ -427,11 +436,21 @@ pub struct VM {
 impl VM {
     /// Creates a new VM instance with the given program and gas limits.
     ///
+    /// Concatenates init_code + runtime_code for execution. Use `run` for deployment
+    /// (starts at ip=0) or `run_call` for runtime calls (starts at ip=init_size).
+    ///
     /// Returns `OutOfGas` if the base cost of creating the smart contract exceeds `max_gas`.
     pub fn new(program: Program, max_gas: u64) -> Result<Self, VMError> {
-        let bytes = program.bytecode.len();
+        let init_size = program.init_code.len();
+        let total_bytes = init_size + program.runtime_code.len();
+
+        // Concatenate init_code + runtime_code
+        let mut data = program.init_code;
+        data.extend(program.runtime_code);
+
         let mut vm = Self {
-            data: program.bytecode,
+            data,
+            init_size,
             ip: 0,
             registers: Registers::new(program.max_register as usize + 1),
             heap: Heap::new(program.items),
@@ -441,8 +460,13 @@ impl VM {
             gas_profile: GasProfile::new(),
         };
 
-        vm.charge_gas_categorized(20_000 + bytes as u64 * 200, GasCategory::Deploy)?;
+        vm.charge_gas_categorized(20_000 + total_bytes as u64 * 200, GasCategory::Deploy)?;
         Ok(vm)
+    }
+
+    /// Returns the byte offset where runtime_code begins.
+    pub fn init_size(&self) -> usize {
+        self.init_size
     }
 
     /// Derives a unique storage key from chain ID, contract ID, and user-provided key.
@@ -474,9 +498,9 @@ impl VM {
         self.gas_used
     }
 
-    /// Returns a reference to the gas profile for this execution.
-    pub fn gas_profile(&self) -> &GasProfile {
-        &self.gas_profile
+    /// Returns the gas profile for this execution.
+    pub fn gas_profile(&self) -> GasProfile {
+        self.gas_profile.clone()
     }
 
     /// Adds gas to the running total with category tracking.
@@ -632,7 +656,12 @@ impl VM {
             GasCategory::StateStore,
         )?;
 
-        let byte_cost = (HASH_LEN as u64 + item.len() as u64)
+        let byte_cost = (HASH_LEN as u64)
+            .checked_add(item.len() as u64)
+            .ok_or(VMError::OutOfGas {
+                used: self.gas_used,
+                limit: self.max_gas,
+            })?
             .checked_mul(STORE_BYTE_COST)
             .ok_or(VMError::OutOfGas {
                 used: self.gas_used,
@@ -659,12 +688,26 @@ impl VM {
 
 /// impl block for VM execution functions
 impl VM {
-    /// Executes the bytecode until completion or error.
+    /// Executes the bytecode from ip=0 (deployment mode).
     ///
-    /// Runs instructions sequentially until the instruction pointer reaches
-    /// the end of the bytecode buffer. If a gas limit is set in the context,
-    /// execution halts with [`VMError::OutOfGas`] when exceeded.
+    /// Runs init_code first, which may call into runtime_code. Use this method
+    /// for contract deployment. For subsequent calls, use [`run_call`].
     pub fn run<S: State>(&mut self, state: &mut S, ctx: &ExecContext) -> Result<(), VMError> {
+        self.ip = 0;
+        self.run_inner(state, ctx)
+    }
+
+    /// Executes the bytecode from ip=init_size (runtime call mode).
+    ///
+    /// Skips init_code and runs runtime_code directly. Use this method for
+    /// contract calls after deployment. For deployment, use [`run`].
+    pub fn run_call<S: State>(&mut self, state: &mut S, ctx: &ExecContext) -> Result<(), VMError> {
+        self.ip = self.init_size;
+        self.run_inner(state, ctx)
+    }
+
+    /// Internal execution loop.
+    fn run_inner<S: State>(&mut self, state: &mut S, ctx: &ExecContext) -> Result<(), VMError> {
         while self.ip < self.data.len() {
             let opcode_offset = self.ip;
             let opcode = self.data[opcode_offset];
@@ -775,6 +818,7 @@ impl VM {
                 Bgeu => op_bgeu(rs1: Reg, rs2: Reg, offset: ImmI64),
                 Jump => op_jump(offset: ImmI64),
                 Ret => op_ret(rs: Reg),
+                Halt => op_halt(),
             }
         }
     }
@@ -1467,6 +1511,12 @@ impl VM {
         Ok(())
     }
 
+    fn op_halt(&mut self, _instr: &'static str) -> Result<(), VMError> {
+        // Move IP to the end to exit the execution loop cleanly.
+        self.ip = self.data.len();
+        Ok(())
+    }
+
     fn op_ret(&mut self, _instr: &'static str, rs: u8) -> Result<(), VMError> {
         let frame = self.call_stack.pop().ok_or(VMError::ReturnWithoutCall {
             call_depth: self.call_stack.len(),
@@ -1494,8 +1544,13 @@ mod tests {
             init_cost: u64,
             max_gas: u64,
         ) -> Result<Self, VMError> {
+            let init_size = program.init_code.len();
+            let mut data = program.init_code;
+            data.extend(program.runtime_code);
+
             let mut vm = Self {
-                data: program.bytecode,
+                data,
+                init_size,
                 ip: 0,
                 registers: Registers::new(program.max_register as usize + 1),
                 heap: Heap::new(program.items),
@@ -2491,6 +2546,17 @@ LOAD_HASH_STATE r2, r0"#,
         let vm = run_vm(source);
         // Branch taken because -1 as u64 > 1
         assert_eq!(vm.registers.get(2).unwrap(), &Value::Zero);
+    }
+
+    #[test]
+    fn halt_stops_execution() {
+        let source = r#"
+            LOAD_I64 r0, 1
+            HALT
+            LOAD_I64 r0, 99
+        "#;
+        let vm = run_vm(source);
+        assert_eq!(vm.registers.get_int(0, "").unwrap(), 1);
     }
 
     #[test]

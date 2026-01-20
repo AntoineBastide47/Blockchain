@@ -142,3 +142,21 @@ impl<const N: usize> From<&[u8; N]> for Bytes {
         Self::new(arr.as_slice())
     }
 }
+
+impl IntoIterator for Bytes {
+    type Item = u8;
+    type IntoIter = std::vec::IntoIter<u8>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.to_vec().into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a Bytes {
+    type Item = &'a u8;
+    type IntoIter = std::slice::Iter<'a, u8>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
+}

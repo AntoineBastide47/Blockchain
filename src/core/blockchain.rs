@@ -10,6 +10,7 @@ use crate::storage::state_store::{AccountStorage, VmStorage};
 use crate::storage::state_view::StateViewProvider;
 use crate::storage::storage_trait::{Storage, StorageError};
 use crate::storage::txpool::TxPool;
+use crate::types::bytes::Bytes;
 use crate::types::encoding::{Decode, Encode};
 use crate::types::hash::Hash;
 use crate::types::merkle_tree::MerkleTree;
@@ -97,8 +98,15 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
         h.update(b"SMART_CONTRACT");
         transaction.from.encode(&mut h);
         transaction.nonce.encode(&mut h);
-        transaction.data.encode(&mut h);
         h.finalize()
+    }
+
+    /// Computes a namespaced hash for contract runtime bytecode.
+    ///
+    /// The `"RUNTIME_CODE"` prefix ensures this hash cannot collide with state
+    /// storage keys (prefixed with `"STATE"`) or other hash domains.
+    fn code_hash(bytes: &[u8]) -> Hash {
+        Hash::sha3().chain(b"RUNTIME_CODE").chain(bytes).finalize()
     }
 
     /// Computes the base gas cost for a transaction before execution.
@@ -108,21 +116,21 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
     /// - `TransferFunds`: 0 gas per byte (data ignored)
     /// - `DeployContract`: 200 gas per byte (bytecode storage)
     /// - `InvokeContract`: 20 gas per byte (call data processing)
-    fn intrinsic_gas_units(transaction: &Transaction) -> u64 {
-        21_000
-            + transaction.data.len() as u64
-                * match transaction.tx_type {
-                    TransactionType::TransferFunds => 0,
-                    TransactionType::DeployContract => 200,
-                    TransactionType::InvokeContract => 20,
-                }
+    pub fn intrinsic_gas_units(tx_type: TransactionType, data: &Bytes) -> u64 {
+        let mut gas = 21_000 + ((tx_type == TransactionType::DeployContract) as u64 * 32_000);
+        for b in data {
+            gas = gas.saturating_add(4 + (*b != 0) as u64 * 12);
+        }
+        gas
     }
 
     /// Executes a transaction based on its type and updates gas usage.
     ///
-    /// Handles different transaction types: fund transfers, contract deployment, and
-    /// contract invocation. For deployments, validates gas limits, initializes the VM
-    /// with the contract bytecode, executes, and persists the contract account on success.
+    /// Handles three transaction types:
+    /// - `TransferFunds`: moves native currency between accounts
+    /// - `DeployContract`: runs init_code, then persists the contract account and
+    ///   runtime bytecode under a namespaced `code_hash` key
+    /// - `InvokeContract`: loads stored runtime bytecode and executes via `run_call`
     fn execute_tx<T: State>(
         &self,
         transaction: &Transaction,
@@ -141,13 +149,17 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
                 to.1.transfer(transaction.amount)
             }
             TransactionType::DeployContract => {
-                // TODO:
-                // this isn't a deployment just a run of the contract and then the contract is discarded
-                // So it needs to be stored on chain and the run data needs to be discarded (not account mutation)
                 let program = Program::from_bytes(transaction.data.as_slice())?;
 
-                // Make sure the maximum gas allowed by the user is in the correct range
-                let max_gas = transaction.gas_limit;
+                // Compute remaining gas after intrinsic costs
+                let max_gas =
+                    transaction
+                        .gas_limit
+                        .checked_sub(*gas_used)
+                        .ok_or(VMError::OutOfGas {
+                            used: *gas_used,
+                            limit: transaction.gas_limit,
+                        })?;
                 if max_gas > TRANSACTION_GAS_LIMIT {
                     return Err(VMError::OutOfGas {
                         used: max_gas,
@@ -156,35 +168,47 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
                     .into());
                 }
 
-                let mut vm = VM::new(program, max_gas)?;
+                let mut vm = VM::new(program.clone(), max_gas)?;
                 let contract_id = Self::contract_id(transaction);
                 let ctx = ExecContext {
                     chain_id: self.id,
                     contract_id,
                 };
 
-                // Execute tx in its own overlay, reading from current block overlay
+                // Run init_code (may call into runtime_code for setup)
                 let result = vm.run(tx_overlay, &ctx);
                 *gas_used += vm.gas_used();
+
                 match result {
                     Ok(_) => {
+                        // Charge sender for amount transferred to contract
+                        from.1.charge(transaction.amount)?;
+
+                        // Persist runtime bytecode under its namespaced hash
+                        let code_hash = Self::code_hash(&program.runtime_code);
+                        tx_overlay.push(code_hash, program.runtime_code);
+
+                        // Create contract account with code_hash reference
                         tx_overlay.push(
                             contract_id,
                             Account::from(
-                                transaction.nonce + 1,
                                 0,
-                                contract_id,
+                                transaction.amount,
+                                code_hash,
                                 Account::EMPTY_STORAGE_ROOT,
                             )
                             .to_vec(),
                         );
-                        // TODO: persist contract in storage
                         Ok(())
                     }
                     Err(e) => Err(e.into()),
                 }
             }
-            TransactionType::InvokeContract => Err(VMError::OutOfGas { used: 0, limit: 0 }.into()), // TODO
+            TransactionType::InvokeContract => {
+                // TODO: Load contract account, retrieve runtime bytecode via code_hash,
+                // create VM, and execute with vm.run_call()
+                Err(VMError::OutOfGas { used: 0, limit: 0 }.into())
+            }
         }
     }
 
@@ -204,7 +228,7 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
         }
 
         // Charge base transaction cost: covers processing + broadcasting
-        let intrinsic = Self::intrinsic_gas_units(transaction);
+        let intrinsic = Self::intrinsic_gas_units(transaction.tx_type, &transaction.data);
         if transaction.gas_limit < intrinsic {
             return Err(VMError::OutOfGas {
                 used: intrinsic,
@@ -732,15 +756,43 @@ mod tests {
     }
 
     #[test]
-    fn contract_id_differs_for_different_data() {
-        let key = PrivateKey::new();
-        let tx1 = new_tx(Bytes::new(b"code_a"), key.clone(), TEST_CHAIN_ID);
-        let tx2 = new_tx(Bytes::new(b"code_b"), key, TEST_CHAIN_ID);
+    fn intrinsic_gas_units_accounts_for_zero_and_nonzero_bytes() {
+        let data = Bytes::new([0, 1, 2, 0]);
 
-        let id1 = Blockchain::<AcceptAllValidator, TestStorage>::contract_id(&tx1);
-        let id2 = Blockchain::<AcceptAllValidator, TestStorage>::contract_id(&tx2);
+        let gas = Blockchain::<AcceptAllValidator, TestStorage>::intrinsic_gas_units(
+            TransactionType::TransferFunds,
+            &data,
+        );
 
-        assert_ne!(id1, id2);
+        let expected = 21_000 + 4 + 16 + 16 + 4;
+        assert_eq!(gas, expected);
+    }
+
+    #[test]
+    fn intrinsic_gas_units_includes_deploy_base_cost() {
+        let data = Bytes::new([5, 6, 7]);
+
+        let gas = Blockchain::<AcceptAllValidator, TestStorage>::intrinsic_gas_units(
+            TransactionType::DeployContract,
+            &data,
+        );
+
+        let expected = 21_000 + 32_000 + (3 * 16);
+        assert_eq!(gas, expected);
+    }
+
+    #[test]
+    fn code_hash_is_namespaced_and_deterministic() {
+        let runtime = b"runtime_code";
+
+        let hash1 = Blockchain::<AcceptAllValidator, TestStorage>::code_hash(runtime);
+        let hash2 = Blockchain::<AcceptAllValidator, TestStorage>::code_hash(runtime);
+        let raw_hash = Hash::sha3().chain(runtime).finalize();
+        let different = Blockchain::<AcceptAllValidator, TestStorage>::code_hash(b"other");
+
+        assert_eq!(hash1, hash2);
+        assert_ne!(hash1, raw_hash);
+        assert_ne!(hash1, different);
     }
 
     #[test]
@@ -1054,65 +1106,140 @@ mod tests {
     }
 
     #[test]
-    fn intrinsic_gas_varies_by_tx_type_and_data() {
+    fn deploy_contract_creates_contract_account() {
+        let genesis = create_genesis(TEST_CHAIN_ID);
+        let storage = test_storage(genesis);
+
         let key = PrivateKey::new();
-        let data = Bytes::new(vec![0u8; 100]);
+        let sender = key.public_key().address();
+        storage.set_account(sender, Account::new(10_000_000));
+        storage.set_account(Address::zero(), Account::new(0));
 
-        let transfer_tx = Transaction::new(
-            Address::zero(),
-            None,
-            data.clone(),
-            0,
-            0,
-            1,
-            100_000,
-            0,
-            key.clone(),
-            TEST_CHAIN_ID,
-            TransactionType::TransferFunds,
-        );
+        let bc = with_validator_and_storage(TEST_CHAIN_ID, AcceptAllValidator, storage);
+        let tx = make_deploy_tx(key, TEST_CHAIN_ID);
+        let contract_id = Blockchain::<AcceptAllValidator, TestStorage>::contract_id(&tx);
 
-        let deploy_tx = Transaction::new(
-            Address::zero(),
-            None,
-            data.clone(),
-            0,
-            0,
-            1,
-            100_000,
-            0,
-            key.clone(),
-            TEST_CHAIN_ID,
-            TransactionType::DeployContract,
-        );
+        let base = bc.storage.state_view();
+        let mut overlay = OverlayState::new(&base);
+        let mut tx_overlay = OverlayState::new(&overlay);
 
-        let invoke_tx = Transaction::new(
-            Address::zero(),
-            None,
-            data,
-            0,
-            0,
-            1,
-            100_000,
-            0,
-            key,
-            TEST_CHAIN_ID,
-            TransactionType::InvokeContract,
-        );
+        let (accounts, _) = bc
+            .apply_tx(&tx, &overlay, &mut tx_overlay)
+            .expect("apply_tx failed");
+        tx_overlay
+            .into_writes()
+            .apply_tx_overlay(accounts, &mut overlay);
 
-        // TransferFunds: 21_000 + 0 * 100 = 21_000
-        let transfer_intrinsic =
-            Blockchain::<AcceptAllValidator, TestStorage>::intrinsic_gas_units(&transfer_tx);
-        assert_eq!(transfer_intrinsic, 21_000);
+        let contract_bytes = overlay
+            .get(contract_id)
+            .expect("contract account should exist");
+        let contract = Account::from_bytes(&contract_bytes).unwrap();
 
-        // DeployContract: 21_000 + 200 * 100 = 41_000
-        let deploy_intrinsic =
-            Blockchain::<AcceptAllValidator, TestStorage>::intrinsic_gas_units(&deploy_tx);
-        assert_eq!(deploy_intrinsic, 41_000);
+        assert!(contract.is_contract());
+        assert_eq!(contract.nonce(), 0);
+    }
 
-        // InvokeContract: 21_000 + 20 * 100 = 23_000
-        let invoke_intrinsic =
-            Blockchain::<AcceptAllValidator, TestStorage>::intrinsic_gas_units(&invoke_tx);
-        assert_eq!(invoke_intrinsic, 23_000);
+    #[test]
+    fn deploy_contract_stores_runtime_bytecode() {
+        use crate::virtual_machine::assembler::assemble_source;
+
+        let genesis = create_genesis(TEST_CHAIN_ID);
+        let storage = test_storage(genesis);
+
+        let key = PrivateKey::new();
+        let sender = key.public_key().address();
+        storage.set_account(sender, Account::new(10_000_000));
+        storage.set_account(Address::zero(), Account::new(0));
+
+        let bc = with_validator_and_storage(TEST_CHAIN_ID, AcceptAllValidator, storage);
+
+        let program = assemble_source("LOAD_I64 r0, 42").expect("assemble failed");
+        let expected_runtime = program.runtime_code.clone();
+        let expected_code_hash =
+            Blockchain::<AcceptAllValidator, TestStorage>::code_hash(&expected_runtime);
+
+        let mut tx = new_tx(program.to_bytes(), key, TEST_CHAIN_ID);
+        tx.tx_type = TransactionType::DeployContract;
+        tx.gas_limit = 100_000;
+        tx.gas_price = 1;
+
+        let contract_id = Blockchain::<AcceptAllValidator, TestStorage>::contract_id(&tx);
+
+        let base = bc.storage.state_view();
+        let mut overlay = OverlayState::new(&base);
+        let mut tx_overlay = OverlayState::new(&overlay);
+
+        let (accounts, _) = bc
+            .apply_tx(&tx, &overlay, &mut tx_overlay)
+            .expect("apply_tx failed");
+        tx_overlay
+            .into_writes()
+            .apply_tx_overlay(accounts, &mut overlay);
+
+        // Verify contract account has correct code_hash
+        let contract_bytes = overlay.get(contract_id).expect("contract should exist");
+        let contract = Account::from_bytes(&contract_bytes).unwrap();
+        assert_eq!(contract.code_hash(), expected_code_hash);
+
+        // Verify runtime bytecode is stored under code_hash
+        let stored_code = overlay
+            .get(expected_code_hash)
+            .expect("runtime code should be stored");
+        assert_eq!(stored_code, expected_runtime);
+    }
+
+    #[test]
+    fn deploy_contract_with_init_and_runtime_sections() {
+        use crate::virtual_machine::assembler::assemble_source;
+
+        let genesis = create_genesis(TEST_CHAIN_ID);
+        let storage = test_storage(genesis);
+
+        let key = PrivateKey::new();
+        let sender = key.public_key().address();
+        storage.set_account(sender, Account::new(10_000_000));
+        storage.set_account(Address::zero(), Account::new(0));
+
+        let bc = with_validator_and_storage(TEST_CHAIN_ID, AcceptAllValidator, storage);
+
+        let source = r#"
+[ init code ]
+LOAD_I64 r0, 1
+
+[ runtime code ]
+LOAD_I64 r1, 2
+"#;
+        let program = assemble_source(source).expect("assemble failed");
+        assert!(!program.init_code.is_empty());
+        assert!(!program.runtime_code.is_empty());
+
+        let expected_code_hash =
+            Blockchain::<AcceptAllValidator, TestStorage>::code_hash(&program.runtime_code);
+
+        let mut tx = new_tx(program.to_bytes(), key, TEST_CHAIN_ID);
+        tx.tx_type = TransactionType::DeployContract;
+        tx.gas_limit = 100_000;
+        tx.gas_price = 1;
+
+        let contract_id = Blockchain::<AcceptAllValidator, TestStorage>::contract_id(&tx);
+
+        let base = bc.storage.state_view();
+        let mut overlay = OverlayState::new(&base);
+        let mut tx_overlay = OverlayState::new(&overlay);
+
+        let (accounts, _) = bc
+            .apply_tx(&tx, &overlay, &mut tx_overlay)
+            .expect("apply_tx failed");
+        tx_overlay
+            .into_writes()
+            .apply_tx_overlay(accounts, &mut overlay);
+
+        // Verify only runtime_code is stored (not init_code)
+        let contract_bytes = overlay.get(contract_id).expect("contract should exist");
+        let contract = Account::from_bytes(&contract_bytes).unwrap();
+        assert_eq!(contract.code_hash(), expected_code_hash);
+
+        let stored_code = overlay.get(expected_code_hash).expect("code should exist");
+        assert_eq!(stored_code, program.runtime_code);
     }
 }

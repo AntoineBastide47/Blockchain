@@ -12,7 +12,7 @@ use blockchain_derive::BinaryCodec;
 const MAGIC: &[u8; 5] = b"VM_BC";
 
 /// Current bytecode format version.
-const CURRENT_VERSION: Version = Version::new(0, 3, 0);
+const CURRENT_VERSION: Version = Version::new(0, 4, 0);
 
 /// Semantic version for bytecode format compatibility.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, BinaryCodec)]
@@ -42,8 +42,10 @@ impl Version {
 pub struct Program {
     /// The maximal register used by this program, i.e: r{max_register}
     pub max_register: u8,
-    /// Compiled instruction bytecode.
-    pub bytecode: Vec<u8>,
+    /// Compiled initialization instruction bytecode.
+    pub init_code: Vec<u8>,
+    /// Compiled runtime instruction bytecode.
+    pub runtime_code: Vec<u8>,
     /// Interned string literals referenced by index.
     pub items: Vec<Vec<u8>>,
 }
@@ -77,7 +79,7 @@ impl Program {
             });
         }
 
-        if Version::decode(&mut input)? > CURRENT_VERSION {
+        if Version::decode(&mut input)? != CURRENT_VERSION {
             return Err(VMError::DecodeError {
                 reason: "unsupported version".to_string(),
             });
@@ -103,7 +105,8 @@ pub mod tests {
             Self {
                 max_register: 255,
                 items: strings,
-                bytecode,
+                init_code: Vec::new(),
+                runtime_code: bytecode,
             }
         }
     }
@@ -114,7 +117,7 @@ pub mod tests {
         let bytes = program.to_bytes();
         let decoded = Program::from_bytes(&bytes).unwrap();
         assert!(decoded.items.is_empty());
-        assert!(decoded.bytecode.is_empty());
+        assert!(decoded.runtime_code.is_empty());
     }
 
     #[test]
@@ -122,7 +125,7 @@ pub mod tests {
         let program = Program::new(vec![], vec![0x00, 0x01, 0x02]);
         let bytes = program.to_bytes();
         let decoded = Program::from_bytes(&bytes).unwrap();
-        assert_eq!(decoded.bytecode, vec![0x00, 0x01, 0x02]);
+        assert_eq!(decoded.runtime_code, vec![0x00, 0x01, 0x02]);
     }
 
     #[test]
@@ -131,7 +134,7 @@ pub mod tests {
         let bytes = program.to_bytes();
         let decoded = Program::from_bytes(&bytes).unwrap();
         assert_eq!(decoded.items, vec![b"hello", b"world"]);
-        assert_eq!(decoded.bytecode, vec![0x01, 0x00]);
+        assert_eq!(decoded.runtime_code, vec![0x01, 0x00]);
     }
 
     #[test]

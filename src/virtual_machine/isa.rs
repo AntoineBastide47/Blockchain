@@ -152,6 +152,8 @@ macro_rules! for_each_instruction {
             Jump = 0x4B, "JUMP" => [offset: ImmI64], 5,
             /// RET rs ; return from function call with value in rs
             Ret = 0x4C, "RET" => [rs: Reg], 5,
+            /// HALT ; stop execution immediately
+            Halt = 0x4D, "HALT" => [], 1,
         }
     };
 }

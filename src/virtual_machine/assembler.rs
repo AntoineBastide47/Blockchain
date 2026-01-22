@@ -490,7 +490,7 @@ for_each_instruction!(define_parse_instruction);
 /// `[ runtime code ]` section.
 fn assemble_source_step_1(source: String) -> Result<String, VMError> {
     // Track where to insert the dispatcher (line number of `[ runtime code ]`)
-    let mut insert_point: (usize, &str) = (0, "");
+    let mut insert_point = 0usize;
     // Collect all public label names (including trailing ':')
     let mut public_labels: HashSet<&str> = HashSet::new();
 
@@ -499,7 +499,7 @@ fn assemble_source_step_1(source: String) -> Result<String, VMError> {
         // Check for section markers first
         if let Some(section) = parse_section_marker(line) {
             if section == Section::Runtime {
-                insert_point = (line_no, line);
+                insert_point = line_no;
             }
             continue;
         }
@@ -526,49 +526,28 @@ fn assemble_source_step_1(source: String) -> Result<String, VMError> {
     }
 
     let mut base = String::new();
-    base.push_str("__resolver_jump_table:\n");
-
     let mut labels: Vec<&str> = public_labels.iter().copied().collect();
     labels.sort();
-    match labels.len() {
-        1 => {
-            // Smallest possible dispatcher: just jump to the single entry.
-            base.push_str("JUMP __dispatch_entry_0\n");
-        }
-        _ => {
-            // Computed jump table using high registers to avoid clobbering user args.
-            // Each entry is CALL0 + HALT: 10 + 1 = 11 bytes.
-            //
-            // Labels are PC-relative, so we use JAL to capture the current absolute
-            // position, then add the relative offset to compute the absolute target.
-            // Uses r250-r254 to preserve r1+ for function arguments.
-            base.push_str("LOAD_I64 r250, 11\n");
-            base.push_str("MUL r251, r0, r250\n");
-            base.push_str("JAL r252, 0\n"); // r252 = absolute addr of next instr
-            base.push_str("LOAD_I64 r253, __dispatch_table\n"); // r253 = relative offset
-            base.push_str("LOAD_I64 r254, 10\n"); // size of LOAD_I64
-            base.push_str("ADD r252, r252, r254\n"); // r252 = end of LOAD_I64 r253
-            base.push_str("ADD r253, r253, r252\n"); // r253 = absolute addr of __dispatch_table
-            base.push_str("ADD r251, r251, r253\n"); // r251 = absolute addr of target entry
-            base.push_str("JALR r254, r251, 0\n");
-            base.push_str("HALT\n");
-            base.push_str("__dispatch_table:\n");
-        }
+    let has_multiple = labels.len() > 1;
+    if has_multiple {
+        // Jump over the entries while capturing the base address (r252) of
+        // `__dispatch_header` via the JAL return address. Entries sit right
+        // after this instruction so the captured address is the entry base.
+        base.push_str("JAL r254, __dispatch_header\n");
     }
 
-    for (idx, label) in labels.iter().enumerate() {
+    for label in labels.iter() {
         let name = label.strip_suffix(':').unwrap_or(label);
-        match labels.len() {
-            1 => {
-                base.push_str("__dispatch_entry_0:\n");
-            }
-            _ => {
-                writeln!(base, "__dispatch_entry_{idx}:").unwrap();
-            }
-        }
         // Use CALL0 to keep per-entry size minimal (11 bytes with HALT) while leaving
         // argument registers untouched for the callee.
-        writeln!(base, "CALL0 r0, {name}").unwrap();
+        writeln!(base, "CALL0 r0, {name}\nHALT\n").unwrap();
+    }
+
+    if has_multiple {
+        base.push_str("__dispatch_header:\n");
+        base.push_str("MULI r253, r0, 11\n"); // byte offset into table
+        base.push_str("ADD r253, r253, r254\n"); // absolute addr of target entry
+        base.push_str("JALR r255, r253, 0\n");
         base.push_str("HALT\n");
     }
 
@@ -578,7 +557,7 @@ fn assemble_source_step_1(source: String) -> Result<String, VMError> {
         out.push_str(line.split(COMMENT_CHAR).next().unwrap_or("").trim());
         out.push('\n');
         // Insert dispatcher just after the `[ runtime code ]` line
-        if i == insert_point.0 {
+        if i == insert_point {
             out.push_str(&base);
             out.push('\n');
         }
@@ -1076,6 +1055,90 @@ mod tests {
         assert_eq!(out[0], Instruction::LoadStr as u8);
         assert_eq!(out[1], 1);
         assert_eq!(u32::from_le_bytes(out[2..6].try_into().unwrap()), 0x1234);
+    }
+
+    #[test]
+    fn instruction_parse_addi_and_beqi() {
+        // ADDI rd, rs, imm
+        let tokens = [
+            Token {
+                text: "ADDI",
+                offset: 1,
+            },
+            Token {
+                text: "r1",
+                offset: 6,
+            },
+            Token {
+                text: "r2",
+                offset: 10,
+            },
+            Token {
+                text: "5",
+                offset: 14,
+            },
+        ];
+        let instr = parse_instruction(&mut AsmContext::new(), &tokens, 0).unwrap();
+        match instr {
+            AsmInstr::AddI { rd, rs, imm } => {
+                assert_eq!((rd, rs, imm), (1, 2, 5));
+            }
+            other => panic!("unexpected instr: {other:?}"),
+        }
+
+        // BEQI rs, imm, offset
+        let tokens = [
+            Token {
+                text: "BEQI",
+                offset: 1,
+            },
+            Token {
+                text: "r3",
+                offset: 6,
+            },
+            Token {
+                text: "0",
+                offset: 10,
+            },
+            Token {
+                text: "12",
+                offset: 12,
+            },
+        ];
+        let instr = parse_instruction(&mut AsmContext::new(), &tokens, 0).unwrap();
+        match instr {
+            AsmInstr::BeqI { rs, imm, offset } => {
+                assert_eq!((rs, imm, offset), (3, 0, 12));
+            }
+            other => panic!("unexpected instr: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn asm_instr_assemble_addi_and_orxori() {
+        let addi = AsmInstr::AddI {
+            rd: 4,
+            rs: 5,
+            imm: -7,
+        };
+        let mut out = Vec::new();
+        addi.assemble(&mut out);
+        assert_eq!(out[0], Instruction::AddI as u8);
+        assert_eq!(out[1], 4);
+        assert_eq!(out[2], 5);
+        assert_eq!(i64::from_le_bytes(out[3..11].try_into().unwrap()), -7);
+
+        let xori = AsmInstr::XorI {
+            rd: 1,
+            rs: 2,
+            imm: 1,
+        };
+        out.clear();
+        xori.assemble(&mut out);
+        assert_eq!(out[0], Instruction::XorI as u8);
+        assert_eq!(out[1], 1);
+        assert_eq!(out[2], 2);
+        assert_eq!(i64::from_le_bytes(out[3..11].try_into().unwrap()), 1);
     }
 
     // ==================== Labels ====================

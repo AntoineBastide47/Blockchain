@@ -154,6 +154,47 @@ macro_rules! for_each_instruction {
             Ret = 0x4C, "RET" => [rs: Reg], 5,
             /// HALT ; stop execution immediately
             Halt = 0x4D, "HALT" => [], 1,
+            // =========================
+            // Immediate Arithmetic / Logic / Branch
+            // =========================
+            /// ADDI rd, rs, imm ; rd = rs + imm
+            AddI = 0x50, "ADDI" => [rd: Reg, rs: Reg, imm: ImmI64], 3,
+            /// SUBI rd, rs, imm ; rd = rs - imm
+            SubI = 0x51, "SUBI" => [rd: Reg, rs: Reg, imm: ImmI64], 3,
+            /// MULI rd, rs, imm ; rd = rs * imm
+            MulI = 0x52, "MULI" => [rd: Reg, rs: Reg, imm: ImmI64], 5,
+            /// SHLI rd, rs, imm ; rd = rs << imm
+            ShlI = 0x53, "SHLI" => [rd: Reg, rs: Reg, imm: ImmI64], 3,
+            /// SHRI rd, rs, imm ; rd = rs >> imm (arithmetic shift)
+            ShrI = 0x54, "SHRI" => [rd: Reg, rs: Reg, imm: ImmI64], 3,
+            /// ANDI rd, rs, imm ; rd = rs & imm
+            AndI = 0x55, "ANDI" => [rd: Reg, rs: Reg, imm: ImmI64], 2,
+            /// ORI rd, rs, imm ; rd = rs | imm
+            OrI = 0x56, "ORI" => [rd: Reg, rs: Reg, imm: ImmI64], 2,
+            /// XORI rd, rs, imm ; rd = rs ^ imm
+            XorI = 0x57, "XORI" => [rd: Reg, rs: Reg, imm: ImmI64], 2,
+            /// EQI rd, rs, imm ; rd = (rs == imm)
+            EqI = 0x58, "EQI" => [rd: Reg, rs: Reg, imm: ImmI64], 3,
+            /// LTI rd, rs, imm ; rd = (rs < imm)
+            LtI = 0x59, "LTI" => [rd: Reg, rs: Reg, imm: ImmI64], 3,
+            /// LEI rd, rs, imm ; rd = (rs <= imm)
+            LeI = 0x5A, "LEI" => [rd: Reg, rs: Reg, imm: ImmI64], 3,
+            /// GTI rd, rs, imm ; rd = (rs > imm)
+            GtI = 0x5B, "GTI" => [rd: Reg, rs: Reg, imm: ImmI64], 3,
+            /// GEI rd, rs, imm ; rd = (rs >= imm)
+            GeI = 0x5C, "GEI" => [rd: Reg, rs: Reg, imm: ImmI64], 3,
+            /// BEQI rs, imm, offset ; if rs == imm then PC += offset
+            BeqI = 0x5D, "BEQI" => [rs: Reg, imm: ImmI64, offset: ImmI64], 5,
+            /// BNEI rs, imm, offset ; if rs != imm then PC += offset
+            BneI = 0x5E, "BNEI" => [rs: Reg, imm: ImmI64, offset: ImmI64], 5,
+            /// BLTI rs, imm, offset ; if rs < imm (signed) then PC += offset
+            BltI = 0x5F, "BLTI" => [rs: Reg, imm: ImmI64, offset: ImmI64], 5,
+            /// BGEI rs, imm, offset ; if rs >= imm (signed) then PC += offset
+            BgeI = 0x60, "BGEI" => [rs: Reg, imm: ImmI64, offset: ImmI64], 5,
+            /// BLTUI rs, imm, offset ; if rs < imm (unsigned) then PC += offset
+            BltuI = 0x61, "BLTUI" => [rs: Reg, imm: ImmI64, offset: ImmI64], 5,
+            /// BGEUI rs, imm, offset ; if rs >= imm (unsigned) then PC += offset
+            BgeuI = 0x62, "BGEUI" => [rs: Reg, imm: ImmI64, offset: ImmI64], 5,
         }
     };
 }

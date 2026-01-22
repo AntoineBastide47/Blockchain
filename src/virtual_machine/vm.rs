@@ -503,14 +503,13 @@ struct CallFrame {
 /// at ip=init_size (runtime_code). This allows init_code to call into runtime_code.
 ///
 /// # TODO potential before 1.0.0:
-/// 1) 🔴 Add arithmetic op codes that take in immediate instead of register
-/// 2) 🔴 Add list and map support
-/// 3) 🔴 Add a deterministic optimizer do make the assembly code more performant
+/// 1) 🔴 Add a deterministic optimizer do make the assembly code more performant
 ///
 /// # TODO after 1.0.0:
-/// 4) 🔴 Add a smart contract language to not require assembly written smart contracts
-/// 5) 🔴 Add a deterministic compiler to convert the language to assembly
-/// 6) 🔴 Add an LSP for smoother smart contract writing experience
+/// 1) 🔴 Add a smart contract language to not require assembly written smart contracts
+/// 2) 🔴 Add list and map support
+/// 3) 🔴 Add a deterministic compiler to convert the language to assembly
+/// 4) 🔴 Add an LSP for smoother smart contract writing experience
 pub struct VM {
     /// Concatenated bytecode (init_code + runtime_code).
     data: Vec<u8>,
@@ -990,6 +989,11 @@ impl VM {
                 Max => op_max(rd: Reg, rs1: Reg, rs2: Reg),
                 Shl => op_shl(rd: Reg, rs1: Reg, rs2: Reg),
                 Shr => op_shr(rd: Reg, rs1: Reg, rs2: Reg),
+                AddI => op_addi(rd: Reg, rs: Reg, imm: ImmI64),
+                SubI => op_subi(rd: Reg, rs: Reg, imm: ImmI64),
+                MulI => op_muli(rd: Reg, rs: Reg, imm: ImmI64),
+                ShlI => op_shli(rd: Reg, rs: Reg, imm: ImmI64),
+                ShrI => op_shri(rd: Reg, rs: Reg, imm: ImmI64),
                 // Boolean / comparison
                 Not => op_not(rd: Reg, rs: Reg),
                 And => op_and(rd: Reg, rs1: Reg, rs2: Reg),
@@ -1000,6 +1004,14 @@ impl VM {
                 Le => op_le(rd: Reg, rs1: Reg, rs2: Reg),
                 Gt => op_gt(rd: Reg, rs1: Reg, rs2: Reg),
                 Ge => op_ge(rd: Reg, rs1: Reg, rs2: Reg),
+                AndI => op_andi(rd: Reg, rs: Reg, imm: ImmI64),
+                OrI => op_ori(rd: Reg, rs: Reg, imm: ImmI64),
+                XorI => op_xori(rd: Reg, rs: Reg, imm: ImmI64),
+                EqI => op_eqi(rd: Reg, rs: Reg, imm: ImmI64),
+                LtI => op_lti(rd: Reg, rs: Reg, imm: ImmI64),
+                LeI => op_lei(rd: Reg, rs: Reg, imm: ImmI64),
+                GtI => op_gti(rd: Reg, rs: Reg, imm: ImmI64),
+                GeI => op_gei(rd: Reg, rs: Reg, imm: ImmI64),
                 // Control Flow
                 CallHost => op_call_host(dst: Reg, fn_id: RefU32, argc: ImmU8, argv: Reg),
                 Call => op_call(dst: Reg, offset: ImmI64, argc: ImmU8, argv: Reg),
@@ -1012,6 +1024,12 @@ impl VM {
                 Bge => op_bge(rs1: Reg, rs2: Reg, offset: ImmI64),
                 Bltu => op_bltu(rs1: Reg, rs2: Reg, offset: ImmI64),
                 Bgeu => op_bgeu(rs1: Reg, rs2: Reg, offset: ImmI64),
+                BeqI => op_beqi(rs: Reg, imm: ImmI64, offset: ImmI64),
+                BneI => op_bnei(rs: Reg, imm: ImmI64, offset: ImmI64),
+                BltI => op_blti(rs: Reg, imm: ImmI64, offset: ImmI64),
+                BgeI => op_bgei(rs: Reg, imm: ImmI64, offset: ImmI64),
+                BltuI => op_bltui(rs: Reg, imm: ImmI64, offset: ImmI64),
+                BgeuI => op_bgeui(rs: Reg, imm: ImmI64, offset: ImmI64),
                 Jump => op_jump(offset: ImmI64),
                 Ret => op_ret(rs: Reg),
                 Halt => op_halt(),
@@ -1431,6 +1449,73 @@ impl VM {
         self.registers.set(dst, Value::Bool(va >= vb))
     }
 
+    fn op_addi(&mut self, instr: &'static str, dst: u8, src: u8, imm: i64) -> Result<(), VMError> {
+        let v = self.registers.get_int(src, instr)?;
+        self.registers.set(dst, Value::Int(v.wrapping_add(imm)))
+    }
+
+    fn op_subi(&mut self, instr: &'static str, dst: u8, src: u8, imm: i64) -> Result<(), VMError> {
+        let v = self.registers.get_int(src, instr)?;
+        self.registers.set(dst, Value::Int(v.wrapping_sub(imm)))
+    }
+
+    fn op_muli(&mut self, instr: &'static str, dst: u8, src: u8, imm: i64) -> Result<(), VMError> {
+        let v = self.registers.get_int(src, instr)?;
+        self.registers.set(dst, Value::Int(v.wrapping_mul(imm)))
+    }
+
+    fn op_shli(&mut self, instr: &'static str, dst: u8, src: u8, imm: i64) -> Result<(), VMError> {
+        let v = self.registers.get_int(src, instr)?;
+        self.registers
+            .set(dst, Value::Int(v.wrapping_shl(imm as u32)))
+    }
+
+    fn op_shri(&mut self, instr: &'static str, dst: u8, src: u8, imm: i64) -> Result<(), VMError> {
+        let v = self.registers.get_int(src, instr)?;
+        self.registers
+            .set(dst, Value::Int(v.wrapping_shr(imm as u32)))
+    }
+
+    fn op_andi(&mut self, instr: &'static str, dst: u8, src: u8, imm: i64) -> Result<(), VMError> {
+        let v = self.registers.get_bool(src, instr)?;
+        self.registers.set(dst, Value::Bool(v && imm != 0))
+    }
+
+    fn op_ori(&mut self, instr: &'static str, dst: u8, src: u8, imm: i64) -> Result<(), VMError> {
+        let v = self.registers.get_bool(src, instr)?;
+        self.registers.set(dst, Value::Bool(v || imm != 0))
+    }
+
+    fn op_xori(&mut self, instr: &'static str, dst: u8, src: u8, imm: i64) -> Result<(), VMError> {
+        let v = self.registers.get_bool(src, instr)?;
+        self.registers.set(dst, Value::Bool(v ^ (imm != 0)))
+    }
+
+    fn op_eqi(&mut self, instr: &'static str, dst: u8, src: u8, imm: i64) -> Result<(), VMError> {
+        let v = self.registers.get_int(src, instr)?;
+        self.registers.set(dst, Value::Bool(v == imm))
+    }
+
+    fn op_lti(&mut self, instr: &'static str, dst: u8, src: u8, imm: i64) -> Result<(), VMError> {
+        let v = self.registers.get_int(src, instr)?;
+        self.registers.set(dst, Value::Bool(v < imm))
+    }
+
+    fn op_lei(&mut self, instr: &'static str, dst: u8, src: u8, imm: i64) -> Result<(), VMError> {
+        let v = self.registers.get_int(src, instr)?;
+        self.registers.set(dst, Value::Bool(v <= imm))
+    }
+
+    fn op_gti(&mut self, instr: &'static str, dst: u8, src: u8, imm: i64) -> Result<(), VMError> {
+        let v = self.registers.get_int(src, instr)?;
+        self.registers.set(dst, Value::Bool(v > imm))
+    }
+
+    fn op_gei(&mut self, instr: &'static str, dst: u8, src: u8, imm: i64) -> Result<(), VMError> {
+        let v = self.registers.get_int(src, instr)?;
+        self.registers.set(dst, Value::Bool(v >= imm))
+    }
+
     fn op_call_host(
         &mut self,
         instr: &'static str,
@@ -1692,6 +1777,92 @@ impl VM {
         let a = self.registers.get_int(rs1, instr)? as u64;
         let b = self.registers.get_int(rs2, instr)? as u64;
         if a >= b {
+            self.op_jump(instr, offset)?;
+        }
+        Ok(())
+    }
+
+    fn op_beqi(
+        &mut self,
+        instr: &'static str,
+        rs: u8,
+        imm: i64,
+        offset: i64,
+    ) -> Result<(), VMError> {
+        let v = self.registers.get_int(rs, instr)?;
+        if v == imm {
+            self.op_jump(instr, offset)?;
+        }
+        Ok(())
+    }
+
+    fn op_bnei(
+        &mut self,
+        instr: &'static str,
+        rs: u8,
+        imm: i64,
+        offset: i64,
+    ) -> Result<(), VMError> {
+        let v = self.registers.get_int(rs, instr)?;
+        if v != imm {
+            self.op_jump(instr, offset)?;
+        }
+        Ok(())
+    }
+
+    fn op_blti(
+        &mut self,
+        instr: &'static str,
+        rs: u8,
+        imm: i64,
+        offset: i64,
+    ) -> Result<(), VMError> {
+        let v = self.registers.get_int(rs, instr)?;
+        if v < imm {
+            self.op_jump(instr, offset)?;
+        }
+        Ok(())
+    }
+
+    fn op_bgei(
+        &mut self,
+        instr: &'static str,
+        rs: u8,
+        imm: i64,
+        offset: i64,
+    ) -> Result<(), VMError> {
+        let v = self.registers.get_int(rs, instr)?;
+        if v >= imm {
+            self.op_jump(instr, offset)?;
+        }
+        Ok(())
+    }
+
+    fn op_bltui(
+        &mut self,
+        instr: &'static str,
+        rs: u8,
+        imm: i64,
+        offset: i64,
+    ) -> Result<(), VMError> {
+        let v = self.registers.get_int(rs, instr)? as u64;
+        let imm = imm as u64;
+        if v < imm {
+            self.op_jump(instr, offset)?;
+        }
+        Ok(())
+    }
+
+    fn op_bgeui(
+        &mut self,
+        instr: &'static str,
+        rs: u8,
+        imm: i64,
+        offset: i64,
+    ) -> Result<(), VMError> {
+        let v = self.registers.get_int(rs, instr)? as u64;
+        let imm = imm as u64;
+        if v >= imm {
             self.op_jump(instr, offset)?;
         }
         Ok(())
@@ -2079,6 +2250,90 @@ mod tests {
             run_and_get_int("LOAD_I64 r0, -16\nLOAD_I64 r1, 2\nSHR r2, r0, r1", 2),
             -4
         );
+    }
+
+    #[test]
+    fn immediate_arithmetic_and_logic() {
+        assert_eq!(run_and_get_int("LOAD_I64 r0, 5\nADDI r1, r0, -2", 1), 3);
+        assert_eq!(run_and_get_int("LOAD_I64 r0, 10\nSUBI r1, r0, 4", 1), 6);
+        assert_eq!(run_and_get_int("LOAD_I64 r0, 6\nMULI r1, r0, 7", 1), 42);
+        assert_eq!(run_and_get_int("LOAD_I64 r0, 1\nSHLI r1, r0, 3", 1), 8);
+        assert_eq!(run_and_get_int("LOAD_I64 r0, 16\nSHRI r1, r0, 2", 1), 4);
+        assert!(run_and_get_bool("LOAD_BOOL r0, true\nANDI r1, r0, 1", 1));
+        assert!(run_and_get_bool("LOAD_BOOL r0, false\nORI r1, r0, 1", 1));
+        assert!(!run_and_get_bool("LOAD_BOOL r0, true\nXORI r1, r0, 1", 1));
+    }
+
+    #[test]
+    fn immediate_comparisons() {
+        assert!(run_and_get_bool("LOAD_I64 r0, 7\nEQI r1, r0, 7", 1));
+        assert!(run_and_get_bool("LOAD_I64 r0, 7\nLTI r1, r0, 10", 1));
+        assert!(run_and_get_bool("LOAD_I64 r0, 7\nGEI r1, r0, 7", 1));
+        assert!(run_and_get_bool("LOAD_I64 r0, 7\nLEI r1, r0, 7", 1));
+        assert!(run_and_get_bool("LOAD_I64 r0, 7\nGTI r1, r0, 5", 1));
+    }
+
+    #[test]
+    fn immediate_branches() {
+        let source = r#"
+LOAD_I64 r0, 0
+BEQI r0, 0, target
+LOAD_I64 r1, 1
+HALT
+target:
+LOAD_I64 r1, 42
+"#;
+        assert_eq!(run_and_get_int(source, 1), 42);
+
+        let source = r#"
+LOAD_I64 r0, 5
+BNEI r0, 5, target
+LOAD_I64 r1, 99
+HALT
+target:
+LOAD_I64 r1, 1
+"#;
+        assert_eq!(run_and_get_int(source, 1), 99);
+
+        let source = r#"
+LOAD_I64 r0, 3
+BLTI r0, 5, target
+LOAD_I64 r1, 0
+HALT
+target:
+LOAD_I64 r1, 77
+"#;
+        assert_eq!(run_and_get_int(source, 1), 77);
+
+        let source = r#"
+LOAD_I64 r0, -1
+BGEUI r0, 0, target
+LOAD_I64 r1, 0
+HALT
+target:
+LOAD_I64 r1, 123
+"#;
+        assert_eq!(run_and_get_int(source, 1), 123);
+
+        let source = r#"
+LOAD_I64 r0, -5
+BGEI r0, -10, target
+LOAD_I64 r1, 0
+HALT
+target:
+LOAD_I64 r1, 9
+"#;
+        assert_eq!(run_and_get_int(source, 1), 9);
+
+        let source = r#"
+LOAD_I64 r0, 1
+BLTUI r0, 5, target
+LOAD_I64 r1, 0
+HALT
+target:
+LOAD_I64 r1, 11
+"#;
+        assert_eq!(run_and_get_int(source, 1), 11);
     }
 
     // ==================== Boolean ====================

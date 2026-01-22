@@ -73,6 +73,28 @@ mod tests {
         assert_eq!(Instruction::Bgeu as u8, 0x4A);
         assert_eq!(Instruction::Jump as u8, 0x4B);
         assert_eq!(Instruction::Ret as u8, 0x4C);
+        assert_eq!(Instruction::Halt as u8, 0x4D);
+
+        // Immediate arithmetic / logic / branch
+        assert_eq!(Instruction::AddI as u8, 0x50);
+        assert_eq!(Instruction::SubI as u8, 0x51);
+        assert_eq!(Instruction::MulI as u8, 0x52);
+        assert_eq!(Instruction::ShlI as u8, 0x53);
+        assert_eq!(Instruction::ShrI as u8, 0x54);
+        assert_eq!(Instruction::AndI as u8, 0x55);
+        assert_eq!(Instruction::OrI as u8, 0x56);
+        assert_eq!(Instruction::XorI as u8, 0x57);
+        assert_eq!(Instruction::EqI as u8, 0x58);
+        assert_eq!(Instruction::LtI as u8, 0x59);
+        assert_eq!(Instruction::LeI as u8, 0x5A);
+        assert_eq!(Instruction::GtI as u8, 0x5B);
+        assert_eq!(Instruction::GeI as u8, 0x5C);
+        assert_eq!(Instruction::BeqI as u8, 0x5D);
+        assert_eq!(Instruction::BneI as u8, 0x5E);
+        assert_eq!(Instruction::BltI as u8, 0x5F);
+        assert_eq!(Instruction::BgeI as u8, 0x60);
+        assert_eq!(Instruction::BltuI as u8, 0x61);
+        assert_eq!(Instruction::BgeuI as u8, 0x62);
     }
 
     /// Verifies that all instruction mnemonics match their expected values.
@@ -141,6 +163,27 @@ mod tests {
         assert_eq!(Instruction::Jump.mnemonic(), "JUMP");
         assert_eq!(Instruction::Ret.mnemonic(), "RET");
         assert_eq!(Instruction::Halt.mnemonic(), "HALT");
+
+        // Immediate arithmetic / logic / branch
+        assert_eq!(Instruction::AddI.mnemonic(), "ADDI");
+        assert_eq!(Instruction::SubI.mnemonic(), "SUBI");
+        assert_eq!(Instruction::MulI.mnemonic(), "MULI");
+        assert_eq!(Instruction::ShlI.mnemonic(), "SHLI");
+        assert_eq!(Instruction::ShrI.mnemonic(), "SHRI");
+        assert_eq!(Instruction::AndI.mnemonic(), "ANDI");
+        assert_eq!(Instruction::OrI.mnemonic(), "ORI");
+        assert_eq!(Instruction::XorI.mnemonic(), "XORI");
+        assert_eq!(Instruction::EqI.mnemonic(), "EQI");
+        assert_eq!(Instruction::LtI.mnemonic(), "LTI");
+        assert_eq!(Instruction::LeI.mnemonic(), "LEI");
+        assert_eq!(Instruction::GtI.mnemonic(), "GTI");
+        assert_eq!(Instruction::GeI.mnemonic(), "GEI");
+        assert_eq!(Instruction::BeqI.mnemonic(), "BEQI");
+        assert_eq!(Instruction::BneI.mnemonic(), "BNEI");
+        assert_eq!(Instruction::BltI.mnemonic(), "BLTI");
+        assert_eq!(Instruction::BgeI.mnemonic(), "BGEI");
+        assert_eq!(Instruction::BltuI.mnemonic(), "BLTUI");
+        assert_eq!(Instruction::BgeuI.mnemonic(), "BGEUI");
     }
 
     /// Verifies that all instruction base gas costs match their expected values.
@@ -209,12 +252,33 @@ mod tests {
         assert_eq!(Instruction::Jump.base_gas(), 5);
         assert_eq!(Instruction::Ret.base_gas(), 5);
         assert_eq!(Instruction::Halt.base_gas(), 1);
+
+        // Immediate arithmetic / logic / branch
+        assert_eq!(Instruction::AddI.base_gas(), 3);
+        assert_eq!(Instruction::SubI.base_gas(), 3);
+        assert_eq!(Instruction::MulI.base_gas(), 5);
+        assert_eq!(Instruction::ShlI.base_gas(), 3);
+        assert_eq!(Instruction::ShrI.base_gas(), 3);
+        assert_eq!(Instruction::AndI.base_gas(), 2);
+        assert_eq!(Instruction::OrI.base_gas(), 2);
+        assert_eq!(Instruction::XorI.base_gas(), 2);
+        assert_eq!(Instruction::EqI.base_gas(), 3);
+        assert_eq!(Instruction::LtI.base_gas(), 3);
+        assert_eq!(Instruction::LeI.base_gas(), 3);
+        assert_eq!(Instruction::GtI.base_gas(), 3);
+        assert_eq!(Instruction::GeI.base_gas(), 3);
+        assert_eq!(Instruction::BeqI.base_gas(), 5);
+        assert_eq!(Instruction::BneI.base_gas(), 5);
+        assert_eq!(Instruction::BltI.base_gas(), 5);
+        assert_eq!(Instruction::BgeI.base_gas(), 5);
+        assert_eq!(Instruction::BltuI.base_gas(), 5);
+        assert_eq!(Instruction::BgeuI.base_gas(), 5);
     }
 
     /// Verifies the total instruction count has not changed.
     #[test]
     fn instruction_count_unchanged() {
-        const EXPECTED_COUNT: usize = 54;
+        const EXPECTED_COUNT: usize = 73;
 
         // Count by verifying TryFrom succeeds for expected opcodes
         let mut count = 0;

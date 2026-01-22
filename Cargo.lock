@@ -248,7 +248,7 @@ dependencies = [
 
 [[package]]
 name = "blockchain"
-version = "0.15.6"
+version = "0.15.7"
 dependencies = [
  "argon2",
  "blockchain_derive",

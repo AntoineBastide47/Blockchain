@@ -13,9 +13,8 @@ main:                            # Equivalent to a contract constructor
 pub factorial:
     LOAD_I64 r3, 1              # result = 1
     LOAD_I64 r4, 1              # i = 1
-    LOAD_I64 r5, 1              # increment
-    pub fact_loop:
+    fact_loop:
         MUL r3, r3, r4          # result *= i
-        ADD r4, r4, r5          # i++
+        ADDI r4, r4, 1          # i++
         BGE r1, r4, fact_loop   # while n >= i
     RET r3

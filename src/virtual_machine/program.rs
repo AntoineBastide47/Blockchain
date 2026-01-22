@@ -303,9 +303,9 @@ pub mod tests {
 
     #[test]
     fn dispatcher_uses_compact_call0_entries() {
-        // Two public functions -> jump table header (68 bytes) + 2 entries (11 bytes each).
-        // Header uses JAL to compute absolute addresses from PC-relative label offsets.
-        // Uses r250-r254 for scratch to preserve r1+ for function arguments.
+        // Two public functions -> prologue JAL (10 bytes), 2 entries (11 bytes each),
+        // and a compact header (27 bytes) that reuses the captured return address as
+        // the base of the dispatch table.
         let source = r#"
 [ runtime code ]
 pub foo:
@@ -316,23 +316,83 @@ pub bar:
         let program = assemble_source(source).unwrap();
         let bc = &program.runtime_code;
 
-        // Header opcodes (68 bytes total)
-        assert_eq!(bc[0], Instruction::LoadI64 as u8); // LOAD_I64 r250, 11
-        assert_eq!(bc[10], Instruction::Mul as u8); // MUL r251, r0, r250
-        assert_eq!(bc[14], Instruction::Jal as u8); // JAL r252, 0
-        assert_eq!(bc[24], Instruction::LoadI64 as u8); // LOAD_I64 r253, __dispatch_table
-        assert_eq!(bc[34], Instruction::LoadI64 as u8); // LOAD_I64 r254, 10
-        assert_eq!(bc[44], Instruction::Add as u8); // ADD r252, r252, r254
-        assert_eq!(bc[48], Instruction::Add as u8); // ADD r253, r253, r252
-        assert_eq!(bc[52], Instruction::Add as u8); // ADD r251, r251, r253
-        assert_eq!(bc[56], Instruction::Jalr as u8); // JALR r254, r251, 0
-        assert_eq!(bc[67], Instruction::Halt as u8); // HALT
+        // Prologue captures entry base via return address
+        assert_eq!(bc[0], Instruction::Jal as u8); // JAL r254, __dispatch_header
 
-        // Entry 0 at offset 68, entry 1 at 79 (stride 11 bytes)
-        assert_eq!(bc[68], Instruction::Call0 as u8);
-        assert_eq!(bc[78], Instruction::Halt as u8);
-        assert_eq!(bc[79], Instruction::Call0 as u8);
-        assert_eq!(bc[89], Instruction::Halt as u8);
+        // Entries (stride 11 bytes)
+        assert_eq!(bc[10], Instruction::Call0 as u8);
+        assert_eq!(bc[20], Instruction::Halt as u8);
+        assert_eq!(bc[21], Instruction::Call0 as u8);
+        assert_eq!(bc[31], Instruction::Halt as u8);
+
+        // Header (starts at offset 32)
+        assert_eq!(bc[32], Instruction::MulI as u8); // MULI r253, r0, 11
+        assert_eq!(bc[43], Instruction::Add as u8); // ADD r253, r253, r254
+        assert_eq!(bc[47], Instruction::Jalr as u8); // JALR r255, r253, 0
+        assert_eq!(bc[58], Instruction::Halt as u8); // HALT
+
+        // Original function bodies still present after dispatcher (one HALT each)
+        assert_eq!(bc[59], Instruction::Halt as u8);
+        assert_eq!(bc[60], Instruction::Halt as u8);
+
+        assert_eq!(bc.len(), 61);
+    }
+
+    #[test]
+    fn dispatcher_skips_when_no_public_labels() {
+        let source = r#"
+[ runtime code ]
+foo:
+    HALT
+"#;
+        let program = assemble_source(source).unwrap();
+        let bc = &program.runtime_code;
+
+        // No dispatcher injected; only the user HALT remains.
+        assert_eq!(bc.len(), 1);
+        assert_eq!(bc[0], Instruction::Halt as u8);
+    }
+
+    #[test]
+    fn dispatcher_single_entry_is_direct_jump() {
+        let source = r#"
+[ runtime code ]
+pub only:
+    HALT
+"#;
+        let program = assemble_source(source).unwrap();
+        let bc = &program.runtime_code;
+
+        // Layout: entry (CALL0 + HALT, 11 bytes) -> body HALT (1 byte)
+        assert_eq!(bc[0], Instruction::Call0 as u8);
+        assert_eq!(bc[10], Instruction::Halt as u8);
+        assert_eq!(bc[11], Instruction::Halt as u8);
+
+        // CALL0 immediate points to the function body (offset 11 - after call size).
+        let imm = i64::from_le_bytes(bc[2..10].try_into().expect("immediate slice"));
+        assert_eq!(imm, 1);
+        assert_eq!(bc.len(), 12);
+    }
+
+    #[test]
+    fn dispatcher_sorts_public_labels_for_entries() {
+        // Source order is z then a; entries should be sorted alphabetically (a, z).
+        let source = r#"
+[ runtime code ]
+pub zebra:
+    HALT
+pub alpha:
+    HALT
+"#;
+        let program = assemble_source(source).unwrap();
+        let bc = &program.runtime_code;
+
+        // Entry 0 targets `alpha`, entry 1 targets `zebra`.
+        let entry0_imm = i64::from_le_bytes(bc[12..20].try_into().expect("entry0 immediate slice"));
+        let entry1_imm = i64::from_le_bytes(bc[23..31].try_into().expect("entry1 immediate slice"));
+
+        assert_eq!(entry0_imm, 40); // alpha at offset 60, entry0 resolves from ip+10 -> 60-20
+        assert_eq!(entry1_imm, 28); // zebra at offset 59, entry1 resolves from ip+10 -> 59-31
     }
 
     #[test]

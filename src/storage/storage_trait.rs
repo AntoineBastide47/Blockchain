@@ -29,6 +29,9 @@ pub enum StorageError {
     /// Account lookup failed for the given address.
     #[error("no account exist for the given public_key={0}")]
     MissingAccount(Hash),
+    /// Contract code lookup failed for the given contract_id.
+    #[error("no code exist for the given contract_id={0}")]
+    MissingCode(Hash),
     /// Gas cost computation overflowed u128.
     #[error(
         "error computing gas cost in transaction, gas_used={gas_used} * gas_price={gas_price} > u128::MAX"

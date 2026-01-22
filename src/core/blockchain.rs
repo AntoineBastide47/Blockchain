@@ -15,7 +15,7 @@ use crate::types::encoding::{Decode, Encode};
 use crate::types::hash::Hash;
 use crate::types::merkle_tree::MerkleTree;
 use crate::virtual_machine::errors::VMError;
-use crate::virtual_machine::program::Program;
+use crate::virtual_machine::program::{DeployProgram, ExecuteProgram};
 use crate::virtual_machine::state::{OverlayState, State, TxAccountChanges};
 use crate::virtual_machine::vm::{BLOCK_GAS_LIMIT, ExecContext, TRANSACTION_GAS_LIMIT, VM};
 use crate::{info, warn};
@@ -93,7 +93,7 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
     ///
     /// The ID is derived from the sender, nonce, and bytecode, ensuring each
     /// deployment produces a unique address even with identical code.
-    fn contract_id(transaction: &Transaction) -> Hash {
+    pub fn contract_id(transaction: &Transaction) -> Hash {
         let mut h = Hash::sha3();
         h.update(b"SMART_CONTRACT");
         transaction.from.encode(&mut h);
@@ -130,7 +130,7 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
     /// - `TransferFunds`: moves native currency between accounts
     /// - `DeployContract`: runs init_code, then persists the contract account and
     ///   runtime bytecode under a namespaced `code_hash` key
-    /// - `InvokeContract`: loads stored runtime bytecode and executes via `run_call`
+    /// - `InvokeContract`: loads stored runtime bytecode and executes
     fn execute_tx<T: State>(
         &self,
         transaction: &Transaction,
@@ -149,7 +149,7 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
                 to.1.transfer(transaction.amount)
             }
             TransactionType::DeployContract => {
-                let program = Program::from_bytes(transaction.data.as_slice())?;
+                let program = DeployProgram::from_bytes(transaction.data.as_slice())?;
 
                 // Compute remaining gas after intrinsic costs
                 let max_gas =
@@ -168,7 +168,7 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
                     .into());
                 }
 
-                let mut vm = VM::new(program.clone(), max_gas)?;
+                let mut vm = VM::new_deploy(program.clone(), max_gas)?;
                 let contract_id = Self::contract_id(transaction);
                 let ctx = ExecContext {
                     chain_id: self.id,
@@ -184,9 +184,12 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
                         // Charge sender for amount transferred to contract
                         from.1.charge(transaction.amount)?;
 
-                        // Persist runtime bytecode under its namespaced hash
+                        // Persist runtime bytecode + heap items under namespaced hash
+                        let mut stored_code = Vec::new();
+                        program.items.encode(&mut stored_code);
+                        stored_code.extend(&program.runtime_code);
                         let code_hash = Self::code_hash(&program.runtime_code);
-                        tx_overlay.push(code_hash, program.runtime_code);
+                        tx_overlay.push(code_hash, stored_code);
 
                         // Create contract account with code_hash reference
                         tx_overlay.push(
@@ -205,9 +208,51 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
                 }
             }
             TransactionType::InvokeContract => {
-                // TODO: Load contract account, retrieve runtime bytecode via code_hash,
-                // create VM, and execute with vm.run_call()
-                Err(VMError::OutOfGas { used: 0, limit: 0 }.into())
+                let program = ExecuteProgram::from_bytes(transaction.data.as_slice())?;
+
+                // Compute remaining gas after intrinsic costs
+                let max_gas =
+                    transaction
+                        .gas_limit
+                        .checked_sub(*gas_used)
+                        .ok_or(VMError::OutOfGas {
+                            used: *gas_used,
+                            limit: transaction.gas_limit,
+                        })?;
+                if max_gas > TRANSACTION_GAS_LIMIT {
+                    return Err(VMError::OutOfGas {
+                        used: max_gas,
+                        limit: TRANSACTION_GAS_LIMIT,
+                    }
+                    .into());
+                }
+
+                let contract_id = program.contract_id;
+                let contract = self
+                    .storage
+                    .get_account(contract_id)
+                    .ok_or(StorageError::MissingAccount(contract_id))?;
+                let stored_code = self
+                    .storage
+                    .get(contract.code_hash())
+                    .ok_or(StorageError::MissingCode(contract_id))?;
+
+                // Decode stored format: max_register + items + runtime_code
+                let mut cursor = stored_code.as_slice();
+                let items = Vec::<Vec<u8>>::decode(&mut cursor)?;
+                let runtime_code = cursor.to_vec();
+
+                let mut vm = VM::new_execute(program, runtime_code, items, max_gas)?;
+                let ctx = ExecContext {
+                    chain_id: self.id,
+                    contract_id,
+                };
+
+                // Run runtime_code
+                vm.run(tx_overlay, &ctx)?;
+                *gas_used += vm.gas_used();
+
+                Ok(())
             }
         }
     }
@@ -789,10 +834,13 @@ mod tests {
         let hash2 = Blockchain::<AcceptAllValidator, TestStorage>::code_hash(runtime);
         let raw_hash = Hash::sha3().chain(runtime).finalize();
         let different = Blockchain::<AcceptAllValidator, TestStorage>::code_hash(b"other");
+        let different2 = Blockchain::<AcceptAllValidator, TestStorage>::code_hash(b"runtime_c0de");
 
         assert_eq!(hash1, hash2);
         assert_ne!(hash1, raw_hash);
         assert_ne!(hash1, different);
+        assert_ne!(hash1, different2);
+        assert_ne!(different, different2);
     }
 
     #[test]
@@ -1154,9 +1202,11 @@ mod tests {
         let bc = with_validator_and_storage(TEST_CHAIN_ID, AcceptAllValidator, storage);
 
         let program = assemble_source("LOAD_I64 r0, 42").expect("assemble failed");
-        let expected_runtime = program.runtime_code.clone();
+        let mut expected_runtime = Vec::new();
+        program.items.encode(&mut expected_runtime);
+        expected_runtime.extend(program.runtime_code.clone());
         let expected_code_hash =
-            Blockchain::<AcceptAllValidator, TestStorage>::code_hash(&expected_runtime);
+            Blockchain::<AcceptAllValidator, TestStorage>::code_hash(&program.runtime_code);
 
         let mut tx = new_tx(program.to_bytes(), key, TEST_CHAIN_ID);
         tx.tx_type = TransactionType::DeployContract;
@@ -1240,6 +1290,9 @@ LOAD_I64 r1, 2
         assert_eq!(contract.code_hash(), expected_code_hash);
 
         let stored_code = overlay.get(expected_code_hash).expect("code should exist");
-        assert_eq!(stored_code, program.runtime_code);
+        let mut expected = Vec::new();
+        program.items.encode(&mut expected);
+        expected.extend(program.runtime_code);
+        assert_eq!(stored_code, expected);
     }
 }

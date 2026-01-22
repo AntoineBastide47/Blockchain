@@ -22,16 +22,20 @@
 //! The passphrase is read from `NODE_PASSPHRASE` env var, or prompted if not set.
 
 use blockchain::core::account::Account;
+use blockchain::core::blockchain::Blockchain;
 use blockchain::core::transaction::{Transaction, TransactionType};
+use blockchain::core::validator::BlockValidator;
 use blockchain::crypto::key_pair::{Address, PublicKey, load_or_generate_validator_key};
 use blockchain::network::libp2p_transport::Libp2pTransport;
 use blockchain::network::message::{Message, MessageType};
 use blockchain::network::rpc::Rpc;
 use blockchain::network::server::{DEV_CHAIN_ID, Server};
 use blockchain::network::transport::Transport;
+use blockchain::storage::main_storage::MainStorage;
 use blockchain::types::encoding::{Decode, Encode};
 use blockchain::virtual_machine::assembler::assemble_file;
-use blockchain::virtual_machine::vm::TRANSACTION_GAS_LIMIT;
+use blockchain::virtual_machine::program::ExecuteProgram;
+use blockchain::virtual_machine::vm::{TRANSACTION_GAS_LIMIT, Value};
 use blockchain::{error, info, warn};
 use rpassword::prompt_password;
 use std::env;
@@ -212,43 +216,84 @@ async fn main() {
         }
     }
 
-    // If validator: periodically craft and broadcast a dummy transaction.
+    // If validator: deploy a contract, then repeatedly invoke it.
     if validator_mode {
         static TX_NONCE: AtomicU64 = AtomicU64::new(0);
 
         let server_for_txs = server.clone();
+        let validator_key_clone = validator_key.clone().unwrap();
+
         tokio::spawn(async move {
+            // Deploy contract first
+            let deploy_data = assemble_file("main.asm")
+                .expect("assembly failed")
+                .to_bytes();
+
+            let deploy_nonce = TX_NONCE.fetch_add(1, Ordering::Relaxed);
+            let deploy_tx = Transaction::new(
+                validator_key_clone.public_key().address(),
+                None,
+                deploy_data.to_vec(),
+                0,
+                0,
+                10u128.pow(9),
+                TRANSACTION_GAS_LIMIT,
+                deploy_nonce,
+                validator_key_clone.clone(),
+                DEV_CHAIN_ID,
+                TransactionType::DeployContract,
+            );
+
+            // Compute the contract_id (same as Blockchain::contract_id)
+            let contract_id = Blockchain::<BlockValidator, MainStorage>::contract_id(&deploy_tx);
+
+            let msg = Message::new(MessageType::Transaction, deploy_tx.to_bytes());
+            if let Err(e) = server_for_txs.add_to_pool(deploy_tx) {
+                warn!("deploy tx rejected: {e}");
+            } else if let Err(e) = server_for_txs
+                .transport()
+                .broadcast(server_for_txs.transport().peer_id(), msg.to_bytes())
+                .await
+            {
+                warn!("deploy tx broadcast failed: {e}");
+            }
+
+            // Wait for deployment to be mined
+            sleep(Duration::from_secs(5)).await;
+
+            // Now invoke the contract repeatedly
             loop {
-                let data = assemble_file("main.asm")
-                    .expect("assembly failed")
-                    .to_bytes();
+                let exec_program = ExecuteProgram {
+                    contract_id,
+                    function_id: 0,            // First public function (factorial)
+                    args: vec![Value::Int(5)], // Compute 5!
+                    arg_items: Vec::new(),
+                };
 
                 let nonce = TX_NONCE.fetch_add(1, Ordering::Relaxed);
-
-                // Build a fully populated transaction for the demo.
-                let tx = Transaction::new(
-                    validator_key.clone().unwrap().public_key().address(),
+                let invoke_tx = Transaction::new(
+                    contract_id,
                     None,
-                    data,
+                    exec_program.to_bytes().to_vec(),
                     0,
                     0,
                     10u128.pow(9),
                     TRANSACTION_GAS_LIMIT,
                     nonce,
-                    validator_key.clone().unwrap(),
+                    validator_key_clone.clone(),
                     DEV_CHAIN_ID,
-                    TransactionType::DeployContract,
+                    TransactionType::InvokeContract,
                 );
-                let msg = Message::new(MessageType::Transaction, tx.to_bytes());
 
-                if let Err(e) = server_for_txs.add_to_pool(tx) {
-                    warn!("validator tx rejected by local pool: {e}");
+                let msg = Message::new(MessageType::Transaction, invoke_tx.to_bytes());
+                if let Err(e) = server_for_txs.add_to_pool(invoke_tx) {
+                    warn!("invoke tx rejected: {e}");
                 } else if let Err(e) = server_for_txs
                     .transport()
                     .broadcast(server_for_txs.transport().peer_id(), msg.to_bytes())
                     .await
                 {
-                    warn!("validator tx broadcast failed: {e}");
+                    warn!("invoke tx broadcast failed: {e}");
                 }
 
                 sleep(Duration::from_secs(1)).await;

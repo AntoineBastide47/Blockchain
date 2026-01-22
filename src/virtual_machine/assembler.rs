@@ -22,8 +22,9 @@ use crate::define_instructions;
 use crate::for_each_instruction;
 use crate::virtual_machine::errors::VMError;
 use crate::virtual_machine::isa::Instruction;
-use crate::virtual_machine::program::Program;
-use std::collections::HashMap;
+use crate::virtual_machine::program::DeployProgram;
+use std::collections::{HashMap, HashSet};
+use std::fmt::Write;
 use std::fs;
 use std::path::Path;
 
@@ -32,9 +33,61 @@ const LABEL_SUFFIX: char = ':';
 const SECTION_INIT: &str = "[ init code ]";
 const SECTION_RUNTIME: &str = "[ runtime code ]";
 
+/// Return the line/column/message triple for assembly-related errors.
+fn assembly_error_location(err: &VMError) -> Option<(usize, usize, String)> {
+    match err {
+        VMError::AssemblyError {
+            line,
+            offset,
+            source,
+        } => Some((*line, *offset, source.clone())),
+        VMError::ParseError {
+            line,
+            offset,
+            message,
+        } => Some((*line, *offset, message.to_string())),
+        _ => None,
+    }
+}
+
+/// Formats a compiler-style diagnostic for assembly failures.
+fn render_assembly_diagnostic(
+    file: &str,
+    source: &str,
+    line: usize,
+    offset: usize,
+    message: &str,
+) -> String {
+    let mut diag = String::new();
+    let _ = writeln!(diag, "error: {message}");
+    let _ = writeln!(diag, " --> {file}:{line}:{offset}");
+
+    if let Some(raw_line) = source.lines().nth(line.saturating_sub(1)) {
+        let line_text = raw_line.trim_end_matches('\r');
+        let underline = " ".repeat(offset.saturating_sub(1));
+        let _ = writeln!(diag, "  |");
+        let _ = writeln!(diag, "{:>4} | {}", line, line_text);
+        let _ = writeln!(diag, "  | {}^", underline);
+    }
+
+    diag
+}
+
+/// Emit a helpful diagnostic to stderr for assembly errors.
+fn log_assembly_error(file: &str, source: &str, err: &VMError) {
+    if let Some((line, offset, message)) = assembly_error_location(err) {
+        eprintln!(
+            "{}",
+            render_assembly_diagnostic(file, source, line, offset, &message)
+        );
+    } else {
+        eprintln!("error: {err}");
+    }
+}
+
 /// Represents which section of the assembly we're currently parsing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Section {
+pub enum Section {
     /// Before any section marker - code goes to runtime by default.
     None,
     /// Inside `[ init code ]` section.
@@ -46,14 +99,12 @@ enum Section {
 /// Assembly context for heap items interning and label tracking during compilation.
 ///
 /// Tracks heap items and labels encountered during assembly, assigning each
-/// heap items a unique index that becomes part of the compiled [`Program`].
+/// heap items a unique index that becomes part of the compiled [`DeployProgram`].
 pub struct AsmContext {
     /// Accumulated heap items.
     pub items: Vec<Vec<u8>>,
-    /// Label definitions mapping names to bytecode offsets.
-    pub labels: HashMap<String, usize>,
-    /// The maximal register found
-    pub max_register: u8,
+    /// Label definitions mapping names to global bytecode offsets (init || runtime).
+    pub(crate) labels: HashMap<String, usize>,
 }
 
 impl AsmContext {
@@ -62,7 +113,6 @@ impl AsmContext {
         Self {
             items: Vec::new(),
             labels: HashMap::new(),
-            max_register: 0,
         }
     }
 
@@ -73,8 +123,8 @@ impl AsmContext {
         id
     }
 
-    /// Registers a label at the given bytecode offset.
-    pub fn define_label(&mut self, name: String, offset: usize) -> Result<(), VMError> {
+    /// Registers a label at the given global bytecode offset.
+    pub(crate) fn define_label(&mut self, name: String, offset: usize) -> Result<(), VMError> {
         if self.labels.contains_key(&name) {
             return Err(VMError::DuplicateLabel { label: name });
         }
@@ -82,8 +132,8 @@ impl AsmContext {
         Ok(())
     }
 
-    /// Resolves a label to its bytecode offset.
-    pub fn resolve_label(&self, name: &str) -> Result<usize, VMError> {
+    /// Resolves a label to its global bytecode offset.
+    pub(crate) fn resolve_label(&self, name: &str) -> Result<usize, VMError> {
         self.labels
             .get(name)
             .copied()
@@ -100,8 +150,8 @@ impl Default for AsmContext {
 }
 
 #[derive(Debug, Clone)]
-struct Token {
-    text: String,
+struct Token<'a> {
+    text: &'a str,
     /// 1-based column offset in the line.
     offset: usize,
 }
@@ -112,72 +162,78 @@ struct Token {
 /// - `#` starts a comment
 /// - commas are ignored
 /// - whitespace-separated tokens
-fn tokenize(line_no: usize, line: &str) -> Result<Vec<Token>, VMError> {
-    let line = line.split(COMMENT_CHAR).next().unwrap_or("");
-
+fn tokenize(line_no: usize, line: &str) -> Result<Vec<Token<'_>>, VMError> {
     let mut out = Vec::with_capacity(8);
-    let mut cur = String::with_capacity(line.len().min(64));
-    let mut start_col: Option<usize> = None;
+
+    let mut start: Option<usize> = None;
+    let mut start_col: usize = 0;
     let mut in_str = false;
-    let mut col = 0usize;
 
-    for ch in line.chars() {
-        col += 1;
+    let bytes = line.as_bytes();
+    let mut i = 0;
 
-        if ch == COMMENT_CHAR && !in_str {
+    while i < bytes.len() {
+        let b = bytes[i];
+
+        // comment start
+        if b == COMMENT_CHAR as u8 && !in_str {
             break;
         }
 
-        match ch {
-            '"' => {
-                if start_col.is_none() {
-                    start_col = Some(col);
+        match b {
+            b'"' => {
+                if start.is_none() {
+                    start = Some(i);
+                    start_col = i + 1;
                 }
-                cur.push(ch);
                 in_str = !in_str;
+                i += 1;
             }
-            ',' if !in_str => {
-                flush_token(&mut out, &mut cur, &mut start_col);
-            }
-            c if !in_str && c.is_whitespace() => {
-                flush_token(&mut out, &mut cur, &mut start_col);
-            }
-            _ => {
-                if start_col.is_none() {
-                    start_col = Some(col);
+
+            b',' | b' ' | b'\t' if !in_str => {
+                if let Some(s) = start {
+                    let text = &line[s..i];
+                    let text = text.trim();
+                    if !text.is_empty() {
+                        out.push(Token {
+                            text,
+                            offset: start_col,
+                        });
+                    }
+                    start = None;
                 }
-                cur.push(ch);
+                i += 1;
+            }
+
+            _ => {
+                if start.is_none() {
+                    start = Some(i);
+                    start_col = i + 1;
+                }
+                i += 1;
             }
         }
     }
 
     if in_str {
-        let offset = start_col.unwrap_or(col + 1);
         return Err(VMError::ParseError {
             line: line_no,
-            offset,
+            offset: start_col,
             message: "unterminated string literal (missing closing quote)",
         });
     }
 
-    flush_token(&mut out, &mut cur, &mut start_col);
-    Ok(out)
-}
+    if let Some(s) = start {
+        let text = line[s..i].trim();
+        if !text.is_empty() {
+            out.push(Token {
+                text,
+                offset: start_col,
+            });
+        }
+    }
 
-fn flush_token(out: &mut Vec<Token>, cur: &mut String, start_col: &mut Option<usize>) {
-    if cur.is_empty() {
-        *start_col = None;
-        return;
-    }
-    let token = cur.trim();
-    if !token.is_empty() {
-        out.push(Token {
-            text: token.to_string(),
-            offset: start_col.unwrap_or(1),
-        });
-    }
-    cur.clear();
-    *start_col = None;
+    Ok(out)
 }
 
 /// Parse a register token like `r0`, `r15`
@@ -230,21 +286,21 @@ pub(crate) fn parse_bool(tok: &str) -> Result<bool, VMError> {
     }
 }
 
-/// Parse an i64 immediate or a label reference.
+/// Parses an i64 immediate or a label reference.
 ///
-/// If `tok` parses as an integer, returns it directly.
-/// Otherwise, treats it as a label name and computes a relative offset
-/// from `after_instr` (the PC value after decoding the current instruction).
+/// If `tok` parses as an integer, returns it directly. Otherwise, resolves
+/// `tok` as a label name and computes a PC-relative offset in the global
+/// address space (init || runtime).
 pub(crate) fn parse_i64_or_label(
     tok: &str,
     ctx: &AsmContext,
-    after_instr: usize,
+    current_global_offset: usize,
 ) -> Result<i64, VMError> {
     if let Ok(v) = tok.parse::<i64>() {
         return Ok(v);
     }
     let target = ctx.resolve_label(tok)?;
-    Ok(target as i64 - after_instr as i64)
+    Ok(target as i64 - current_global_offset as i64)
 }
 
 /// Checks if a token is a label definition (ends with `:`)
@@ -329,12 +385,12 @@ macro_rules! define_parse_instruction {
 
         /// Parse one instruction from tokens into [`AsmInstr`].
         ///
-        /// `current_offset` is the bytecode offset where this instruction starts,
-        /// used for resolving label references to relative offsets.
+        /// `current_global_offset` is the global bytecode offset (in init || runtime space)
+        /// where this instruction starts, used for resolving label references to relative offsets.
         fn parse_instruction(
             ctx: &mut AsmContext,
             tokens: &[Token],
-            current_offset: usize,
+            current_global_offset: usize,
         ) -> Result<AsmInstr, VMError> {
             if tokens.is_empty() {
                 return Err(VMError::ArityMismatch {
@@ -345,7 +401,7 @@ macro_rules! define_parse_instruction {
             }
 
             let instr = instruction_from_str(&tokens[0].text)?;
-            let offset = current_offset + instruction_size(instr);
+            let offset = current_global_offset + instruction_size(instr);
 
             match instr {
                 $(
@@ -353,7 +409,7 @@ macro_rules! define_parse_instruction {
                         const EXPECTED: usize = 1 + define_parse_instruction!(@count $( $field ),*);
                         if tokens.len() != EXPECTED {
                             return Err(VMError::ArityMismatch {
-                                instruction: tokens[0].text.clone(),
+                                instruction: tokens[0].text.to_string(),
                                 expected: EXPECTED - 1,
                                 actual: tokens.len() - 1,
                             });
@@ -399,11 +455,7 @@ macro_rules! define_parse_instruction {
     }};
 
     (@parse_operand Reg, $tok:expr, $ctx:expr, $current_offset:expr) => {{
-          let reg = parse_reg(&$tok.text)?;
-          if reg > $ctx.max_register {
-              $ctx.max_register = reg;
-          }
-          Ok::<_, VMError>(reg)
+          parse_reg(&$tok.text)
       }};
 
     (@parse_operand ImmU8, $tok:expr, $ctx:expr, $current_offset:expr) => {
@@ -430,27 +482,123 @@ macro_rules! define_parse_instruction {
 
 for_each_instruction!(define_parse_instruction);
 
-/// Assemble a full source string into bytecode.
+/// Preprocesses assembly source to generate a dispatcher for public entry points.
 ///
-/// Uses two-pass assembly:
-/// 1. First pass: tokenize lines, record label positions, detect sections
-/// 2. Second pass: parse instructions with label resolution, emit bytecode
+/// Scans the source for labels prefixed with `pub` and generates a jump table
+/// (`__resolver_jump_table`) that dispatches to public functions based on a
+/// selector in `r0`. The generated dispatcher is inserted at the start of the
+/// `[ runtime code ]` section.
+fn assemble_source_step_1(source: String) -> Result<String, VMError> {
+    // Track where to insert the dispatcher (line number of `[ runtime code ]`)
+    let mut insert_point: (usize, &str) = (0, "");
+    // Collect all public label names (including trailing ':')
+    let mut public_labels: HashSet<&str> = HashSet::new();
+
+    // First pass: scan source to find public labels and the runtime section marker
+    for (line_no, line) in source.lines().enumerate() {
+        // Check for section markers first
+        if let Some(section) = parse_section_marker(line) {
+            if section == Section::Runtime {
+                insert_point = (line_no, line);
+            }
+            continue;
+        }
+
+        let tokens = tokenize(line_no + 1, line)?;
+        if tokens.is_empty() {
+            continue;
+        }
+
+        let (is_pub, label_idx) = if tokens[0].text == "pub" && tokens.len() > 1 {
+            (true, 1)
+        } else {
+            (false, 0)
+        };
+
+        // Check if this is a public label definition (`pub label_name:`)
+        if tokens.len() > label_idx && is_pub && is_label_def(tokens[label_idx].text) {
+            public_labels.insert(tokens[label_idx].text);
+        }
+    }
+
+    if public_labels.is_empty() {
+        return Ok(source);
+    }
+
+    let mut base = String::new();
+    base.push_str("__resolver_jump_table:\n");
+
+    let mut labels: Vec<&str> = public_labels.iter().copied().collect();
+    labels.sort();
+    match labels.len() {
+        1 => {
+            // Smallest possible dispatcher: just jump to the single entry.
+            base.push_str("JUMP __dispatch_entry_0\n");
+        }
+        _ => {
+            // Computed jump table using high registers to avoid clobbering user args.
+            // Each entry is CALL0 + HALT: 10 + 1 = 11 bytes.
+            //
+            // Labels are PC-relative, so we use JAL to capture the current absolute
+            // position, then add the relative offset to compute the absolute target.
+            // Uses r250-r254 to preserve r1+ for function arguments.
+            base.push_str("LOAD_I64 r250, 11\n");
+            base.push_str("MUL r251, r0, r250\n");
+            base.push_str("JAL r252, 0\n"); // r252 = absolute addr of next instr
+            base.push_str("LOAD_I64 r253, __dispatch_table\n"); // r253 = relative offset
+            base.push_str("LOAD_I64 r254, 10\n"); // size of LOAD_I64
+            base.push_str("ADD r252, r252, r254\n"); // r252 = end of LOAD_I64 r253
+            base.push_str("ADD r253, r253, r252\n"); // r253 = absolute addr of __dispatch_table
+            base.push_str("ADD r251, r251, r253\n"); // r251 = absolute addr of target entry
+            base.push_str("JALR r254, r251, 0\n");
+            base.push_str("HALT\n");
+            base.push_str("__dispatch_table:\n");
+        }
+    }
+
+    for (idx, label) in labels.iter().enumerate() {
+        let name = label.strip_suffix(':').unwrap_or(label);
+        match labels.len() {
+            1 => {
+                base.push_str("__dispatch_entry_0:\n");
+            }
+            _ => {
+                writeln!(base, "__dispatch_entry_{idx}:").unwrap();
+            }
+        }
+        // Use CALL0 to keep per-entry size minimal (11 bytes with HALT) while leaving
+        // argument registers untouched for the callee.
+        writeln!(base, "CALL0 r0, {name}").unwrap();
+        base.push_str("HALT\n");
+    }
+
+    // Reassemble source with dispatcher inserted at the runtime section marker
+    let mut out = String::with_capacity(source.len() + base.len());
+    for (i, line) in source.lines().enumerate() {
+        out.push_str(line.split(COMMENT_CHAR).next().unwrap_or("").trim());
+        out.push('\n');
+        // Insert dispatcher just after the `[ runtime code ]` line
+        if i == insert_point.0 {
+            out.push_str(&base);
+            out.push('\n');
+        }
+    }
+
+    Ok(out)
+}
+
+/// Performs two-pass assembly on preprocessed source.
 ///
-/// Section markers `[ init code ]` and `[ runtime code ]` split the source:
-/// - Code between `[ init code ]` and `[ runtime code ]` goes to `init_code`
-/// - Code after `[ runtime code ]` goes to `runtime_code`
-/// - Code before any section marker goes to `runtime_code` by default
+/// Pass 1: Tokenizes all lines, detects `[ init code ]` / `[ runtime code ]` sections,
+/// computes instruction sizes, and records label positions as global offsets in the
+/// concatenated address space (init || runtime).
 ///
-/// Labels are computed for a concatenated view (init_code + runtime_code) so that
-/// init_code can call into runtime_code. The VM should run the concatenated bytecode,
-/// starting at ip=0 for deployment and ip=init_code.len() for runtime calls.
-pub fn assemble_source(source: impl Into<String>) -> Result<Program, VMError> {
-    let source = source.into();
+/// Pass 2: Parses instructions with label resolution and emits bytecode.
+fn assemble_source_step_2(source: String) -> Result<DeployProgram, VMError> {
     let mut asm_context = AsmContext::new();
 
-    // First pass: tokenize all lines, detect sections, compute section sizes
+    // First pass: tokenize all lines, detect sections, compute global offsets
     // We track (line_no, tokens, section) for each instruction line
-    // Labels are stored with section info for later adjustment
     let mut parsed_lines: Vec<(usize, Vec<Token>, Section)> = Vec::new();
     let mut current_section = Section::None;
 
@@ -458,7 +606,7 @@ pub fn assemble_source(source: impl Into<String>) -> Result<Program, VMError> {
     let mut init_size = 0usize;
     let mut runtime_size = 0usize;
 
-    // Temporary label storage: (name, section, local_offset)
+    // Temporary label storage: (name, global_offset, line_no, tok_offset)
     let mut pending_labels: Vec<(String, Section, usize, usize, usize)> = Vec::new();
 
     for (line_no, line) in source.lines().enumerate() {
@@ -485,9 +633,16 @@ pub fn assemble_source(source: impl Into<String>) -> Result<Program, VMError> {
             Section::Runtime | Section::None => &mut runtime_size,
         };
 
+        // Detect pub prefix and label position
+        let label_idx = if tokens[0].text == "pub" && tokens.len() > 1 {
+            1
+        } else {
+            0
+        };
+
         // Check if first token is a label definition
-        if is_label_def(&tokens[0].text) {
-            let name = label_name(&tokens[0].text).to_string();
+        if tokens.len() > label_idx && is_label_def(tokens[label_idx].text) {
+            let name = label_name(tokens[label_idx].text).to_string();
             pending_labels.push((
                 name,
                 effective_section,
@@ -497,9 +652,10 @@ pub fn assemble_source(source: impl Into<String>) -> Result<Program, VMError> {
             ));
 
             // If there are more tokens after the label, treat them as an instruction
-            if tokens.len() > 1 {
-                let instr_tokens: Vec<Token> = tokens[1..].to_vec();
-                let instr = instruction_from_str(&instr_tokens[0].text).map_err(|e| {
+            let instr_start = label_idx + 1;
+            if tokens.len() > instr_start {
+                let instr_tokens: Vec<Token> = tokens[instr_start..].to_vec();
+                let instr = instruction_from_str(instr_tokens[0].text).map_err(|e| {
                     VMError::AssemblyError {
                         line: line_no + 1,
                         offset: instr_tokens[0].offset,
@@ -511,7 +667,7 @@ pub fn assemble_source(source: impl Into<String>) -> Result<Program, VMError> {
             }
         } else {
             let instr =
-                instruction_from_str(&tokens[0].text).map_err(|e| VMError::AssemblyError {
+                instruction_from_str(tokens[0].text).map_err(|e| VMError::AssemblyError {
                     line: line_no + 1,
                     offset: tokens[0].offset,
                     source: e.to_string(),
@@ -521,9 +677,7 @@ pub fn assemble_source(source: impl Into<String>) -> Result<Program, VMError> {
         }
     }
 
-    // Now register all labels with their concatenated offsets
-    // init_code labels: local_offset
-    // runtime_code labels: init_size + local_offset
+    // Register labels with global offsets (init || runtime address space).
     for (name, section, local_offset, line_no, tok_offset) in pending_labels {
         let global_offset = match section {
             Section::Init => local_offset,
@@ -539,19 +693,22 @@ pub fn assemble_source(source: impl Into<String>) -> Result<Program, VMError> {
     }
 
     // Second pass: parse instructions and emit bytecode to separate vectors
-    // Offsets are computed in concatenated view for correct label resolution
     let mut init_bytecode = Vec::new();
     let mut runtime_bytecode = Vec::new();
 
     for (line_no, tokens, section) in parsed_lines {
-        let (bytecode, base_offset) = match section {
-            Section::Init => (&mut init_bytecode, 0),
-            Section::Runtime | Section::None => (&mut runtime_bytecode, init_size),
+        let bytecode = match section {
+            Section::Init => &mut init_bytecode,
+            Section::Runtime | Section::None => &mut runtime_bytecode,
         };
 
-        // current_offset in concatenated view
-        let current_offset = base_offset + bytecode.len();
-        let instr = parse_instruction(&mut asm_context, &tokens, current_offset).map_err(|e| {
+        // Compute global offset for label resolution
+        let global_offset = match section {
+            Section::Init => bytecode.len(),
+            Section::Runtime | Section::None => init_size + bytecode.len(),
+        };
+
+        let instr = parse_instruction(&mut asm_context, &tokens, global_offset).map_err(|e| {
             VMError::AssemblyError {
                 line: line_no + 1,
                 offset: tokens.first().map(|t| t.offset).unwrap_or(1),
@@ -561,22 +718,59 @@ pub fn assemble_source(source: impl Into<String>) -> Result<Program, VMError> {
         instr.assemble(bytecode);
     }
 
-    Ok(Program {
-        max_register: asm_context.max_register,
-        items: asm_context.items,
+    Ok(DeployProgram {
         init_code: init_bytecode,
         runtime_code: runtime_bytecode,
+        items: asm_context.items,
     })
 }
 
+/// Assemble a full source string into bytecode.
+///
+/// Uses two-pass assembly:
+/// 1. First pass: tokenize lines, record label positions, detect sections
+/// 2. Second pass: parse instructions with label resolution, emit bytecode
+///
+/// Section markers `[ init code ]` and `[ runtime code ]` split the source:
+/// - Code between `[ init code ]` and `[ runtime code ]` goes to `init_code`
+/// - Code after `[ runtime code ]` goes to `runtime_code`
+/// - Code before any section marker goes to `runtime_code` by default
+///
+/// Labels are computed for a concatenated view (init_code + runtime_code) so that
+/// init_code can call into runtime_code. The VM should run the concatenated bytecode,
+/// starting at ip=0 for deployment and ip=init_code.len() for runtime calls.
+pub fn assemble_source(source: impl Into<String>) -> Result<DeployProgram, VMError> {
+    assemble_source_with_name(source.into(), "<source>")
+}
+
+/// Assembles source with an associated filename for error diagnostics.
+///
+/// Runs both assembly passes and logs a compiler-style diagnostic to stderr
+/// on failure, including source location information.
+fn assemble_source_with_name(source: String, source_name: &str) -> Result<DeployProgram, VMError> {
+    let mut processed = None;
+    let result = (|| {
+        let dispatcher = assemble_source_step_1(source.clone())?;
+        processed = Some(dispatcher.clone());
+        assemble_source_step_2(dispatcher)
+    })();
+
+    if let Err(err) = &result {
+        let display_source = processed.as_deref().unwrap_or(&source);
+        log_assembly_error(source_name, display_source, err);
+    }
+
+    result
+}
+
 /// Convenience: assemble directly from file path
-pub fn assemble_file<P: AsRef<Path>>(path: P) -> Result<Program, VMError> {
+pub fn assemble_file<P: AsRef<Path>>(path: P) -> Result<DeployProgram, VMError> {
     let path_ref = path.as_ref();
     let source = fs::read_to_string(path_ref).map_err(|e| VMError::IoError {
         path: path_ref.display().to_string(),
         source: e.to_string(),
     })?;
-    assemble_source(source)
+    assemble_source_with_name(source, &path_ref.display().to_string())
 }
 
 #[cfg(test)]
@@ -761,15 +955,15 @@ mod tests {
     fn instruction_parse_load_i64() {
         let tokens = vec![
             Token {
-                text: "LOAD_I64".into(),
+                text: "LOAD_I64",
                 offset: 1,
             },
             Token {
-                text: "r5".into(),
+                text: "r5",
                 offset: 10,
             },
             Token {
-                text: "100".into(),
+                text: "100",
                 offset: 14,
             },
         ];
@@ -787,19 +981,19 @@ mod tests {
     fn instruction_parse_three_reg() {
         let tokens = vec![
             Token {
-                text: "ADD".into(),
+                text: "ADD",
                 offset: 1,
             },
             Token {
-                text: "r0".into(),
+                text: "r0",
                 offset: 5,
             },
             Token {
-                text: "r1".into(),
+                text: "r1",
                 offset: 9,
             },
             Token {
-                text: "r2".into(),
+                text: "r2",
                 offset: 13,
             },
         ];

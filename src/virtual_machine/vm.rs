@@ -7,8 +7,116 @@ use crate::types::hash::{HASH_LEN, Hash};
 use crate::virtual_machine::assembler::parse_i64;
 use crate::virtual_machine::errors::VMError;
 use crate::virtual_machine::isa::Instruction;
-use crate::virtual_machine::program::Program;
+use crate::virtual_machine::program::{DeployProgram, ExecuteProgram};
 use crate::virtual_machine::state::State;
+use blockchain_derive::BinaryCodec;
+use std::fmt::Write;
+
+/// Reads `len` bytes from `data` starting at `cursor`, advancing the cursor.
+///
+/// Returns an error if reading would exceed the data bounds.
+fn read_bytes<'a>(
+    data: &'a [u8],
+    cursor: &mut usize,
+    len: usize,
+    ip: usize,
+) -> Result<&'a [u8], VMError> {
+    let end = cursor
+        .checked_add(len)
+        .ok_or(VMError::InvalidIP { ip: *cursor })?;
+    if end > data.len() {
+        return Err(VMError::UnexpectedEndOfBytecode {
+            ip,
+            requested: len,
+            available: data.len().saturating_sub(*cursor),
+        });
+    }
+    let slice = &data[*cursor..end];
+    *cursor = end;
+    Ok(slice)
+}
+
+/// Reads a single byte from `data` at `cursor`, advancing the cursor.
+fn read_u8(data: &[u8], cursor: &mut usize, ip: usize) -> Result<u8, VMError> {
+    Ok(*read_bytes(data, cursor, 1, ip)?.first().unwrap())
+}
+
+macro_rules! define_instruction_decoder {
+    (
+        $(
+            $(#[$doc:meta])*
+            $name:ident = $opcode:expr, $mnemonic:literal => [
+                $( $field:ident : $kind:ident ),* $(,)?
+            ], $gas:expr
+        ),* $(,)?
+    ) => {
+        fn decode_instruction_at(data: &[u8], start: usize) -> Result<(String, usize), VMError> {
+            if start >= data.len() {
+                return Err(VMError::UnexpectedEndOfBytecode {
+                    ip: start,
+                    requested: 1,
+                    available: 0,
+                });
+            }
+
+            let opcode = data[start];
+            let instr = Instruction::try_from(opcode)?;
+            let mut cursor = start + 1;
+
+            let text = match instr {
+                $(
+                    Instruction::$name => {
+                        define_instruction_decoder!(
+                            @decode data cursor start $mnemonic; $( $kind ),*
+                        )?
+                    }
+                ),*
+            };
+
+            Ok((text, cursor - start))
+        }
+    };
+
+    (@decode $data:ident $cursor:ident $start:ident $mnemonic:expr; ) => {
+        Ok::<_, VMError>($mnemonic.to_string())
+    };
+
+    (@decode $data:ident $cursor:ident $start:ident $mnemonic:expr; $( $kind:ident ),+ ) => {{
+        let mut parts = Vec::new();
+        $(
+            let val = define_instruction_decoder!(@read $data $cursor $start $kind)?;
+            parts.push(val);
+        )*
+        Ok::<_, VMError>(format!("{} {}", $mnemonic, parts.join(", ")))
+    }};
+
+    (@read $data:ident $cursor:ident $start:ident Reg) => {{
+        let v = read_u8($data, &mut $cursor, $start)?;
+        Ok::<String, VMError>(format!("r{}", v))
+    }};
+
+    (@read $data:ident $cursor:ident $start:ident ImmU8) => {{
+        let v = read_u8($data, &mut $cursor, $start)?;
+        Ok::<String, VMError>(v.to_string())
+    }};
+
+    (@read $data:ident $cursor:ident $start:ident Bool) => {{
+        let v = read_u8($data, &mut $cursor, $start)?;
+        Ok::<String, VMError>(if v == 0 { "false".to_string() } else { "true".to_string() })
+    }};
+
+    (@read $data:ident $cursor:ident $start:ident RefU32) => {{
+        let bytes = read_bytes($data, &mut $cursor, 4, $start)?;
+        Ok::<String, VMError>(format!("@{}", u32::from_le_bytes(bytes.try_into().unwrap())))
+    }};
+
+    (@read $data:ident $cursor:ident $start:ident ImmI64) => {{
+        let bytes = read_bytes($data, &mut $cursor, 8, $start)?;
+        Ok::<String, VMError>(i64::from_le_bytes(bytes.try_into().unwrap()).to_string())
+    }};
+}
+
+crate::for_each_instruction!(define_instruction_decoder);
 
 /// Categories of gas consumption for profiling and debugging.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -19,8 +127,6 @@ pub enum GasCategory {
     Deploy,
     /// Base cost for executing opcodes.
     OpcodeBase,
-    /// Cost for accessing registers (tiered by register index).
-    RegisterAccess,
     /// Cost for deriving state storage keys.
     StateKeyDerivation,
     /// Cost for writing to state storage.
@@ -41,7 +147,6 @@ impl GasCategory {
             GasCategory::Intrinsic => "Intrinsic",
             GasCategory::Deploy => "Deployment",
             GasCategory::OpcodeBase => "Opcode Base",
-            GasCategory::RegisterAccess => "Register Access",
             GasCategory::StateKeyDerivation => "State Key Derivation",
             GasCategory::StateStore => "State Store",
             GasCategory::StateRead => "State Read",
@@ -61,7 +166,6 @@ pub struct GasProfile {
     intrinsic: u64,
     deploy: u64,
     opcode_base: u64,
-    register_access: u64,
     state_key_derivation: u64,
     state_store: u64,
     state_read: u64,
@@ -82,9 +186,6 @@ impl GasProfile {
             GasCategory::Intrinsic => self.intrinsic = self.intrinsic.saturating_add(amount),
             GasCategory::Deploy => self.deploy = self.deploy.saturating_add(amount),
             GasCategory::OpcodeBase => self.opcode_base = self.opcode_base.saturating_add(amount),
-            GasCategory::RegisterAccess => {
-                self.register_access = self.register_access.saturating_add(amount)
-            }
             GasCategory::StateKeyDerivation => {
                 self.state_key_derivation = self.state_key_derivation.saturating_add(amount)
             }
@@ -107,7 +208,6 @@ impl GasProfile {
         self.deploy
             .saturating_add(self.intrinsic)
             .saturating_add(self.opcode_base)
-            .saturating_add(self.register_access)
             .saturating_add(self.state_key_derivation)
             .saturating_add(self.state_store)
             .saturating_add(self.state_read)
@@ -122,7 +222,6 @@ impl GasProfile {
             (GasCategory::Intrinsic, self.intrinsic),
             (GasCategory::Deploy, self.deploy),
             (GasCategory::OpcodeBase, self.opcode_base),
-            (GasCategory::RegisterAccess, self.register_access),
             (GasCategory::StateKeyDerivation, self.state_key_derivation),
             (GasCategory::StateStore, self.state_store),
             (GasCategory::StateRead, self.state_read),
@@ -146,9 +245,10 @@ const STORE_BYTE_COST: u64 = 10;
 /// Gas cost per byte when reading from state storage.
 const READ_BYTE_COST: u64 = 5;
 
-/// Runtime value stored in registers.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Value {
+/// Runtime value stored in registers and used for typed call arguments.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, BinaryCodec)]
+pub enum Value {
+    /// Uninitialized or zero value.
     Zero,
     /// Boolean value.
     Bool(bool),
@@ -180,9 +280,9 @@ struct Registers {
 
 impl Registers {
     /// Creates a new register file with `count` registers.
-    pub fn new(count: usize) -> Self {
+    pub fn new() -> Self {
         Self {
-            regs: vec![Value::Zero; count],
+            regs: vec![Value::Zero; 256],
         }
     }
 
@@ -414,11 +514,9 @@ struct CallFrame {
 pub struct VM {
     /// Concatenated bytecode (init_code + runtime_code).
     data: Vec<u8>,
-    /// Byte offset where runtime_code begins (i.e., init_code.len()).
-    init_size: usize,
     /// Instruction pointer (current position in bytecode).
     ip: usize,
-    /// Register file (256 max registers).
+    /// Register file (256 registers).
     registers: Registers,
     /// Heap for string pool and future allocations.
     heap: Heap,
@@ -434,13 +532,13 @@ pub struct VM {
 
 /// impl block for basic VM functions
 impl VM {
-    /// Creates a new VM instance with the given program and gas limits.
+    /// Creates a VM for deploying a contract.
     ///
-    /// Concatenates init_code + runtime_code for execution. Use `run` for deployment
-    /// (starts at ip=0) or `run_call` for runtime calls (starts at ip=init_size).
+    /// Concatenates init_code + runtime_code for execution. Use [`run`](Self::run)
+    /// to execute from ip=0. For runtime calls, use [`new_execute`](Self::new_execute).
     ///
-    /// Returns `OutOfGas` if the base cost of creating the smart contract exceeds `max_gas`.
-    pub fn new(program: Program, max_gas: u64) -> Result<Self, VMError> {
+    /// Returns `OutOfGas` if the base deployment cost exceeds `max_gas`.
+    pub fn new_deploy(program: DeployProgram, max_gas: u64) -> Result<Self, VMError> {
         let init_size = program.init_code.len();
         let total_bytes = init_size + program.runtime_code.len();
 
@@ -450,9 +548,8 @@ impl VM {
 
         let mut vm = Self {
             data,
-            init_size,
             ip: 0,
-            registers: Registers::new(program.max_register as usize + 1),
+            registers: Registers::new(),
             heap: Heap::new(program.items),
             call_stack: Vec::new(),
             gas_used: 0,
@@ -464,9 +561,181 @@ impl VM {
         Ok(vm)
     }
 
-    /// Returns the byte offset where runtime_code begins.
-    pub fn init_size(&self) -> usize {
-        self.init_size
+    /// Creates a VM for executing a function call on a deployed contract.
+    ///
+    /// Seeds `r0` with the function selector and subsequent registers with the
+    /// provided arguments. Heap items from the stored contract and any argument
+    /// refs are merged so `Value::Ref` indices resolve correctly.
+    pub fn new_execute(
+        program: ExecuteProgram,
+        data: Vec<u8>,
+        items: Vec<Vec<u8>>,
+        max_gas: u64,
+    ) -> Result<Self, VMError> {
+        // Build a VM for runtime execution, seeding registers with typed args and extending
+        // the heap with any argument-owned items referenced via Value::Ref.
+        // Labels are resolved as PC-relative offsets, so init_size is not needed.
+        let mut vm = Self {
+            data,
+            ip: 0,
+            registers: Registers::new(),
+            heap: Heap::new(items),
+            call_stack: Vec::new(),
+            gas_used: 0,
+            max_gas,
+            gas_profile: GasProfile::new(),
+        };
+
+        // Load argument-specific heap items so Value::Ref can target them.
+        let arg_items_len = program.arg_items.len();
+        let arg_ref_base = vm.heap.len() as u32;
+        for item in program.arg_items {
+            vm.heap.index(item);
+        }
+
+        vm.registers.set(0, Value::Int(program.function_id))?;
+        let mut i = 1u8;
+        for arg in program.args {
+            let mapped = match arg {
+                Value::Ref(r) if (r as usize) < arg_items_len => Value::Ref(arg_ref_base + r),
+                other => other,
+            };
+            vm.registers.set(i, mapped)?;
+            i += 1;
+        }
+
+        Ok(vm)
+    }
+
+    /// Logs a formatted runtime error diagnostic to stderr.
+    fn log_runtime_error(&self, err: &VMError) {
+        eprintln!("{}", self.format_runtime_error(err));
+    }
+
+    /// Formats a runtime error with bytecode context and call stack.
+    fn format_runtime_error(&self, err: &VMError) -> String {
+        let mut out = String::new();
+        let _ = writeln!(out, "error: VM runtime failure: {err}");
+
+        if let Some(ip) = self.error_ip(err) {
+            let _ = writeln!(out, "   --> bytecode:{ip}");
+            if let Some(asm) = self.disassembly_snippet(ip) {
+                out.push_str(&asm);
+            }
+            if let Some(snippet) = self.bytecode_snippet(ip) {
+                out.push_str(&snippet);
+            }
+        }
+
+        let _ = writeln!(out, "note: gas used {} of {}", self.gas_used, self.max_gas);
+        if self.call_stack.is_empty() {
+            let _ = writeln!(out, "note: call stack is empty");
+        } else {
+            let _ = writeln!(out, "note: call stack (most recent first):");
+            for (depth, frame) in self.call_stack.iter().rev().enumerate() {
+                let _ = writeln!(
+                    out,
+                    "  {depth}: return to ip {} -> r{}",
+                    frame.return_addr, frame.dst_reg
+                );
+            }
+        }
+
+        out
+    }
+
+    /// Returns a hex dump of bytecode around the given instruction pointer.
+    fn bytecode_snippet(&self, ip: usize) -> Option<String> {
+        if self.data.is_empty() {
+            return None;
+        }
+
+        let window = 8usize;
+        let start = ip.saturating_sub(window);
+        let end = (ip + window + 1).min(self.data.len());
+
+        let mut rendered = String::new();
+        let mut caret_col = 0usize;
+        for (idx, byte) in self.data.get(start..end)?.iter().enumerate() {
+            if idx > 0 {
+                rendered.push(' ');
+            }
+            if start + idx == ip {
+                caret_col = rendered.len();
+            }
+            rendered.push_str(&format!("{:02X}", byte));
+        }
+
+        if caret_col == 0 && ip >= end {
+            caret_col = rendered.len();
+        }
+
+        let mut snippet = String::new();
+        let _ = writeln!(
+            snippet,
+            "    | window [{}..{}) of {} bytes",
+            start,
+            end,
+            self.data.len()
+        );
+        let _ = writeln!(snippet, "    | {rendered}");
+        let _ = writeln!(snippet, "    | {}^", " ".repeat(caret_col));
+        Some(snippet)
+    }
+
+    /// Disassembles the entire bytecode into (offset, text, size) tuples.
+    fn disassembly_listing(&self) -> Vec<(usize, String, usize)> {
+        let mut listing = Vec::new();
+        let mut pos = 0usize;
+        while pos < self.data.len() {
+            match decode_instruction_at(&self.data, pos) {
+                Ok((text, size)) => {
+                    listing.push((pos, text, size));
+                    pos = pos.saturating_add(size.max(1));
+                }
+                Err(_) => break,
+            }
+        }
+        listing
+    }
+
+    /// Returns a few disassembled instructions around the given IP.
+    fn disassembly_snippet(&self, ip: usize) -> Option<String> {
+        let listing = self.disassembly_listing();
+        if listing.is_empty() {
+            return None;
+        }
+
+        let target_idx = listing
+            .iter()
+            .position(|(offset, _, size)| (*offset..offset + *size).contains(&ip))
+            .or_else(|| listing.iter().rposition(|(offset, _, _)| *offset <= ip));
+
+        let idx = target_idx?;
+        let start = idx.saturating_sub(2);
+        let end = (idx + 3).min(listing.len());
+
+        let mut out = String::new();
+        let _ = writeln!(out, "    | assembly around ip {ip}:");
+        for (i, (offset, text, _)) in listing[start..end].iter().enumerate() {
+            let cursor = start + i == idx;
+            let marker = if cursor { "-->" } else { "   " };
+            let _ = writeln!(out, "{marker} {:>6}: {}", offset, text);
+        }
+        Some(out)
+    }
+
+    /// Extracts the instruction pointer associated with a VM error, if available.
+    fn error_ip(&self, err: &VMError) -> Option<usize> {
+        match err {
+            VMError::InvalidInstruction { offset, .. } => Some(*offset),
+            VMError::UnexpectedEndOfBytecode { ip, .. } => Some(*ip),
+            VMError::InvalidIP { ip } => Some(*ip),
+            VMError::JumpOutOfBounds { from, .. } => Some(*from),
+            VMError::ReturnWithoutCall { .. } => Some(self.ip),
+            VMError::OutOfGas { .. } => Some(self.ip.saturating_sub(1)),
+            _ => Some(self.ip),
+        }
     }
 
     /// Derives a unique storage key from chain ID, contract ID, and user-provided key.
@@ -544,77 +813,10 @@ impl VM {
             GasCategory::CallOverhead,
         )
     }
-
-    /// Returns the gas cost for accessing a register based on its index tier.
-    ///
-    /// Lower registers (0-31) are free, higher registers cost progressively more
-    /// to encourage efficient register allocation.
-    ///
-    /// Try and mimic real cpu costs
-    /// * r0 - r31 : x0-x31 => free to use as much as required
-    /// * r32 - r63 : L1 cache => costs more than a register
-    /// * r64 - r127: L2 cache => costs more than the L1 cache
-    /// * r128 - r255: L3 cache => costs more than the L2 cache
-    fn register_gas_fee(register: u8) -> u64 {
-        match register {
-            0..=31 => 0,
-            32..=63 => 1,
-            64..=127 => 2,
-            128..=255 => 4,
-        }
-    }
-
-    /// Charges gas for accessing the specified register.
-    fn charge_register(&mut self, register: u8) -> Result<(), VMError> {
-        self.charge_gas_categorized(
-            Self::register_gas_fee(register),
-            GasCategory::RegisterAccess,
-        )
-    }
 }
 
 /// impl block for VM wrapper functions to charge gas
 impl VM {
-    /// Returns the value in register `idx` with gas charging.
-    ///
-    /// Returns [`VMError::InvalidRegisterIndex`] if `idx` is out of bounds.
-    fn registers_set(&mut self, idx: u8, v: Value) -> Result<(), VMError> {
-        self.charge_register(idx)?;
-        self.registers.set(idx, v)
-    }
-
-    /// Returns the value in register `idx` with gas charging.
-    ///
-    /// Returns [`VMError::InvalidRegisterIndex`] if `idx` is out of bounds.
-    fn registers_get(&mut self, idx: u8) -> Result<&Value, VMError> {
-        self.charge_register(idx)?;
-        self.registers.get(idx)
-    }
-
-    /// Returns the boolean value in register `idx` with gas charging.
-    ///
-    /// Returns [`VMError::TypeMismatch`] if the value is not a boolean.
-    fn registers_get_bool(&mut self, idx: u8, instr: &'static str) -> Result<bool, VMError> {
-        self.charge_register(idx)?;
-        self.registers.get_bool(idx, instr)
-    }
-
-    /// Returns the reference value in register `idx` with gas charging.
-    ///
-    /// Returns [`VMError::TypeMismatch`] if the value is not a reference.
-    fn registers_get_ref(&mut self, idx: u8, instr: &'static str) -> Result<u32, VMError> {
-        self.charge_register(idx)?;
-        self.registers.get_ref(idx, instr)
-    }
-
-    /// Returns the integer value in register `idx` with gas charging.
-    ///
-    /// Returns [`VMError::TypeMismatch`] if the value is not an integer.
-    fn registers_get_int(&mut self, idx: u8, instr: &'static str) -> Result<i64, VMError> {
-        self.charge_register(idx)?;
-        self.registers.get_int(idx, instr)
-    }
-
     /// Stores an item on the heap and returns its reference index.
     ///
     /// Charges gas proportional to the item's byte length.
@@ -688,39 +890,33 @@ impl VM {
 
 /// impl block for VM execution functions
 impl VM {
-    /// Executes the bytecode from ip=0 (deployment mode).
+    /// Executes the bytecode from ip=0.
     ///
-    /// Runs init_code first, which may call into runtime_code. Use this method
-    /// for contract deployment. For subsequent calls, use [`run_call`].
+    /// For deployment, init_code runs first and may call into runtime_code.
+    /// For contract calls, use [`new_execute`](Self::new_execute) and then `run`.
     pub fn run<S: State>(&mut self, state: &mut S, ctx: &ExecContext) -> Result<(), VMError> {
-        self.ip = 0;
-        self.run_inner(state, ctx)
-    }
+        let result = (|| {
+            while self.ip < self.data.len() {
+                let opcode_offset = self.ip;
+                let opcode = self.data[opcode_offset];
+                self.ip += 1;
 
-    /// Executes the bytecode from ip=init_size (runtime call mode).
-    ///
-    /// Skips init_code and runs runtime_code directly. Use this method for
-    /// contract calls after deployment. For deployment, use [`run`].
-    pub fn run_call<S: State>(&mut self, state: &mut S, ctx: &ExecContext) -> Result<(), VMError> {
-        self.ip = self.init_size;
-        self.run_inner(state, ctx)
-    }
+                let instr =
+                    Instruction::try_from(opcode).map_err(|_| VMError::InvalidInstruction {
+                        opcode,
+                        offset: opcode_offset,
+                    })?;
+                self.charge_base(instr)?;
+                self.exec(instr, state, ctx)?;
+            }
+            Ok(())
+        })();
 
-    /// Internal execution loop.
-    fn run_inner<S: State>(&mut self, state: &mut S, ctx: &ExecContext) -> Result<(), VMError> {
-        while self.ip < self.data.len() {
-            let opcode_offset = self.ip;
-            let opcode = self.data[opcode_offset];
-            self.ip += 1;
-
-            let instr = Instruction::try_from(opcode).map_err(|_| VMError::InvalidInstruction {
-                opcode,
-                offset: opcode_offset,
-            })?;
-            self.charge_base(instr)?;
-            self.exec(instr, state, ctx)?;
+        if let Err(err) = &result {
+            self.log_runtime_error(err);
         }
-        Ok(())
+
+        result
     }
 
     /// Reads exactly `count` bytes from the bytecode at the current IP.
@@ -830,7 +1026,7 @@ impl VM {
         ctx: &ExecContext,
         key: u8,
     ) -> Result<(), VMError> {
-        let key_ref = self.registers_get_ref(key, instr)?;
+        let key_ref = self.registers.get_ref(key, instr)?;
         let key_str = self.heap_get_string(key_ref)?;
         let key = self.make_state_key(ctx.chain_id, &ctx.contract_id, key_str.as_bytes())?;
         state.delete(key);
@@ -838,7 +1034,7 @@ impl VM {
     }
 
     fn op_load_i64(&mut self, _instr: &'static str, dst: u8, imm: i64) -> Result<(), VMError> {
-        self.registers_set(dst, Value::Int(imm))
+        self.registers.set(dst, Value::Int(imm))
     }
 
     fn op_store_i64<S: State>(
@@ -849,9 +1045,9 @@ impl VM {
         key: u8,
         value: u8,
     ) -> Result<(), VMError> {
-        let key_ref = self.registers_get_ref(key, instr)?;
+        let key_ref = self.registers.get_ref(key, instr)?;
         let key_str = self.heap_get_string(key_ref)?;
-        let val = self.registers_get_int(value, instr)?;
+        let val = self.registers.get_int(value, instr)?;
         let key = self.make_state_key(ctx.chain_id, &ctx.contract_id, key_str.as_bytes())?;
         self.state_push(state, key, val.to_le_bytes().to_vec())?;
         Ok(())
@@ -865,7 +1061,7 @@ impl VM {
         dst: u8,
         key: u8,
     ) -> Result<(), VMError> {
-        let key_ref = self.registers_get_ref(key, instr)?;
+        let key_ref = self.registers.get_ref(key, instr)?;
         let key_str = self.heap_get_string(key_ref)?;
         let state_key = self.make_state_key(ctx.chain_id, &ctx.contract_id, key_str.as_bytes())?;
         let value = self.state_get(state, state_key)?;
@@ -873,11 +1069,12 @@ impl VM {
             key: key_str.clone(),
             expected: "8 bytes for i64",
         })?;
-        self.registers_set(dst, Value::Int(i64::from_le_bytes(bytes)))
+        self.registers
+            .set(dst, Value::Int(i64::from_le_bytes(bytes)))
     }
 
     fn op_load_bool(&mut self, _instr: &'static str, dst: u8, b: bool) -> Result<(), VMError> {
-        self.registers_set(dst, Value::Bool(b))
+        self.registers.set(dst, Value::Bool(b))
     }
 
     fn op_store_bool<S: State>(
@@ -888,9 +1085,9 @@ impl VM {
         key: u8,
         value: u8,
     ) -> Result<(), VMError> {
-        let key_ref = self.registers_get_ref(key, instr)?;
+        let key_ref = self.registers.get_ref(key, instr)?;
         let key_str = self.heap_get_string(key_ref)?;
-        let val = self.registers_get_bool(value, instr)?;
+        let val = self.registers.get_bool(value, instr)?;
         let key = self.make_state_key(ctx.chain_id, &ctx.contract_id, key_str.as_bytes())?;
         self.state_push(state, key, [val as u8].into())?;
         Ok(())
@@ -904,7 +1101,7 @@ impl VM {
         dst: u8,
         key: u8,
     ) -> Result<(), VMError> {
-        let key_ref = self.registers_get_ref(key, instr)?;
+        let key_ref = self.registers.get_ref(key, instr)?;
         let key_str = self.heap_get_string(key_ref)?;
         let state_key = self.make_state_key(ctx.chain_id, &ctx.contract_id, key_str.as_bytes())?;
         let value = self.state_get(state, state_key)?;
@@ -914,11 +1111,11 @@ impl VM {
                 expected: "1 byte for bool",
             });
         }
-        self.registers_set(dst, Value::Bool(value[0] != 0))
+        self.registers.set(dst, Value::Bool(value[0] != 0))
     }
 
     fn op_load_str(&mut self, _instr: &'static str, dst: u8, str_ref: u32) -> Result<(), VMError> {
-        self.registers_set(dst, Value::Ref(str_ref))
+        self.registers.set(dst, Value::Ref(str_ref))
     }
 
     fn op_store_str<S: State>(
@@ -929,9 +1126,9 @@ impl VM {
         key: u8,
         value: u8,
     ) -> Result<(), VMError> {
-        let key_ref = self.registers_get_ref(key, instr)?;
+        let key_ref = self.registers.get_ref(key, instr)?;
         let key_str = self.heap_get_string(key_ref)?;
-        let val_ref = self.registers_get_ref(value, instr)?;
+        let val_ref = self.registers.get_ref(value, instr)?;
         let val_str = self.heap_get_string(val_ref)?;
         let key = self.make_state_key(ctx.chain_id, &ctx.contract_id, key_str.as_bytes())?;
         self.state_push(state, key, val_str.into_bytes())?;
@@ -946,7 +1143,7 @@ impl VM {
         dst: u8,
         key: u8,
     ) -> Result<(), VMError> {
-        let key_ref = self.registers_get_ref(key, instr)?;
+        let key_ref = self.registers.get_ref(key, instr)?;
         let key_str = self.heap_get_string(key_ref)?;
         let state_key = self.make_state_key(ctx.chain_id, &ctx.contract_id, key_str.as_bytes())?;
         let value = state
@@ -962,7 +1159,7 @@ impl VM {
         dst: u8,
         hash_ref: u32,
     ) -> Result<(), VMError> {
-        self.registers_set(dst, Value::Ref(hash_ref))
+        self.registers.set(dst, Value::Ref(hash_ref))
     }
 
     fn op_store_hash<S: State>(
@@ -973,9 +1170,9 @@ impl VM {
         key: u8,
         value: u8,
     ) -> Result<(), VMError> {
-        let key_ref = self.registers_get_ref(key, instr)?;
+        let key_ref = self.registers.get_ref(key, instr)?;
         let key_str = self.heap_get_string(key_ref)?;
-        let val_ref = self.registers_get_ref(value, instr)?;
+        let val_ref = self.registers.get_ref(value, instr)?;
         let val_hash = self.heap_get_hash(val_ref)?;
         let key = self.make_state_key(ctx.chain_id, &ctx.contract_id, key_str.as_bytes())?;
         self.state_push(state, key, val_hash.to_vec())?;
@@ -990,7 +1187,7 @@ impl VM {
         dst: u8,
         key: u8,
     ) -> Result<(), VMError> {
-        let key_ref = self.registers_get_ref(key, instr)?;
+        let key_ref = self.registers.get_ref(key, instr)?;
         let key_str = self.heap_get_string(key_ref)?;
         let state_key = self.make_state_key(ctx.chain_id, &ctx.contract_id, key_str.as_bytes())?;
         let value = state
@@ -1001,22 +1198,22 @@ impl VM {
     }
 
     fn op_move(&mut self, _instr: &'static str, dst: u8, src: u8) -> Result<(), VMError> {
-        let v = *self.registers_get(src)?;
-        self.registers_set(dst, v)
+        let v = *self.registers.get(src)?;
+        self.registers.set(dst, v)
     }
 
     fn op_i64_to_bool(&mut self, instr: &'static str, dst: u8, src: u8) -> Result<(), VMError> {
-        let v = self.registers_get_int(src, instr)?;
-        self.registers_set(dst, Value::Bool(v != 0))
+        let v = self.registers.get_int(src, instr)?;
+        self.registers.set(dst, Value::Bool(v != 0))
     }
 
     fn op_bool_to_i64(&mut self, instr: &'static str, dst: u8, src: u8) -> Result<(), VMError> {
-        let v = self.registers_get_bool(src, instr)?;
-        self.registers_set(dst, Value::Int(if v { 1 } else { 0 }))
+        let v = self.registers.get_bool(src, instr)?;
+        self.registers.set(dst, Value::Int(if v { 1 } else { 0 }))
     }
 
     fn op_str_to_i64(&mut self, instr: &'static str, dst: u8, src: u8) -> Result<(), VMError> {
-        let reg = self.registers_get_ref(src, instr)?;
+        let reg = self.registers.get_ref(src, instr)?;
         let str = self.heap_get_string(reg)?;
         self.op_load_i64(instr, dst, parse_i64(&str)?)
     }
@@ -1075,7 +1272,7 @@ impl VM {
     }
 
     fn op_i64_to_str(&mut self, instr: &'static str, dst: u8, src: u8) -> Result<(), VMError> {
-        let reg = self.registers_get_int(src, instr)?;
+        let reg = self.registers.get_int(src, instr)?;
         // Charge gas manually before allocation instead of using heap_index()
         self.charge_gas_categorized(Self::digits_i64(reg), GasCategory::HeapAllocation)?;
         let str_ref = self.heap.index(reg.to_string().into_bytes());
@@ -1083,7 +1280,7 @@ impl VM {
     }
 
     fn op_str_to_bool(&mut self, instr: &'static str, dst: u8, src: u8) -> Result<(), VMError> {
-        let reg = self.registers_get_ref(src, instr)?;
+        let reg = self.registers.get_ref(src, instr)?;
         let str = self.heap_get_string(reg)?;
         let b = if str == "true" {
             true
@@ -1101,7 +1298,7 @@ impl VM {
     }
 
     fn op_bool_to_str(&mut self, instr: &'static str, dst: u8, src: u8) -> Result<(), VMError> {
-        let reg = self.registers_get_bool(src, instr)?;
+        let reg = self.registers.get_bool(src, instr)?;
         // Charge gas manually before allocation instead of using heap_index()
         self.charge_gas_categorized(if reg { 4 } else { 5 }, GasCategory::HeapAllocation)?;
         let str = (if reg { "true" } else { "false" }).to_string();
@@ -1110,126 +1307,128 @@ impl VM {
     }
 
     fn op_add(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers_get_int(a, instr)?;
-        let vb = self.registers_get_int(b, instr)?;
-        self.registers_set(dst, Value::Int(va.wrapping_add(vb)))
+        let va = self.registers.get_int(a, instr)?;
+        let vb = self.registers.get_int(b, instr)?;
+        self.registers.set(dst, Value::Int(va.wrapping_add(vb)))
     }
 
     fn op_sub(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers_get_int(a, instr)?;
-        let vb = self.registers_get_int(b, instr)?;
-        self.registers_set(dst, Value::Int(va.wrapping_sub(vb)))
+        let va = self.registers.get_int(a, instr)?;
+        let vb = self.registers.get_int(b, instr)?;
+        self.registers.set(dst, Value::Int(va.wrapping_sub(vb)))
     }
 
     fn op_mul(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers_get_int(a, instr)?;
-        let vb = self.registers_get_int(b, instr)?;
-        self.registers_set(dst, Value::Int(va.wrapping_mul(vb)))
+        let va = self.registers.get_int(a, instr)?;
+        let vb = self.registers.get_int(b, instr)?;
+        self.registers.set(dst, Value::Int(va.wrapping_mul(vb)))
     }
 
     fn op_div(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers_get_int(a, instr)?;
-        let vb = self.registers_get_int(b, instr)?;
+        let va = self.registers.get_int(a, instr)?;
+        let vb = self.registers.get_int(b, instr)?;
         if vb == 0 {
             return Err(VMError::DivisionByZero);
         }
-        self.registers_set(dst, Value::Int(va.wrapping_div(vb)))
+        self.registers.set(dst, Value::Int(va.wrapping_div(vb)))
     }
 
     fn op_mod(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers_get_int(a, instr)?;
-        let vb = self.registers_get_int(b, instr)?;
+        let va = self.registers.get_int(a, instr)?;
+        let vb = self.registers.get_int(b, instr)?;
         if vb == 0 {
             return Err(VMError::DivisionByZero);
         }
-        self.registers_set(dst, Value::Int(va.wrapping_rem(vb)))
+        self.registers.set(dst, Value::Int(va.wrapping_rem(vb)))
     }
 
     fn op_neg(&mut self, instr: &'static str, dst: u8, src: u8) -> Result<(), VMError> {
-        let v = self.registers_get_int(src, instr)?;
-        self.registers_set(dst, Value::Int(v.wrapping_neg()))
+        let v = self.registers.get_int(src, instr)?;
+        self.registers.set(dst, Value::Int(v.wrapping_neg()))
     }
 
     fn op_abs(&mut self, instr: &'static str, dst: u8, src: u8) -> Result<(), VMError> {
-        let v = self.registers_get_int(src, instr)?;
-        self.registers_set(dst, Value::Int(v.wrapping_abs()))
+        let v = self.registers.get_int(src, instr)?;
+        self.registers.set(dst, Value::Int(v.wrapping_abs()))
     }
 
     fn op_min(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers_get_int(a, instr)?;
-        let vb = self.registers_get_int(b, instr)?;
-        self.registers_set(dst, Value::Int(va.min(vb)))
+        let va = self.registers.get_int(a, instr)?;
+        let vb = self.registers.get_int(b, instr)?;
+        self.registers.set(dst, Value::Int(va.min(vb)))
     }
 
     fn op_max(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers_get_int(a, instr)?;
-        let vb = self.registers_get_int(b, instr)?;
-        self.registers_set(dst, Value::Int(va.max(vb)))
+        let va = self.registers.get_int(a, instr)?;
+        let vb = self.registers.get_int(b, instr)?;
+        self.registers.set(dst, Value::Int(va.max(vb)))
     }
 
     fn op_shl(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers_get_int(a, instr)?;
-        let vb = self.registers_get_int(b, instr)?;
-        self.registers_set(dst, Value::Int(va.wrapping_shl(vb as u32)))
+        let va = self.registers.get_int(a, instr)?;
+        let vb = self.registers.get_int(b, instr)?;
+        self.registers
+            .set(dst, Value::Int(va.wrapping_shl(vb as u32)))
     }
 
     fn op_shr(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers_get_int(a, instr)?;
-        let vb = self.registers_get_int(b, instr)?;
-        self.registers_set(dst, Value::Int(va.wrapping_shr(vb as u32)))
+        let va = self.registers.get_int(a, instr)?;
+        let vb = self.registers.get_int(b, instr)?;
+        self.registers
+            .set(dst, Value::Int(va.wrapping_shr(vb as u32)))
     }
 
     fn op_not(&mut self, instr: &'static str, dst: u8, src: u8) -> Result<(), VMError> {
-        let v = self.registers_get_bool(src, instr)?;
-        self.registers_set(dst, Value::Bool(!v))
+        let v = self.registers.get_bool(src, instr)?;
+        self.registers.set(dst, Value::Bool(!v))
     }
 
     fn op_and(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers_get_bool(a, instr)?;
-        let vb = self.registers_get_bool(b, instr)?;
-        self.registers_set(dst, Value::Bool(va && vb))
+        let va = self.registers.get_bool(a, instr)?;
+        let vb = self.registers.get_bool(b, instr)?;
+        self.registers.set(dst, Value::Bool(va && vb))
     }
 
     fn op_or(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers_get_bool(a, instr)?;
-        let vb = self.registers_get_bool(b, instr)?;
-        self.registers_set(dst, Value::Bool(va || vb))
+        let va = self.registers.get_bool(a, instr)?;
+        let vb = self.registers.get_bool(b, instr)?;
+        self.registers.set(dst, Value::Bool(va || vb))
     }
 
     fn op_xor(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers_get_bool(a, instr)?;
-        let vb = self.registers_get_bool(b, instr)?;
-        self.registers_set(dst, Value::Bool(va ^ vb))
+        let va = self.registers.get_bool(a, instr)?;
+        let vb = self.registers.get_bool(b, instr)?;
+        self.registers.set(dst, Value::Bool(va ^ vb))
     }
 
     fn op_eq(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers_get_int(a, instr)?;
-        let vb = self.registers_get_int(b, instr)?;
-        self.registers_set(dst, Value::Bool(va == vb))
+        let va = self.registers.get_int(a, instr)?;
+        let vb = self.registers.get_int(b, instr)?;
+        self.registers.set(dst, Value::Bool(va == vb))
     }
 
     fn op_lt(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers_get_int(a, instr)?;
-        let vb = self.registers_get_int(b, instr)?;
-        self.registers_set(dst, Value::Bool(va < vb))
+        let va = self.registers.get_int(a, instr)?;
+        let vb = self.registers.get_int(b, instr)?;
+        self.registers.set(dst, Value::Bool(va < vb))
     }
 
     fn op_gt(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers_get_int(a, instr)?;
-        let vb = self.registers_get_int(b, instr)?;
-        self.registers_set(dst, Value::Bool(va > vb))
+        let va = self.registers.get_int(a, instr)?;
+        let vb = self.registers.get_int(b, instr)?;
+        self.registers.set(dst, Value::Bool(va > vb))
     }
 
     fn op_le(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers_get_int(a, instr)?;
-        let vb = self.registers_get_int(b, instr)?;
-        self.registers_set(dst, Value::Bool(va <= vb))
+        let va = self.registers.get_int(a, instr)?;
+        let vb = self.registers.get_int(b, instr)?;
+        self.registers.set(dst, Value::Bool(va <= vb))
     }
 
     fn op_ge(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers_get_int(a, instr)?;
-        let vb = self.registers_get_int(b, instr)?;
-        self.registers_set(dst, Value::Bool(va >= vb))
+        let va = self.registers.get_int(a, instr)?;
+        let vb = self.registers.get_int(b, instr)?;
+        self.registers.set(dst, Value::Bool(va >= vb))
     }
 
     fn op_call_host(
@@ -1243,7 +1442,7 @@ impl VM {
         self.charge_call(argc, 5, self.call_stack.len(), 10)?;
         let fn_name = self.heap_get_string(fn_id)?;
         let args: Vec<Value> = (0..argc)
-            .map(|i| self.registers_get(argv.wrapping_add(i)).copied())
+            .map(|i| self.registers.get(argv.wrapping_add(i)).copied())
             .collect::<Result<_, _>>()?;
 
         /// Returns an error if actual != expected
@@ -1395,14 +1594,14 @@ impl VM {
     }
 
     fn op_jal(&mut self, instr: &'static str, rd: u8, offset: i64) -> Result<(), VMError> {
-        self.registers_set(rd, Value::Int(self.ip as i64))?;
+        self.registers.set(rd, Value::Int(self.ip as i64))?;
         self.op_jump(instr, offset)?;
         Ok(())
     }
 
     fn op_jalr(&mut self, instr: &'static str, rd: u8, rs: u8, offset: i64) -> Result<(), VMError> {
-        let base = self.registers_get_int(rs, instr)?;
-        self.registers_set(rd, Value::Int(self.ip as i64))?;
+        let base = self.registers.get_int(rs, instr)?;
+        self.registers.set(rd, Value::Int(self.ip as i64))?;
         self.ip = base as usize;
         self.op_jump(instr, offset)?;
         Ok(())
@@ -1415,8 +1614,8 @@ impl VM {
         rs2: u8,
         offset: i64,
     ) -> Result<(), VMError> {
-        let a = self.registers_get_int(rs1, instr)?;
-        let b = self.registers_get_int(rs2, instr)?;
+        let a = self.registers.get_int(rs1, instr)?;
+        let b = self.registers.get_int(rs2, instr)?;
         if a == b {
             self.op_jump(instr, offset)?;
         }
@@ -1430,8 +1629,8 @@ impl VM {
         rs2: u8,
         offset: i64,
     ) -> Result<(), VMError> {
-        let a = self.registers_get_int(rs1, instr)?;
-        let b = self.registers_get_int(rs2, instr)?;
+        let a = self.registers.get_int(rs1, instr)?;
+        let b = self.registers.get_int(rs2, instr)?;
         if a != b {
             self.op_jump(instr, offset)?;
         }
@@ -1445,8 +1644,8 @@ impl VM {
         rs2: u8,
         offset: i64,
     ) -> Result<(), VMError> {
-        let a = self.registers_get_int(rs1, instr)?;
-        let b = self.registers_get_int(rs2, instr)?;
+        let a = self.registers.get_int(rs1, instr)?;
+        let b = self.registers.get_int(rs2, instr)?;
         if a < b {
             self.op_jump(instr, offset)?;
         }
@@ -1460,8 +1659,8 @@ impl VM {
         rs2: u8,
         offset: i64,
     ) -> Result<(), VMError> {
-        let a = self.registers_get_int(rs1, instr)?;
-        let b = self.registers_get_int(rs2, instr)?;
+        let a = self.registers.get_int(rs1, instr)?;
+        let b = self.registers.get_int(rs2, instr)?;
         if a >= b {
             self.op_jump(instr, offset)?;
         }
@@ -1475,8 +1674,8 @@ impl VM {
         rs2: u8,
         offset: i64,
     ) -> Result<(), VMError> {
-        let a = self.registers_get_int(rs1, instr)? as u64;
-        let b = self.registers_get_int(rs2, instr)? as u64;
+        let a = self.registers.get_int(rs1, instr)? as u64;
+        let b = self.registers.get_int(rs2, instr)? as u64;
         if a < b {
             self.op_jump(instr, offset)?;
         }
@@ -1490,8 +1689,8 @@ impl VM {
         rs2: u8,
         offset: i64,
     ) -> Result<(), VMError> {
-        let a = self.registers_get_int(rs1, instr)? as u64;
-        let b = self.registers_get_int(rs2, instr)? as u64;
+        let a = self.registers.get_int(rs1, instr)? as u64;
+        let b = self.registers.get_int(rs2, instr)? as u64;
         if a >= b {
             self.op_jump(instr, offset)?;
         }
@@ -1522,8 +1721,8 @@ impl VM {
             call_depth: self.call_stack.len(),
         })?;
 
-        let ret_val = *self.registers_get(rs)?;
-        self.registers_set(frame.dst_reg, ret_val)?;
+        let ret_val = *self.registers.get(rs)?;
+        self.registers.set(frame.dst_reg, ret_val)?;
         self.ip = frame.return_addr;
         Ok(())
     }
@@ -1533,6 +1732,7 @@ impl VM {
 mod tests {
     use super::*;
     use crate::virtual_machine::assembler::assemble_source;
+    use crate::virtual_machine::program::{DeployProgram, ExecuteProgram};
     use crate::virtual_machine::state::tests::TestState;
 
     impl VM {
@@ -1540,19 +1740,17 @@ mod tests {
         ///
         /// Immediately charges `init_cost` gas. Returns `OutOfGas` if `init_cost` exceeds `max_gas`.
         pub fn new_with_init(
-            program: Program,
+            program: DeployProgram,
             init_cost: u64,
             max_gas: u64,
         ) -> Result<Self, VMError> {
-            let init_size = program.init_code.len();
             let mut data = program.init_code;
             data.extend(program.runtime_code);
 
             let mut vm = Self {
                 data,
-                init_size,
                 ip: 0,
-                registers: Registers::new(program.max_register as usize + 1),
+                registers: Registers::new(),
                 heap: Heap::new(program.items),
                 call_stack: Vec::new(),
                 gas_used: 0,
@@ -2029,8 +2227,12 @@ mod tests {
 
     #[test]
     fn invalid_opcode() {
-        let mut vm = VM::new_with_init(Program::new(vec![], vec![0xFF]), 0, TRANSACTION_GAS_LIMIT)
-            .expect("vm new failed");
+        let mut vm = VM::new_with_init(
+            DeployProgram::new(vec![], vec![0xFF]),
+            0,
+            TRANSACTION_GAS_LIMIT,
+        )
+        .expect("vm new failed");
         assert!(matches!(
             vm.run(&mut TestState::new(), EXECUTION_CONTEXT),
             Err(VMError::InvalidInstruction { opcode: 0xFF, .. })
@@ -2040,7 +2242,7 @@ mod tests {
     #[test]
     fn truncated_bytecode() {
         let mut vm = VM::new_with_init(
-            Program::new(vec![], vec![0x01, 0x00]),
+            DeployProgram::new(vec![], vec![0x01, 0x00]),
             0,
             TRANSACTION_GAS_LIMIT,
         )
@@ -2055,14 +2257,18 @@ mod tests {
 
     #[test]
     fn vm_new_charges_init_cost() {
-        let vm =
-            VM::new_with_init(Program::new(vec![], vec![]), 100, TRANSACTION_GAS_LIMIT).unwrap();
+        let vm = VM::new_with_init(
+            DeployProgram::new(vec![], vec![]),
+            100,
+            TRANSACTION_GAS_LIMIT,
+        )
+        .unwrap();
         assert_eq!(vm.gas_used(), 100);
     }
 
     #[test]
     fn vm_new_fails_when_init_cost_exceeds_max_gas() {
-        let result = VM::new_with_init(Program::new(vec![], vec![]), 1000, 500);
+        let result = VM::new_with_init(DeployProgram::new(vec![], vec![]), 1000, 500);
         assert!(matches!(
             result,
             Err(VMError::OutOfGas {
@@ -2074,7 +2280,7 @@ mod tests {
 
     #[test]
     fn vm_new_succeeds_when_init_cost_equals_max_gas() {
-        let vm = VM::new_with_init(Program::new(vec![], vec![]), 500, 500).unwrap();
+        let vm = VM::new_with_init(DeployProgram::new(vec![], vec![]), 500, 500).unwrap();
         assert_eq!(vm.gas_used(), 500);
     }
 
@@ -2100,7 +2306,7 @@ mod tests {
 
     fn make_test_key(user_key: &[u8]) -> Result<Hash, VMError> {
         VM::new_with_init(
-            Program::new(Vec::new(), Vec::new()),
+            DeployProgram::new(Vec::new(), Vec::new()),
             0,
             TRANSACTION_GAS_LIMIT,
         )
@@ -3005,6 +3211,29 @@ LOAD_HASH_STATE r2, r0"#,
         let ref_id = match vm.registers.get(1).unwrap() {
             Value::Ref(r) => *r,
             other => panic!("expected Ref, got {:?}", other),
+        };
+        assert_eq!(vm.heap.get_string(ref_id).unwrap(), "hello");
+    }
+
+    #[test]
+    fn new_execute_loads_typed_args_and_arg_items() {
+        let exec = ExecuteProgram::new(
+            Hash::zero(),
+            3,
+            vec![Value::Ref(0), Value::Int(7), Value::Bool(true)],
+            vec![b"hello".to_vec()],
+        );
+        let base_items = vec![b"base".to_vec()];
+        let vm = VM::new_execute(exec, Vec::new(), base_items, TRANSACTION_GAS_LIMIT).unwrap();
+
+        assert_eq!(vm.registers.get_int(0, "").unwrap(), 3);
+        assert_eq!(vm.registers.get(1).unwrap(), &Value::Ref(1));
+        assert_eq!(vm.registers.get_int(2, "").unwrap(), 7);
+        assert!(vm.registers.get_bool(3, "").unwrap());
+
+        let ref_id = match vm.registers.get(1).unwrap() {
+            Value::Ref(r) => *r,
+            other => panic!("expected ref, got {:?}", other),
         };
         assert_eq!(vm.heap.get_string(ref_id).unwrap(), "hello");
     }

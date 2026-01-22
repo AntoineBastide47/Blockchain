@@ -157,8 +157,6 @@ blockchain_derive/  # Procedural macros (BinaryCodec, Error)
 - Robust mempool policies and gossip; stronger sync/handshake and block request caps
 - Storage pruning/snapshotting and production-ready database backend
 
-See `checklist.md` for detailed progress.
-
 ## License
 
 See `LICENSE`.

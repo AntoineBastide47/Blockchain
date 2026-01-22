@@ -233,10 +233,8 @@ impl GasProfile {
     }
 }
 
-/// Maximum gas allowed for a single transaction execution.
-pub const TRANSACTION_GAS_LIMIT: u64 = 1_000_000;
 /// Maximum cumulative gas allowed for all transactions in a block.
-pub const BLOCK_GAS_LIMIT: u64 = 20_000_000;
+pub const BLOCK_GAS_LIMIT: u64 = 30_000_000;
 
 /// Maximum depth of the call stack to prevent unbounded recursion.
 const MAX_CALL_STACK_LEN: usize = 1024;
@@ -1941,7 +1939,7 @@ mod tests {
 
     fn run_vm(source: &str) -> VM {
         let program = assemble_source(source).expect("assembly failed");
-        let mut vm = VM::new_with_init(program, 0, TRANSACTION_GAS_LIMIT).expect("vm new failed");
+        let mut vm = VM::new_with_init(program, 0, BLOCK_GAS_LIMIT).expect("vm new failed");
         vm.run(&mut TestState::new(), EXECUTION_CONTEXT)
             .expect("vm run failed");
         vm
@@ -1966,14 +1964,14 @@ mod tests {
             Ok(p) => p,
             Err(e) => return e,
         };
-        let mut vm = VM::new_with_init(program, 0, TRANSACTION_GAS_LIMIT).expect("vm new failed");
+        let mut vm = VM::new_with_init(program, 0, BLOCK_GAS_LIMIT).expect("vm new failed");
         vm.run(&mut TestState::new(), EXECUTION_CONTEXT)
             .expect_err("expected error")
     }
 
     fn run_vm_with_state(source: &str) -> TestState {
         let program = assemble_source(source).expect("assembly failed");
-        let mut vm = VM::new_with_init(program, 0, TRANSACTION_GAS_LIMIT).expect("vm new failed");
+        let mut vm = VM::new_with_init(program, 0, BLOCK_GAS_LIMIT).expect("vm new failed");
         let mut state = TestState::new();
         vm.run(&mut state, EXECUTION_CONTEXT)
             .expect("vm run failed");
@@ -2482,12 +2480,8 @@ LOAD_I64 r1, 11
 
     #[test]
     fn invalid_opcode() {
-        let mut vm = VM::new_with_init(
-            DeployProgram::new(vec![], vec![0xFF]),
-            0,
-            TRANSACTION_GAS_LIMIT,
-        )
-        .expect("vm new failed");
+        let mut vm = VM::new_with_init(DeployProgram::new(vec![], vec![0xFF]), 0, BLOCK_GAS_LIMIT)
+            .expect("vm new failed");
         assert!(matches!(
             vm.run(&mut TestState::new(), EXECUTION_CONTEXT),
             Err(VMError::InvalidInstruction { opcode: 0xFF, .. })
@@ -2499,7 +2493,7 @@ LOAD_I64 r1, 11
         let mut vm = VM::new_with_init(
             DeployProgram::new(vec![], vec![0x01, 0x00]),
             0,
-            TRANSACTION_GAS_LIMIT,
+            BLOCK_GAS_LIMIT,
         )
         .expect("vm new failed");
         assert!(matches!(
@@ -2512,12 +2506,8 @@ LOAD_I64 r1, 11
 
     #[test]
     fn vm_new_charges_init_cost() {
-        let vm = VM::new_with_init(
-            DeployProgram::new(vec![], vec![]),
-            100,
-            TRANSACTION_GAS_LIMIT,
-        )
-        .unwrap();
+        let vm =
+            VM::new_with_init(DeployProgram::new(vec![], vec![]), 100, BLOCK_GAS_LIMIT).unwrap();
         assert_eq!(vm.gas_used(), 100);
     }
 
@@ -2563,7 +2553,7 @@ LOAD_I64 r1, 11
         VM::new_with_init(
             DeployProgram::new(Vec::new(), Vec::new()),
             0,
-            TRANSACTION_GAS_LIMIT,
+            BLOCK_GAS_LIMIT,
         )
         .expect("vm new failed")
         .make_state_key(
@@ -2640,7 +2630,7 @@ STORE_I64 r0, r2"#,
 
     fn run_vm_on_state(source: &str, state: &mut TestState) -> VM {
         let program = assemble_source(source).expect("assembly failed");
-        let mut vm = VM::new_with_init(program, 0, TRANSACTION_GAS_LIMIT).expect("vm new failed");
+        let mut vm = VM::new_with_init(program, 0, BLOCK_GAS_LIMIT).expect("vm new failed");
         vm.run(state, EXECUTION_CONTEXT).expect("vm run failed");
         vm
     }
@@ -2676,7 +2666,7 @@ LOAD_I64_STATE r1, r0"#,
 LOAD_I64_STATE r1, r0"#,
         )
         .expect("assembly failed");
-        let mut vm = VM::new_with_init(program, 0, TRANSACTION_GAS_LIMIT).expect("vm new failed");
+        let mut vm = VM::new_with_init(program, 0, BLOCK_GAS_LIMIT).expect("vm new failed");
         let err = vm
             .run(&mut TestState::new(), EXECUTION_CONTEXT)
             .expect_err("expected error");
@@ -2714,7 +2704,7 @@ LOAD_BOOL_STATE r1, r0"#,
 LOAD_BOOL_STATE r1, r0"#,
         )
         .expect("assembly failed");
-        let mut vm = VM::new_with_init(program, 0, TRANSACTION_GAS_LIMIT).expect("vm new failed");
+        let mut vm = VM::new_with_init(program, 0, BLOCK_GAS_LIMIT).expect("vm new failed");
         let err = vm
             .run(&mut TestState::new(), EXECUTION_CONTEXT)
             .expect_err("expected error");
@@ -2768,7 +2758,7 @@ LOAD_HASH_STATE r1, r0"#,
 LOAD_STR_STATE r1, r0"#,
         )
         .expect("assembly failed");
-        let mut vm = VM::new_with_init(program, 0, TRANSACTION_GAS_LIMIT).expect("vm new failed");
+        let mut vm = VM::new_with_init(program, 0, BLOCK_GAS_LIMIT).expect("vm new failed");
         let err = vm
             .run(&mut TestState::new(), EXECUTION_CONTEXT)
             .expect_err("expected error");
@@ -3148,7 +3138,7 @@ LOAD_HASH_STATE r2, r0"#,
 
         let mut state = TestState::new();
         let program = assemble_source(prog).expect("assembly failed");
-        let mut vm = VM::new_with_init(program, 0, TRANSACTION_GAS_LIMIT).expect("vm new failed");
+        let mut vm = VM::new_with_init(program, 0, BLOCK_GAS_LIMIT).expect("vm new failed");
 
         let key_counter = vm
             .make_state_key(
@@ -3479,7 +3469,7 @@ LOAD_HASH_STATE r2, r0"#,
             vec![b"hello".to_vec()],
         );
         let base_items = vec![b"base".to_vec()];
-        let vm = VM::new_execute(exec, Vec::new(), base_items, TRANSACTION_GAS_LIMIT).unwrap();
+        let vm = VM::new_execute(exec, Vec::new(), base_items, BLOCK_GAS_LIMIT).unwrap();
 
         assert_eq!(vm.registers.get_int(0, "").unwrap(), 3);
         assert_eq!(vm.registers.get(1).unwrap(), &Value::Ref(1));

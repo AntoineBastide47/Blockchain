@@ -17,7 +17,7 @@ use crate::types::merkle_tree::MerkleTree;
 use crate::virtual_machine::errors::VMError;
 use crate::virtual_machine::program::{DeployProgram, ExecuteProgram};
 use crate::virtual_machine::state::{OverlayState, State, TxAccountChanges};
-use crate::virtual_machine::vm::{BLOCK_GAS_LIMIT, ExecContext, TRANSACTION_GAS_LIMIT, VM};
+use crate::virtual_machine::vm::{BLOCK_GAS_LIMIT, ExecContext, VM};
 use crate::{info, warn};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -160,13 +160,6 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
                             used: *gas_used,
                             limit: transaction.gas_limit,
                         })?;
-                if max_gas > TRANSACTION_GAS_LIMIT {
-                    return Err(VMError::OutOfGas {
-                        used: max_gas,
-                        limit: TRANSACTION_GAS_LIMIT,
-                    }
-                    .into());
-                }
 
                 let mut vm = VM::new_deploy(program.clone(), max_gas)?;
                 let contract_id = Self::contract_id(transaction);
@@ -219,13 +212,6 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
                             used: *gas_used,
                             limit: transaction.gas_limit,
                         })?;
-                if max_gas > TRANSACTION_GAS_LIMIT {
-                    return Err(VMError::OutOfGas {
-                        used: max_gas,
-                        limit: TRANSACTION_GAS_LIMIT,
-                    }
-                    .into());
-                }
 
                 let contract_id = program.contract_id;
                 let contract = self

@@ -42,7 +42,7 @@ use blockchain::types::hash::Hash;
 use blockchain::virtual_machine::assembler::assemble_file;
 use blockchain::virtual_machine::program::ExecuteProgram;
 use blockchain::virtual_machine::state::OverlayState;
-use blockchain::virtual_machine::vm::{ExecContext, GasCategory, TRANSACTION_GAS_LIMIT, VM, Value};
+use blockchain::virtual_machine::vm::{BLOCK_GAS_LIMIT, ExecContext, GasCategory, VM, Value};
 use blockchain::{error, info, warn};
 use std::collections::HashSet;
 use std::env;
@@ -243,15 +243,15 @@ fn main() {
             &program_bytes,
         );
 
-        if deploy_intrinsic > TRANSACTION_GAS_LIMIT {
+        if deploy_intrinsic > BLOCK_GAS_LIMIT {
             error!(
                 "Intrinsic gas ({}) exceeds transaction limit ({})",
-                deploy_intrinsic, TRANSACTION_GAS_LIMIT
+                deploy_intrinsic, BLOCK_GAS_LIMIT
             );
             process::exit(1);
         }
 
-        let mut vm = VM::new_deploy(program.clone(), TRANSACTION_GAS_LIMIT - deploy_intrinsic)
+        let mut vm = VM::new_deploy(program.clone(), BLOCK_GAS_LIMIT - deploy_intrinsic)
             .unwrap_or_else(|e| {
                 error!("{e}");
                 process::exit(1)
@@ -303,7 +303,7 @@ fn main() {
                     &exec_data,
                 );
 
-                if exec_intrinsic > TRANSACTION_GAS_LIMIT {
+                if exec_intrinsic > BLOCK_GAS_LIMIT {
                     warn!(
                         "Function '{}': intrinsic gas ({}) exceeds limit, skipping",
                         fn_name, exec_intrinsic
@@ -315,7 +315,7 @@ fn main() {
                     exec_program,
                     program.runtime_code.clone(),
                     program.items.clone(),
-                    TRANSACTION_GAS_LIMIT - exec_intrinsic,
+                    BLOCK_GAS_LIMIT - exec_intrinsic,
                 )
                 .unwrap_or_else(|e| {
                     warn!("Function '{}': failed to create VM: {}", fn_name, e);

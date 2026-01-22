@@ -35,7 +35,7 @@ use blockchain::storage::main_storage::MainStorage;
 use blockchain::types::encoding::{Decode, Encode};
 use blockchain::virtual_machine::assembler::assemble_file;
 use blockchain::virtual_machine::program::ExecuteProgram;
-use blockchain::virtual_machine::vm::{TRANSACTION_GAS_LIMIT, Value};
+use blockchain::virtual_machine::vm::Value;
 use blockchain::{error, info, warn};
 use rpassword::prompt_password;
 use std::env;
@@ -237,7 +237,7 @@ async fn main() {
                 0,
                 0,
                 10u128.pow(9),
-                TRANSACTION_GAS_LIMIT,
+                250_000,
                 deploy_nonce,
                 validator_key_clone.clone(),
                 DEV_CHAIN_ID,
@@ -278,7 +278,7 @@ async fn main() {
                     0,
                     0,
                     10u128.pow(9),
-                    TRANSACTION_GAS_LIMIT,
+                    50_000,
                     nonce,
                     validator_key_clone.clone(),
                     DEV_CHAIN_ID,

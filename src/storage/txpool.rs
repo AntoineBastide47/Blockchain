@@ -2,7 +2,7 @@
 //!
 //! Provides thread-safe storage and ordering of unconfirmed transactions.
 //! Transactions are organized per-account with nonce-based ordering to ensure
-//! correct execution sequence. A max-heap prioritizes transactions by gas price
+//! correct execution sequence. A max-heap prioritizes transactions by priority fee
 //! for block building.
 
 use crate::core::account::Account;
@@ -31,11 +31,11 @@ struct AccountQueue {
 
 /// Heap entry for transaction priority ordering.
 ///
-/// Ordered solely by gas_price for heap operations.
+/// Ordered solely by priority_fee for heap operations (validator income optimization).
 /// Only one entry per account exists in the heap at a time (the lowest ready nonce).
 #[derive(Eq, PartialEq, Debug)]
 struct PoolEntry {
-    gas_price: u128,
+    priority_fee: u128,
     addr: Address,
     nonce: u64,
     hash: Hash,
@@ -43,7 +43,7 @@ struct PoolEntry {
 
 impl Ord for PoolEntry {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.gas_price.cmp(&other.gas_price)
+        self.priority_fee.cmp(&other.priority_fee)
     }
 }
 
@@ -56,8 +56,8 @@ impl PartialOrd for PoolEntry {
 /// Thread-safe pool of pending transactions.
 ///
 /// Transactions are partitioned per-account into "ready" (executable) and "future"
-/// (waiting for prior nonces). A global max-heap orders ready transactions by gas
-/// price for efficient block building. Provides O(1) duplicate detection via hash lookup.
+/// (waiting for prior nonces). A global max-heap orders ready transactions by priority
+/// fee for efficient block building. Provides O(1) duplicate detection via hash lookup.
 pub struct TxPool {
     /// Chain identifier.
     chain_id: u64,
@@ -67,9 +67,9 @@ pub struct TxPool {
     length: Mutex<usize>,
     /// Per-account transaction queues keyed by sender address.
     accounts: DashMap<Address, AccountQueue>,
-    /// Max-heap of ready transactions ordered by gas price for block building.
+    /// Max-heap of ready transactions ordered by priority fee for block building.
     ready: Mutex<BinaryHeap<PoolEntry>>,
-    /// Min-heap for eviction (lowest gas price first).
+    /// Min-heap for eviction (lowest priority fee first).
     eviction: Mutex<BinaryHeap<Reverse<PoolEntry>>>,
     /// Maps transaction hash to (address, nonce) for O(1) lookups and removal.
     hash_index: DashMap<Hash, (Address, u64)>,
@@ -111,7 +111,7 @@ impl TxPool {
     ) {
         if map.is_empty() {
             ready.push(PoolEntry {
-                gas_price: transaction.gas_price,
+                priority_fee: transaction.priority_fee,
                 addr: transaction.from.address(),
                 nonce: transaction.nonce,
                 hash: transaction.id(self.chain_id),
@@ -133,7 +133,7 @@ impl TxPool {
     /// - Nonce exceeds the account nonce by more than 64
     /// - Account balance is insufficient for gas costs
     /// - Pool is at capacity
-    /// - A transaction with the same nonce exists with equal or higher gas price
+    /// - A transaction with the same nonce exists with equal or higher priority fee
     pub fn append(&self, account: &Account, transaction: Transaction) -> bool {
         let hash = transaction.id(self.chain_id);
         if transaction.gas_price == 0 || transaction.gas_limit == 0 {
@@ -193,7 +193,9 @@ impl TxPool {
             return false;
         }
 
-        if transaction.gas_price * (transaction.gas_limit as u128) > account.balance() {
+        let total_gas_cost =
+            (transaction.gas_price + transaction.priority_fee) * (transaction.gas_limit as u128);
+        if total_gas_cost > account.balance() {
             warn!("Insufficient balance in account to execute transaction: transaction={hash}");
             return false;
         }
@@ -212,7 +214,7 @@ impl TxPool {
                         || acct.future.contains_key(&entry.nonce))
                 {
                     // Incoming tx is worse than current lowest transaction
-                    if transaction.gas_price <= entry.gas_price {
+                    if transaction.priority_fee <= entry.priority_fee {
                         warn!("TxPool is at full capacity, transaction rejected: hash={hash}");
                         return false;
                     }
@@ -251,7 +253,7 @@ impl TxPool {
             self.hash_index.insert(hash, (address, nonce));
             q.future.insert(nonce, transaction);
             *self.length.lock().unwrap() += 1;
-        } else if transaction.gas_price > q.future[&nonce].gas_price {
+        } else if transaction.priority_fee > q.future[&nonce].priority_fee {
             // Remove old hash from index, add new one
             let old_hash = q.future[&nonce].id(self.chain_id);
             self.hash_index.remove(&old_hash);
@@ -259,8 +261,8 @@ impl TxPool {
             q.future.insert(nonce, transaction);
         } else {
             warn!(
-                "existing transaction with the same nonce={} has better a bigger gas price: {} VS {}",
-                nonce, transaction.gas_price, q.future[&nonce].gas_price
+                "existing transaction with the same nonce={} has a higher priority fee: {} VS {}",
+                nonce, transaction.priority_fee, q.future[&nonce].priority_fee
             );
             return false;
         }
@@ -301,7 +303,7 @@ impl TxPool {
             if removed_from_ready && let Some((&next_nonce, next_tx)) = acct.ready.first_key_value()
             {
                 ready_lock.push(PoolEntry {
-                    gas_price: next_tx.gas_price,
+                    priority_fee: next_tx.priority_fee,
                     addr,
                     nonce: next_nonce,
                     hash: next_tx.id(self.chain_id),
@@ -318,7 +320,7 @@ impl TxPool {
 
     /// Returns and removes the highest-priority executable transaction that fits within gas and size budgets.
     ///
-    /// Selects the transaction with the highest gas price among all accounts' next
+    /// Selects the transaction with the highest priority fee among all accounts' next
     /// executable nonces. Skips transactions exceeding `gas_left` or `size_left`.
     /// After removal, promotes the next transaction for the same account to the heap
     /// and attempts to promote any now-contiguous future transactions.
@@ -370,7 +372,7 @@ impl TxPool {
             // Remove from account ready map and get next ready transaction
             let removed = acct.ready.remove(&nonce);
             let next_entry = acct.ready.first_key_value().map(|(&n, t)| PoolEntry {
-                gas_price: t.gas_price,
+                priority_fee: t.priority_fee,
                 addr,
                 nonce: n,
                 hash: t.id(self.chain_id),
@@ -441,13 +443,19 @@ mod tests {
         Account::from(nonce, balance, Hash::zero(), Hash::zero())
     }
 
-    fn tx(key: &PrivateKey, nonce: u64, gas_price: u128, gas_limit: u64) -> Transaction {
+    fn tx(
+        key: &PrivateKey,
+        nonce: u64,
+        gas_price: u128,
+        priority_fee: u128,
+        gas_limit: u64,
+    ) -> Transaction {
         Transaction::new(
             Address::zero(),
             None,
             Bytes::new(nonce.to_le_bytes().as_slice()),
             0,
-            0,
+            priority_fee,
             gas_price,
             gas_limit,
             nonce,
@@ -458,7 +466,7 @@ mod tests {
     }
 
     fn simple_tx(key: &PrivateKey, nonce: u64) -> Transaction {
-        tx(key, nonce, 1, 1)
+        tx(key, nonce, 1, 1, 1)
     }
 
     // ==================== Append validation ====================
@@ -469,8 +477,8 @@ mod tests {
         let acc = account(HIGH_BALANCE, 0);
         let key = PrivateKey::new();
 
-        assert!(!pool.append(&acc, tx(&key, 0, 0, 100)));
-        assert!(!pool.append(&acc, tx(&key, 0, 100, 0)));
+        assert!(!pool.append(&acc, tx(&key, 0, 0, 1, 100)));
+        assert!(!pool.append(&acc, tx(&key, 0, 100, 1, 0)));
         assert_eq!(pool.length(), 0);
     }
 
@@ -493,10 +501,10 @@ mod tests {
         let pool = pool();
         let key = PrivateKey::new();
 
-        // gas_price * gas_limit = 100, balance = 99
-        assert!(!pool.append(&account(99, 0), tx(&key, 0, 10, 10)));
+        // (gas_price + priority_fee) * gas_limit = (5 + 5) * 10 = 100, balance = 99
+        assert!(!pool.append(&account(99, 0), tx(&key, 0, 5, 5, 10)));
         // Exact balance
-        assert!(pool.append(&account(100, 0), tx(&key, 0, 10, 10)));
+        assert!(pool.append(&account(100, 0), tx(&key, 0, 5, 5, 10)));
     }
 
     #[test]
@@ -571,21 +579,21 @@ mod tests {
         assert!(pool.take_one(INF_GAS, INF_SIZE).0.is_none());
     }
 
-    // ==================== Gas price replacement ====================
+    // ==================== Priority fee replacement ====================
 
     #[test]
-    fn future_tx_replaced_by_higher_gas_price() {
+    fn future_tx_replaced_by_higher_priority_fee() {
         let pool = pool();
         let acc = account(HIGH_BALANCE, 0);
         let key = PrivateKey::new();
 
-        // Add nonce 5 with gas_price 10
-        let tx_low = tx(&key, 5, 10, 1);
+        // Add nonce 5 with priority_fee 10
+        let tx_low = tx(&key, 5, 1, 10, 1);
         let hash_low = tx_low.id(CHAIN_ID);
         assert!(pool.append(&acc, tx_low));
 
-        // Replace with higher gas price
-        let tx_high = tx(&key, 5, 20, 1);
+        // Replace with higher priority_fee
+        let tx_high = tx(&key, 5, 1, 20, 1);
         let hash_high = tx_high.id(CHAIN_ID);
         assert!(pool.append(&acc, tx_high));
 
@@ -595,19 +603,19 @@ mod tests {
     }
 
     #[test]
-    fn future_tx_not_replaced_by_lower_or_equal_gas_price() {
+    fn future_tx_not_replaced_by_lower_or_equal_priority_fee() {
         let pool = pool();
         let acc = account(HIGH_BALANCE, 0);
         let key = PrivateKey::new();
 
-        let tx_first = tx(&key, 5, 10, 1);
+        let tx_first = tx(&key, 5, 1, 10, 1);
         let hash_first = tx_first.id(CHAIN_ID);
         assert!(pool.append(&acc, tx_first));
 
-        // Equal gas price rejected
-        assert!(!pool.append(&acc, tx(&key, 5, 10, 1)));
-        // Lower gas price rejected
-        assert!(!pool.append(&acc, tx(&key, 5, 5, 1)));
+        // Equal priority_fee rejected
+        assert!(!pool.append(&acc, tx(&key, 5, 1, 10, 1)));
+        // Lower priority_fee rejected
+        assert!(!pool.append(&acc, tx(&key, 5, 1, 5, 1)));
 
         assert_eq!(pool.length(), 1);
         assert!(pool.contains(hash_first));
@@ -616,20 +624,20 @@ mod tests {
     // ==================== take_one ====================
 
     #[test]
-    fn take_one_returns_highest_gas_price_first() {
+    fn take_one_returns_highest_priority_fee_first() {
         let pool = pool();
         let acc = account(HIGH_BALANCE, 0);
 
-        // Add transactions from different accounts with varying gas prices
-        for gas_price in [5u128, 10, 1, 8, 3] {
+        // Add transactions from different accounts with varying priority fees
+        for priority_fee in [5u128, 10, 1, 8, 3] {
             let key = PrivateKey::new();
-            assert!(pool.append(&acc, tx(&key, 0, gas_price, 1)));
+            assert!(pool.append(&acc, tx(&key, 0, 1, priority_fee, 1)));
         }
 
-        // Should return in descending gas price order
+        // Should return in descending priority fee order
         for expected in [10, 8, 5, 3, 1] {
             let (t, _) = pool.take_one(INF_GAS, INF_SIZE);
-            assert_eq!(t.unwrap().gas_price, expected);
+            assert_eq!(t.unwrap().priority_fee, expected);
         }
         assert!(pool.take_one(INF_GAS, INF_SIZE).0.is_none());
     }
@@ -642,22 +650,22 @@ mod tests {
         let key1 = PrivateKey::new();
         let key2 = PrivateKey::new();
 
-        // High gas price but high gas limit
-        assert!(pool.append(&acc, tx(&key1, 0, 100, 500)));
-        // Lower gas price but fits budget
-        assert!(pool.append(&acc, tx(&key2, 0, 50, 100)));
+        // High priority fee but high gas limit
+        assert!(pool.append(&acc, tx(&key1, 0, 1, 100, 500)));
+        // Lower priority fee but fits budget
+        assert!(pool.append(&acc, tx(&key2, 0, 1, 50, 100)));
 
         // Budget of 200 should skip first tx and return second
         let (t, size) = pool.take_one(200, INF_SIZE);
         let t = t.unwrap();
-        assert_eq!(t.gas_price, 50);
+        assert_eq!(t.priority_fee, 50);
         assert_eq!(t.gas_limit, 100);
         assert_eq!(size, t.byte_size());
 
         // First tx should still be in pool
         assert_eq!(pool.length(), 1);
         let (t, _) = pool.take_one(INF_GAS, INF_SIZE);
-        assert_eq!(t.unwrap().gas_price, 100);
+        assert_eq!(t.unwrap().priority_fee, 100);
     }
 
     #[test]
@@ -666,9 +674,9 @@ mod tests {
         let acc = account(HIGH_BALANCE, 0);
         let key = PrivateKey::new();
 
-        // Same account, sequential nonces, increasing gas prices
+        // Same account, sequential nonces, increasing priority fees
         for nonce in 0..3 {
-            assert!(pool.append(&acc, tx(&key, nonce, (nonce + 1) as u128, 1)));
+            assert!(pool.append(&acc, tx(&key, nonce, 1, (nonce + 1) as u128, 1)));
         }
 
         // Should get nonces in order (0, 1, 2)
@@ -854,8 +862,8 @@ mod tests {
             None,
             Bytes::new(vec![1u8; 256]),
             0,
-            0,
-            10,
+            10, // priority_fee
+            1,  // gas_price
             1,
             0,
             key,
@@ -892,15 +900,15 @@ mod tests {
             None,
             Bytes::new(vec![2u8; 512]),
             0,
-            0,
-            100,
+            100, // priority_fee
+            1,   // gas_price
             1,
             0,
             big_key,
             CHAIN_ID,
             TransactionType::TransferFunds,
         );
-        let small_tx = tx(&small_key, 0, 50, 1);
+        let small_tx = tx(&small_key, 0, 1, 50, 1);
         let small_size = small_tx.byte_size();
 
         assert!(pool.append(&acc, big_tx));
@@ -909,7 +917,7 @@ mod tests {
         // Size budget blocks the large tx but allows the small one
         let (taken, size) = pool.take_one(INF_GAS, small_size);
         let taken = taken.expect("small tx should be selected");
-        assert_eq!(taken.gas_price, 50);
+        assert_eq!(taken.priority_fee, 50);
         assert_eq!(size, small_size);
         assert_eq!(pool.length(), 1);
     }

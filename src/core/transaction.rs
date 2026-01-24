@@ -42,8 +42,11 @@ pub struct Transaction {
 
     /// Native token amount to transfer to the recipient.
     pub amount: u128,
-    /// Max fee the sender is willing to pay for inclusion.
-    pub fee: u128,
+    /// Additional fee per gas unit paid directly to the block validator.
+    ///
+    /// Transactions with higher priority fees are selected first during block building,
+    /// allowing senders to bid for faster inclusion during network congestion.
+    pub priority_fee: u128,
 
     /// Price per gas unit offered by the sender.
     pub gas_price: u128,
@@ -67,7 +70,7 @@ impl Transaction {
         gas_sponsor: Option<Address>,
         data: impl Into<Bytes>,
         amount: u128,
-        fee: u128,
+        priority_fee: u128,
         gas_price: u128,
         gas_limit: u64,
         nonce: u64,
@@ -85,7 +88,7 @@ impl Transaction {
             &gas_sponsor,
             &data,
             amount,
-            fee,
+            priority_fee,
             gas_price,
             gas_limit,
             nonce,
@@ -100,7 +103,7 @@ impl Transaction {
             gas_sponsor,
             data,
             amount,
-            fee,
+            priority_fee,
             gas_price,
             gas_limit,
             nonce,
@@ -119,7 +122,7 @@ impl Transaction {
             &self.gas_sponsor,
             &self.data,
             self.amount,
-            self.fee,
+            self.priority_fee,
             self.gas_price,
             self.gas_limit,
             self.nonce,
@@ -158,7 +161,7 @@ impl Transaction {
         gas_sponsor: &Option<Address>,
         data: &Bytes,
         amount: u128,
-        fee: u128,
+        priority_fee: u128,
         gas_price: u128,
         gas_limit: u64,
         nonce: u64,
@@ -172,7 +175,7 @@ impl Transaction {
         gas_sponsor.encode(&mut buf);
         data.encode(&mut buf);
         amount.encode(&mut buf);
-        fee.encode(&mut buf);
+        priority_fee.encode(&mut buf);
         gas_price.encode(&mut buf);
         gas_limit.encode(&mut buf);
         nonce.encode(&mut buf);
@@ -390,7 +393,7 @@ mod tests {
         assert_eq!(original.gas_sponsor, decoded.gas_sponsor);
         assert_eq!(original.data, decoded.data);
         assert_eq!(original.amount, decoded.amount);
-        assert_eq!(original.fee, decoded.fee);
+        assert_eq!(original.priority_fee, decoded.priority_fee);
         assert_eq!(original.gas_price, decoded.gas_price);
         assert_eq!(original.gas_limit, decoded.gas_limit);
         assert_eq!(original.nonce, decoded.nonce);

@@ -36,6 +36,12 @@ use tokio::time::interval;
 /// replayed on production networks with different chain IDs.
 pub const DEV_CHAIN_ID: u64 = 0;
 
+/// Target interval between block productions.
+///
+/// Validators attempt to produce one block per `BLOCK_TIME` interval. This constant
+/// also determines the maximum allowable timestamp drift for incoming blocks.
+pub const BLOCK_TIME: Duration = Duration::from_secs(6);
+
 /// Well-known private key bytes used exclusively for signing the genesis block.
 /// This key has no authority beyond genesis; it exists solely to produce a
 /// deterministic, verifiable genesis block signature across all nodes.
@@ -82,8 +88,6 @@ pub struct Server<T: Transport> {
     transport: Arc<T>,
     /// If set, this node becomes a validator node.
     private_key: Option<PrivateKey>,
-    /// How often new blocks are created.
-    block_time: Duration,
     /// Whether this node participates in block creation.
     is_validator: bool,
     /// Pool of pending transactions awaiting inclusion in a block.
@@ -123,7 +127,6 @@ impl<T: Transport> Server<T> {
     /// Sets `is_validator` to true if `private_key` is provided.
     pub async fn new(
         transport: Arc<T>,
-        block_time: Duration,
         private_key: Option<PrivateKey>,
         transaction_pool_capacity: Option<usize>,
         initial_accounts: &[(Address, Account)],
@@ -136,7 +139,6 @@ impl<T: Transport> Server<T> {
             private_key,
             is_validator,
             tx_pool: TxPool::new(transaction_pool_capacity, chain_id),
-            block_time,
             chain: Blockchain::new(
                 chain_id,
                 Self::genesis_block(chain_id, initial_accounts),
@@ -200,10 +202,10 @@ impl<T: Transport> Server<T> {
     }
 
     async fn validator_loop(&self) {
-        let mut ticker = interval(self.block_time);
+        let mut ticker = interval(BLOCK_TIME);
         info!(
             "starting the validator loop: block_time={}",
-            self.block_time.as_secs()
+            BLOCK_TIME.as_secs()
         );
 
         // Consume the initial ticker storage to force a wait period on startup
@@ -580,11 +582,8 @@ mod tests {
     const TEST_CHAIN_ID: u64 = 10;
 
     /// Creates a new server with sensible defaults for a non-validator node.
-    pub async fn default_server<T: Transport>(
-        transport: Arc<T>,
-        block_time: Duration,
-    ) -> Arc<Server<T>> {
-        Server::new(transport, block_time, None, None, &[]).await
+    pub async fn default_server<T: Transport>(transport: Arc<T>) -> Arc<Server<T>> {
+        Server::new(transport, None, None, &[]).await
     }
 
     /// Atomic port counter to ensure unique ports across parallel tests.
@@ -606,35 +605,21 @@ mod tests {
     #[tokio::test]
     async fn server_is_validator_when_private_key_set() {
         let transport = LocalTransport::new(addr());
-        let server = Server::new(
-            transport,
-            Duration::from_secs(10),
-            Some(PrivateKey::new()),
-            None,
-            &[],
-        )
-        .await;
+        let server = Server::new(transport, Some(PrivateKey::new()), None, &[]).await;
         assert!(server.is_validator);
     }
 
     #[tokio::test]
     async fn server_is_not_validator_without_private_key() {
         let transport = LocalTransport::new(addr());
-        let server = default_server(transport, Duration::from_secs(10)).await;
+        let server = default_server(transport).await;
         assert!(!server.is_validator);
     }
 
     #[tokio::test]
     async fn start_returns_validator_handle_when_enabled() {
         let transport = LocalTransport::new(addr());
-        let server = Server::new(
-            transport,
-            Duration::from_secs(10),
-            Some(PrivateKey::new()),
-            None,
-            &[],
-        )
-        .await;
+        let server = Server::new(transport, Some(PrivateKey::new()), None, &[]).await;
 
         let (sx, _rx) = channel::<Rpc>(1);
         let validator_handle = server.clone().start(sx).await;
@@ -646,7 +631,7 @@ mod tests {
     #[tokio::test]
     async fn start_returns_none_for_non_validator() {
         let transport = LocalTransport::new(addr());
-        let server = default_server(transport, Duration::from_secs(10)).await;
+        let server = default_server(transport).await;
 
         let (sx, _rx) = channel::<Rpc>(1);
         let validator_handle = server.clone().start(sx).await;
@@ -858,8 +843,8 @@ mod tests {
         let tr_a = LocalTransport::new(addr_a);
         let tr_b = LocalTransport::new(addr_b);
 
-        let server_a = default_server(tr_a.clone(), Duration::from_secs(10)).await;
-        let _server_b = default_server(tr_b.clone(), Duration::from_secs(10)).await;
+        let server_a = default_server(tr_a.clone()).await;
+        let _server_b = default_server(tr_b.clone()).await;
 
         server_a.connect(tr_b.addr()).await.unwrap();
 
@@ -877,8 +862,8 @@ mod tests {
         let tr_a = LocalTransport::new(addr_a);
         let tr_b = LocalTransport::new(addr_b);
 
-        let server_a = default_server(tr_a.clone(), Duration::from_secs(10)).await;
-        let _server_b = default_server(tr_b.clone(), Duration::from_secs(10)).await;
+        let server_a = default_server(tr_a.clone()).await;
+        let _server_b = default_server(tr_b.clone()).await;
 
         let mut rx_b = tr_b.consume().await;
 
@@ -898,7 +883,7 @@ mod tests {
         let tr_b = LocalTransport::new(addr_b);
         tr_a.connect(tr_b.addr()).await;
 
-        let server_a = default_server(tr_a.clone(), Duration::from_secs(10)).await;
+        let server_a = default_server(tr_a.clone()).await;
 
         let mut rx_b = tr_b.consume().await;
 
@@ -921,7 +906,7 @@ mod tests {
     #[tokio::test]
     async fn process_send_status_skips_sync_when_both_new_nodes() {
         let tr_a = LocalTransport::new(addr());
-        let server_a = default_server(tr_a.clone(), Duration::from_secs(10)).await;
+        let server_a = default_server(tr_a.clone()).await;
 
         // Both nodes at height 0 (new nodes) - sync is skipped
         let status = SendStatusMessage {
@@ -940,19 +925,20 @@ mod tests {
     #[tokio::test]
     async fn process_send_status_errors_when_peer_behind() {
         let tr_a = LocalTransport::new(addr());
+        let validator_key = PrivateKey::new();
+        let validator_account = (validator_key.public_key().address(), Account::new(0));
         let server_a = Server::new(
             tr_a.clone(),
-            Duration::from_secs(10),
-            Some(PrivateKey::new()),
+            Some(validator_key.clone()),
             None,
-            &[],
+            &[validator_account],
         )
         .await;
 
         // Add a block to server_a so its height is 1
         server_a
             .chain
-            .build_block(PrivateKey::new(), &TxPool::new(Some(1), TEST_CHAIN_ID))
+            .build_block(validator_key, &TxPool::new(Some(1), TEST_CHAIN_ID))
             .expect("build_block failed");
 
         // Peer reports height 0, behind our chain (height 1)
@@ -977,7 +963,7 @@ mod tests {
         let tr_b = LocalTransport::new(addr_b);
         tr_a.connect(tr_b.addr()).await;
 
-        let server_a = default_server(tr_a.clone(), Duration::from_secs(10)).await;
+        let server_a = default_server(tr_a.clone()).await;
 
         let mut rx_b = tr_b.consume().await;
 
@@ -1011,7 +997,7 @@ mod tests {
         let tr_b = LocalTransport::new(addr_b);
         tr_a.connect(tr_b.addr()).await;
 
-        let server_a = default_server(tr_a.clone(), Duration::from_secs(10)).await;
+        let server_a = default_server(tr_a.clone()).await;
 
         let mut rx_b = tr_b.consume().await;
 
@@ -1038,7 +1024,7 @@ mod tests {
         let tr_b = LocalTransport::new(addr_b);
         tr_a.connect(tr_b.addr()).await;
 
-        let server_a = default_server(tr_a.clone(), Duration::from_secs(10)).await;
+        let server_a = default_server(tr_a.clone()).await;
 
         let mut rx_b = tr_b.consume().await;
 
@@ -1061,22 +1047,29 @@ mod tests {
     async fn process_send_blocks_adds_blocks_to_chain() {
         let tr_a = LocalTransport::new(addr());
         let tr_b = LocalTransport::new(addr());
-        let server_a = default_server(tr_a, Duration::from_secs(10)).await;
+        let validator_key = PrivateKey::new();
+        let validator_account = (validator_key.public_key().address(), Account::new(0));
+        let server_a = Server::new(
+            tr_a,
+            Some(validator_key.clone()),
+            None,
+            std::slice::from_ref(&validator_account),
+        )
+        .await;
 
         // Use a builder server to create valid blocks with correct state_root
         let peer_b = tr_b.peer_id();
         let server_builder = Server::new(
             tr_b,
-            Duration::from_secs(10),
-            Some(PrivateKey::new()),
+            Some(validator_key.clone()),
             None,
-            &[],
+            std::slice::from_ref(&validator_account),
         )
         .await;
 
         let block = server_builder
             .chain
-            .build_block(PrivateKey::new(), &TxPool::new(Some(1), TEST_CHAIN_ID))
+            .build_block(validator_key, &TxPool::new(Some(1), TEST_CHAIN_ID))
             .expect("build_block failed");
 
         assert_eq!(server_a.chain.height(), 0);
@@ -1098,29 +1091,36 @@ mod tests {
     async fn process_send_blocks_adds_multiple_blocks_in_order() {
         let tr_a = LocalTransport::new(addr());
         let tr_b = LocalTransport::new(addr());
-        let server_a = default_server(tr_a, Duration::from_secs(10)).await;
+        let validator_key = PrivateKey::new();
+        let validator_account = (validator_key.public_key().address(), Account::new(0));
+        let server_a = Server::new(
+            tr_a,
+            Some(validator_key.clone()),
+            None,
+            std::slice::from_ref(&validator_account),
+        )
+        .await;
 
         // Use a builder server to create valid blocks with correct state_root
         let peer_b = tr_b.peer_id();
         let server_builder = Server::new(
             tr_b,
-            Duration::from_secs(10),
-            Some(PrivateKey::new()),
+            Some(validator_key.clone()),
             None,
-            &[],
+            std::slice::from_ref(&validator_account),
         )
         .await;
 
         // Build block 1
         let block1 = server_builder
             .chain
-            .build_block(PrivateKey::new(), &TxPool::new(Some(1), TEST_CHAIN_ID))
+            .build_block(validator_key.clone(), &TxPool::new(Some(1), TEST_CHAIN_ID))
             .expect("build_block 1 failed");
 
         // Build block 2
         let block2 = server_builder
             .chain
-            .build_block(PrivateKey::new(), &TxPool::new(Some(1), TEST_CHAIN_ID))
+            .build_block(validator_key, &TxPool::new(Some(1), TEST_CHAIN_ID))
             .expect("build_block 2 failed");
 
         let response = SendBlocksMessage {
@@ -1144,12 +1144,12 @@ mod tests {
         // Create an established server with blocks
         let tr_established = LocalTransport::new(addr_established);
         let validator_key = PrivateKey::new();
+        let validator_account = (validator_key.public_key().address(), Account::new(0));
         let server_established = Server::new(
             tr_established.clone(),
-            Duration::from_secs(10),
             Some(validator_key.clone()),
             None,
-            &[],
+            std::slice::from_ref(&validator_account),
         )
         .await;
 
@@ -1164,7 +1164,13 @@ mod tests {
 
         // Create a late-joining server
         let tr_late = LocalTransport::new(addr_late);
-        let server_late = default_server(tr_late.clone(), Duration::from_secs(10)).await;
+        let server_late = Server::new(
+            tr_late.clone(),
+            None,
+            None,
+            std::slice::from_ref(&validator_account),
+        )
+        .await;
         assert_eq!(server_late.chain.height(), 0);
 
         // Connect late server to established (sends GetStatus)
@@ -1249,7 +1255,7 @@ mod tests {
         let tr_b = LocalTransport::new(addr_b);
         tr_a.connect(tr_b.addr()).await;
 
-        let server_a = default_server(tr_a.clone(), Duration::from_secs(10)).await;
+        let server_a = default_server(tr_a.clone()).await;
 
         let mut rx_b = tr_b.consume().await;
 
@@ -1278,7 +1284,7 @@ mod tests {
         let tr_b = LocalTransport::new(addr_b);
         tr_a.connect(tr_b.addr()).await;
 
-        let server_a = default_server(tr_a.clone(), Duration::from_secs(10)).await;
+        let server_a = default_server(tr_a.clone()).await;
 
         let mut rx_b = tr_b.consume().await;
 
@@ -1309,7 +1315,7 @@ mod tests {
         let tr_b = LocalTransport::new(addr_b);
         tr_a.connect(tr_b.addr()).await;
 
-        let server_a = default_server(tr_a.clone(), Duration::from_secs(10)).await;
+        let server_a = default_server(tr_a.clone()).await;
 
         let mut rx_b = tr_b.consume().await;
 
@@ -1341,12 +1347,12 @@ mod tests {
         tr_a.connect(tr_b.addr()).await;
 
         let validator_key = PrivateKey::new();
+        let validator_account = (validator_key.public_key().address(), Account::new(0));
         let server_a = Server::new(
             tr_a.clone(),
-            Duration::from_secs(10),
             Some(validator_key.clone()),
             None,
-            &[],
+            &[validator_account],
         )
         .await;
 
@@ -1384,7 +1390,7 @@ mod tests {
         let tr_b = LocalTransport::new(addr_b);
         tr_a.connect(tr_b.addr()).await;
 
-        let server_a = default_server(tr_a.clone(), Duration::from_secs(10)).await;
+        let server_a = default_server(tr_a.clone()).await;
 
         let mut rx_b = tr_b.consume().await;
 
@@ -1413,12 +1419,12 @@ mod tests {
         tr_a.connect(tr_b.addr()).await;
 
         let validator_key = PrivateKey::new();
+        let validator_account = (validator_key.public_key().address(), Account::new(0));
         let server_a = Server::new(
             tr_a.clone(),
-            Duration::from_secs(10),
             Some(validator_key.clone()),
             None,
-            &[],
+            &[validator_account],
         )
         .await;
 

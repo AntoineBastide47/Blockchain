@@ -1065,8 +1065,7 @@ impl VM {
         let key_str = self.heap_get_string(key_ref)?;
         let val = self.registers.get_int(value, instr)?;
         let key = self.make_state_key(ctx.chain_id, &ctx.contract_id, key_str.as_bytes())?;
-        self.state_push(state, key, val.to_le_bytes().to_vec())?;
-        Ok(())
+        self.state_push(state, key, val.to_le_bytes().to_vec())
     }
 
     fn op_load_i64_state<S: State>(
@@ -1105,8 +1104,7 @@ impl VM {
         let key_str = self.heap_get_string(key_ref)?;
         let val = self.registers.get_bool(value, instr)?;
         let key = self.make_state_key(ctx.chain_id, &ctx.contract_id, key_str.as_bytes())?;
-        self.state_push(state, key, [val as u8].into())?;
-        Ok(())
+        self.state_push(state, key, [val as u8].into())
     }
 
     fn op_load_bool_state<S: State>(
@@ -1147,8 +1145,7 @@ impl VM {
         let val_ref = self.registers.get_ref(value, instr)?;
         let val_str = self.heap_get_string(val_ref)?;
         let key = self.make_state_key(ctx.chain_id, &ctx.contract_id, key_str.as_bytes())?;
-        self.state_push(state, key, val_str.into_bytes())?;
-        Ok(())
+        self.state_push(state, key, val_str.into_bytes())
     }
 
     fn op_load_str_state<S: State>(
@@ -1191,8 +1188,7 @@ impl VM {
         let val_ref = self.registers.get_ref(value, instr)?;
         let val_hash = self.heap_get_hash(val_ref)?;
         let key = self.make_state_key(ctx.chain_id, &ctx.contract_id, key_str.as_bytes())?;
-        self.state_push(state, key, val_hash.to_vec())?;
-        Ok(())
+        self.state_push(state, key, val_hash.to_vec())
     }
 
     fn op_load_hash_state<S: State>(
@@ -1678,16 +1674,14 @@ impl VM {
 
     fn op_jal(&mut self, instr: &'static str, rd: u8, offset: i64) -> Result<(), VMError> {
         self.registers.set(rd, Value::Int(self.ip as i64))?;
-        self.op_jump(instr, offset)?;
-        Ok(())
+        self.op_jump(instr, offset)
     }
 
     fn op_jalr(&mut self, instr: &'static str, rd: u8, rs: u8, offset: i64) -> Result<(), VMError> {
         let base = self.registers.get_int(rs, instr)?;
         self.registers.set(rd, Value::Int(self.ip as i64))?;
         self.ip = base as usize;
-        self.op_jump(instr, offset)?;
-        Ok(())
+        self.op_jump(instr, offset)
     }
 
     fn op_beq(

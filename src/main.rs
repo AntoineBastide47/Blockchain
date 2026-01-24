@@ -161,14 +161,7 @@ async fn main() {
         })
         .collect();
 
-    let server = Server::new(
-        transport,
-        Duration::new(5, 0),
-        validator_key.clone(),
-        None,
-        &validators,
-    )
-    .await;
+    let server = Server::new(transport, validator_key.clone(), None, &validators).await;
     let server_clone = server.clone();
 
     // Start server

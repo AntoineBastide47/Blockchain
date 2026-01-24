@@ -5,6 +5,7 @@ use crate::core::block::{Block, Header};
 use crate::core::transaction::{Transaction, TransactionType};
 use crate::core::validator::{BLOCK_MAX_BYTES, BlockValidator, BlockValidatorError, Validator};
 use crate::crypto::key_pair::{Address, PrivateKey};
+use crate::network::server::BLOCK_TIME;
 use crate::storage::main_storage::MainStorage;
 use crate::storage::state_store::{AccountStorage, VmStorage};
 use crate::storage::state_view::StateViewProvider;
@@ -22,7 +23,22 @@ use crate::{info, warn};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const MAX_BLOCK_TIME_DRIFT: u64 = 15;
+/// Maximum allowable clock drift for incoming blocks.
+///
+/// Blocks with timestamps further in the future than this threshold are rejected
+/// to prevent time manipulation attacks.
+const MAX_BLOCK_TIME_DRIFT: u64 = 3 * BLOCK_TIME.as_secs();
+
+/// Base reward coefficient for validator block rewards (in smallest currency unit).
+///
+/// Combined with the square root of total stake to compute per-block rewards,
+/// incentivizing validators proportionally to their stake.
+const BASE_REWARD: u128 = 64_000_000_000;
+
+/// Placeholder for total active stake across all validators.
+///
+/// TODO: Replace with real staking accounting once the staking module is implemented.
+const TEMP_TOTAL_STAKE: u128 = 32_000_000_000 * 32;
 
 /// Combined storage trait for blockchain operations.
 ///
@@ -124,6 +140,26 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
         gas
     }
 
+    /// Retrieves an account from the overlay or falls back to persistent storage.
+    ///
+    /// Checks the overlay first for uncommitted changes, then queries the underlying
+    /// storage if not found. Returns an error if the account does not exist in either.
+    fn try_get_account_overlay<T: State>(
+        &self,
+        address: Address,
+        overlay: &OverlayState<T>,
+    ) -> Result<Account, StorageError> {
+        match overlay.get(address) {
+            Some(b) => {
+                Account::from_bytes(&b).map_err(|e| StorageError::DecodeError(e.to_string()))
+            }
+            None => self
+                .storage
+                .get_account(address)
+                .ok_or(StorageError::MissingAccount(address)),
+        }
+    }
+
     /// Executes a transaction based on its type and updates gas usage.
     ///
     /// Handles three transaction types:
@@ -146,7 +182,7 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
                 }
 
                 from.1.charge(transaction.amount)?;
-                to.1.transfer(transaction.amount)
+                to.1.credit(transaction.amount)
             }
             TransactionType::DeployContract => {
                 let program = DeployProgram::from_bytes(transaction.data.as_slice())?;
@@ -268,23 +304,11 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
             .into());
         }
 
-        let get_account = |address: Address| -> Result<Account, StorageError> {
-            match block_overlay.get(address) {
-                Some(b) => {
-                    Account::from_bytes(&b).map_err(|e| StorageError::DecodeError(e.to_string()))
-                }
-                None => self
-                    .storage
-                    .get_account(address)
-                    .ok_or(StorageError::MissingAccount(address)),
-            }
-        };
-
         // Make sure an account exists for the transaction sender and receiver
         let from_hash = transaction.from.address();
-        let mut from = get_account(from_hash)?;
+        let mut from = self.try_get_account_overlay(from_hash, block_overlay)?;
         let to_hash = transaction.to;
-        let mut to = get_account(to_hash)?;
+        let mut to = self.try_get_account_overlay(to_hash, block_overlay)?;
 
         // Make sure the account has enough funds if the gas limit is attained
         let user_total = transaction
@@ -323,12 +347,14 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
 
         // If the transaction failed: charge gas and skip the tx_overlay states
         from.increment_nonce();
-        from.charge(transaction.gas_price.checked_mul(gas_used as u128).ok_or(
-            StorageError::ArithmeticOverflow {
-                gas_used,
-                gas_price: transaction.gas_price,
-            },
-        )?)?;
+        from.charge(
+            (transaction.gas_price + transaction.priority_fee)
+                .checked_mul(gas_used as u128)
+                .ok_or(StorageError::ArithmeticOverflow {
+                    gas_used,
+                    gas_price: transaction.gas_price + transaction.priority_fee,
+                })?,
+        )?;
 
         transaction_result?;
 
@@ -356,6 +382,18 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
         Ok(())
     }
 
+    /// Computes the block reward for a validator based on their stake proportion.
+    ///
+    /// The reward formula scales with the square root of total stake to provide
+    /// diminishing returns as network stake grows, while distributing rewards
+    /// proportionally to individual validator stakes.
+    fn validator_reward(validator_stake: u128, total_active_stake: u128) -> u128 {
+        let total = total_active_stake.isqrt() * BASE_REWARD;
+        // Divide first to reduce overflow risk, accepting minor precision loss
+        total / total_active_stake * validator_stake
+            + (total % total_active_stake) * validator_stake / total_active_stake
+    }
+
     /// Builds, executes, and commits a new block linked to the current tip.
     ///
     /// Executes all transactions, computes the state root, signs the block,
@@ -365,11 +403,16 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
         validator: PrivateKey,
         tx_pool: &TxPool,
     ) -> Result<Block, StorageError> {
-        // Executes all transactions in the block and computes the resulting state root.
-        let mut gas_left = BLOCK_GAS_LIMIT;
-        let mut size_left = BLOCK_MAX_BYTES;
+        // Make sure the validator actually exists
+        let validator_address = validator.public_key().address();
         let base = self.storage.state_view();
         let mut block_overlay = OverlayState::new(&base);
+        self.try_get_account_overlay(validator_address, &block_overlay)?;
+
+        // Executes all transactions in the block and computes the resulting state root.
+        let mut gas_left = BLOCK_GAS_LIMIT;
+        let mut validator_fee = 0u128;
+        let mut size_left = BLOCK_MAX_BYTES;
 
         let mut hashes = Vec::<Hash>::new();
         let mut transactions = Vec::<Transaction>::new();
@@ -387,12 +430,22 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
                         .apply_tx_overlay(accounts, &mut block_overlay);
                     gas_left -= gas_used;
                     size_left -= size;
+                    validator_fee = validator_fee
+                        .saturating_add(tx.priority_fee.saturating_mul(gas_used as u128));
                     hashes.push(hash);
                     transactions.push(tx);
                 }
                 Err(e) => warn!("{e}"),
             }
         }
+
+        // Reward the validator for creating the block using: stacking + transaction fees
+        // TODO: replace with real staking instead of balance
+        let mut validator_account =
+            self.try_get_account_overlay(validator_address, &block_overlay)?;
+        let reward = Self::validator_reward(validator_account.balance(), TEMP_TOTAL_STAKE);
+        validator_account.credit(reward + validator_fee)?;
+        block_overlay.push(validator_address, validator_account.to_vec());
 
         // Apply the block state changes to the chain
         self.storage.apply_batch(block_overlay.into_writes().0);
@@ -422,7 +475,7 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
     /// overlay (after per-tx validation), checks the resulting state_root, then
     /// commits the writes and appends the block.
     pub fn apply_block(&self, block: Block) -> Result<(), StorageError> {
-        // Make sure new blocks don't drift to far in the future in date creation
+        // Make sure new blocks don't drift too far in the future in date creation
         if block.header_hash(self.id) == self.storage.tip() {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -453,20 +506,34 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
             .validate_block(&block, &self.storage, self.id)
             .map_err(|e| StorageError::ValidationFailed(e.to_string()))?;
 
+        // Make sure the validator actually exists
+        let validator_address = block.validator.address();
         let base = self.storage.state_view();
         let mut block_overlay = OverlayState::new(&base);
+        self.try_get_account_overlay(validator_address, &block_overlay)?;
+
+        let mut validator_fee = 0u128;
 
         for tx in &block.transactions {
             let mut tx_overlay = OverlayState::new(&block_overlay);
             match self.apply_tx(tx, &block_overlay, &mut tx_overlay) {
-                Ok((accounts, _)) => {
+                Ok((accounts, gas_used)) => {
                     tx_overlay
                         .into_writes()
                         .apply_tx_overlay(accounts, &mut block_overlay);
+                    validator_fee = validator_fee
+                        .saturating_add(tx.priority_fee.saturating_mul(gas_used as u128));
                 }
                 Err(e) => Err(e)?,
             }
         }
+
+        // Reward the validator for creating the block using: staking + transaction fees
+        let mut validator_account =
+            self.try_get_account_overlay(validator_address, &block_overlay)?;
+        let reward = Self::validator_reward(validator_account.balance(), TEMP_TOTAL_STAKE);
+        validator_account.credit(reward + validator_fee)?;
+        block_overlay.push(validator_address, validator_account.to_vec());
 
         // Compute expected post-storage root deterministically
         let writes = block_overlay.into_writes();
@@ -628,21 +695,22 @@ mod tests {
     #[test]
     fn add_blocks() {
         let genesis = create_genesis(TEST_CHAIN_ID);
-        let bc = with_validator_and_storage(
-            TEST_CHAIN_ID,
-            AcceptAllValidator,
-            test_storage(genesis.clone()),
-        );
+        let storage = test_storage(genesis.clone());
+
+        let validator = PrivateKey::new();
+        storage.set_account(validator.public_key().address(), Account::new(0));
+
+        let bc = with_validator_and_storage(TEST_CHAIN_ID, AcceptAllValidator, storage);
 
         let block_count = 100;
         for _i in 1..=block_count {
-            bc.build_block(PrivateKey::new(), &TxPool::new(Some(1), TEST_CHAIN_ID))
+            bc.build_block(validator.clone(), &TxPool::new(Some(1), TEST_CHAIN_ID))
                 .expect("build_block failed");
         }
 
         assert_eq!(bc.height(), block_count);
 
-        bc.build_block(PrivateKey::new(), &TxPool::new(Some(1), TEST_CHAIN_ID))
+        bc.build_block(validator.clone(), &TxPool::new(Some(1), TEST_CHAIN_ID))
             .expect("build_block failed");
         assert_eq!(bc.height(), block_count + 1);
     }
@@ -680,6 +748,9 @@ mod tests {
         storage.set_account(sender, Account::new(10_000_000));
         storage.set_account(Address::zero(), Account::new(0));
 
+        let block_validator = PrivateKey::new();
+        storage.set_account(block_validator.public_key().address(), Account::new(0));
+
         let bc = with_validator_and_storage(TEST_CHAIN_ID, RejectingTxValidator, storage);
 
         let mut tx = new_tx(Bytes::new(b"any"), key, TEST_CHAIN_ID);
@@ -695,7 +766,7 @@ mod tests {
             merkle_root: MerkleTree::from_transactions(std::slice::from_ref(&tx), TEST_CHAIN_ID),
             state_root: random_hash(),
         };
-        let block = Block::new(header, PrivateKey::new(), vec![tx], TEST_CHAIN_ID);
+        let block = Block::new(header, block_validator, vec![tx], TEST_CHAIN_ID);
 
         assert!(matches!(
             bc.apply_block(block),
@@ -855,6 +926,10 @@ mod tests {
     fn apply_block_rejects_state_root_mismatch() {
         let genesis = create_genesis(TEST_CHAIN_ID);
         let storage = test_storage(genesis.clone());
+
+        let block_validator = PrivateKey::new();
+        storage.set_account(block_validator.public_key().address(), Account::new(0));
+
         let bc = with_validator_and_storage(TEST_CHAIN_ID, AcceptAllValidator, storage);
 
         let header = Header {
@@ -866,7 +941,7 @@ mod tests {
             merkle_root: MerkleTree::from_transactions(&[], TEST_CHAIN_ID),
             state_root: random_hash(),
         };
-        let block = Block::new(header, PrivateKey::new(), vec![], TEST_CHAIN_ID);
+        let block = Block::new(header, block_validator, vec![], TEST_CHAIN_ID);
 
         let result = bc.apply_block(block);
         assert!(matches!(

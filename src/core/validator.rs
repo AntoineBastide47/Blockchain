@@ -137,7 +137,7 @@ impl Validator for BlockValidator {
         }
 
         let balance = account.balance();
-        let required = transaction.amount.saturating_add(transaction.fee);
+        let required = transaction.amount.saturating_add(transaction.priority_fee);
         if balance < required {
             return Err(BlockValidatorError::InsufficientBalance { balance, required });
         }

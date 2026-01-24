@@ -52,7 +52,6 @@ struct Inner {
 /// Stores blocks and headers in hash maps with O(1) lookup.
 /// Not yet fully suitable for production due to storing all blocks in memory.
 pub struct MainStorage {
-    // TODO: add disk persistency for blocks and in memory caching LRU block caching
     inner: Mutex<Inner>,
 }
 

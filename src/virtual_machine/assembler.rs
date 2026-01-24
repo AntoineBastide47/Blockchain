@@ -530,7 +530,7 @@ fn assemble_source_step_1(source: String) -> Result<String, VMError> {
     labels.sort();
     let has_multiple = labels.len() > 1;
     if has_multiple {
-        // Jump over the entries while capturing the base address (r252) of
+        // Jump over the entries while capturing the base address (r254) of
         // `__dispatch_header` via the JAL return address. Entries sit right
         // after this instruction so the captured address is the entry base.
         base.push_str("JAL r254, __dispatch_header\n");

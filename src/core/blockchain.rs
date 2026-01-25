@@ -953,7 +953,7 @@ mod tests {
     fn make_deploy_tx(key: PrivateKey, chain_id: u64) -> Transaction {
         use crate::virtual_machine::assembler::assemble_source;
 
-        let program = assemble_source("LOAD_I64 r0, 42").expect("assemble failed");
+        let program = assemble_source("MOVE r0, 42").expect("assemble failed");
         let mut tx = new_tx(program.to_bytes(), key, chain_id);
         tx.tx_type = TransactionType::DeployContract;
         tx.gas_limit = 100_000;
@@ -1262,7 +1262,7 @@ mod tests {
 
         let bc = with_validator_and_storage(TEST_CHAIN_ID, AcceptAllValidator, storage);
 
-        let program = assemble_source("LOAD_I64 r0, 42").expect("assemble failed");
+        let program = assemble_source("MOVE r0, 42").expect("assemble failed");
         let mut expected_runtime = Vec::new();
         program.items.encode(&mut expected_runtime);
         expected_runtime.extend(program.runtime_code.clone());
@@ -1315,10 +1315,10 @@ mod tests {
 
         let source = r#"
 [ init code ]
-LOAD_I64 r0, 1
+MOVE r0, 1
 
 [ runtime code ]
-LOAD_I64 r1, 2
+MOVE r1, 2
 "#;
         let program = assemble_source(source).expect("assemble failed");
         assert!(!program.init_code.is_empty());

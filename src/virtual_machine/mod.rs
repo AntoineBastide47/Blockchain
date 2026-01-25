@@ -20,6 +20,7 @@ pub mod assembler;
 pub mod errors;
 pub mod isa;
 mod isa_static_check;
+pub mod operand;
 pub mod program;
 pub mod state;
 pub mod vm;

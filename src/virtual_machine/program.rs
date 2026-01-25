@@ -39,8 +39,8 @@ impl Version {
 /// Compiled bytecode program with its string pool and labels.
 ///
 /// Contains all data needed to execute a program: the raw bytecode,
-/// string literals referenced by `LOAD_STR` instructions, and label
-/// definitions mapping names to bytecode offsets.
+/// string literals referenced by string operands, and label definitions
+/// mapping names to bytecode offsets.
 #[derive(Debug, Clone, BinaryCodec)]
 pub struct DeployProgram {
     /// Compiled initialization instruction bytecode.
@@ -304,7 +304,7 @@ pub mod tests {
     #[test]
     fn dispatcher_uses_compact_call0_entries() {
         // Two public functions -> prologue JAL (10 bytes), 2 entries (11 bytes each),
-        // and a compact header (27 bytes) that reuses the captured return address as
+        // and a compact header (31 bytes) that reuses the captured return address as
         // the base of the dispatch table.
         let source = r#"
 [ runtime code ]
@@ -326,16 +326,16 @@ pub bar:
         assert_eq!(bc[31], Instruction::Halt as u8);
 
         // Header (starts at offset 32)
-        assert_eq!(bc[32], Instruction::MulI as u8); // MULI r253, r0, 11
-        assert_eq!(bc[43], Instruction::Add as u8); // ADD r253, r253, r254
-        assert_eq!(bc[47], Instruction::Jalr as u8); // JALR r255, r253, 0
-        assert_eq!(bc[58], Instruction::Halt as u8); // HALT
+        assert_eq!(bc[32], Instruction::Mul as u8); // MUL r253, r0, 11
+        assert_eq!(bc[45], Instruction::Add as u8); // ADD r253, r253, r254
+        assert_eq!(bc[51], Instruction::Jalr as u8); // JALR r255, r253, 0
+        assert_eq!(bc[62], Instruction::Halt as u8); // HALT
 
         // Original function bodies still present after dispatcher (one HALT each)
-        assert_eq!(bc[59], Instruction::Halt as u8);
-        assert_eq!(bc[60], Instruction::Halt as u8);
+        assert_eq!(bc[63], Instruction::Halt as u8);
+        assert_eq!(bc[64], Instruction::Halt as u8);
 
-        assert_eq!(bc.len(), 61);
+        assert_eq!(bc.len(), 65);
     }
 
     #[test]
@@ -391,8 +391,8 @@ pub alpha:
         let entry0_imm = i64::from_le_bytes(bc[12..20].try_into().expect("entry0 immediate slice"));
         let entry1_imm = i64::from_le_bytes(bc[23..31].try_into().expect("entry1 immediate slice"));
 
-        assert_eq!(entry0_imm, 40); // alpha at offset 60, entry0 resolves from ip+10 -> 60-20
-        assert_eq!(entry1_imm, 28); // zebra at offset 59, entry1 resolves from ip+10 -> 59-31
+        assert_eq!(entry0_imm, 44); // alpha at offset 64, entry0 resolves from ip+10 -> 64-20
+        assert_eq!(entry1_imm, 32); // zebra at offset 63, entry1 resolves from ip+10 -> 63-31
     }
 
     #[test]

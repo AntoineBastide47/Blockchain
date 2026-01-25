@@ -1,20 +1,18 @@
 [ init code ]
 main:                            # Equivalent to a contract constructor
-    LOAD_I64 r1, 5               # compute 5!
+    MOVE r1, 5                   # compute 5!
     CALL r2, factorial, 1, r1    # r2 now contains 120 (5!)
     CALL_HOST r2, "hash", 1, r2  # hash the value
-    LOAD_STR r1, "hash"
-    STORE_HASH r1, r2            # Store the hashes value at key "hash"
+    STORE_HASH "hash", r2        # Store the hashes value at key "hash"
     HALT
 
 [ runtime code ]
 # factorial(n): computes n! iteratively
 # input: r1 = n, output: r3 = n!
 pub factorial:
-    LOAD_I64 r3, 1              # result = 1
-    LOAD_I64 r4, 1              # i = 1
+    MOVE r3, 1                  # result = 1
     fact_loop:
-        MUL r3, r3, r4          # result *= i
-        ADDI r4, r4, 1          # i++
-        BGE r1, r4, fact_loop   # while n >= i
+        MUL r3, r3, r1          # result *= i
+        SUB r1, r1, 1           # i--
+        BGE r1, 1, fact_loop    # while n >= 1
     RET r3

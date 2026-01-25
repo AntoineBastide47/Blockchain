@@ -121,6 +121,22 @@ pub enum VMError {
     ReferenceOutOfBounds { reference: u32, max: usize },
     #[error("call stack overflow got {actual} while max is {max}")]
     CallStackOverflow { max: usize, actual: usize },
+    #[error("invalid operand tag got {tag} at offset {offset}")]
+    InvalidOperandTag { tag: u8, offset: usize },
+    #[error(
+        "invalid operand type for {instruction} argument {argc}, expected 'register or {expected}' got '{actual}'"
+    )]
+    InvalidOperand {
+        instruction: &'static str,
+        argc: usize,
+        expected: &'static str,
+        actual: &'static str,
+    },
+    #[error("cannot compare types {type1} and {type2}")]
+    InvalidComparison {
+        type1: &'static str,
+        type2: &'static str,
+    },
 }
 
 impl From<DecodeError> for VMError {

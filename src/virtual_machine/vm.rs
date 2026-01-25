@@ -3,14 +3,17 @@
 //! The VM executes bytecode using a register-based architecture with 256 general-purpose
 //! registers. All arithmetic uses wrapping semantics to prevent overflow panics.
 
+use crate::error;
 use crate::types::hash::{HASH_LEN, Hash};
+use crate::utils::log::SHOW_TYPE;
 use crate::virtual_machine::assembler::parse_i64;
 use crate::virtual_machine::errors::VMError;
 use crate::virtual_machine::isa::Instruction;
+use crate::virtual_machine::operand::SrcOperand;
 use crate::virtual_machine::program::{DeployProgram, ExecuteProgram};
 use crate::virtual_machine::state::State;
 use blockchain_derive::BinaryCodec;
-use std::fmt::Write;
+use std::sync::atomic::Ordering;
 
 /// Reads `len` bytes from `data` starting at `cursor`, advancing the cursor.
 ///
@@ -100,11 +103,6 @@ macro_rules! define_instruction_decoder {
         Ok::<String, VMError>(v.to_string())
     }};
 
-    (@read $data:ident $cursor:ident $start:ident Bool) => {{
-        let v = read_u8($data, &mut $cursor, $start)?;
-        Ok::<String, VMError>(if v == 0 { "false".to_string() } else { "true".to_string() })
-    }};
-
     (@read $data:ident $cursor:ident $start:ident RefU32) => {{
         let bytes = read_bytes($data, &mut $cursor, 4, $start)?;
         Ok::<String, VMError>(format!("@{}", u32::from_le_bytes(bytes.try_into().unwrap())))
@@ -114,6 +112,20 @@ macro_rules! define_instruction_decoder {
         let bytes = read_bytes($data, &mut $cursor, 8, $start)?;
         Ok::<String, VMError>(i64::from_le_bytes(bytes.try_into().unwrap()).to_string())
     }};
+
+    (@read $data:ident $cursor:ident $start:ident Src) => {{
+      let tag = read_u8($data, &mut $cursor, $start)?;
+      match tag {
+          0 => define_instruction_decoder!(@read $data $cursor $start Reg),
+          1 => {
+              let b = read_u8($data, &mut $cursor, $start)?;
+              Ok::<String, VMError>(if b == 0 { "false" } else { "true" }.to_string())
+          }
+          2 => define_instruction_decoder!(@read $data $cursor $start ImmI64),
+          3 => define_instruction_decoder!(@read $data $cursor $start RefU32),
+          _ => Err(VMError::InvalidOperandTag { tag, offset: $start })
+      }
+  }};
 }
 
 crate::for_each_instruction!(define_instruction_decoder);
@@ -261,10 +273,24 @@ impl Value {
     pub fn type_name(&self) -> &'static str {
         match self {
             Value::Zero => "Zero",
-            Value::Bool(_) => "Bool",
-            Value::Ref(_) => "Ref",
-            Value::Int(_) => "Int",
+            Value::Bool(_) => "Boolean",
+            Value::Ref(_) => "Reference",
+            Value::Int(_) => "Integer",
         }
+    }
+
+    pub fn equals(va: Value, vb: Value) -> Result<Value, VMError> {
+        Ok(Value::Bool(match (va, vb) {
+            (Value::Bool(b1), Value::Bool(b2)) => b1 == b2,
+            (Value::Ref(r1), Value::Ref(r2)) => r1 == r2,
+            (Value::Int(i1), Value::Int(i2)) => i1 == i2,
+            _ => {
+                return Err(VMError::InvalidComparison {
+                    type1: va.type_name(),
+                    type2: vb.type_name(),
+                });
+            }
+        }))
     }
 }
 
@@ -466,9 +492,16 @@ macro_rules! exec_vm {
     }};
 
     // Decode a bool (1 byte, 0 = false, nonzero = true)
-    (@read $vm:ident, Bool) => {{
-        Ok::<bool, VMError>($vm.read_exact(1)?[0] != 0)
-    }};
+    (@read $vm:ident, Src) => {{
+      let tag = $vm.read_exact(1)?[0];
+      match tag {
+          0 => Ok::<SrcOperand, VMError>(SrcOperand::Reg(exec_vm!(@read $vm, Reg)?)),
+          1 => Ok::<SrcOperand, VMError>(SrcOperand::Bool(exec_vm!(@read $vm, Reg)? == 1)),
+          2 => Ok::<SrcOperand, VMError>(SrcOperand::I64(exec_vm!(@read $vm, ImmI64)?)),
+          3 => Ok::<SrcOperand, VMError>(SrcOperand::Ref(exec_vm!(@read $vm, RefU32)?)),
+          _ => Err(VMError::InvalidOperandTag { tag, offset: $vm.ip })
+      }
+  }}
 }
 
 /// Execution context passed to the VM during contract execution.
@@ -513,6 +546,8 @@ pub struct VM {
     data: Vec<u8>,
     /// Instruction pointer (current position in bytecode).
     ip: usize,
+    /// Start offset of the currently executing instruction (for error reporting).
+    instr_offset: usize,
     /// Register file (256 registers).
     registers: Registers,
     /// Heap for string pool and future allocations.
@@ -546,6 +581,7 @@ impl VM {
         let mut vm = Self {
             data,
             ip: 0,
+            instr_offset: 0,
             registers: Registers::new(),
             heap: Heap::new(program.items),
             call_stack: Vec::new(),
@@ -575,6 +611,7 @@ impl VM {
         let mut vm = Self {
             data,
             ip: 0,
+            instr_offset: 0,
             registers: Registers::new(),
             heap: Heap::new(items),
             call_stack: Vec::new(),
@@ -604,47 +641,36 @@ impl VM {
         Ok(vm)
     }
 
-    /// Logs a formatted runtime error diagnostic to stderr.
-    fn log_runtime_error(&self, err: &VMError) {
-        eprintln!("{}", self.format_runtime_error(err));
-    }
-
     /// Formats a runtime error with bytecode context and call stack.
-    fn format_runtime_error(&self, err: &VMError) -> String {
-        let mut out = String::new();
-        let _ = writeln!(out, "error: VM runtime failure: {err}");
+    fn log_runtime_error(&self, err: &VMError) {
+        error!("VM runtime failure: {err}");
 
         if let Some(ip) = self.error_ip(err) {
-            let _ = writeln!(out, "   --> bytecode:{ip}");
-            if let Some(asm) = self.disassembly_snippet(ip) {
-                out.push_str(&asm);
-            }
-            if let Some(snippet) = self.bytecode_snippet(ip) {
-                out.push_str(&snippet);
-            }
+            eprintln!("   --> bytecode:{ip}");
+            self.disassembly_snippet(ip, err);
+            self.bytecode_snippet(ip, err);
         }
 
-        let _ = writeln!(out, "note: gas used {} of {}", self.gas_used, self.max_gas);
+        eprintln!("note: gas used {} of {}", self.gas_used, self.max_gas);
         if self.call_stack.is_empty() {
-            let _ = writeln!(out, "note: call stack is empty");
+            eprintln!("note: call stack is empty");
         } else {
-            let _ = writeln!(out, "note: call stack (most recent first):");
+            eprintln!("note: call stack (most recent first):");
             for (depth, frame) in self.call_stack.iter().rev().enumerate() {
-                let _ = writeln!(
-                    out,
+                eprintln!(
                     "  {depth}: return to ip {} -> r{}",
                     frame.return_addr, frame.dst_reg
                 );
             }
         }
 
-        out
+        error!("aborting due to previous error");
     }
 
     /// Returns a hex dump of bytecode around the given instruction pointer.
-    fn bytecode_snippet(&self, ip: usize) -> Option<String> {
+    fn bytecode_snippet(&self, ip: usize, err: &VMError) {
         if self.data.is_empty() {
-            return None;
+            return;
         }
 
         let window = 8usize;
@@ -653,7 +679,7 @@ impl VM {
 
         let mut rendered = String::new();
         let mut caret_col = 0usize;
-        for (idx, byte) in self.data.get(start..end)?.iter().enumerate() {
+        for (idx, byte) in self.data[start..end].iter().enumerate() {
             if idx > 0 {
                 rendered.push(' ');
             }
@@ -667,17 +693,17 @@ impl VM {
             caret_col = rendered.len();
         }
 
-        let mut snippet = String::new();
-        let _ = writeln!(
-            snippet,
+        eprintln!(
             "    | window [{}..{}) of {} bytes",
             start,
             end,
             self.data.len()
         );
-        let _ = writeln!(snippet, "    | {rendered}");
-        let _ = writeln!(snippet, "    | {}^", " ".repeat(caret_col));
-        Some(snippet)
+        eprintln!("    | {rendered}");
+        eprint!("    |");
+        SHOW_TYPE.store(false, Ordering::Relaxed);
+        error!(" {}^^ {}", " ".repeat(caret_col), err);
+        SHOW_TYPE.store(true, Ordering::Relaxed);
     }
 
     /// Disassembles the entire bytecode into (offset, text, size) tuples.
@@ -697,10 +723,10 @@ impl VM {
     }
 
     /// Returns a few disassembled instructions around the given IP.
-    fn disassembly_snippet(&self, ip: usize) -> Option<String> {
+    fn disassembly_snippet(&self, ip: usize, err: &VMError) {
         let listing = self.disassembly_listing();
         if listing.is_empty() {
-            return None;
+            return;
         }
 
         let target_idx = listing
@@ -708,18 +734,22 @@ impl VM {
             .position(|(offset, _, size)| (*offset..offset + *size).contains(&ip))
             .or_else(|| listing.iter().rposition(|(offset, _, _)| *offset <= ip));
 
-        let idx = target_idx?;
-        let start = idx.saturating_sub(2);
-        let end = (idx + 3).min(listing.len());
+        if let Some(idx) = target_idx {
+            let start = idx.saturating_sub(2);
+            let end = (idx + 3).min(listing.len());
 
-        let mut out = String::new();
-        let _ = writeln!(out, "    | assembly around ip {ip}:");
-        for (i, (offset, text, _)) in listing[start..end].iter().enumerate() {
-            let cursor = start + i == idx;
-            let marker = if cursor { "-->" } else { "   " };
-            let _ = writeln!(out, "{marker} {:>6}: {}", offset, text);
+            eprintln!("    | assembly around ip {ip}:");
+            for (i, (offset, text, _)) in listing[start..end].iter().enumerate() {
+                let is_target = start + i == idx;
+                let marker = if is_target { "-->" } else { "   " };
+                eprintln!("{marker} {:>6}: {}", offset, text);
+                if is_target {
+                    SHOW_TYPE.store(false, Ordering::Relaxed);
+                    error!("            {} {}", "^".repeat(text.len()), err);
+                    SHOW_TYPE.store(true, Ordering::Relaxed);
+                }
+            }
         }
-        Some(out)
     }
 
     /// Extracts the instruction pointer associated with a VM error, if available.
@@ -729,9 +759,9 @@ impl VM {
             VMError::UnexpectedEndOfBytecode { ip, .. } => Some(*ip),
             VMError::InvalidIP { ip } => Some(*ip),
             VMError::JumpOutOfBounds { from, .. } => Some(*from),
-            VMError::ReturnWithoutCall { .. } => Some(self.ip),
-            VMError::OutOfGas { .. } => Some(self.ip.saturating_sub(1)),
-            _ => Some(self.ip),
+            VMError::ReturnWithoutCall { .. } => Some(self.instr_offset),
+            VMError::OutOfGas { .. } => Some(self.instr_offset),
+            _ => Some(self.instr_offset),
         }
     }
 
@@ -812,6 +842,91 @@ impl VM {
     }
 }
 
+impl VM {
+    fn bool_from_operand(
+        &self,
+        src_operand: SrcOperand,
+        instruction: &'static str,
+        argc: usize,
+    ) -> Result<bool, VMError> {
+        Ok(match src_operand {
+            SrcOperand::Reg(idx) => self.registers.get_bool(idx, instruction)?,
+            SrcOperand::Bool(b) => b,
+            _ => {
+                return Err(VMError::InvalidOperand {
+                    instruction,
+                    argc,
+                    expected: SrcOperand::Bool(false).to_string(),
+                    actual: src_operand.to_string(),
+                });
+            }
+        })
+    }
+
+    fn ref_from_operand(
+        &self,
+        src_operand: SrcOperand,
+        instruction: &'static str,
+        argc: usize,
+    ) -> Result<u32, VMError> {
+        Ok(match src_operand {
+            SrcOperand::Reg(idx) => self.registers.get_ref(idx, instruction)?,
+            SrcOperand::Ref(r) => r,
+            _ => {
+                return Err(VMError::InvalidOperand {
+                    instruction,
+                    argc,
+                    expected: SrcOperand::Ref(0).to_string(),
+                    actual: src_operand.to_string(),
+                });
+            }
+        })
+    }
+
+    fn int_from_operand(
+        &self,
+        src_operand: SrcOperand,
+        instruction: &'static str,
+        argc: usize,
+    ) -> Result<i64, VMError> {
+        Ok(match src_operand {
+            SrcOperand::Reg(idx) => self.registers.get_int(idx, instruction)?,
+            SrcOperand::I64(i) => i,
+            _ => {
+                return Err(VMError::InvalidOperand {
+                    instruction,
+                    argc,
+                    expected: SrcOperand::I64(0).to_string(),
+                    actual: src_operand.to_string(),
+                });
+            }
+        })
+    }
+
+    fn value_from_operand(&self, src_operand: SrcOperand) -> Result<Value, VMError> {
+        Ok(match src_operand {
+            SrcOperand::Reg(idx) => *self.registers.get(idx)?,
+            SrcOperand::Bool(b) => Value::Bool(b),
+            SrcOperand::I64(i) => Value::Int(i),
+            SrcOperand::Ref(r) => Value::Ref(r),
+        })
+    }
+
+    fn bytes_from_operand(&mut self, src_operand: SrcOperand) -> Result<Vec<u8>, VMError> {
+        Ok(match src_operand {
+            SrcOperand::Reg(idx) => match self.registers.get(idx)? {
+                Value::Zero => Vec::new(),
+                Value::Bool(b) => vec![*b as u8],
+                Value::Ref(r) => self.heap_get_raw_ref(*r)?,
+                Value::Int(i) => i.to_le_bytes().to_vec(),
+            },
+            SrcOperand::Bool(b) => vec![b as u8],
+            SrcOperand::I64(i) => i.to_le_bytes().to_vec(),
+            SrcOperand::Ref(r) => self.heap_get_raw_ref(r)?,
+        })
+    }
+}
+
 /// impl block for VM wrapper functions to charge gas
 impl VM {
     /// Stores an item on the heap and returns its reference index.
@@ -820,6 +935,12 @@ impl VM {
     fn heap_index(&mut self, item: Vec<u8>) -> Result<u32, VMError> {
         self.charge_gas_categorized(item.len() as u64, GasCategory::HeapAllocation)?;
         Ok(self.heap.index(item))
+    }
+
+    fn heap_get_raw_ref(&mut self, id: u32) -> Result<Vec<u8>, VMError> {
+        let size = self.heap.get_raw_ref(id)?.len();
+        self.charge_gas_categorized(size as u64, GasCategory::HeapAllocation)?;
+        self.heap.get_raw_ref(id).cloned()
     }
 
     /// Retrieves a string from the heap by reference index with gas charging.
@@ -894,14 +1015,14 @@ impl VM {
     pub fn run<S: State>(&mut self, state: &mut S, ctx: &ExecContext) -> Result<(), VMError> {
         let result = (|| {
             while self.ip < self.data.len() {
-                let opcode_offset = self.ip;
-                let opcode = self.data[opcode_offset];
+                self.instr_offset = self.ip;
+                let opcode = self.data[self.instr_offset];
                 self.ip += 1;
 
                 let instr =
                     Instruction::try_from(opcode).map_err(|_| VMError::InvalidInstruction {
                         opcode,
-                        offset: opcode_offset,
+                        offset: self.instr_offset,
                     })?;
                 self.charge_base(instr)?;
                 self.exec(instr, state, ctx)?;
@@ -954,80 +1075,57 @@ impl VM {
             instr = instruction,
             {
                 // Store and Load
-                DeleteState => op_delete_state(state, ctx; rd: Reg),
-                LoadI64 => op_load_i64(rd: Reg, imm: ImmI64),
-                StoreI64 => op_store_i64(state, ctx; key: Reg, value: Reg),
-                LoadI64State => op_load_i64_state(state, ctx; rd: Reg, key: Reg),
-                LoadBool => op_load_bool(rd: Reg, b: Bool),
-                StoreBool => op_store_bool(state, ctx; key: Reg, value: Reg),
-                LoadBoolState => op_load_bool_state(state, ctx; rd: Reg, key: Reg),
-                LoadStr => op_load_str(rd: Reg, str_ref: RefU32),
-                StoreStr => op_store_str(state, ctx; key: Reg, value: Reg),
-                LoadStrState => op_load_str_state(state, ctx; rd: Reg, key: Reg),
-                LoadHash => op_load_hash(rd: Reg, hash_ref: RefU32),
-                StoreHash => op_store_hash(state, ctx; key: Reg, value: Reg),
-                LoadHashState => op_load_hash_state(state, ctx; rd: Reg, key: Reg),
+                DeleteState => op_delete_state(state, ctx; rd: Src),
+                StoreI64 => op_store_i64(state, ctx; key: Src, value: Src),
+                LoadI64State => op_load_i64_state(state, ctx; rd: Reg, key: Src),
+                StoreBool => op_store_bool(state, ctx; key: Src, value: Src),
+                LoadBoolState => op_load_bool_state(state, ctx; rd: Reg, key: Src),
+                StoreStr => op_store_str(state, ctx; key: Src, value: Src),
+                LoadStrState => op_load_str_state(state, ctx; rd: Reg, key: Src),
+                StoreHash => op_store_hash(state, ctx; key: Src, value: Src),
+                LoadHashState => op_load_hash_state(state, ctx; rd: Reg, key: Src),
                 // Moves / casts
-                Move => op_move(rd: Reg, rs: Reg),
-                I64ToBool => op_i64_to_bool(rd: Reg, rs: Reg),
-                BoolToI64 => op_bool_to_i64(rd: Reg, rs: Reg),
-                StrToI64 => op_str_to_i64(rd: Reg, rs: Reg),
-                I64ToStr => op_i64_to_str(rd: Reg, rs: Reg),
-                StrToBool => op_str_to_bool(rd: Reg, rs: Reg),
-                BoolToStr => op_bool_to_str(rd: Reg, rs: Reg),
+                Move => op_move(rd: Reg, rs: Src),
+                I64ToBool => op_i64_to_bool(rd: Reg, rs: Src),
+                BoolToI64 => op_bool_to_i64(rd: Reg, rs: Src),
+                StrToI64 => op_str_to_i64(rd: Reg, rs: Src),
+                I64ToStr => op_i64_to_str(rd: Reg, rs: Src),
+                StrToBool => op_str_to_bool(rd: Reg, rs: Src),
+                BoolToStr => op_bool_to_str(rd: Reg, rs: Src),
                 // Integer arithmetic
-                Add => op_add(rd: Reg, rs1: Reg, rs2: Reg),
-                Sub => op_sub(rd: Reg, rs1: Reg, rs2: Reg),
-                Mul => op_mul(rd: Reg, rs1: Reg, rs2: Reg),
-                Div => op_div(rd: Reg, rs1: Reg, rs2: Reg),
-                Mod => op_mod(rd: Reg, rs1: Reg, rs2: Reg),
-                Neg => op_neg(rd: Reg, rs: Reg),
-                Abs => op_abs(rd: Reg, rs: Reg),
-                Min => op_min(rd: Reg, rs1: Reg, rs2: Reg),
-                Max => op_max(rd: Reg, rs1: Reg, rs2: Reg),
-                Shl => op_shl(rd: Reg, rs1: Reg, rs2: Reg),
-                Shr => op_shr(rd: Reg, rs1: Reg, rs2: Reg),
-                AddI => op_addi(rd: Reg, rs: Reg, imm: ImmI64),
-                SubI => op_subi(rd: Reg, rs: Reg, imm: ImmI64),
-                MulI => op_muli(rd: Reg, rs: Reg, imm: ImmI64),
-                ShlI => op_shli(rd: Reg, rs: Reg, imm: ImmI64),
-                ShrI => op_shri(rd: Reg, rs: Reg, imm: ImmI64),
+                Add => op_add(rd: Reg, rs1: Src, rs2: Src),
+                Sub => op_sub(rd: Reg, rs1: Src, rs2: Src),
+                Mul => op_mul(rd: Reg, rs1: Src, rs2: Src),
+                Div => op_div(rd: Reg, rs1: Src, rs2: Src),
+                Mod => op_mod(rd: Reg, rs1: Src, rs2: Src),
+                Neg => op_neg(rd: Reg, rs: Src),
+                Abs => op_abs(rd: Reg, rs: Src),
+                Min => op_min(rd: Reg, rs1: Src, rs2: Src),
+                Max => op_max(rd: Reg, rs1: Src, rs2: Src),
+                Shl => op_shl(rd: Reg, rs1: Src, rs2: Src),
+                Shr => op_shr(rd: Reg, rs1: Src, rs2: Src),
                 // Boolean / comparison
-                Not => op_not(rd: Reg, rs: Reg),
-                And => op_and(rd: Reg, rs1: Reg, rs2: Reg),
-                Or => op_or(rd: Reg, rs1: Reg, rs2: Reg),
-                Xor => op_xor(rd: Reg, rs1: Reg, rs2: Reg),
-                Eq => op_eq(rd: Reg, rs1: Reg, rs2: Reg),
-                Lt => op_lt(rd: Reg, rs1: Reg, rs2: Reg),
-                Le => op_le(rd: Reg, rs1: Reg, rs2: Reg),
-                Gt => op_gt(rd: Reg, rs1: Reg, rs2: Reg),
-                Ge => op_ge(rd: Reg, rs1: Reg, rs2: Reg),
-                AndI => op_andi(rd: Reg, rs: Reg, imm: ImmI64),
-                OrI => op_ori(rd: Reg, rs: Reg, imm: ImmI64),
-                XorI => op_xori(rd: Reg, rs: Reg, imm: ImmI64),
-                EqI => op_eqi(rd: Reg, rs: Reg, imm: ImmI64),
-                LtI => op_lti(rd: Reg, rs: Reg, imm: ImmI64),
-                LeI => op_lei(rd: Reg, rs: Reg, imm: ImmI64),
-                GtI => op_gti(rd: Reg, rs: Reg, imm: ImmI64),
-                GeI => op_gei(rd: Reg, rs: Reg, imm: ImmI64),
+                Not => op_not(rd: Reg, rs: Src),
+                And => op_and(rd: Reg, rs1: Src, rs2: Src),
+                Or => op_or(rd: Reg, rs1: Src, rs2: Src),
+                Xor => op_xor(rd: Reg, rs1: Src, rs2: Src),
+                Eq => op_eq(rd: Reg, rs1: Src, rs2: Src),
+                Lt => op_lt(rd: Reg, rs1: Src, rs2: Src),
+                Le => op_le(rd: Reg, rs1: Src, rs2: Src),
+                Gt => op_gt(rd: Reg, rs1: Src, rs2: Src),
+                Ge => op_ge(rd: Reg, rs1: Src, rs2: Src),
                 // Control Flow
                 CallHost => op_call_host(dst: Reg, fn_id: RefU32, argc: ImmU8, argv: Reg),
                 Call => op_call(dst: Reg, offset: ImmI64, argc: ImmU8, argv: Reg),
                 Call0 => op_call0(dst: Reg, fn_id: ImmI64),
                 Jal => op_jal(rd: Reg, offset: ImmI64),
                 Jalr => op_jalr(rd: Reg, rs: Reg, offset: ImmI64),
-                Beq => op_beq(rs1: Reg, rs2: Reg, offset: ImmI64),
-                Bne => op_bne(rs1: Reg, rs2: Reg, offset: ImmI64),
-                Blt => op_blt(rs1: Reg, rs2: Reg, offset: ImmI64),
-                Bge => op_bge(rs1: Reg, rs2: Reg, offset: ImmI64),
-                Bltu => op_bltu(rs1: Reg, rs2: Reg, offset: ImmI64),
-                Bgeu => op_bgeu(rs1: Reg, rs2: Reg, offset: ImmI64),
-                BeqI => op_beqi(rs: Reg, imm: ImmI64, offset: ImmI64),
-                BneI => op_bnei(rs: Reg, imm: ImmI64, offset: ImmI64),
-                BltI => op_blti(rs: Reg, imm: ImmI64, offset: ImmI64),
-                BgeI => op_bgei(rs: Reg, imm: ImmI64, offset: ImmI64),
-                BltuI => op_bltui(rs: Reg, imm: ImmI64, offset: ImmI64),
-                BgeuI => op_bgeui(rs: Reg, imm: ImmI64, offset: ImmI64),
+                Beq => op_beq(rs1: Src, rs2: Src, offset: ImmI64),
+                Bne => op_bne(rs1: Src, rs2: Src, offset: ImmI64),
+                Blt => op_blt(rs1: Src, rs2: Src, offset: ImmI64),
+                Bge => op_bge(rs1: Src, rs2: Src, offset: ImmI64),
+                Bltu => op_bltu(rs1: Src, rs2: Src, offset: ImmI64),
+                Bgeu => op_bgeu(rs1: Src, rs2: Src, offset: ImmI64),
                 Jump => op_jump(offset: ImmI64),
                 Ret => op_ret(rs: Reg),
                 Halt => op_halt(),
@@ -1037,14 +1135,13 @@ impl VM {
 
     fn op_delete_state<S: State>(
         &mut self,
-        instr: &'static str,
+        _instr: &'static str,
         state: &mut S,
         ctx: &ExecContext,
-        key: u8,
+        key: SrcOperand,
     ) -> Result<(), VMError> {
-        let key_ref = self.registers.get_ref(key, instr)?;
-        let key_str = self.heap_get_string(key_ref)?;
-        let key = self.make_state_key(ctx.chain_id, &ctx.contract_id, key_str.as_bytes())?;
+        let key_ref = self.bytes_from_operand(key)?;
+        let key = self.make_state_key(ctx.chain_id, &ctx.contract_id, &key_ref)?;
         state.delete(key);
         Ok(())
     }
@@ -1058,13 +1155,12 @@ impl VM {
         instr: &'static str,
         state: &mut S,
         ctx: &ExecContext,
-        key: u8,
-        value: u8,
+        key: SrcOperand,
+        value: SrcOperand,
     ) -> Result<(), VMError> {
-        let key_ref = self.registers.get_ref(key, instr)?;
-        let key_str = self.heap_get_string(key_ref)?;
-        let val = self.registers.get_int(value, instr)?;
-        let key = self.make_state_key(ctx.chain_id, &ctx.contract_id, key_str.as_bytes())?;
+        let key_ref = self.bytes_from_operand(key)?;
+        let val = self.int_from_operand(value, instr, 1)?;
+        let key = self.make_state_key(ctx.chain_id, &ctx.contract_id, &key_ref)?;
         self.state_push(state, key, val.to_le_bytes().to_vec())
     }
 
@@ -1074,9 +1170,9 @@ impl VM {
         state: &mut S,
         ctx: &ExecContext,
         dst: u8,
-        key: u8,
+        key: SrcOperand,
     ) -> Result<(), VMError> {
-        let key_ref = self.registers.get_ref(key, instr)?;
+        let key_ref = self.ref_from_operand(key, instr, 1)?;
         let key_str = self.heap_get_string(key_ref)?;
         let state_key = self.make_state_key(ctx.chain_id, &ctx.contract_id, key_str.as_bytes())?;
         let value = self.state_get(state, state_key)?;
@@ -1097,13 +1193,12 @@ impl VM {
         instr: &'static str,
         state: &mut S,
         ctx: &ExecContext,
-        key: u8,
-        value: u8,
+        key: SrcOperand,
+        value: SrcOperand,
     ) -> Result<(), VMError> {
-        let key_ref = self.registers.get_ref(key, instr)?;
-        let key_str = self.heap_get_string(key_ref)?;
-        let val = self.registers.get_bool(value, instr)?;
-        let key = self.make_state_key(ctx.chain_id, &ctx.contract_id, key_str.as_bytes())?;
+        let key_ref = self.bytes_from_operand(key)?;
+        let val = self.bool_from_operand(value, instr, 1)?;
+        let key = self.make_state_key(ctx.chain_id, &ctx.contract_id, &key_ref)?;
         self.state_push(state, key, [val as u8].into())
     }
 
@@ -1113,9 +1208,9 @@ impl VM {
         state: &mut S,
         ctx: &ExecContext,
         dst: u8,
-        key: u8,
+        key: SrcOperand,
     ) -> Result<(), VMError> {
-        let key_ref = self.registers.get_ref(key, instr)?;
+        let key_ref = self.ref_from_operand(key, instr, 1)?;
         let key_str = self.heap_get_string(key_ref)?;
         let state_key = self.make_state_key(ctx.chain_id, &ctx.contract_id, key_str.as_bytes())?;
         let value = self.state_get(state, state_key)?;
@@ -1137,14 +1232,13 @@ impl VM {
         instr: &'static str,
         state: &mut S,
         ctx: &ExecContext,
-        key: u8,
-        value: u8,
+        key: SrcOperand,
+        value: SrcOperand,
     ) -> Result<(), VMError> {
-        let key_ref = self.registers.get_ref(key, instr)?;
-        let key_str = self.heap_get_string(key_ref)?;
-        let val_ref = self.registers.get_ref(value, instr)?;
+        let key_ref = self.bytes_from_operand(key)?;
+        let val_ref = self.ref_from_operand(value, instr, 1)?;
         let val_str = self.heap_get_string(val_ref)?;
-        let key = self.make_state_key(ctx.chain_id, &ctx.contract_id, key_str.as_bytes())?;
+        let key = self.make_state_key(ctx.chain_id, &ctx.contract_id, &key_ref)?;
         self.state_push(state, key, val_str.into_bytes())
     }
 
@@ -1154,9 +1248,9 @@ impl VM {
         state: &mut S,
         ctx: &ExecContext,
         dst: u8,
-        key: u8,
+        key: SrcOperand,
     ) -> Result<(), VMError> {
-        let key_ref = self.registers.get_ref(key, instr)?;
+        let key_ref = self.ref_from_operand(key, instr, 1)?;
         let key_str = self.heap_get_string(key_ref)?;
         let state_key = self.make_state_key(ctx.chain_id, &ctx.contract_id, key_str.as_bytes())?;
         let value = state
@@ -1180,14 +1274,13 @@ impl VM {
         instr: &'static str,
         state: &mut S,
         ctx: &ExecContext,
-        key: u8,
-        value: u8,
+        key: SrcOperand,
+        value: SrcOperand,
     ) -> Result<(), VMError> {
-        let key_ref = self.registers.get_ref(key, instr)?;
-        let key_str = self.heap_get_string(key_ref)?;
-        let val_ref = self.registers.get_ref(value, instr)?;
+        let key_ref = self.bytes_from_operand(key)?;
+        let val_ref = self.ref_from_operand(value, instr, 1)?;
         let val_hash = self.heap_get_hash(val_ref)?;
-        let key = self.make_state_key(ctx.chain_id, &ctx.contract_id, key_str.as_bytes())?;
+        let key = self.make_state_key(ctx.chain_id, &ctx.contract_id, &key_ref)?;
         self.state_push(state, key, val_hash.to_vec())
     }
 
@@ -1197,9 +1290,9 @@ impl VM {
         state: &mut S,
         ctx: &ExecContext,
         dst: u8,
-        key: u8,
+        key: SrcOperand,
     ) -> Result<(), VMError> {
-        let key_ref = self.registers.get_ref(key, instr)?;
+        let key_ref = self.ref_from_operand(key, instr, 1)?;
         let key_str = self.heap_get_string(key_ref)?;
         let state_key = self.make_state_key(ctx.chain_id, &ctx.contract_id, key_str.as_bytes())?;
         let value = state
@@ -1209,23 +1302,43 @@ impl VM {
         self.op_load_hash(instr, dst, hash_ref)
     }
 
-    fn op_move(&mut self, _instr: &'static str, dst: u8, src: u8) -> Result<(), VMError> {
-        let v = *self.registers.get(src)?;
+    fn op_move(&mut self, _instr: &'static str, dst: u8, src: SrcOperand) -> Result<(), VMError> {
+        let v: Value = match src {
+            SrcOperand::Reg(idx) => *self.registers.get(idx)?,
+            SrcOperand::Bool(b) => Value::Bool(b),
+            SrcOperand::I64(i) => Value::Int(i),
+            SrcOperand::Ref(r) => Value::Ref(r),
+        };
         self.registers.set(dst, v)
     }
 
-    fn op_i64_to_bool(&mut self, instr: &'static str, dst: u8, src: u8) -> Result<(), VMError> {
-        let v = self.registers.get_int(src, instr)?;
+    fn op_i64_to_bool(
+        &mut self,
+        instr: &'static str,
+        dst: u8,
+        src: SrcOperand,
+    ) -> Result<(), VMError> {
+        let v = self.int_from_operand(src, instr, 1)?;
         self.registers.set(dst, Value::Bool(v != 0))
     }
 
-    fn op_bool_to_i64(&mut self, instr: &'static str, dst: u8, src: u8) -> Result<(), VMError> {
-        let v = self.registers.get_bool(src, instr)?;
+    fn op_bool_to_i64(
+        &mut self,
+        instr: &'static str,
+        dst: u8,
+        src: SrcOperand,
+    ) -> Result<(), VMError> {
+        let v = self.bool_from_operand(src, instr, 1)?;
         self.registers.set(dst, Value::Int(if v { 1 } else { 0 }))
     }
 
-    fn op_str_to_i64(&mut self, instr: &'static str, dst: u8, src: u8) -> Result<(), VMError> {
-        let reg = self.registers.get_ref(src, instr)?;
+    fn op_str_to_i64(
+        &mut self,
+        instr: &'static str,
+        dst: u8,
+        src: SrcOperand,
+    ) -> Result<(), VMError> {
+        let reg = self.ref_from_operand(src, instr, 1)?;
         let str = self.heap_get_string(reg)?;
         self.op_load_i64(instr, dst, parse_i64(&str)?)
     }
@@ -1283,16 +1396,26 @@ impl VM {
         (d + extra) as u64
     }
 
-    fn op_i64_to_str(&mut self, instr: &'static str, dst: u8, src: u8) -> Result<(), VMError> {
-        let reg = self.registers.get_int(src, instr)?;
+    fn op_i64_to_str(
+        &mut self,
+        instr: &'static str,
+        dst: u8,
+        src: SrcOperand,
+    ) -> Result<(), VMError> {
+        let reg = self.int_from_operand(src, instr, 1)?;
         // Charge gas manually before allocation instead of using heap_index()
         self.charge_gas_categorized(Self::digits_i64(reg), GasCategory::HeapAllocation)?;
         let str_ref = self.heap.index(reg.to_string().into_bytes());
         self.op_load_str(instr, dst, str_ref)
     }
 
-    fn op_str_to_bool(&mut self, instr: &'static str, dst: u8, src: u8) -> Result<(), VMError> {
-        let reg = self.registers.get_ref(src, instr)?;
+    fn op_str_to_bool(
+        &mut self,
+        instr: &'static str,
+        dst: u8,
+        src: SrcOperand,
+    ) -> Result<(), VMError> {
+        let reg = self.ref_from_operand(src, instr, 1)?;
         let str = self.heap_get_string(reg)?;
         let b = if str == "true" {
             true
@@ -1301,7 +1424,7 @@ impl VM {
         } else {
             return Err(VMError::TypeMismatch {
                 instruction: instr,
-                arg_index: 0,
+                arg_index: 1,
                 expected: "\"true\" or \"false\"",
                 actual: str,
             });
@@ -1309,8 +1432,13 @@ impl VM {
         self.op_load_bool(instr, dst, b)
     }
 
-    fn op_bool_to_str(&mut self, instr: &'static str, dst: u8, src: u8) -> Result<(), VMError> {
-        let reg = self.registers.get_bool(src, instr)?;
+    fn op_bool_to_str(
+        &mut self,
+        instr: &'static str,
+        dst: u8,
+        src: SrcOperand,
+    ) -> Result<(), VMError> {
+        let reg = self.bool_from_operand(src, instr, 1)?;
         // Charge gas manually before allocation instead of using heap_index()
         self.charge_gas_categorized(if reg { 4 } else { 5 }, GasCategory::HeapAllocation)?;
         let str = (if reg { "true" } else { "false" }).to_string();
@@ -1318,196 +1446,231 @@ impl VM {
         self.op_load_str(instr, dst, bool_ref)
     }
 
-    fn op_add(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers.get_int(a, instr)?;
-        let vb = self.registers.get_int(b, instr)?;
+    fn op_add(
+        &mut self,
+        instr: &'static str,
+        dst: u8,
+        a: SrcOperand,
+        b: SrcOperand,
+    ) -> Result<(), VMError> {
+        let va = self.int_from_operand(a, instr, 1)?;
+        let vb = self.int_from_operand(b, instr, 2)?;
         self.registers.set(dst, Value::Int(va.wrapping_add(vb)))
     }
 
-    fn op_sub(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers.get_int(a, instr)?;
-        let vb = self.registers.get_int(b, instr)?;
+    fn op_sub(
+        &mut self,
+        instr: &'static str,
+        dst: u8,
+        a: SrcOperand,
+        b: SrcOperand,
+    ) -> Result<(), VMError> {
+        let va = self.int_from_operand(a, instr, 1)?;
+        let vb = self.int_from_operand(b, instr, 2)?;
         self.registers.set(dst, Value::Int(va.wrapping_sub(vb)))
     }
 
-    fn op_mul(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers.get_int(a, instr)?;
-        let vb = self.registers.get_int(b, instr)?;
+    fn op_mul(
+        &mut self,
+        instr: &'static str,
+        dst: u8,
+        a: SrcOperand,
+        b: SrcOperand,
+    ) -> Result<(), VMError> {
+        let va = self.int_from_operand(a, instr, 1)?;
+        let vb = self.int_from_operand(b, instr, 2)?;
         self.registers.set(dst, Value::Int(va.wrapping_mul(vb)))
     }
 
-    fn op_div(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers.get_int(a, instr)?;
-        let vb = self.registers.get_int(b, instr)?;
+    fn op_div(
+        &mut self,
+        instr: &'static str,
+        dst: u8,
+        a: SrcOperand,
+        b: SrcOperand,
+    ) -> Result<(), VMError> {
+        let va = self.int_from_operand(a, instr, 1)?;
+        let vb = self.int_from_operand(b, instr, 2)?;
         if vb == 0 {
             return Err(VMError::DivisionByZero);
         }
         self.registers.set(dst, Value::Int(va.wrapping_div(vb)))
     }
 
-    fn op_mod(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers.get_int(a, instr)?;
-        let vb = self.registers.get_int(b, instr)?;
+    fn op_mod(
+        &mut self,
+        instr: &'static str,
+        dst: u8,
+        a: SrcOperand,
+        b: SrcOperand,
+    ) -> Result<(), VMError> {
+        let va = self.int_from_operand(a, instr, 1)?;
+        let vb = self.int_from_operand(b, instr, 2)?;
         if vb == 0 {
             return Err(VMError::DivisionByZero);
         }
         self.registers.set(dst, Value::Int(va.wrapping_rem(vb)))
     }
 
-    fn op_neg(&mut self, instr: &'static str, dst: u8, src: u8) -> Result<(), VMError> {
-        let v = self.registers.get_int(src, instr)?;
+    fn op_neg(&mut self, instr: &'static str, dst: u8, src: SrcOperand) -> Result<(), VMError> {
+        let v = self.int_from_operand(src, instr, 1)?;
         self.registers.set(dst, Value::Int(v.wrapping_neg()))
     }
 
-    fn op_abs(&mut self, instr: &'static str, dst: u8, src: u8) -> Result<(), VMError> {
-        let v = self.registers.get_int(src, instr)?;
+    fn op_abs(&mut self, instr: &'static str, dst: u8, src: SrcOperand) -> Result<(), VMError> {
+        let v = self.int_from_operand(src, instr, 1)?;
         self.registers.set(dst, Value::Int(v.wrapping_abs()))
     }
 
-    fn op_min(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers.get_int(a, instr)?;
-        let vb = self.registers.get_int(b, instr)?;
+    fn op_min(
+        &mut self,
+        instr: &'static str,
+        dst: u8,
+        a: SrcOperand,
+        b: SrcOperand,
+    ) -> Result<(), VMError> {
+        let va = self.int_from_operand(a, instr, 1)?;
+        let vb = self.int_from_operand(b, instr, 2)?;
         self.registers.set(dst, Value::Int(va.min(vb)))
     }
 
-    fn op_max(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers.get_int(a, instr)?;
-        let vb = self.registers.get_int(b, instr)?;
+    fn op_max(
+        &mut self,
+        instr: &'static str,
+        dst: u8,
+        a: SrcOperand,
+        b: SrcOperand,
+    ) -> Result<(), VMError> {
+        let va = self.int_from_operand(a, instr, 1)?;
+        let vb = self.int_from_operand(b, instr, 2)?;
         self.registers.set(dst, Value::Int(va.max(vb)))
     }
 
-    fn op_shl(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers.get_int(a, instr)?;
-        let vb = self.registers.get_int(b, instr)?;
+    fn op_shl(
+        &mut self,
+        instr: &'static str,
+        dst: u8,
+        a: SrcOperand,
+        b: SrcOperand,
+    ) -> Result<(), VMError> {
+        let va = self.int_from_operand(a, instr, 1)?;
+        let vb = self.int_from_operand(b, instr, 2)?;
         self.registers
             .set(dst, Value::Int(va.wrapping_shl(vb as u32)))
     }
 
-    fn op_shr(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers.get_int(a, instr)?;
-        let vb = self.registers.get_int(b, instr)?;
+    fn op_shr(
+        &mut self,
+        instr: &'static str,
+        dst: u8,
+        a: SrcOperand,
+        b: SrcOperand,
+    ) -> Result<(), VMError> {
+        let va = self.int_from_operand(a, instr, 1)?;
+        let vb = self.int_from_operand(b, instr, 2)?;
         self.registers
             .set(dst, Value::Int(va.wrapping_shr(vb as u32)))
     }
 
-    fn op_not(&mut self, instr: &'static str, dst: u8, src: u8) -> Result<(), VMError> {
-        let v = self.registers.get_bool(src, instr)?;
+    fn op_not(&mut self, instr: &'static str, dst: u8, src: SrcOperand) -> Result<(), VMError> {
+        let v = self.bool_from_operand(src, instr, 1)?;
         self.registers.set(dst, Value::Bool(!v))
     }
 
-    fn op_and(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers.get_bool(a, instr)?;
-        let vb = self.registers.get_bool(b, instr)?;
+    fn op_and(
+        &mut self,
+        instr: &'static str,
+        dst: u8,
+        a: SrcOperand,
+        b: SrcOperand,
+    ) -> Result<(), VMError> {
+        let va = self.bool_from_operand(a, instr, 1)?;
+        let vb = self.bool_from_operand(b, instr, 2)?;
         self.registers.set(dst, Value::Bool(va && vb))
     }
 
-    fn op_or(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers.get_bool(a, instr)?;
-        let vb = self.registers.get_bool(b, instr)?;
+    fn op_or(
+        &mut self,
+        instr: &'static str,
+        dst: u8,
+        a: SrcOperand,
+        b: SrcOperand,
+    ) -> Result<(), VMError> {
+        let va = self.bool_from_operand(a, instr, 1)?;
+        let vb = self.bool_from_operand(b, instr, 2)?;
         self.registers.set(dst, Value::Bool(va || vb))
     }
 
-    fn op_xor(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers.get_bool(a, instr)?;
-        let vb = self.registers.get_bool(b, instr)?;
+    fn op_xor(
+        &mut self,
+        instr: &'static str,
+        dst: u8,
+        a: SrcOperand,
+        b: SrcOperand,
+    ) -> Result<(), VMError> {
+        let va = self.bool_from_operand(a, instr, 1)?;
+        let vb = self.bool_from_operand(b, instr, 2)?;
         self.registers.set(dst, Value::Bool(va ^ vb))
     }
 
-    fn op_eq(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers.get_int(a, instr)?;
-        let vb = self.registers.get_int(b, instr)?;
-        self.registers.set(dst, Value::Bool(va == vb))
+    fn op_eq(
+        &mut self,
+        _instr: &'static str,
+        dst: u8,
+        a: SrcOperand,
+        b: SrcOperand,
+    ) -> Result<(), VMError> {
+        let va = self.value_from_operand(a)?;
+        let vb = self.value_from_operand(b)?;
+        self.registers.set(dst, Value::equals(va, vb)?)
     }
 
-    fn op_lt(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers.get_int(a, instr)?;
-        let vb = self.registers.get_int(b, instr)?;
+    fn op_lt(
+        &mut self,
+        instr: &'static str,
+        dst: u8,
+        a: SrcOperand,
+        b: SrcOperand,
+    ) -> Result<(), VMError> {
+        let va = self.int_from_operand(a, instr, 1)?;
+        let vb = self.int_from_operand(b, instr, 2)?;
         self.registers.set(dst, Value::Bool(va < vb))
     }
 
-    fn op_gt(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers.get_int(a, instr)?;
-        let vb = self.registers.get_int(b, instr)?;
+    fn op_gt(
+        &mut self,
+        instr: &'static str,
+        dst: u8,
+        a: SrcOperand,
+        b: SrcOperand,
+    ) -> Result<(), VMError> {
+        let va = self.int_from_operand(a, instr, 1)?;
+        let vb = self.int_from_operand(b, instr, 2)?;
         self.registers.set(dst, Value::Bool(va > vb))
     }
 
-    fn op_le(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers.get_int(a, instr)?;
-        let vb = self.registers.get_int(b, instr)?;
+    fn op_le(
+        &mut self,
+        instr: &'static str,
+        dst: u8,
+        a: SrcOperand,
+        b: SrcOperand,
+    ) -> Result<(), VMError> {
+        let va = self.int_from_operand(a, instr, 1)?;
+        let vb = self.int_from_operand(b, instr, 2)?;
         self.registers.set(dst, Value::Bool(va <= vb))
     }
 
-    fn op_ge(&mut self, instr: &'static str, dst: u8, a: u8, b: u8) -> Result<(), VMError> {
-        let va = self.registers.get_int(a, instr)?;
-        let vb = self.registers.get_int(b, instr)?;
+    fn op_ge(
+        &mut self,
+        instr: &'static str,
+        dst: u8,
+        a: SrcOperand,
+        b: SrcOperand,
+    ) -> Result<(), VMError> {
+        let va = self.int_from_operand(a, instr, 1)?;
+        let vb = self.int_from_operand(b, instr, 2)?;
         self.registers.set(dst, Value::Bool(va >= vb))
-    }
-
-    fn op_addi(&mut self, instr: &'static str, dst: u8, src: u8, imm: i64) -> Result<(), VMError> {
-        let v = self.registers.get_int(src, instr)?;
-        self.registers.set(dst, Value::Int(v.wrapping_add(imm)))
-    }
-
-    fn op_subi(&mut self, instr: &'static str, dst: u8, src: u8, imm: i64) -> Result<(), VMError> {
-        let v = self.registers.get_int(src, instr)?;
-        self.registers.set(dst, Value::Int(v.wrapping_sub(imm)))
-    }
-
-    fn op_muli(&mut self, instr: &'static str, dst: u8, src: u8, imm: i64) -> Result<(), VMError> {
-        let v = self.registers.get_int(src, instr)?;
-        self.registers.set(dst, Value::Int(v.wrapping_mul(imm)))
-    }
-
-    fn op_shli(&mut self, instr: &'static str, dst: u8, src: u8, imm: i64) -> Result<(), VMError> {
-        let v = self.registers.get_int(src, instr)?;
-        self.registers
-            .set(dst, Value::Int(v.wrapping_shl(imm as u32)))
-    }
-
-    fn op_shri(&mut self, instr: &'static str, dst: u8, src: u8, imm: i64) -> Result<(), VMError> {
-        let v = self.registers.get_int(src, instr)?;
-        self.registers
-            .set(dst, Value::Int(v.wrapping_shr(imm as u32)))
-    }
-
-    fn op_andi(&mut self, instr: &'static str, dst: u8, src: u8, imm: i64) -> Result<(), VMError> {
-        let v = self.registers.get_bool(src, instr)?;
-        self.registers.set(dst, Value::Bool(v && imm != 0))
-    }
-
-    fn op_ori(&mut self, instr: &'static str, dst: u8, src: u8, imm: i64) -> Result<(), VMError> {
-        let v = self.registers.get_bool(src, instr)?;
-        self.registers.set(dst, Value::Bool(v || imm != 0))
-    }
-
-    fn op_xori(&mut self, instr: &'static str, dst: u8, src: u8, imm: i64) -> Result<(), VMError> {
-        let v = self.registers.get_bool(src, instr)?;
-        self.registers.set(dst, Value::Bool(v ^ (imm != 0)))
-    }
-
-    fn op_eqi(&mut self, instr: &'static str, dst: u8, src: u8, imm: i64) -> Result<(), VMError> {
-        let v = self.registers.get_int(src, instr)?;
-        self.registers.set(dst, Value::Bool(v == imm))
-    }
-
-    fn op_lti(&mut self, instr: &'static str, dst: u8, src: u8, imm: i64) -> Result<(), VMError> {
-        let v = self.registers.get_int(src, instr)?;
-        self.registers.set(dst, Value::Bool(v < imm))
-    }
-
-    fn op_lei(&mut self, instr: &'static str, dst: u8, src: u8, imm: i64) -> Result<(), VMError> {
-        let v = self.registers.get_int(src, instr)?;
-        self.registers.set(dst, Value::Bool(v <= imm))
-    }
-
-    fn op_gti(&mut self, instr: &'static str, dst: u8, src: u8, imm: i64) -> Result<(), VMError> {
-        let v = self.registers.get_int(src, instr)?;
-        self.registers.set(dst, Value::Bool(v > imm))
-    }
-
-    fn op_gei(&mut self, instr: &'static str, dst: u8, src: u8, imm: i64) -> Result<(), VMError> {
-        let v = self.registers.get_int(src, instr)?;
-        self.registers.set(dst, Value::Bool(v >= imm))
     }
 
     fn op_call_host(
@@ -1687,13 +1850,14 @@ impl VM {
     fn op_beq(
         &mut self,
         instr: &'static str,
-        rs1: u8,
-        rs2: u8,
+        rs1: SrcOperand,
+        rs2: SrcOperand,
         offset: i64,
     ) -> Result<(), VMError> {
-        let a = self.registers.get_int(rs1, instr)?;
-        let b = self.registers.get_int(rs2, instr)?;
-        if a == b {
+        let va = self.value_from_operand(rs1)?;
+        let vb = self.value_from_operand(rs2)?;
+
+        if Value::equals(va, vb)? == Value::Bool(true) {
             self.op_jump(instr, offset)?;
         }
         Ok(())
@@ -1702,13 +1866,14 @@ impl VM {
     fn op_bne(
         &mut self,
         instr: &'static str,
-        rs1: u8,
-        rs2: u8,
+        rs1: SrcOperand,
+        rs2: SrcOperand,
         offset: i64,
     ) -> Result<(), VMError> {
-        let a = self.registers.get_int(rs1, instr)?;
-        let b = self.registers.get_int(rs2, instr)?;
-        if a != b {
+        let va = self.value_from_operand(rs1)?;
+        let vb = self.value_from_operand(rs2)?;
+
+        if Value::equals(va, vb)? != Value::Bool(true) {
             self.op_jump(instr, offset)?;
         }
         Ok(())
@@ -1717,12 +1882,12 @@ impl VM {
     fn op_blt(
         &mut self,
         instr: &'static str,
-        rs1: u8,
-        rs2: u8,
+        rs1: SrcOperand,
+        rs2: SrcOperand,
         offset: i64,
     ) -> Result<(), VMError> {
-        let a = self.registers.get_int(rs1, instr)?;
-        let b = self.registers.get_int(rs2, instr)?;
+        let a = self.int_from_operand(rs1, instr, 1)?;
+        let b = self.int_from_operand(rs2, instr, 2)?;
         if a < b {
             self.op_jump(instr, offset)?;
         }
@@ -1732,12 +1897,12 @@ impl VM {
     fn op_bge(
         &mut self,
         instr: &'static str,
-        rs1: u8,
-        rs2: u8,
+        rs1: SrcOperand,
+        rs2: SrcOperand,
         offset: i64,
     ) -> Result<(), VMError> {
-        let a = self.registers.get_int(rs1, instr)?;
-        let b = self.registers.get_int(rs2, instr)?;
+        let a = self.int_from_operand(rs1, instr, 1)?;
+        let b = self.int_from_operand(rs2, instr, 2)?;
         if a >= b {
             self.op_jump(instr, offset)?;
         }
@@ -1747,12 +1912,12 @@ impl VM {
     fn op_bltu(
         &mut self,
         instr: &'static str,
-        rs1: u8,
-        rs2: u8,
+        rs1: SrcOperand,
+        rs2: SrcOperand,
         offset: i64,
     ) -> Result<(), VMError> {
-        let a = self.registers.get_int(rs1, instr)? as u64;
-        let b = self.registers.get_int(rs2, instr)? as u64;
+        let a = self.int_from_operand(rs1, instr, 1)? as u64;
+        let b = self.int_from_operand(rs2, instr, 1)? as u64;
         if a < b {
             self.op_jump(instr, offset)?;
         }
@@ -1762,99 +1927,13 @@ impl VM {
     fn op_bgeu(
         &mut self,
         instr: &'static str,
-        rs1: u8,
-        rs2: u8,
+        rs1: SrcOperand,
+        rs2: SrcOperand,
         offset: i64,
     ) -> Result<(), VMError> {
-        let a = self.registers.get_int(rs1, instr)? as u64;
-        let b = self.registers.get_int(rs2, instr)? as u64;
+        let a = self.int_from_operand(rs1, instr, 1)? as u64;
+        let b = self.int_from_operand(rs2, instr, 1)? as u64;
         if a >= b {
-            self.op_jump(instr, offset)?;
-        }
-        Ok(())
-    }
-
-    fn op_beqi(
-        &mut self,
-        instr: &'static str,
-        rs: u8,
-        imm: i64,
-        offset: i64,
-    ) -> Result<(), VMError> {
-        let v = self.registers.get_int(rs, instr)?;
-        if v == imm {
-            self.op_jump(instr, offset)?;
-        }
-        Ok(())
-    }
-
-    fn op_bnei(
-        &mut self,
-        instr: &'static str,
-        rs: u8,
-        imm: i64,
-        offset: i64,
-    ) -> Result<(), VMError> {
-        let v = self.registers.get_int(rs, instr)?;
-        if v != imm {
-            self.op_jump(instr, offset)?;
-        }
-        Ok(())
-    }
-
-    fn op_blti(
-        &mut self,
-        instr: &'static str,
-        rs: u8,
-        imm: i64,
-        offset: i64,
-    ) -> Result<(), VMError> {
-        let v = self.registers.get_int(rs, instr)?;
-        if v < imm {
-            self.op_jump(instr, offset)?;
-        }
-        Ok(())
-    }
-
-    fn op_bgei(
-        &mut self,
-        instr: &'static str,
-        rs: u8,
-        imm: i64,
-        offset: i64,
-    ) -> Result<(), VMError> {
-        let v = self.registers.get_int(rs, instr)?;
-        if v >= imm {
-            self.op_jump(instr, offset)?;
-        }
-        Ok(())
-    }
-
-    fn op_bltui(
-        &mut self,
-        instr: &'static str,
-        rs: u8,
-        imm: i64,
-        offset: i64,
-    ) -> Result<(), VMError> {
-        let v = self.registers.get_int(rs, instr)? as u64;
-        let imm = imm as u64;
-        if v < imm {
-            self.op_jump(instr, offset)?;
-        }
-        Ok(())
-    }
-
-    fn op_bgeui(
-        &mut self,
-        instr: &'static str,
-        rs: u8,
-        imm: i64,
-        offset: i64,
-    ) -> Result<(), VMError> {
-        let v = self.registers.get_int(rs, instr)? as u64;
-        let imm = imm as u64;
-        if v >= imm {
             self.op_jump(instr, offset)?;
         }
         Ok(())
@@ -1913,6 +1992,7 @@ mod tests {
             let mut vm = Self {
                 data,
                 ip: 0,
+                instr_offset: 0,
                 registers: Registers::new(),
                 heap: Heap::new(program.items),
                 call_stack: Vec::new(),
@@ -1976,27 +2056,27 @@ mod tests {
 
     #[test]
     fn load_i64() {
-        assert_eq!(run_and_get_int("LOAD_I64 r0, 42", 0), 42);
-        assert_eq!(run_and_get_int("LOAD_I64 r0, -1", 0), -1);
-        assert_eq!(run_and_get_int("LOAD_I64 r0, 0", 0), 0);
+        assert_eq!(run_and_get_int("MOVE r0, 42", 0), 42);
+        assert_eq!(run_and_get_int("MOVE r0, -1", 0), -1);
+        assert_eq!(run_and_get_int("MOVE r0, 0", 0), 0);
     }
 
     #[test]
     fn load_bool() {
-        assert!(run_and_get_bool("LOAD_BOOL r0, true", 0));
-        assert!(!run_and_get_bool("LOAD_BOOL r0, false", 0));
+        assert!(run_and_get_bool("MOVE r0, true", 0));
+        assert!(!run_and_get_bool("MOVE r0, false", 0));
     }
 
     #[test]
     fn load_str() {
-        let vm = run_vm(r#"LOAD_STR r0, "hello""#);
+        let vm = run_vm(r#"MOVE r0, "hello""#);
         let ref_id = vm.registers.get_ref(0, "").unwrap();
         assert_eq!(vm.heap.get_string(ref_id).unwrap(), "hello");
     }
 
     #[test]
     fn load_hash() {
-        let vm = run_vm(r#"LOAD_HASH r0, "00000000000000000000000000000000""#);
+        let vm = run_vm(r#"MOVE r0, "00000000000000000000000000000000""#);
         let ref_id = vm.registers.get_ref(0, "").unwrap();
         let expected = Hash::from_slice(b"00000000000000000000000000000000").unwrap();
         assert_eq!(vm.heap.get_hash(ref_id).unwrap(), expected);
@@ -2006,31 +2086,25 @@ mod tests {
 
     #[test]
     fn move_int() {
-        assert_eq!(run_and_get_int("LOAD_I64 r0, 99\nMOVE r1, r0", 1), 99);
+        assert_eq!(run_and_get_int("MOVE r0, 99\nMOVE r1, r0", 1), 99);
     }
 
     #[test]
     fn move_bool() {
-        assert!(run_and_get_bool("LOAD_BOOL r0, true\nMOVE r1, r0", 1));
+        assert!(run_and_get_bool("MOVE r0, true\nMOVE r1, r0", 1));
     }
 
     #[test]
     fn i64_to_bool() {
-        assert!(run_and_get_bool("LOAD_I64 r0, 1\nI64_TO_BOOL r1, r0", 1));
-        assert!(run_and_get_bool("LOAD_I64 r0, -5\nI64_TO_BOOL r1, r0", 1));
-        assert!(!run_and_get_bool("LOAD_I64 r0, 0\nI64_TO_BOOL r1, r0", 1));
+        assert!(run_and_get_bool("MOVE r0, 1\nI64_TO_BOOL r1, r0", 1));
+        assert!(run_and_get_bool("MOVE r0, -5\nI64_TO_BOOL r1, r0", 1));
+        assert!(!run_and_get_bool("MOVE r0, 0\nI64_TO_BOOL r1, r0", 1));
     }
 
     #[test]
     fn bool_to_i64() {
-        assert_eq!(
-            run_and_get_int("LOAD_BOOL r0, true\nBOOL_TO_I64 r1, r0", 1),
-            1
-        );
-        assert_eq!(
-            run_and_get_int("LOAD_BOOL r0, false\nBOOL_TO_I64 r1, r0", 1),
-            0
-        );
+        assert_eq!(run_and_get_int("MOVE r0, true\nBOOL_TO_I64 r1, r0", 1), 1);
+        assert_eq!(run_and_get_int("MOVE r0, false\nBOOL_TO_I64 r1, r0", 1), 0);
     }
 
     #[test]
@@ -2038,7 +2112,7 @@ mod tests {
         assert_eq!(
             run_and_get_int(
                 r#"
-                LOAD_STR r0, "12345"
+                MOVE r0, "12345"
                 STR_TO_I64 r1, r0
             "#,
                 1
@@ -2048,7 +2122,7 @@ mod tests {
         assert_eq!(
             run_and_get_int(
                 r#"
-                LOAD_STR r0, "-7"
+                MOVE r0, "-7"
                 STR_TO_I64 r1, r0
             "#,
                 1
@@ -2062,7 +2136,7 @@ mod tests {
         assert!(matches!(
             run_expect_err(
                 r#"
-                LOAD_STR r0, "abc"
+                MOVE r0, "abc"
                 STR_TO_I64 r1, r0
             "#
             ),
@@ -2073,27 +2147,24 @@ mod tests {
     #[test]
     fn i64_to_str_round_trips() {
         assert_eq!(
-            run_and_get_int("LOAD_I64 r0, -99\nI64_TO_STR r1, r0\nSTR_TO_I64 r2, r1", 2),
+            run_and_get_int("MOVE r0, -99\nI64_TO_STR r1, r0\nSTR_TO_I64 r2, r1", 2),
             -99
         );
-        assert_eq!(
-            run_and_get_str("LOAD_I64 r0, -99\nI64_TO_STR r1, r0", 1),
-            "-99"
-        );
+        assert_eq!(run_and_get_str("MOVE r0, -99\nI64_TO_STR r1, r0", 1), "-99");
     }
 
     #[test]
     fn str_to_bool_accepts_true_and_false() {
         assert!(run_and_get_bool(
             r#"
-            LOAD_STR r0, "true"
+            MOVE r0, "true"
             STR_TO_BOOL r1, r0
             "#,
             1
         ));
         assert!(!run_and_get_bool(
             r#"
-            LOAD_STR r0, "false"
+            MOVE r0, "false"
             STR_TO_BOOL r1, r0
             "#,
             1
@@ -2105,7 +2176,7 @@ mod tests {
         assert!(matches!(
             run_expect_err(
                 r#"
-                LOAD_STR r0, "notabool"
+                MOVE r0, "notabool"
                 STR_TO_BOOL r1, r0
             "#
             ),
@@ -2119,15 +2190,15 @@ mod tests {
     #[test]
     fn bool_to_str_round_trips() {
         assert_eq!(
-            run_and_get_str("LOAD_BOOL r0, true\nBOOL_TO_STR r1, r0", 1),
+            run_and_get_str("MOVE r0, true\nBOOL_TO_STR r1, r0", 1),
             "true"
         );
         assert!(run_and_get_bool(
-            "LOAD_BOOL r0, true\nBOOL_TO_STR r1, r0\nSTR_TO_BOOL r2, r1",
+            "MOVE r0, true\nBOOL_TO_STR r1, r0\nSTR_TO_BOOL r2, r1",
             2
         ));
         assert!(!run_and_get_bool(
-            "LOAD_BOOL r0, false\nBOOL_TO_STR r1, r0\nSTR_TO_BOOL r2, r1",
+            "MOVE r0, false\nBOOL_TO_STR r1, r0\nSTR_TO_BOOL r2, r1",
             2
         ));
     }
@@ -2137,21 +2208,21 @@ mod tests {
     #[test]
     fn add() {
         assert_eq!(
-            run_and_get_int("LOAD_I64 r0, 10\nLOAD_I64 r1, 32\nADD r2, r0, r1", 2),
+            run_and_get_int("MOVE r0, 10\nMOVE r1, 32\nADD r2, r0, r1", 2),
             42
         );
     }
 
     #[test]
     fn add_wrapping() {
-        let source = "LOAD_I64 r0, 9223372036854775807\nLOAD_I64 r1, 1\nADD r2, r0, r1";
+        let source = "MOVE r0, 9223372036854775807\nMOVE r1, 1\nADD r2, r0, r1";
         assert_eq!(run_and_get_int(source, 2), i64::MIN);
     }
 
     #[test]
     fn sub() {
         assert_eq!(
-            run_and_get_int("LOAD_I64 r0, 50\nLOAD_I64 r1, 8\nSUB r2, r0, r1", 2),
+            run_and_get_int("MOVE r0, 50\nMOVE r1, 8\nSUB r2, r0, r1", 2),
             42
         );
     }
@@ -2159,7 +2230,7 @@ mod tests {
     #[test]
     fn mul() {
         assert_eq!(
-            run_and_get_int("LOAD_I64 r0, 6\nLOAD_I64 r1, 7\nMUL r2, r0, r1", 2),
+            run_and_get_int("MOVE r0, 6\nMOVE r1, 7\nMUL r2, r0, r1", 2),
             42
         );
     }
@@ -2167,7 +2238,7 @@ mod tests {
     #[test]
     fn div() {
         assert_eq!(
-            run_and_get_int("LOAD_I64 r0, 84\nLOAD_I64 r1, 2\nDIV r2, r0, r1", 2),
+            run_and_get_int("MOVE r0, 84\nMOVE r1, 2\nDIV r2, r0, r1", 2),
             42
         );
     }
@@ -2175,7 +2246,7 @@ mod tests {
     #[test]
     fn div_by_zero() {
         assert!(matches!(
-            run_expect_err("LOAD_I64 r0, 1\nLOAD_I64 r1, 0\nDIV r2, r0, r1"),
+            run_expect_err("MOVE r0, 1\nMOVE r1, 0\nDIV r2, r0, r1"),
             VMError::DivisionByZero
         ));
     }
@@ -2183,7 +2254,7 @@ mod tests {
     #[test]
     fn modulo() {
         assert_eq!(
-            run_and_get_int("LOAD_I64 r0, 47\nLOAD_I64 r1, 5\nMOD r2, r0, r1", 2),
+            run_and_get_int("MOVE r0, 47\nMOVE r1, 5\nMOD r2, r0, r1", 2),
             2
         );
     }
@@ -2191,26 +2262,26 @@ mod tests {
     #[test]
     fn mod_by_zero() {
         assert!(matches!(
-            run_expect_err("LOAD_I64 r0, 1\nLOAD_I64 r1, 0\nMOD r2, r0, r1"),
+            run_expect_err("MOVE r0, 1\nMOVE r1, 0\nMOD r2, r0, r1"),
             VMError::DivisionByZero
         ));
     }
 
     #[test]
     fn neg() {
-        assert_eq!(run_and_get_int("LOAD_I64 r0, 42\nNEG r1, r0", 1), -42);
+        assert_eq!(run_and_get_int("MOVE r0, 42\nNEG r1, r0", 1), -42);
     }
 
     #[test]
     fn abs() {
-        assert_eq!(run_and_get_int("LOAD_I64 r0, -42\nABS r1, r0", 1), 42);
-        assert_eq!(run_and_get_int("LOAD_I64 r0, 42\nABS r1, r0", 1), 42);
+        assert_eq!(run_and_get_int("MOVE r0, -42\nABS r1, r0", 1), 42);
+        assert_eq!(run_and_get_int("MOVE r0, 42\nABS r1, r0", 1), 42);
     }
 
     #[test]
     fn min() {
         assert_eq!(
-            run_and_get_int("LOAD_I64 r0, 10\nLOAD_I64 r1, 5\nMIN r2, r0, r1", 2),
+            run_and_get_int("MOVE r0, 10\nMOVE r1, 5\nMIN r2, r0, r1", 2),
             5
         );
     }
@@ -2218,7 +2289,7 @@ mod tests {
     #[test]
     fn max() {
         assert_eq!(
-            run_and_get_int("LOAD_I64 r0, 10\nLOAD_I64 r1, 5\nMAX r2, r0, r1", 2),
+            run_and_get_int("MOVE r0, 10\nMOVE r1, 5\nMAX r2, r0, r1", 2),
             10
         );
     }
@@ -2226,7 +2297,7 @@ mod tests {
     #[test]
     fn shl() {
         assert_eq!(
-            run_and_get_int("LOAD_I64 r0, 1\nLOAD_I64 r1, 4\nSHL r2, r0, r1", 2),
+            run_and_get_int("MOVE r0, 1\nMOVE r1, 4\nSHL r2, r0, r1", 2),
             16
         );
     }
@@ -2234,96 +2305,96 @@ mod tests {
     #[test]
     fn shr() {
         assert_eq!(
-            run_and_get_int("LOAD_I64 r0, 16\nLOAD_I64 r1, 2\nSHR r2, r0, r1", 2),
+            run_and_get_int("MOVE r0, 16\nMOVE r1, 2\nSHR r2, r0, r1", 2),
             4
         );
         // Arithmetic shift preserves sign
         assert_eq!(
-            run_and_get_int("LOAD_I64 r0, -16\nLOAD_I64 r1, 2\nSHR r2, r0, r1", 2),
+            run_and_get_int("MOVE r0, -16\nMOVE r1, 2\nSHR r2, r0, r1", 2),
             -4
         );
     }
 
     #[test]
     fn immediate_arithmetic_and_logic() {
-        assert_eq!(run_and_get_int("LOAD_I64 r0, 5\nADDI r1, r0, -2", 1), 3);
-        assert_eq!(run_and_get_int("LOAD_I64 r0, 10\nSUBI r1, r0, 4", 1), 6);
-        assert_eq!(run_and_get_int("LOAD_I64 r0, 6\nMULI r1, r0, 7", 1), 42);
-        assert_eq!(run_and_get_int("LOAD_I64 r0, 1\nSHLI r1, r0, 3", 1), 8);
-        assert_eq!(run_and_get_int("LOAD_I64 r0, 16\nSHRI r1, r0, 2", 1), 4);
-        assert!(run_and_get_bool("LOAD_BOOL r0, true\nANDI r1, r0, 1", 1));
-        assert!(run_and_get_bool("LOAD_BOOL r0, false\nORI r1, r0, 1", 1));
-        assert!(!run_and_get_bool("LOAD_BOOL r0, true\nXORI r1, r0, 1", 1));
+        assert_eq!(run_and_get_int("MOVE r0, 5\nADD r1, r0, -2", 1), 3);
+        assert_eq!(run_and_get_int("MOVE r0, 10\nSUB r1, r0, 4", 1), 6);
+        assert_eq!(run_and_get_int("MOVE r0, 6\nMUL r1, r0, 7", 1), 42);
+        assert_eq!(run_and_get_int("MOVE r0, 1\nSHL r1, r0, 3", 1), 8);
+        assert_eq!(run_and_get_int("MOVE r0, 16\nSHR r1, r0, 2", 1), 4);
+        assert!(run_and_get_bool("MOVE r0, true\nAND r1, r0, true", 1));
+        assert!(run_and_get_bool("MOVE r0, false\nOR r1, r0, true", 1));
+        assert!(!run_and_get_bool("MOVE r0, true\nXOR r1, r0, true", 1));
     }
 
     #[test]
     fn immediate_comparisons() {
-        assert!(run_and_get_bool("LOAD_I64 r0, 7\nEQI r1, r0, 7", 1));
-        assert!(run_and_get_bool("LOAD_I64 r0, 7\nLTI r1, r0, 10", 1));
-        assert!(run_and_get_bool("LOAD_I64 r0, 7\nGEI r1, r0, 7", 1));
-        assert!(run_and_get_bool("LOAD_I64 r0, 7\nLEI r1, r0, 7", 1));
-        assert!(run_and_get_bool("LOAD_I64 r0, 7\nGTI r1, r0, 5", 1));
+        assert!(run_and_get_bool("MOVE r0, 7\nEQ r1, r0, 7", 1));
+        assert!(run_and_get_bool("MOVE r0, 7\nLT r1, r0, 10", 1));
+        assert!(run_and_get_bool("MOVE r0, 7\nGE r1, r0, 7", 1));
+        assert!(run_and_get_bool("MOVE r0, 7\nLE r1, r0, 7", 1));
+        assert!(run_and_get_bool("MOVE r0, 7\nGT r1, r0, 5", 1));
     }
 
     #[test]
     fn immediate_branches() {
         let source = r#"
-LOAD_I64 r0, 0
-BEQI r0, 0, target
-LOAD_I64 r1, 1
+MOVE r0, 0
+BEQ r0, 0, target
+MOVE r1, 1
 HALT
 target:
-LOAD_I64 r1, 42
+MOVE r1, 42
 "#;
         assert_eq!(run_and_get_int(source, 1), 42);
 
         let source = r#"
-LOAD_I64 r0, 5
-BNEI r0, 5, target
-LOAD_I64 r1, 99
+MOVE r0, 5
+BNE r0, 5, target
+MOVE r1, 99
 HALT
 target:
-LOAD_I64 r1, 1
+MOVE r1, 1
 "#;
         assert_eq!(run_and_get_int(source, 1), 99);
 
         let source = r#"
-LOAD_I64 r0, 3
-BLTI r0, 5, target
-LOAD_I64 r1, 0
+MOVE r0, 3
+BLT r0, 5, target
+MOVE r1, 0
 HALT
 target:
-LOAD_I64 r1, 77
+MOVE r1, 77
 "#;
         assert_eq!(run_and_get_int(source, 1), 77);
 
         let source = r#"
-LOAD_I64 r0, -1
-BGEUI r0, 0, target
-LOAD_I64 r1, 0
+MOVE r0, -1
+BGEU r0, 0, target
+MOVE r1, 0
 HALT
 target:
-LOAD_I64 r1, 123
+MOVE r1, 123
 "#;
         assert_eq!(run_and_get_int(source, 1), 123);
 
         let source = r#"
-LOAD_I64 r0, -5
-BGEI r0, -10, target
-LOAD_I64 r1, 0
+MOVE r0, -5
+BGE r0, -10, target
+MOVE r1, 0
 HALT
 target:
-LOAD_I64 r1, 9
+MOVE r1, 9
 "#;
         assert_eq!(run_and_get_int(source, 1), 9);
 
         let source = r#"
-LOAD_I64 r0, 1
-BLTUI r0, 5, target
-LOAD_I64 r1, 0
+MOVE r0, 1
+BLTU r0, 5, target
+MOVE r1, 0
 HALT
 target:
-LOAD_I64 r1, 11
+MOVE r1, 11
 "#;
         assert_eq!(run_and_get_int(source, 1), 11);
     }
@@ -2332,18 +2403,18 @@ LOAD_I64 r1, 11
 
     #[test]
     fn not() {
-        assert!(!run_and_get_bool("LOAD_BOOL r0, true\nNOT r1, r0", 1));
-        assert!(run_and_get_bool("LOAD_BOOL r0, false\nNOT r1, r0", 1));
+        assert!(!run_and_get_bool("MOVE r0, true\nNOT r1, r0", 1));
+        assert!(run_and_get_bool("MOVE r0, false\nNOT r1, r0", 1));
     }
 
     #[test]
     fn and() {
         assert!(run_and_get_bool(
-            "LOAD_BOOL r0, true\nLOAD_BOOL r1, true\nAND r2, r0, r1",
+            "MOVE r0, true\nMOVE r1, true\nAND r2, r0, r1",
             2
         ));
         assert!(!run_and_get_bool(
-            "LOAD_BOOL r0, true\nLOAD_BOOL r1, false\nAND r2, r0, r1",
+            "MOVE r0, true\nMOVE r1, false\nAND r2, r0, r1",
             2
         ));
     }
@@ -2351,11 +2422,11 @@ LOAD_I64 r1, 11
     #[test]
     fn or() {
         assert!(run_and_get_bool(
-            "LOAD_BOOL r0, false\nLOAD_BOOL r1, true\nOR r2, r0, r1",
+            "MOVE r0, false\nMOVE r1, true\nOR r2, r0, r1",
             2
         ));
         assert!(!run_and_get_bool(
-            "LOAD_BOOL r0, false\nLOAD_BOOL r1, false\nOR r2, r0, r1",
+            "MOVE r0, false\nMOVE r1, false\nOR r2, r0, r1",
             2
         ));
     }
@@ -2363,11 +2434,11 @@ LOAD_I64 r1, 11
     #[test]
     fn xor() {
         assert!(run_and_get_bool(
-            "LOAD_BOOL r0, true\nLOAD_BOOL r1, false\nXOR r2, r0, r1",
+            "MOVE r0, true\nMOVE r1, false\nXOR r2, r0, r1",
             2
         ));
         assert!(!run_and_get_bool(
-            "LOAD_BOOL r0, true\nLOAD_BOOL r1, true\nXOR r2, r0, r1",
+            "MOVE r0, true\nMOVE r1, true\nXOR r2, r0, r1",
             2
         ));
     }
@@ -2376,40 +2447,28 @@ LOAD_I64 r1, 11
 
     #[test]
     fn eq() {
-        assert!(run_and_get_bool(
-            "LOAD_I64 r0, 5\nLOAD_I64 r1, 5\nEQ r2, r0, r1",
-            2
-        ));
+        assert!(run_and_get_bool("MOVE r0, 5\nMOVE r1, 5\nEQ r2, r0, r1", 2));
         assert!(!run_and_get_bool(
-            "LOAD_I64 r0, 5\nLOAD_I64 r1, 6\nEQ r2, r0, r1",
+            "MOVE r0, 5\nMOVE r1, 6\nEQ r2, r0, r1",
             2
         ));
     }
 
     #[test]
     fn lt() {
-        assert!(run_and_get_bool(
-            "LOAD_I64 r0, 3\nLOAD_I64 r1, 5\nLT r2, r0, r1",
-            2
-        ));
+        assert!(run_and_get_bool("MOVE r0, 3\nMOVE r1, 5\nLT r2, r0, r1", 2));
         assert!(!run_and_get_bool(
-            "LOAD_I64 r0, 5\nLOAD_I64 r1, 3\nLT r2, r0, r1",
+            "MOVE r0, 5\nMOVE r1, 3\nLT r2, r0, r1",
             2
         ));
     }
 
     #[test]
     fn le() {
-        assert!(run_and_get_bool(
-            "LOAD_I64 r0, 3\nLOAD_I64 r1, 5\nLE r2, r0, r1",
-            2
-        ));
-        assert!(run_and_get_bool(
-            "LOAD_I64 r0, 5\nLOAD_I64 r1, 5\nLE r2, r0, r1",
-            2
-        ));
+        assert!(run_and_get_bool("MOVE r0, 3\nMOVE r1, 5\nLE r2, r0, r1", 2));
+        assert!(run_and_get_bool("MOVE r0, 5\nMOVE r1, 5\nLE r2, r0, r1", 2));
         assert!(!run_and_get_bool(
-            "LOAD_I64 r0, 6\nLOAD_I64 r1, 5\nLE r2, r0, r1",
+            "MOVE r0, 6\nMOVE r1, 5\nLE r2, r0, r1",
             2
         ));
     }
@@ -2417,11 +2476,11 @@ LOAD_I64 r1, 11
     #[test]
     fn gt() {
         assert!(run_and_get_bool(
-            "LOAD_I64 r0, 10\nLOAD_I64 r1, 5\nGT r2, r0, r1",
+            "MOVE r0, 10\nMOVE r1, 5\nGT r2, r0, r1",
             2
         ));
         assert!(!run_and_get_bool(
-            "LOAD_I64 r0, 5\nLOAD_I64 r1, 10\nGT r2, r0, r1",
+            "MOVE r0, 5\nMOVE r1, 10\nGT r2, r0, r1",
             2
         ));
     }
@@ -2429,15 +2488,12 @@ LOAD_I64 r1, 11
     #[test]
     fn ge() {
         assert!(run_and_get_bool(
-            "LOAD_I64 r0, 10\nLOAD_I64 r1, 5\nGE r2, r0, r1",
+            "MOVE r0, 10\nMOVE r1, 5\nGE r2, r0, r1",
             2
         ));
-        assert!(run_and_get_bool(
-            "LOAD_I64 r0, 5\nLOAD_I64 r1, 5\nGE r2, r0, r1",
-            2
-        ));
+        assert!(run_and_get_bool("MOVE r0, 5\nMOVE r1, 5\nGE r2, r0, r1", 2));
         assert!(!run_and_get_bool(
-            "LOAD_I64 r0, 4\nLOAD_I64 r1, 5\nGE r2, r0, r1",
+            "MOVE r0, 4\nMOVE r1, 5\nGE r2, r0, r1",
             2
         ));
     }
@@ -2446,7 +2502,7 @@ LOAD_I64 r1, 11
 
     #[test]
     fn type_mismatch_int_for_bool() {
-        let source = "LOAD_I64 r0, 1\nNOT r1, r0";
+        let source = "MOVE r0, 1\nNOT r1, r0";
         assert!(matches!(
             run_expect_err(source),
             VMError::TypeMismatchStatic { .. }
@@ -2455,7 +2511,7 @@ LOAD_I64 r1, 11
 
     #[test]
     fn type_mismatch_bool_for_int() {
-        let source = "LOAD_BOOL r0, true\nLOAD_BOOL r1, true\nADD r2, r0, r1";
+        let source = "MOVE r0, true\nMOVE r1, true\nADD r2, r0, r1";
         assert!(matches!(
             run_expect_err(source),
             VMError::TypeMismatchStatic { .. }
@@ -2527,8 +2583,8 @@ LOAD_I64 r1, 11
     fn vm_respects_custom_max_gas() {
         let program = assemble_source(
             r#"
-            LOAD_I64 r0, 1
-            LOAD_I64 r1, 2
+            MOVE r0, 1
+            MOVE r1, 2
             ADD r2, r0, r1
             ADD r2, r1, r2
         "#,
@@ -2560,8 +2616,8 @@ LOAD_I64 r1, 11
     #[test]
     fn store_i64() {
         let state = run_vm_with_state(
-            r#"LOAD_STR r0, "counter"
-LOAD_I64 r1, 42
+            r#"MOVE r0, "counter"
+MOVE r1, 42
 STORE_I64 r0, r1"#,
         );
         let key = make_test_key(b"counter").unwrap();
@@ -2572,8 +2628,8 @@ STORE_I64 r0, r1"#,
     #[test]
     fn store_str() {
         let state = run_vm_with_state(
-            r#"LOAD_STR r0, "name"
-LOAD_STR r1, "alice"
+            r#"MOVE r0, "name"
+MOVE r1, "alice"
 STORE_STR r0, r1"#,
         );
         let key = make_test_key(b"name").unwrap();
@@ -2584,8 +2640,8 @@ STORE_STR r0, r1"#,
     #[test]
     fn store_hash() {
         let state = run_vm_with_state(
-            r#"LOAD_STR r0, "hash_key"
-LOAD_HASH r1, "00000000000000000000000000000000"
+            r#"MOVE r0, "hash_key"
+MOVE r1, "00000000000000000000000000000000"
 STORE_HASH r0, r1"#,
         );
         let key = make_test_key(b"hash_key").unwrap();
@@ -2597,8 +2653,8 @@ STORE_HASH r0, r1"#,
     #[test]
     fn store_bool() {
         let state = run_vm_with_state(
-            r#"LOAD_STR r0, "flag"
-LOAD_BOOL r1, true
+            r#"MOVE r0, "flag"
+MOVE r1, true
 STORE_BOOL r0, r1"#,
         );
         let key = make_test_key(b"flag").unwrap();
@@ -2609,10 +2665,10 @@ STORE_BOOL r0, r1"#,
     #[test]
     fn store_overwrites_previous_value() {
         let state = run_vm_with_state(
-            r#"LOAD_STR r0, "x"
-LOAD_I64 r1, 100
+            r#"MOVE r0, "x"
+MOVE r1, 100
 STORE_I64 r0, r1
-LOAD_I64 r2, 200
+MOVE r2, 200
 STORE_I64 r0, r2"#,
         );
         let key = make_test_key(b"x").unwrap();
@@ -2634,7 +2690,7 @@ STORE_I64 r0, r2"#,
         let key = make_test_key(b"counter").unwrap();
         let mut state = TestState::with_data(vec![(key, 42i64.to_le_bytes().to_vec())]);
         let vm = run_vm_on_state(
-            r#"LOAD_STR r0, "counter"
+            r#"MOVE r0, "counter"
 LOAD_I64_STATE r1, r0"#,
             &mut state,
         );
@@ -2646,7 +2702,7 @@ LOAD_I64_STATE r1, r0"#,
         let key = make_test_key(b"neg").unwrap();
         let mut state = TestState::with_data(vec![(key, (-999i64).to_le_bytes().to_vec())]);
         let vm = run_vm_on_state(
-            r#"LOAD_STR r0, "neg"
+            r#"MOVE r0, "neg"
 LOAD_I64_STATE r1, r0"#,
             &mut state,
         );
@@ -2656,7 +2712,7 @@ LOAD_I64_STATE r1, r0"#,
     #[test]
     fn load_i64_state_key_not_found() {
         let program = assemble_source(
-            r#"LOAD_STR r0, "missing"
+            r#"MOVE r0, "missing"
 LOAD_I64_STATE r1, r0"#,
         )
         .expect("assembly failed");
@@ -2672,7 +2728,7 @@ LOAD_I64_STATE r1, r0"#,
         let key = make_test_key(b"flag").unwrap();
         let mut state = TestState::with_data(vec![(key, vec![1u8])]);
         let vm = run_vm_on_state(
-            r#"LOAD_STR r0, "flag"
+            r#"MOVE r0, "flag"
 LOAD_BOOL_STATE r1, r0"#,
             &mut state,
         );
@@ -2684,7 +2740,7 @@ LOAD_BOOL_STATE r1, r0"#,
         let key = make_test_key(b"flag").unwrap();
         let mut state = TestState::with_data(vec![(key, vec![0u8])]);
         let vm = run_vm_on_state(
-            r#"LOAD_STR r0, "flag"
+            r#"MOVE r0, "flag"
 LOAD_BOOL_STATE r1, r0"#,
             &mut state,
         );
@@ -2694,7 +2750,7 @@ LOAD_BOOL_STATE r1, r0"#,
     #[test]
     fn load_bool_state_key_not_found() {
         let program = assemble_source(
-            r#"LOAD_STR r0, "missing"
+            r#"MOVE r0, "missing"
 LOAD_BOOL_STATE r1, r0"#,
         )
         .expect("assembly failed");
@@ -2710,7 +2766,7 @@ LOAD_BOOL_STATE r1, r0"#,
         let key = make_test_key(b"name").unwrap();
         let mut state = TestState::with_data(vec![(key, b"alice".to_vec())]);
         let vm = run_vm_on_state(
-            r#"LOAD_STR r0, "name"
+            r#"MOVE r0, "name"
 LOAD_STR_STATE r1, r0"#,
             &mut state,
         );
@@ -2723,7 +2779,7 @@ LOAD_STR_STATE r1, r0"#,
         let key = make_test_key(b"empty").unwrap();
         let mut state = TestState::with_data(vec![(key, vec![])]);
         let vm = run_vm_on_state(
-            r#"LOAD_STR r0, "empty"
+            r#"MOVE r0, "empty"
 LOAD_STR_STATE r1, r0"#,
             &mut state,
         );
@@ -2737,7 +2793,7 @@ LOAD_STR_STATE r1, r0"#,
         let expected = Hash::from_slice(b"11111111111111111111111111111111").unwrap();
         let mut state = TestState::with_data(vec![(key, expected.to_vec())]);
         let vm = run_vm_on_state(
-            r#"LOAD_STR r0, "hash_key"
+            r#"MOVE r0, "hash_key"
 LOAD_HASH_STATE r1, r0"#,
             &mut state,
         );
@@ -2748,7 +2804,7 @@ LOAD_HASH_STATE r1, r0"#,
     #[test]
     fn load_str_state_key_not_found() {
         let program = assemble_source(
-            r#"LOAD_STR r0, "missing"
+            r#"MOVE r0, "missing"
 LOAD_STR_STATE r1, r0"#,
         )
         .expect("assembly failed");
@@ -2762,8 +2818,8 @@ LOAD_STR_STATE r1, r0"#,
     #[test]
     fn store_then_load_i64() {
         let vm = run_vm(
-            r#"LOAD_STR r0, "x"
-LOAD_I64 r1, 123
+            r#"MOVE r0, "x"
+MOVE r1, 123
 STORE_I64 r0, r1
 LOAD_I64_STATE r2, r0"#,
         );
@@ -2773,8 +2829,8 @@ LOAD_I64_STATE r2, r0"#,
     #[test]
     fn store_then_load_bool() {
         let vm = run_vm(
-            r#"LOAD_STR r0, "b"
-LOAD_BOOL r1, true
+            r#"MOVE r0, "b"
+MOVE r1, true
 STORE_BOOL r0, r1
 LOAD_BOOL_STATE r2, r0"#,
         );
@@ -2784,8 +2840,8 @@ LOAD_BOOL_STATE r2, r0"#,
     #[test]
     fn store_then_load_str() {
         let vm = run_vm(
-            r#"LOAD_STR r0, "s"
-LOAD_STR r1, "hello"
+            r#"MOVE r0, "s"
+MOVE r1, "hello"
 STORE_STR r0, r1
 LOAD_STR_STATE r2, r0"#,
         );
@@ -2796,8 +2852,8 @@ LOAD_STR_STATE r2, r0"#,
     #[test]
     fn store_then_load_hash() {
         let vm = run_vm(
-            r#"LOAD_STR r0, "hash_key"
-LOAD_HASH r1, "22222222222222222222222222222222"
+            r#"MOVE r0, "hash_key"
+MOVE r1, "22222222222222222222222222222222"
 STORE_HASH r0, r1
 LOAD_HASH_STATE r2, r0"#,
         );
@@ -2819,11 +2875,11 @@ LOAD_HASH_STATE r2, r0"#,
 
     #[test]
     fn jal_forward_jump() {
-        // Jump over LOAD_I64 r1, 99 to reach LOAD_I64 r2, 42
+        // Jump over MOVE r1, 99 to reach MOVE r2, 42
         let source = r#"
             JAL r0, skip
-            LOAD_I64 r1, 99
-            skip: LOAD_I64 r2, 42
+            MOVE r1, 99
+            skip: MOVE r2, 42
         "#;
         let vm = run_vm(source);
         // r1 should still be zero (skipped)
@@ -2834,8 +2890,8 @@ LOAD_HASH_STATE r2, r0"#,
 
     #[test]
     fn jump_skips_instructions() {
-        // LOAD_I64 is 10 bytes, so jump forward by 10 to skip the following load
-        let vm = run_vm("LOAD_I64 r0, 1\nJUMP 10\nLOAD_I64 r0, 99");
+        // MOVE is 11 bytes, so jump forward by 11 to skip the following load
+        let vm = run_vm("MOVE r0, 1\nJUMP 11\nMOVE r0, 99");
         assert_eq!(vm.registers.get_int(0, "").unwrap(), 1);
     }
 
@@ -2843,11 +2899,11 @@ LOAD_HASH_STATE r2, r0"#,
     fn beq_taken() {
         // Branch taken when equal
         let source = r#"
-            LOAD_I64 r0, 5
-            LOAD_I64 r1, 5
+            MOVE r0, 5
+            MOVE r1, 5
             BEQ r0, r1, skip
-            LOAD_I64 r2, 99
-            skip: LOAD_I64 r3, 42
+            MOVE r2, 99
+            skip: MOVE r3, 42
         "#;
         let vm = run_vm(source);
         assert_eq!(vm.registers.get(2).unwrap(), &Value::Zero);
@@ -2858,11 +2914,11 @@ LOAD_HASH_STATE r2, r0"#,
     fn beq_not_taken() {
         // Branch not taken when not equal
         let source = r#"
-            LOAD_I64 r0, 5
-            LOAD_I64 r1, 6
+            MOVE r0, 5
+            MOVE r1, 6
             BEQ r0, r1, skip
-            LOAD_I64 r2, 99
-            skip: LOAD_I64 r3, 42
+            MOVE r2, 99
+            skip: MOVE r3, 42
         "#;
         let vm = run_vm(source);
         assert_eq!(vm.registers.get_int(2, "").unwrap(), 99);
@@ -2872,11 +2928,11 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn bne_taken() {
         let source = r#"
-            LOAD_I64 r0, 5
-            LOAD_I64 r1, 6
+            MOVE r0, 5
+            MOVE r1, 6
             BNE r0, r1, skip
-            LOAD_I64 r2, 99
-            skip: LOAD_I64 r3, 42
+            MOVE r2, 99
+            skip: MOVE r3, 42
         "#;
         let vm = run_vm(source);
         assert_eq!(vm.registers.get(2).unwrap(), &Value::Zero);
@@ -2886,11 +2942,11 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn bne_not_taken() {
         let source = r#"
-            LOAD_I64 r0, 5
-            LOAD_I64 r1, 5
+            MOVE r0, 5
+            MOVE r1, 5
             BNE r0, r1, skip
-            LOAD_I64 r2, 99
-            skip: LOAD_I64 r3, 42
+            MOVE r2, 99
+            skip: MOVE r3, 42
         "#;
         let vm = run_vm(source);
         assert_eq!(vm.registers.get_int(2, "").unwrap(), 99);
@@ -2899,11 +2955,11 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn blt_taken() {
         let source = r#"
-            LOAD_I64 r0, 3
-            LOAD_I64 r1, 5
+            MOVE r0, 3
+            MOVE r1, 5
             BLT r0, r1, skip
-            LOAD_I64 r2, 99
-            skip: LOAD_I64 r3, 42
+            MOVE r2, 99
+            skip: MOVE r3, 42
         "#;
         let vm = run_vm(source);
         assert_eq!(vm.registers.get(2).unwrap(), &Value::Zero);
@@ -2913,11 +2969,11 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn blt_not_taken() {
         let source = r#"
-            LOAD_I64 r0, 5
-            LOAD_I64 r1, 3
+            MOVE r0, 5
+            MOVE r1, 3
             BLT r0, r1, skip
-            LOAD_I64 r2, 99
-            skip: LOAD_I64 r3, 42
+            MOVE r2, 99
+            skip: MOVE r3, 42
         "#;
         let vm = run_vm(source);
         assert_eq!(vm.registers.get_int(2, "").unwrap(), 99);
@@ -2927,11 +2983,11 @@ LOAD_HASH_STATE r2, r0"#,
     fn blt_signed() {
         // -1 < 1 in signed comparison
         let source = r#"
-            LOAD_I64 r0, -1
-            LOAD_I64 r1, 1
+            MOVE r0, -1
+            MOVE r1, 1
             BLT r0, r1, skip
-            LOAD_I64 r2, 99
-            skip: LOAD_I64 r3, 42
+            MOVE r2, 99
+            skip: MOVE r3, 42
         "#;
         let vm = run_vm(source);
         assert_eq!(vm.registers.get(2).unwrap(), &Value::Zero);
@@ -2940,11 +2996,11 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn bge_taken() {
         let source = r#"
-            LOAD_I64 r0, 5
-            LOAD_I64 r1, 5
+            MOVE r0, 5
+            MOVE r1, 5
             BGE r0, r1, skip
-            LOAD_I64 r2, 99
-            skip: LOAD_I64 r3, 42
+            MOVE r2, 99
+            skip: MOVE r3, 42
         "#;
         let vm = run_vm(source);
         assert_eq!(vm.registers.get(2).unwrap(), &Value::Zero);
@@ -2953,11 +3009,11 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn bge_greater() {
         let source = r#"
-            LOAD_I64 r0, 7
-            LOAD_I64 r1, 5
+            MOVE r0, 7
+            MOVE r1, 5
             BGE r0, r1, skip
-            LOAD_I64 r2, 99
-            skip: LOAD_I64 r3, 42
+            MOVE r2, 99
+            skip: MOVE r3, 42
         "#;
         let vm = run_vm(source);
         assert_eq!(vm.registers.get(2).unwrap(), &Value::Zero);
@@ -2967,11 +3023,11 @@ LOAD_HASH_STATE r2, r0"#,
     fn bltu_unsigned() {
         // -1 as u64 is MAX, so -1 > 1 in unsigned comparison
         let source = r#"
-            LOAD_I64 r0, -1
-            LOAD_I64 r1, 1
+            MOVE r0, -1
+            MOVE r1, 1
             BLTU r0, r1, skip
-            LOAD_I64 r2, 99
-            skip: LOAD_I64 r3, 42
+            MOVE r2, 99
+            skip: MOVE r3, 42
         "#;
         let vm = run_vm(source);
         // Branch NOT taken because -1 as u64 > 1
@@ -2982,11 +3038,11 @@ LOAD_HASH_STATE r2, r0"#,
     fn bgeu_unsigned() {
         // -1 as u64 is MAX, so -1 >= 1 in unsigned comparison
         let source = r#"
-            LOAD_I64 r0, -1
-            LOAD_I64 r1, 1
+            MOVE r0, -1
+            MOVE r1, 1
             BGEU r0, r1, skip
-            LOAD_I64 r2, 99
-            skip: LOAD_I64 r3, 42
+            MOVE r2, 99
+            skip: MOVE r3, 42
         "#;
         let vm = run_vm(source);
         // Branch taken because -1 as u64 > 1
@@ -2996,9 +3052,9 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn halt_stops_execution() {
         let source = r#"
-            LOAD_I64 r0, 1
+            MOVE r0, 1
             HALT
-            LOAD_I64 r0, 99
+            MOVE r0, 99
         "#;
         let vm = run_vm(source);
         assert_eq!(vm.registers.get_int(0, "").unwrap(), 1);
@@ -3008,9 +3064,9 @@ LOAD_HASH_STATE r2, r0"#,
     fn loop_with_backward_branch() {
         // Simple loop: count from 0 to 3
         let source = r#"
-            LOAD_I64 r0, 0
-            LOAD_I64 r1, 1
-            LOAD_I64 r2, 3
+            MOVE r0, 0
+            MOVE r1, 1
+            MOVE r2, 3
             loop:
             ADD r0, r0, r1
             BLT r0, r2, loop
@@ -3023,16 +3079,16 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn jalr_indirect_jump() {
         // JALR jumps to address in register + offset
-        // LOAD_I64: 10 bytes, JALR: 11 bytes
-        // Offsets: LOAD_I64[0-9], JALR[10-20], LOAD_I64 r2[21-30], LOAD_I64 r3[31-40]
+        // MOVE: 11 bytes, JALR: 11 bytes
+        // Offsets: MOVE[0-10], JALR[11-21], MOVE r2[22-32], MOVE r3[33-43]
         let source = r#"
-            LOAD_I64 r1, 30
+            MOVE r1, 32
             JALR r0, r1, 1
-            LOAD_I64 r2, 99
-            LOAD_I64 r3, 42
+            MOVE r2, 99
+            MOVE r3, 42
         "#;
         let vm = run_vm(source);
-        // Should skip LOAD_I64 r2, 99 and execute LOAD_I64 r3, 42
+        // Should skip MOVE r2, 99 and execute MOVE r3, 42
         assert_eq!(vm.registers.get(2).unwrap(), &Value::Zero);
         assert_eq!(vm.registers.get_int(3, "").unwrap(), 42);
     }
@@ -3048,7 +3104,7 @@ LOAD_HASH_STATE r2, r0"#,
             CALL0 r1, double
             JAL r0, end
             double:
-            LOAD_I64 r10, 42
+            MOVE r10, 42
             RET r10
             end:
         "#;
@@ -3068,7 +3124,7 @@ LOAD_HASH_STATE r2, r0"#,
             CALL0 r2, inner
             RET r2
             inner:
-            LOAD_I64 r10, 99
+            MOVE r10, 99
             RET r10
             end:
         "#;
@@ -3085,7 +3141,7 @@ LOAD_HASH_STATE r2, r0"#,
 
     #[test]
     fn ret_without_call() {
-        let source = "LOAD_I64 r0, 1\nRET r0";
+        let source = "MOVE r0, 1\nRET r0";
         let err = run_expect_err(source);
         assert!(matches!(err, VMError::ReturnWithoutCall { .. }));
     }
@@ -3095,12 +3151,12 @@ LOAD_HASH_STATE r2, r0"#,
         let source = r#"
             JAL r0, main
             main:
-            LOAD_I64 r5, 100
+            MOVE r5, 100
             CALL0 r1, func
             ADD r2, r1, r5
             JAL r0, end
             func:
-            LOAD_I64 r10, 50
+            MOVE r10, 50
             RET r10
             end:
         "#;
@@ -3114,13 +3170,13 @@ LOAD_HASH_STATE r2, r0"#,
         let prog = r#"
         # increment counter N times, where N is stored under "steps"
         main:
-            LOAD_STR r0, "counter"
-            LOAD_STR r1, "steps"
+            MOVE r0, "counter"
+            MOVE r1, "steps"
 
             LOAD_I64_STATE r2, r0     # acc = counter
             LOAD_I64_STATE r3, r1     # limit = steps
-            LOAD_I64 r4, 0            # i = 0
-            LOAD_I64 r5, 1            # inc = 1
+            MOVE r4, 0            # i = 0
+            MOVE r5, 1            # inc = 1
 
         loop:
             ADD r2, r2, r5            # acc += 1
@@ -3182,7 +3238,7 @@ LOAD_HASH_STATE r2, r0"#,
             CALL0 r5, f5
             RET r5
             f5:
-            LOAD_I64 r10, 777
+            MOVE r10, 777
             RET r10
             end:
         "#;
@@ -3196,7 +3252,7 @@ LOAD_HASH_STATE r2, r0"#,
         let source = r#"
             JAL r0, main
             main:
-            LOAD_I64 r10, 1
+            MOVE r10, 1
             CALL0 r1, add_ten
             CALL0 r2, add_ten
             CALL0 r3, add_ten
@@ -3204,7 +3260,7 @@ LOAD_HASH_STATE r2, r0"#,
             ADD r4, r4, r3
             JAL r0, end
             add_ten:
-            LOAD_I64 r20, 10
+            MOVE r20, 10
             RET r20
             end:
         "#;
@@ -3219,11 +3275,11 @@ LOAD_HASH_STATE r2, r0"#,
         let source = r#"
             JAL r0, main
             main:
-            LOAD_I64 r5, 999
+            MOVE r5, 999
             CALL0 r5, get_42
             JAL r0, end
             get_42:
-            LOAD_I64 r10, 42
+            MOVE r10, 42
             RET r10
             end:
         "#;
@@ -3238,13 +3294,13 @@ LOAD_HASH_STATE r2, r0"#,
         let source = r#"
             JAL r0, main
             main:
-            LOAD_I64 r1, 3
+            MOVE r1, 3
             CALL0 r2, countdown
             JAL r0, end
 
             countdown:
-            LOAD_I64 r10, 0
-            LOAD_I64 r11, 1
+            MOVE r10, 0
+            MOVE r11, 1
             BEQ r1, r10, done
             SUB r1, r1, r11
             CALL0 r12, countdown
@@ -3267,7 +3323,7 @@ LOAD_HASH_STATE r2, r0"#,
             CALL0 r1, func
             JAL r0, end
             func:
-            LOAD_I64 r10, 1
+            MOVE r10, 1
             RET r10
             RET r10
             end:
@@ -3280,7 +3336,7 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn ret_with_empty_stack_fails() {
         // Direct RET without any CALL
-        let source = "LOAD_I64 r0, 42\nRET r0";
+        let source = "MOVE r0, 42\nRET r0";
         let err = run_expect_err(source);
         assert!(matches!(err, VMError::ReturnWithoutCall { .. }));
     }
@@ -3296,7 +3352,7 @@ LOAD_HASH_STATE r2, r0"#,
             func:
             JAL r0, escape
             escape:
-            LOAD_I64 r10, 1
+            MOVE r10, 1
             RET r10
             end:
         "#;
@@ -3316,13 +3372,13 @@ LOAD_HASH_STATE r2, r0"#,
             CALL0 r3, ret_30
             JAL r0, end
             ret_10:
-            LOAD_I64 r10, 10
+            MOVE r10, 10
             RET r10
             ret_20:
-            LOAD_I64 r10, 20
+            MOVE r10, 20
             RET r10
             ret_30:
-            LOAD_I64 r10, 30
+            MOVE r10, 30
             RET r10
             end:
         "#;
@@ -3341,7 +3397,7 @@ LOAD_HASH_STATE r2, r0"#,
             CALL0 r10, func
             JAL r0, end
             func:
-            LOAD_I64 r10, 42
+            MOVE r10, 42
             RET r10
             end:
         "#;
@@ -3360,16 +3416,16 @@ LOAD_HASH_STATE r2, r0"#,
             JAL r0, end
             outer:
             CALL0 r2, middle
-            LOAD_I64 r3, 1
+            MOVE r3, 1
             ADD r2, r2, r3
             RET r2
             middle:
             CALL0 r4, inner
-            LOAD_I64 r5, 1
+            MOVE r5, 1
             ADD r4, r4, r5
             RET r4
             inner:
-            LOAD_I64 r6, 1
+            MOVE r6, 1
             RET r6
             end:
         "#;
@@ -3388,10 +3444,10 @@ LOAD_HASH_STATE r2, r0"#,
             CALL0 r2, b
             JAL r0, end
             a:
-            LOAD_I64 r10, 1
+            MOVE r10, 1
             RET r10
             b:
-            LOAD_I64 r10, 2
+            MOVE r10, 2
             RET r10
             end:
         "#;
@@ -3425,7 +3481,7 @@ LOAD_HASH_STATE r2, r0"#,
             CALL0 r1, ret_bool
             JAL r0, end
             ret_bool:
-            LOAD_BOOL r10, true
+            MOVE r10, true
             RET r10
             end:
         "#;
@@ -3442,7 +3498,7 @@ LOAD_HASH_STATE r2, r0"#,
             CALL0 r1, ret_str
             JAL r0, end
             ret_str:
-            LOAD_STR r10, "hello"
+            MOVE r10, "hello"
             RET r10
             end:
         "#;
@@ -3484,7 +3540,7 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn host_len_empty_string() {
         let source = r#"
-            LOAD_STR r1, ""
+            MOVE r1, ""
             CALL_HOST r0, "len", 1, r1
         "#;
         assert_eq!(run_and_get_int(source, 0), 0);
@@ -3493,7 +3549,7 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn host_len_ascii_string() {
         let source = r#"
-            LOAD_STR r1, "hello"
+            MOVE r1, "hello"
             CALL_HOST r0, "len", 1, r1
         "#;
         assert_eq!(run_and_get_int(source, 0), 5);
@@ -3502,7 +3558,7 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn host_len_single_char() {
         let source = r#"
-            LOAD_STR r1, "x"
+            MOVE r1, "x"
             CALL_HOST r0, "len", 1, r1
         "#;
         assert_eq!(run_and_get_int(source, 0), 1);
@@ -3511,8 +3567,8 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn host_len_wrong_arg_count() {
         let source = r#"
-            LOAD_STR r1, "test"
-            LOAD_STR r2, "extra"
+            MOVE r1, "test"
+            MOVE r2, "extra"
             CALL_HOST r0, "len", 2, r1
         "#;
         assert!(matches!(
@@ -3524,7 +3580,7 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn host_len_wrong_type() {
         let source = r#"
-            LOAD_I64 r1, 42
+            MOVE r1, 42
             CALL_HOST r0, "len", 1, r1
         "#;
         assert!(matches!(
@@ -3538,9 +3594,9 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn host_slice_middle() {
         let source = r#"
-            LOAD_STR r1, "hello world"
-            LOAD_I64 r2, 0
-            LOAD_I64 r3, 5
+            MOVE r1, "hello world"
+            MOVE r2, 0
+            MOVE r3, 5
             CALL_HOST r0, "slice", 3, r1
         "#;
         let vm = run_vm(source);
@@ -3551,9 +3607,9 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn host_slice_from_offset() {
         let source = r#"
-            LOAD_STR r1, "hello world"
-            LOAD_I64 r2, 6
-            LOAD_I64 r3, 11
+            MOVE r1, "hello world"
+            MOVE r2, 6
+            MOVE r3, 11
             CALL_HOST r0, "slice", 3, r1
         "#;
         let vm = run_vm(source);
@@ -3564,9 +3620,9 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn host_slice_empty_result() {
         let source = r#"
-            LOAD_STR r1, "hello"
-            LOAD_I64 r2, 2
-            LOAD_I64 r3, 2
+            MOVE r1, "hello"
+            MOVE r2, 2
+            MOVE r3, 2
             CALL_HOST r0, "slice", 3, r1
         "#;
         let vm = run_vm(source);
@@ -3577,9 +3633,9 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn host_slice_full_string() {
         let source = r#"
-            LOAD_STR r1, "abc"
-            LOAD_I64 r2, 0
-            LOAD_I64 r3, 3
+            MOVE r1, "abc"
+            MOVE r2, 0
+            MOVE r3, 3
             CALL_HOST r0, "slice", 3, r1
         "#;
         let vm = run_vm(source);
@@ -3590,9 +3646,9 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn host_slice_clamps_end_beyond_length() {
         let source = r#"
-            LOAD_STR r1, "short"
-            LOAD_I64 r2, 0
-            LOAD_I64 r3, 100
+            MOVE r1, "short"
+            MOVE r2, 0
+            MOVE r3, 100
             CALL_HOST r0, "slice", 3, r1
         "#;
         let vm = run_vm(source);
@@ -3603,9 +3659,9 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn host_slice_clamps_start_beyond_end() {
         let source = r#"
-            LOAD_STR r1, "hello"
-            LOAD_I64 r2, 10
-            LOAD_I64 r3, 5
+            MOVE r1, "hello"
+            MOVE r2, 10
+            MOVE r3, 5
             CALL_HOST r0, "slice", 3, r1
         "#;
         let vm = run_vm(source);
@@ -3616,8 +3672,8 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn host_slice_wrong_arg_count() {
         let source = r#"
-            LOAD_STR r1, "test"
-            LOAD_I64 r2, 0
+            MOVE r1, "test"
+            MOVE r2, 0
             CALL_HOST r0, "slice", 2, r1
         "#;
         assert!(matches!(
@@ -3631,8 +3687,8 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn host_concat_two_strings() {
         let source = r#"
-            LOAD_STR r1, "hello"
-            LOAD_STR r2, " world"
+            MOVE r1, "hello"
+            MOVE r2, " world"
             CALL_HOST r0, "concat", 2, r1
         "#;
         let vm = run_vm(source);
@@ -3643,8 +3699,8 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn host_concat_empty_left() {
         let source = r#"
-            LOAD_STR r1, ""
-            LOAD_STR r2, "world"
+            MOVE r1, ""
+            MOVE r2, "world"
             CALL_HOST r0, "concat", 2, r1
         "#;
         let vm = run_vm(source);
@@ -3655,8 +3711,8 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn host_concat_empty_right() {
         let source = r#"
-            LOAD_STR r1, "hello"
-            LOAD_STR r2, ""
+            MOVE r1, "hello"
+            MOVE r2, ""
             CALL_HOST r0, "concat", 2, r1
         "#;
         let vm = run_vm(source);
@@ -3667,8 +3723,8 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn host_concat_both_empty() {
         let source = r#"
-            LOAD_STR r1, ""
-            LOAD_STR r2, ""
+            MOVE r1, ""
+            MOVE r2, ""
             CALL_HOST r0, "concat", 2, r1
         "#;
         let vm = run_vm(source);
@@ -3679,7 +3735,7 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn host_concat_wrong_arg_count() {
         let source = r#"
-            LOAD_STR r1, "only one"
+            MOVE r1, "only one"
             CALL_HOST r0, "concat", 1, r1
         "#;
         assert!(matches!(
@@ -3691,8 +3747,8 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn host_concat_wrong_type() {
         let source = r#"
-            LOAD_STR r1, "str"
-            LOAD_I64 r2, 42
+            MOVE r1, "str"
+            MOVE r2, 42
             CALL_HOST r0, "concat", 2, r1
         "#;
         assert!(matches!(
@@ -3706,8 +3762,8 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn host_compare_equal() {
         let source = r#"
-            LOAD_STR r1, "abc"
-            LOAD_STR r2, "abc"
+            MOVE r1, "abc"
+            MOVE r2, "abc"
             CALL_HOST r0, "compare", 2, r1
         "#;
         assert_eq!(run_and_get_int(source, 0), 0);
@@ -3716,8 +3772,8 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn host_compare_less_than() {
         let source = r#"
-            LOAD_STR r1, "abc"
-            LOAD_STR r2, "abd"
+            MOVE r1, "abc"
+            MOVE r2, "abd"
             CALL_HOST r0, "compare", 2, r1
         "#;
         assert_eq!(run_and_get_int(source, 0), -1);
@@ -3726,8 +3782,8 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn host_compare_greater_than() {
         let source = r#"
-            LOAD_STR r1, "abd"
-            LOAD_STR r2, "abc"
+            MOVE r1, "abd"
+            MOVE r2, "abc"
             CALL_HOST r0, "compare", 2, r1
         "#;
         assert_eq!(run_and_get_int(source, 0), 1);
@@ -3736,8 +3792,8 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn host_compare_prefix_shorter() {
         let source = r#"
-            LOAD_STR r1, "ab"
-            LOAD_STR r2, "abc"
+            MOVE r1, "ab"
+            MOVE r2, "abc"
             CALL_HOST r0, "compare", 2, r1
         "#;
         assert_eq!(run_and_get_int(source, 0), -1);
@@ -3746,8 +3802,8 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn host_compare_prefix_longer() {
         let source = r#"
-            LOAD_STR r1, "abc"
-            LOAD_STR r2, "ab"
+            MOVE r1, "abc"
+            MOVE r2, "ab"
             CALL_HOST r0, "compare", 2, r1
         "#;
         assert_eq!(run_and_get_int(source, 0), 1);
@@ -3756,8 +3812,8 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn host_compare_empty_strings() {
         let source = r#"
-            LOAD_STR r1, ""
-            LOAD_STR r2, ""
+            MOVE r1, ""
+            MOVE r2, ""
             CALL_HOST r0, "compare", 2, r1
         "#;
         assert_eq!(run_and_get_int(source, 0), 0);
@@ -3766,8 +3822,8 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn host_compare_empty_vs_nonempty() {
         let source = r#"
-            LOAD_STR r1, ""
-            LOAD_STR r2, "a"
+            MOVE r1, ""
+            MOVE r2, "a"
             CALL_HOST r0, "compare", 2, r1
         "#;
         assert_eq!(run_and_get_int(source, 0), -1);
@@ -3776,7 +3832,7 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn host_compare_wrong_arg_count() {
         let source = r#"
-            LOAD_STR r1, "only"
+            MOVE r1, "only"
             CALL_HOST r0, "compare", 1, r1
         "#;
         assert!(matches!(
@@ -3790,7 +3846,7 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn host_hash_returns_ref() {
         let source = r#"
-            LOAD_STR r1, "hello"
+            MOVE r1, "hello"
             CALL_HOST r0, "hash", 1, r1
         "#;
         let vm = run_vm(source);
@@ -3800,9 +3856,9 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn host_hash_consistent() {
         let source = r#"
-            LOAD_STR r1, "test"
+            MOVE r1, "test"
             CALL_HOST r1, "hash", 1, r1
-            LOAD_STR r2, "test"
+            MOVE r2, "test"
             CALL_HOST r2, "hash", 1, r2
             CALL_HOST r0, "compare", 2, r1
         "#;
@@ -3812,9 +3868,9 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn host_hash_different_inputs() {
         let source = r#"
-            LOAD_STR r1, "abc"
+            MOVE r1, "abc"
             CALL_HOST r2, "hash", 1, r1
-            LOAD_STR r3, "abd"
+            MOVE r3, "abd"
             CALL_HOST r4, "hash", 1, r3
             CALL_HOST r0, "compare", 2, r2
         "#;
@@ -3825,7 +3881,7 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn host_hash_empty_string() {
         let source = r#"
-            LOAD_STR r1, ""
+            MOVE r1, ""
             CALL_HOST r0, "hash", 1, r1
         "#;
         let vm = run_vm(source);
@@ -3839,7 +3895,7 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn host_hash_known_value() {
         let source = r#"
-            LOAD_STR r1, "hello"
+            MOVE r1, "hello"
             CALL_HOST r0, "hash", 1, r1
         "#;
         let vm = run_vm(source);
@@ -3852,8 +3908,8 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn host_hash_wrong_arg_count() {
         let source = r#"
-            LOAD_STR r1, "a"
-            LOAD_STR r2, "b"
+            MOVE r1, "a"
+            MOVE r2, "b"
             CALL_HOST r0, "hash", 2, r1
         "#;
         assert!(matches!(
@@ -3865,7 +3921,7 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn host_hash_wrong_type() {
         let source = r#"
-            LOAD_I64 r1, 123
+            MOVE r1, 123
             CALL_HOST r0, "hash", 1, r1
         "#;
         let vm = run_vm(source);
@@ -3881,7 +3937,7 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn host_invalid_function() {
         let source = r#"
-            LOAD_STR r1, "arg"
+            MOVE r1, "arg"
             CALL_HOST r0, "nonexistent", 1, r1
         "#;
         assert!(matches!(

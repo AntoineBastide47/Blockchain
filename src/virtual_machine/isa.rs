@@ -35,94 +35,86 @@ macro_rules! for_each_instruction {
             // Store and Load
             // =========================
             /// DELETE_STATE key ; deletes the value at key in storage
-            DeleteState = 0x00, "DELETE_STATE" => [key: Reg], 2000,
-            /// LOAD_I64 rd, imm64 ; rd = imm64
-            LoadI64 = 0x01, "LOAD_I64" => [rd: Reg, imm: ImmI64], 1,
+            DeleteState = 0x00, "DELETE_STATE" => [key: Src], 2000,
             /// STORE_I64 key, value ; store i64 value at key in storage
-            StoreI64 = 0x02, "STORE_I64" => [key: Reg, value: Reg], 2000,
+            StoreI64 = 0x01, "STORE_I64" => [key: Src, value: Src], 2000,
             /// LOAD_I64_STATE dst, key ; loads the i64 stored as key from storage
-            LoadI64State = 0x03, "LOAD_I64_STATE" => [rd: Reg, key: Reg], 50,
-            /// LOAD_BOOL rd, true|false ; rd = true|false
-            LoadBool = 0x04, "LOAD_BOOL" => [rd: Reg, bool: Bool], 1,
+            LoadI64State = 0x02, "LOAD_I64_STATE" => [rd: Reg, key: Src], 50,
             /// STORE_BOOL key, value ; store bool value at key in storage
-            StoreBool = 0x05, "STORE_BOOL" => [key: Reg, value: Reg], 2000,
+            StoreBool = 0x03, "STORE_BOOL" => [key: Src, value: Src], 2000,
             /// LOAD_BOOL_STATE dst, key ; loads the boolean stored as key from storage
-            LoadBoolState = 0x06, "LOAD_BOOL_STATE" => [rd: Reg, key: Reg], 50,
-            /// LOAD_STR rd, ref ; rd = ref
-            LoadStr = 0x07, "LOAD_STR" => [rd: Reg, str: RefU32], 1,
+            LoadBoolState = 0x04, "LOAD_BOOL_STATE" => [rd: Reg, key: Src], 50,
             /// STORE_STR key, value ; store string value at key in storage
-            StoreStr = 0x08, "STORE_STR" => [key: Reg, value: Reg], 2000,
+            StoreStr = 0x05, "STORE_STR" => [key: Src, value: Src], 2000,
             /// LOAD_STR_STATE dst, key ; loads the string stored as key from storage
-            LoadStrState = 0x09, "LOAD_STR_STATE" => [rd: Reg, key: Reg], 50,
-            /// LOAD_HASH rd, ref ; rd = ref
-            LoadHash = 0x0A, "LOAD_HASH" => [rd: Reg, str: RefU32], 1,
+            LoadStrState = 0x06, "LOAD_STR_STATE" => [rd: Reg, key: Src], 50,
             /// STORE_HASH key, value ; store string value at key in storage
-            StoreHash = 0x0B, "STORE_HASH" => [key: Reg, value: Reg], 2000,
+            StoreHash = 0x07, "STORE_HASH" => [key: Src, value: Src], 2000,
             /// LOAD_HASH_STATE dst, key ; loads the string stored as key from storage
-            LoadHashState = 0x0C, "LOAD_HASH_STATE" => [rd: Reg, key: Reg], 50,
+            LoadHashState = 0x08, "LOAD_HASH_STATE" => [rd: Reg, key: Src], 50,
             // =========================
             // Moves / casts
             // =========================
             /// MOVE rd, rs ; rd = rs
-            Move = 0x10, "MOVE" => [rd: Reg, rs: Reg], 1,
+            Move = 0x10, "MOVE" => [rd: Reg, rs: Src], 1,
             /// I64_TO_BOOL rd, rs ; rd = (rs != 0)
-            I64ToBool = 0x11, "I64_TO_BOOL" => [rd: Reg, rs: Reg], 1,
+            I64ToBool = 0x11, "I64_TO_BOOL" => [rd: Reg, rs: Src], 1,
             /// BOOL_TO_I64 rd, rs ; rd = rs as i64 (false=0, true=1)
-            BoolToI64 = 0x12, "BOOL_TO_I64" => [rd: Reg, rs: Reg], 1,
+            BoolToI64 = 0x12, "BOOL_TO_I64" => [rd: Reg, rs: Src], 1,
             /// STR_TO_I64 rd, rs ; rd = parse_i64(rs)
-            StrToI64 = 0x13, "STR_TO_I64" => [rd: Reg, rs: Reg], 30,
+            StrToI64 = 0x13, "STR_TO_I64" => [rd: Reg, rs: Src], 30,
             /// I64_TO_STR rd, rs ; rd = rs formatted as string
-            I64ToStr = 0x14, "I64_TO_STR" => [rd: Reg, rs: Reg], 30,
+            I64ToStr = 0x14, "I64_TO_STR" => [rd: Reg, rs: Src], 30,
             /// STR_TO_BOOL rd, rs ; rd = parse_bool(rs)
-            StrToBool = 0x15, "STR_TO_BOOL" => [rd: Reg, rs: Reg], 20,
+            StrToBool = 0x15, "STR_TO_BOOL" => [rd: Reg, rs: Src], 20,
             /// BOOL_TO_STR rd, rs ; rd = rs formatted as string
-            BoolToStr = 0x16, "BOOL_TO_STR" => [rd: Reg, rs: Reg], 20,
+            BoolToStr = 0x16, "BOOL_TO_STR" => [rd: Reg, rs: Src], 20,
             // =========================
             // Integer arithmetic
             // =========================
             /// ADD rd, rs1, rs2 ; rd = rs1 + rs2
-            Add = 0x20, "ADD" => [rd: Reg, rs1: Reg, rs2: Reg], 3,
+            Add = 0x20, "ADD" => [rd: Reg, rs1: Src, rs2: Src], 3,
             /// SUB rd, rs1, rs2 ; rd = rs1 - rs2
-            Sub = 0x21, "SUB" => [rd: Reg, rs1: Reg, rs2: Reg], 3,
+            Sub = 0x21, "SUB" => [rd: Reg, rs1: Src, rs2: Src], 3,
             /// MUL rd, rs1, rs2 ; rd = rs1 * rs2
-            Mul = 0x22, "MUL" => [rd: Reg, rs1: Reg, rs2: Reg], 5,
+            Mul = 0x22, "MUL" => [rd: Reg, rs1: Src, rs2: Src], 5,
             /// DIV rd, rs1, rs2 ; rd = rs1 / rs2 (trap on division by zero)
-            Div = 0x23, "DIV" => [rd: Reg, rs1: Reg, rs2: Reg], 10,
+            Div = 0x23, "DIV" => [rd: Reg, rs1: Src, rs2: Src], 10,
             /// MOD rd, rs1, rs2 ; rd = rs1 % rs2
-            Mod = 0x24, "MOD" => [rd: Reg, rs1: Reg, rs2: Reg], 10,
+            Mod = 0x24, "MOD" => [rd: Reg, rs1: Src, rs2: Src], 10,
             /// NEG rd, rs ; rd = -rs
-            Neg = 0x25, "NEG" => [rd: Reg, rs: Reg], 2,
+            Neg = 0x25, "NEG" => [rd: Reg, rs: Src], 2,
             /// ABS rd, rs ; rd = |rs|
-            Abs = 0x26, "ABS" => [rd: Reg, rs: Reg], 2,
+            Abs = 0x26, "ABS" => [rd: Reg, rs: Src], 2,
             /// MIN rd, rs1, rs2 ; rd = min(rs1, rs2)
-            Min = 0x27, "MIN" => [rd: Reg, rs1: Reg, rs2: Reg], 3,
+            Min = 0x27, "MIN" => [rd: Reg, rs1: Src, rs2: Src], 3,
             /// MAX rd, rs1, rs2 ; rd = max(rs1, rs2)
-            Max = 0x28, "MAX" => [rd: Reg, rs1: Reg, rs2: Reg], 3,
+            Max = 0x28, "MAX" => [rd: Reg, rs1: Src, rs2: Src], 3,
             /// SHL rd, rs1, rs2 ; rd = rs1 << rs2
-            Shl = 0x29, "SHL" => [rd: Reg, rs1: Reg, rs2: Reg], 3,
+            Shl = 0x29, "SHL" => [rd: Reg, rs1: Src, rs2: Src], 3,
             /// SHR rd, rs1, rs2 ; rd = rs1 >> rs2 (arithmetic shift)
-            Shr = 0x2A, "SHR" => [rd: Reg, rs1: Reg, rs2: Reg], 3,
+            Shr = 0x2A, "SHR" => [rd: Reg, rs1: Src, rs2: Src], 3,
             // =========================
             // Boolean / comparison
             // =========================
             /// NOT rd, rs ; rd = !rs (logical negation)
-            Not = 0x30, "NOT" => [rd: Reg, rs: Reg], 1,
+            Not = 0x30, "NOT" => [rd: Reg, rs: Src], 1,
             /// AND rd, rs1, rs2 ; rd = rs1 & rs2 (bitwise and)
-            And = 0x31, "AND" => [rd: Reg, rs1: Reg, rs2: Reg], 2,
+            And = 0x31, "AND" => [rd: Reg, rs1: Src, rs2: Src], 2,
             /// OR rd, rs1, rs2 ; rd = rs1 | rs2 (bitwise or)
-            Or = 0x32, "OR" => [rd: Reg, rs1: Reg, rs2: Reg], 2,
+            Or = 0x32, "OR" => [rd: Reg, rs1: Src, rs2: Src], 2,
             /// XOR rd, rs1, rs2 ; rd = rs1 ^ rs2 (bitwise xor)
-            Xor = 0x33, "XOR" => [rd: Reg, rs1: Reg, rs2: Reg], 2,
+            Xor = 0x33, "XOR" => [rd: Reg, rs1: Src, rs2: Src], 2,
             /// EQ rd, rs1, rs2 ; rd = (rs1 == rs2)
-            Eq = 0x34, "EQ" => [rd: Reg, rs1: Reg, rs2: Reg], 3,
+            Eq = 0x34, "EQ" => [rd: Reg, rs1: Src, rs2: Src], 3,
             /// LT rd, rs1, rs2 ; rd = (rs1 < rs2)
-            Lt = 0x35, "LT" => [rd: Reg, rs1: Reg, rs2: Reg], 3,
+            Lt = 0x35, "LT" => [rd: Reg, rs1: Src, rs2: Src], 3,
             /// LE rd, rs1, rs2 ; rd = (rs1 <= rs2)
-            Le = 0x37, "LE" => [rd: Reg, rs1: Reg, rs2: Reg], 3,
+            Le = 0x37, "LE" => [rd: Reg, rs1: Src, rs2: Src], 3,
             /// GT rd, rs1, rs2 ; rd = (rs1 > rs2)
-            Gt = 0x38, "GT" => [rd: Reg, rs1: Reg, rs2: Reg], 3,
+            Gt = 0x38, "GT" => [rd: Reg, rs1: Src, rs2: Src], 3,
             /// GE rd, rs1, rs2 ; rd = (rs1 >= rs2)
-            Ge = 0x39, "GE" => [rd: Reg, rs1: Reg, rs2: Reg], 3,
+            Ge = 0x39, "GE" => [rd: Reg, rs1: Src, rs2: Src], 3,
             // =========================
             // Control Flow
             // =========================
@@ -137,64 +129,23 @@ macro_rules! for_each_instruction {
             /// JALR rd, rs, offset ; rd = PC + instr_size; PC = rs + offset (jump and link register)
             Jalr = 0x44, "JALR" => [rd: Reg, rs: Reg, offset: ImmI64], 5,
             /// BEQ rs1, rs2, offset ; if rs1 == rs2 then PC += offset
-            Beq = 0x45, "BEQ" => [rs1: Reg, rs2: Reg, offset: ImmI64], 5,
+            Beq = 0x45, "BEQ" => [rs1: Src, rs2: Src, offset: ImmI64], 5,
             /// BNE rs1, rs2, offset ; if rs1 != rs2 then PC += offset
-            Bne = 0x46, "BNE" => [rs1: Reg, rs2: Reg, offset: ImmI64], 5,
+            Bne = 0x46, "BNE" => [rs1: Src, rs2: Src, offset: ImmI64], 5,
             /// BLT rs1, rs2, offset ; if rs1 < rs2 (signed) then PC += offset
-            Blt = 0x47, "BLT" => [rs1: Reg, rs2: Reg, offset: ImmI64], 5,
+            Blt = 0x47, "BLT" => [rs1: Src, rs2: Src, offset: ImmI64], 5,
             /// BGE rs1, rs2, offset ; if rs1 >= rs2 (signed) then PC += offset
-            Bge = 0x48, "BGE" => [rs1: Reg, rs2: Reg, offset: ImmI64], 5,
+            Bge = 0x48, "BGE" => [rs1: Src, rs2: Src, offset: ImmI64], 5,
             /// BLTU rs1, rs2, offset ; if rs1 < rs2 (unsigned) then PC += offset
-            Bltu = 0x49, "BLTU" => [rs1: Reg, rs2: Reg, offset: ImmI64], 5,
+            Bltu = 0x49, "BLTU" => [rs1: Src, rs2: Src, offset: ImmI64], 5,
             /// BGEU rs1, rs2, offset ; if rs1 >= rs2 (unsigned) then PC += offset
-            Bgeu = 0x4A, "BGEU" => [rs1: Reg, rs2: Reg, offset: ImmI64], 5,
+            Bgeu = 0x4A, "BGEU" => [rs1: Src, rs2: Src, offset: ImmI64], 5,
             /// JUMP offset ; PC += offset (unconditional jump)
             Jump = 0x4B, "JUMP" => [offset: ImmI64], 5,
             /// RET rs ; return from function call with value in rs
             Ret = 0x4C, "RET" => [rs: Reg], 5,
             /// HALT ; stop execution immediately
             Halt = 0x4D, "HALT" => [], 1,
-            // =========================
-            // Immediate Arithmetic / Logic / Branch
-            // =========================
-            /// ADDI rd, rs, imm ; rd = rs + imm
-            AddI = 0x50, "ADDI" => [rd: Reg, rs: Reg, imm: ImmI64], 3,
-            /// SUBI rd, rs, imm ; rd = rs - imm
-            SubI = 0x51, "SUBI" => [rd: Reg, rs: Reg, imm: ImmI64], 3,
-            /// MULI rd, rs, imm ; rd = rs * imm
-            MulI = 0x52, "MULI" => [rd: Reg, rs: Reg, imm: ImmI64], 5,
-            /// SHLI rd, rs, imm ; rd = rs << imm
-            ShlI = 0x53, "SHLI" => [rd: Reg, rs: Reg, imm: ImmI64], 3,
-            /// SHRI rd, rs, imm ; rd = rs >> imm (arithmetic shift)
-            ShrI = 0x54, "SHRI" => [rd: Reg, rs: Reg, imm: ImmI64], 3,
-            /// ANDI rd, rs, imm ; rd = rs & imm
-            AndI = 0x55, "ANDI" => [rd: Reg, rs: Reg, imm: ImmI64], 2,
-            /// ORI rd, rs, imm ; rd = rs | imm
-            OrI = 0x56, "ORI" => [rd: Reg, rs: Reg, imm: ImmI64], 2,
-            /// XORI rd, rs, imm ; rd = rs ^ imm
-            XorI = 0x57, "XORI" => [rd: Reg, rs: Reg, imm: ImmI64], 2,
-            /// EQI rd, rs, imm ; rd = (rs == imm)
-            EqI = 0x58, "EQI" => [rd: Reg, rs: Reg, imm: ImmI64], 3,
-            /// LTI rd, rs, imm ; rd = (rs < imm)
-            LtI = 0x59, "LTI" => [rd: Reg, rs: Reg, imm: ImmI64], 3,
-            /// LEI rd, rs, imm ; rd = (rs <= imm)
-            LeI = 0x5A, "LEI" => [rd: Reg, rs: Reg, imm: ImmI64], 3,
-            /// GTI rd, rs, imm ; rd = (rs > imm)
-            GtI = 0x5B, "GTI" => [rd: Reg, rs: Reg, imm: ImmI64], 3,
-            /// GEI rd, rs, imm ; rd = (rs >= imm)
-            GeI = 0x5C, "GEI" => [rd: Reg, rs: Reg, imm: ImmI64], 3,
-            /// BEQI rs, imm, offset ; if rs == imm then PC += offset
-            BeqI = 0x5D, "BEQI" => [rs: Reg, imm: ImmI64, offset: ImmI64], 5,
-            /// BNEI rs, imm, offset ; if rs != imm then PC += offset
-            BneI = 0x5E, "BNEI" => [rs: Reg, imm: ImmI64, offset: ImmI64], 5,
-            /// BLTI rs, imm, offset ; if rs < imm (signed) then PC += offset
-            BltI = 0x5F, "BLTI" => [rs: Reg, imm: ImmI64, offset: ImmI64], 5,
-            /// BGEI rs, imm, offset ; if rs >= imm (signed) then PC += offset
-            BgeI = 0x60, "BGEI" => [rs: Reg, imm: ImmI64, offset: ImmI64], 5,
-            /// BLTUI rs, imm, offset ; if rs < imm (unsigned) then PC += offset
-            BltuI = 0x61, "BLTUI" => [rs: Reg, imm: ImmI64, offset: ImmI64], 5,
-            /// BGEUI rs, imm, offset ; if rs >= imm (unsigned) then PC += offset
-            BgeuI = 0x62, "BGEUI" => [rs: Reg, imm: ImmI64, offset: ImmI64], 5,
         }
     };
 }
@@ -254,9 +205,9 @@ macro_rules! define_instructions {
     // ---------- types ----------
     (@ty Reg)    => { u8 };
     (@ty ImmU8)  => { u8 };
-    (@ty Bool)   => { bool };
     (@ty RefU32) => { u32 };
     (@ty ImmI64) => { i64 };
+    (@ty Src) => { SrcOperand };
 
     // ---------- encoding ----------
     (@emit $out:ident, Reg, $v:ident) => {
@@ -275,8 +226,25 @@ macro_rules! define_instructions {
         $out.extend_from_slice(&$v.to_le_bytes());
     };
 
-    (@emit $out:ident, Bool, $v:ident) => {
-        $out.push(if *$v { 1 } else { 0 });
+    (@emit $out:ident, Src, $v:ident) => {
+      match $v {
+          SrcOperand::Reg(r) => {
+              $out.push(0); // TAG_REG
+              $out.push(*r);
+          }
+          SrcOperand::Bool(b) => {
+              $out.push(1); // TAG_BOOL
+              $out.push(if *b { 1 } else { 0 });
+          }
+          SrcOperand::I64(i) => {
+              $out.push(2); // TAG_INT
+              $out.extend_from_slice(&i.to_le_bytes());
+          }
+          SrcOperand::Ref(r) => {
+              $out.push(3); // TAG_REF
+              $out.extend_from_slice(&r.to_le_bytes());
+          }
+      }
     };
 }
 

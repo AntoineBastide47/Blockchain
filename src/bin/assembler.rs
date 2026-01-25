@@ -262,10 +262,8 @@ fn main() {
             });
 
         let mut overlay = OverlayState::new(&base);
-        vm.run(&mut overlay, &ctx).unwrap_or_else(|e| {
-            error!("{e}");
-            process::exit(1)
-        });
+        vm.run(&mut overlay, &ctx)
+            .unwrap_or_else(|_| process::exit(1));
 
         let mut deploy_profile = vm.gas_profile();
         deploy_profile.add(GasCategory::Intrinsic, deploy_intrinsic);

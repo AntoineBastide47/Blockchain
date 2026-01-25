@@ -10,7 +10,7 @@
 //! INSTRUCTION operand1, operand2, ...  # optional comment
 //! ```
 //!
-//! - Instructions are uppercase (e.g., `LOAD_I64`, `ADD`)
+//! - Instructions are uppercase (e.g., `MOVE`, `ADD`)
 //! - Registers use `r` prefix (e.g., `r0`, `r255`)
 //! - Immediates are decimal integers (e.g., `42`, `-1`)
 //! - String literals are double-quoted (e.g., `"hello"`)
@@ -22,6 +22,7 @@ use crate::for_each_instruction;
 use crate::utils::log::SHOW_TYPE;
 use crate::virtual_machine::errors::VMError;
 use crate::virtual_machine::isa::Instruction;
+use crate::virtual_machine::operand::SrcOperand;
 use crate::virtual_machine::program::DeployProgram;
 use crate::{define_instructions, error};
 use std::collections::{HashMap, HashSet};
@@ -349,20 +350,6 @@ pub(crate) fn parse_ref_u32(tok: &str) -> Result<u32, VMError> {
         })
 }
 
-/// Parse a boolean literal (`true` or `false`).
-pub(crate) fn parse_bool(tok: &str) -> Result<bool, VMError> {
-    match tok {
-        "true" => Ok(true),
-        "false" => Ok(false),
-        _ => Err(VMError::TypeMismatch {
-            instruction: "bool",
-            arg_index: 0,
-            expected: "bool",
-            actual: tok.to_string(),
-        }),
-    }
-}
-
 /// Parses an i64 immediate or a label reference.
 ///
 /// If `tok` parses as an integer, returns it directly. Otherwise, resolves
@@ -378,6 +365,34 @@ pub(crate) fn parse_i64_or_label(
     }
     let target = ctx.resolve_label(tok)?;
     Ok(target as i64 - current_global_offset as i64)
+}
+
+fn parse_src(
+    tok: &str,
+    ctx: &mut AsmContext,
+    current_offset: usize,
+) -> Result<SrcOperand, VMError> {
+    // Register: r0, r1, ...
+    if let Ok(reg) = parse_reg(tok) {
+        return Ok(SrcOperand::Reg(reg));
+    }
+    // Bool literals
+    if tok == "true" {
+        return Ok(SrcOperand::Bool(true));
+    }
+    if tok == "false" {
+        return Ok(SrcOperand::Bool(false));
+    }
+    // String literal
+    if let Some(s) = tok.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
+        return Ok(SrcOperand::Ref(ctx.intern_string(s.to_string())));
+    }
+    // i64 or label
+    Ok(SrcOperand::I64(parse_i64_or_label(
+        tok,
+        ctx,
+        current_offset,
+    )?))
 }
 
 /// Extracts the token text that caused an error, if available.
@@ -396,6 +411,26 @@ fn error_token_text(err: &VMError) -> Option<&str> {
 /// Checks if a token is a label definition (ends with `:`)
 fn is_label_def(tok: &str) -> bool {
     tok.ends_with(LABEL_SUFFIX) && tok.len() > 1
+}
+
+/// Computes the encoded size of a Src operand from its token text.
+///
+/// Determines the operand type by inspecting the token:
+/// - Register (r0, r1, ...): tag(1) + reg(1) = 2 bytes
+/// - Bool (true/false): tag(1) + bool(1) = 2 bytes
+/// - String literal ("..."): tag(1) + ref(4) = 5 bytes
+/// - Number or label: tag(1) + i64(8) = 9 bytes
+fn src_size_from_token(tok: &str) -> usize {
+    if tok.starts_with('r') && tok.len() > 1 && tok[1..].chars().all(|c| c.is_ascii_digit())
+        || tok == "true"
+        || tok == "false"
+    {
+        2 // tag + (register or bool)
+    } else if tok.starts_with('"') {
+        5 // tag + u32 ref
+    } else {
+        9 // tag + i64 (numbers and labels)
+    }
 }
 
 /// Extracts the label name from a label definition token.
@@ -462,15 +497,36 @@ macro_rules! define_parse_instruction {
             }
         }
 
-        /// Returns the bytecode size for an instruction (opcode + operands).
-        fn instruction_size(instr: Instruction) -> usize {
-            match instr {
+        /// Returns the bytecode size for an instruction from its tokens.
+        ///
+        /// Tokens should include the instruction mnemonic followed by operands.
+        /// Size depends on operand types, which are determined by inspecting tokens.
+        fn instruction_size_from_tokens(tokens: &[Token]) -> Result<usize, VMError> {
+            if tokens.is_empty() {
+                return Err(VMError::ArityMismatch {
+                    instruction: "<missing opcode>".to_string(),
+                    expected: 1,
+                    actual: 0,
+                });
+            }
+
+            let instr = instruction_from_str(tokens[0].text)?;
+            let mut tok_iter = tokens.iter().skip(1);
+            Ok(match instr {
                 $(
                     Instruction::$name => {
-                        1usize $( + define_parse_instruction!(@size $kind) )*
+                        const EXPECTED: usize = 1 + define_parse_instruction!(@count $( $field ),*);
+                        if tokens.len() != EXPECTED {
+                            return Err(VMError::ArityMismatch {
+                                instruction: tokens[0].text.to_string(),
+                                expected: EXPECTED - 1,
+                                actual: tokens.len() - 1,
+                            });
+                        }
+                        1usize $( + define_parse_instruction!(@token_size $kind, tok_iter) )*
                     }
                 ),*
-            }
+            })
         }
 
         /// Parse one instruction from tokens into [`AsmInstr`].
@@ -491,7 +547,7 @@ macro_rules! define_parse_instruction {
             }
 
             let instr = instruction_from_str(&tokens[0].text)?;
-            let offset = current_global_offset + instruction_size(instr);
+            let offset = current_global_offset + instruction_size_from_tokens(tokens)?;
 
             match instr {
                 $(
@@ -521,12 +577,12 @@ macro_rules! define_parse_instruction {
 
     (@unit $x:ident) => { () };
 
-    // ---------- operand sizes ----------
-    (@size Reg)    => { 1usize };
-    (@size Bool)   => { 1usize };
-    (@size RefU32) => { 4usize };
-    (@size ImmU8)  => { 1usize };
-    (@size ImmI64) => { 8usize };
+    // ---------- operand sizes from tokens ----------
+    (@token_size Reg, $iter:ident) => { { $iter.next(); 1usize } };
+    (@token_size RefU32, $iter:ident) => { { $iter.next(); 4usize } };
+    (@token_size ImmU8, $iter:ident) => { { $iter.next(); 1usize } };
+    (@token_size ImmI64, $iter:ident) => { { $iter.next(); 8usize } };
+    (@token_size Src, $iter:ident) => { { src_size_from_token($iter.next().unwrap().text) } };
 
     // ---------- parsing ----------
     (@construct $ctx:ident $offset:ident $tokens:ident; $name:ident) => {
@@ -565,8 +621,8 @@ macro_rules! define_parse_instruction {
         }
     }};
 
-    (@parse_operand Bool, $tok:expr, $ctx:expr, $current_offset:expr) => {
-        parse_bool(&$tok.text)
+    (@parse_operand Src, $tok:expr, $ctx:expr, $current_offset:expr) => {
+        parse_src(&$tok.text, $ctx, $current_offset)
     };
 }
 
@@ -647,7 +703,7 @@ fn assemble_source_step_1(
 
     if has_multiple {
         base.push_str("__dispatch_header:\n");
-        base.push_str("MULI r253, r0, 11\n"); // byte offset into table
+        base.push_str("MUL r253, r0, 11\n"); // byte offset into table
         base.push_str("ADD r253, r253, r254\n"); // absolute addr of target entry
         base.push_str("JALR r255, r253, 0\n");
         base.push_str("HALT\n");
@@ -758,9 +814,9 @@ fn assemble_source_step_2(source: String, errors: &mut Vec<VMError>) -> Option<D
 
         if instr_start == 0 || tokens.len() > instr_start {
             let instr_tokens: Vec<Token> = tokens[instr_start..].to_vec();
-            match instruction_from_str(instr_tokens[0].text) {
-                Ok(instr) => {
-                    *local_offset += instruction_size(instr);
+            match instruction_size_from_tokens(&instr_tokens) {
+                Ok(size) => {
+                    *local_offset += size;
                     parsed_lines.push((line_no, instr_tokens, effective_section));
                 }
                 Err(e) => {
@@ -955,20 +1011,9 @@ mod tests {
 
     #[test]
     fn assemble_inline_comment() {
-        let source = format!("LOAD_I64 r0, 42 {COMMENT_CHAR} load value");
+        let source = format!("MOVE r0, 42 {COMMENT_CHAR} load value");
         let program = assemble_source(source).unwrap();
-        assert_eq!(program.runtime_code.len(), 10); // opcode(1) + reg(1) + i64(8)
-    }
-
-    #[test]
-    fn assemble_single_instruction() {
-        let program = assemble_source("LOAD_I64 r0, 42").unwrap();
-        assert_eq!(program.runtime_code[0], Instruction::LoadI64 as u8);
-        assert_eq!(program.runtime_code[1], 0);
-        assert_eq!(
-            i64::from_le_bytes(program.runtime_code[2..10].try_into().unwrap()),
-            42
-        );
+        assert_eq!(program.runtime_code.len(), 11); // opcode(1) + reg(1) + tag(1) + i64(8)
     }
 
     #[test]
@@ -1003,30 +1048,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_bool_valid() {
-        assert!(parse_bool("true").unwrap());
-        assert!(!parse_bool("false").unwrap());
-    }
-
-    #[test]
-    fn parse_bool_invalid() {
-        assert!(parse_bool("TRUE").is_err());
-        assert!(parse_bool("1").is_err());
-        assert!(parse_bool("").is_err());
-    }
-
-    #[test]
-    fn assemble_string_literal() {
-        let program = assemble_source(r#"LOAD_STR r0, "hello""#).unwrap();
-        assert_eq!(program.items, vec!["hello".as_bytes().to_vec()]);
-        assert_eq!(program.runtime_code[0], Instruction::LoadStr as u8);
-    }
-
-    #[test]
     fn assemble_multiple_strings() {
         let source = r#"
-            LOAD_STR r0, "first"
-            LOAD_STR r1, "second"
+            MOVE r0, "first"
+            MOVE r1, "second"
         "#;
         let program = assemble_source(source).unwrap();
         assert_eq!(
@@ -1038,33 +1063,19 @@ mod tests {
     #[test]
     fn assemble_invalid_string_literal() {
         let source = r#"
-            LOAD_STR r0, "first
+            MOVE r0, "first
         "#;
         assert!(assemble_source(source).is_err());
 
         let source = r#"
-            LOAD_STR r0, first
+            MOVE r0, first
         "#;
         assert!(assemble_source(source).is_err());
 
         let source = r#"
-            LOAD_STR r0, first"
+            MOVE r0, first"
         "#;
         assert!(assemble_source(source).is_err());
-    }
-
-    #[test]
-    fn assemble_bool_literal() {
-        let program = assemble_source("LOAD_BOOL r0, true").unwrap();
-        assert_eq!(program.runtime_code[0], Instruction::LoadBool as u8);
-        assert_eq!(program.runtime_code[2], 1);
-
-        let program = assemble_source("LOAD_BOOL r0, false").unwrap();
-        assert_eq!(program.runtime_code[0], Instruction::LoadBool as u8);
-        assert_eq!(program.runtime_code[2], 0);
-
-        let err = assemble_source("LOAD_BOOL r0, 1").unwrap_err();
-        assert!(matches!(err, VMError::AssemblyError { .. }));
     }
 
     #[test]
@@ -1073,32 +1084,6 @@ mod tests {
             parse_instruction(&mut AsmContext::new(), &[], 0),
             Err(VMError::ArityMismatch { .. })
         ));
-    }
-
-    #[test]
-    fn instruction_parse_load_i64() {
-        let tokens = vec![
-            Token {
-                text: "LOAD_I64",
-                offset: 1,
-            },
-            Token {
-                text: "r5",
-                offset: 10,
-            },
-            Token {
-                text: "100",
-                offset: 14,
-            },
-        ];
-        let instr = parse_instruction(&mut AsmContext::new(), &tokens, 0).unwrap();
-        match instr {
-            AsmInstr::LoadI64 { rd, imm } => {
-                assert_eq!(rd, 5);
-                assert_eq!(imm, 100);
-            }
-            _ => panic!("wrong instruction type"),
-        }
     }
 
     #[test]
@@ -1125,21 +1110,11 @@ mod tests {
         match instr {
             AsmInstr::Add { rd, rs1, rs2 } => {
                 assert_eq!(rd, 0);
-                assert_eq!(rs1, 1);
-                assert_eq!(rs2, 2);
+                assert_eq!(rs1, SrcOperand::Reg(1));
+                assert_eq!(rs2, SrcOperand::Reg(2));
             }
             _ => panic!("wrong instruction type"),
         }
-    }
-
-    #[test]
-    fn instruction_from_str_valid() {
-        assert_eq!(
-            instruction_from_str("LOAD_I64").unwrap(),
-            Instruction::LoadI64
-        );
-        assert_eq!(instruction_from_str("ADD").unwrap(), Instruction::Add);
-        assert_eq!(instruction_from_str("DIV").unwrap(), Instruction::Div);
     }
 
     #[test]
@@ -1155,142 +1130,39 @@ mod tests {
     }
 
     #[test]
-    fn asm_instr_assemble_load_i64() {
-        let instr = AsmInstr::LoadI64 { rd: 3, imm: -1 };
-        let mut out = Vec::new();
-        instr.assemble(&mut out);
-        assert_eq!(out[0], Instruction::LoadI64 as u8);
-        assert_eq!(out[1], 3);
-        assert_eq!(i64::from_le_bytes(out[2..10].try_into().unwrap()), -1);
-    }
-
-    #[test]
     fn asm_instr_assemble_three_reg() {
         let instr = AsmInstr::Sub {
             rd: 10,
-            rs1: 20,
-            rs2: 30,
+            rs1: SrcOperand::I64(20),
+            rs2: SrcOperand::I64(30),
         };
         let mut out = Vec::new();
         instr.assemble(&mut out);
-        assert_eq!(out, vec![Instruction::Sub as u8, 10, 20, 30]);
+        let mut expected = vec![Instruction::Sub as u8, 10, 2];
+        expected.extend_from_slice(&20i64.to_le_bytes());
+        expected.push(2);
+        expected.extend_from_slice(&30i64.to_le_bytes());
+        assert_eq!(out, expected);
     }
 
     #[test]
     fn asm_instr_assemble_two_reg() {
-        let instr = AsmInstr::Neg { rd: 1, rs: 2 };
-        let mut out = Vec::new();
-        instr.assemble(&mut out);
-        assert_eq!(out, vec![Instruction::Neg as u8, 1, 2]);
-    }
-
-    #[test]
-    fn asm_instr_assemble_bool() {
-        let instr = AsmInstr::LoadBool { rd: 0, bool: true };
-        let mut out = Vec::new();
-        instr.assemble(&mut out);
-        assert_eq!(out, vec![Instruction::LoadBool as u8, 0, 1]);
-    }
-
-    #[test]
-    fn asm_instr_assemble_ref() {
-        let instr = AsmInstr::LoadStr { rd: 1, str: 0x1234 };
-        let mut out = Vec::new();
-        instr.assemble(&mut out);
-        assert_eq!(out[0], Instruction::LoadStr as u8);
-        assert_eq!(out[1], 1);
-        assert_eq!(u32::from_le_bytes(out[2..6].try_into().unwrap()), 0x1234);
-    }
-
-    #[test]
-    fn instruction_parse_addi_and_beqi() {
-        // ADDI rd, rs, imm
-        let tokens = [
-            Token {
-                text: "ADDI",
-                offset: 1,
-            },
-            Token {
-                text: "r1",
-                offset: 6,
-            },
-            Token {
-                text: "r2",
-                offset: 10,
-            },
-            Token {
-                text: "5",
-                offset: 14,
-            },
-        ];
-        let instr = parse_instruction(&mut AsmContext::new(), &tokens, 0).unwrap();
-        match instr {
-            AsmInstr::AddI { rd, rs, imm } => {
-                assert_eq!((rd, rs, imm), (1, 2, 5));
-            }
-            other => panic!("unexpected instr: {other:?}"),
-        }
-
-        // BEQI rs, imm, offset
-        let tokens = [
-            Token {
-                text: "BEQI",
-                offset: 1,
-            },
-            Token {
-                text: "r3",
-                offset: 6,
-            },
-            Token {
-                text: "0",
-                offset: 10,
-            },
-            Token {
-                text: "12",
-                offset: 12,
-            },
-        ];
-        let instr = parse_instruction(&mut AsmContext::new(), &tokens, 0).unwrap();
-        match instr {
-            AsmInstr::BeqI { rs, imm, offset } => {
-                assert_eq!((rs, imm, offset), (3, 0, 12));
-            }
-            other => panic!("unexpected instr: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn asm_instr_assemble_addi_and_orxori() {
-        let addi = AsmInstr::AddI {
-            rd: 4,
-            rs: 5,
-            imm: -7,
-        };
-        let mut out = Vec::new();
-        addi.assemble(&mut out);
-        assert_eq!(out[0], Instruction::AddI as u8);
-        assert_eq!(out[1], 4);
-        assert_eq!(out[2], 5);
-        assert_eq!(i64::from_le_bytes(out[3..11].try_into().unwrap()), -7);
-
-        let xori = AsmInstr::XorI {
+        let instr = AsmInstr::Neg {
             rd: 1,
-            rs: 2,
-            imm: 1,
+            rs: SrcOperand::I64(2),
         };
-        out.clear();
-        xori.assemble(&mut out);
-        assert_eq!(out[0], Instruction::XorI as u8);
-        assert_eq!(out[1], 1);
-        assert_eq!(out[2], 2);
-        assert_eq!(i64::from_le_bytes(out[3..11].try_into().unwrap()), 1);
+        let mut out = Vec::new();
+        instr.assemble(&mut out);
+        let mut expected = vec![Instruction::Neg as u8, 1, 2];
+        expected.extend_from_slice(&2i64.to_le_bytes());
+        assert_eq!(out, expected);
     }
 
     // ==================== Labels ====================
 
     #[test]
     fn duplicate_label_error() {
-        let source = "dup: LOAD_I64 r0, 1\ndup: LOAD_I64 r1, 2";
+        let source = "dup: MOVE r0, 1\ndup: MOVE r1, 2";
         let err = assemble_source(source).unwrap_err();
         assert!(matches!(
             err,
@@ -1350,7 +1222,7 @@ mod tests {
 
     #[test]
     fn assemble_call_argc_u8() {
-        // CALL: opcode(1) + dst(1) + fn_id(4) + argc(1) + argv(1) = 8 bytes
+        // CALL: opcode(1) + dst(1) + fn_id(8) + argc(1) + argv(1) = 12 bytes
         let program = assemble_source("my_func:\nCALL r0, my_func, 5, r2").unwrap();
         assert_eq!(program.runtime_code[0], Instruction::Call as u8);
         assert_eq!(program.runtime_code[1], 0); // dst = r0
@@ -1393,55 +1265,55 @@ mod tests {
         assert_eq!(parse_section_marker("init code"), None);
         assert_eq!(parse_section_marker("[init code]"), None);
         assert_eq!(parse_section_marker("[ unknown ]"), None);
-        assert_eq!(parse_section_marker("LOAD_I64 r0, 1"), None);
+        assert_eq!(parse_section_marker("MOVE r0, 1"), None);
     }
 
     #[test]
     fn assemble_no_sections_defaults_to_runtime() {
-        let program = assemble_source("LOAD_I64 r0, 1").unwrap();
+        let program = assemble_source("MOVE r0, 1").unwrap();
         assert!(program.init_code.is_empty());
         assert!(!program.runtime_code.is_empty());
     }
 
     #[test]
     fn assemble_init_section_only() {
-        let source = "[ init code ]\nLOAD_I64 r0, 42";
+        let source = "[ init code ]\nMOVE r0, 42";
         let program = assemble_source(source).unwrap();
-        assert_eq!(program.init_code.len(), 10);
+        assert_eq!(program.init_code.len(), 11);
         assert!(program.runtime_code.is_empty());
     }
 
     #[test]
     fn assemble_runtime_section_only() {
-        let source = "[ runtime code ]\nLOAD_I64 r0, 42";
+        let source = "[ runtime code ]\nMOVE r0, 42";
         let program = assemble_source(source).unwrap();
         assert!(program.init_code.is_empty());
-        assert_eq!(program.runtime_code.len(), 10);
+        assert_eq!(program.runtime_code.len(), 11);
     }
 
     #[test]
     fn assemble_both_sections() {
         let source = r#"
 [ init code ]
-LOAD_I64 r0, 1
-LOAD_I64 r1, 2
+MOVE r0, 1
+MOVE r1, 2
 
 [ runtime code ]
-LOAD_I64 r2, 3
+MOVE r2, 3
 "#;
         let program = assemble_source(source).unwrap();
-        assert_eq!(program.init_code.len(), 20); // 2 LOAD_I64 instructions
-        assert_eq!(program.runtime_code.len(), 10); // 1 LOAD_I64 instruction
+        assert_eq!(program.init_code.len(), 22); // 2 MOVE instructions
+        assert_eq!(program.runtime_code.len(), 11); // 1 MOVE instruction
     }
 
     #[test]
     fn assemble_labels_within_sections() {
         let source = r#"
 [ init code ]
-start: LOAD_I64 r0, 1
+start: MOVE r0, 1
 
 [ runtime code ]
-func: LOAD_I64 r1, 2
+func: MOVE r1, 2
 "#;
         let program = assemble_source(source).unwrap();
         assert!(!program.init_code.is_empty());
@@ -1450,20 +1322,20 @@ func: LOAD_I64 r1, 2
 
     #[test]
     fn assemble_empty_init_section() {
-        let source = "[ init code ]\n[ runtime code ]\nLOAD_I64 r0, 1";
+        let source = "[ init code ]\n[ runtime code ]\nMOVE r0, 1";
         let program = assemble_source(source).unwrap();
         assert!(program.init_code.is_empty());
-        assert_eq!(program.runtime_code.len(), 10);
+        assert_eq!(program.runtime_code.len(), 11);
     }
 
     #[test]
     fn assemble_strings_across_sections() {
         let source = r#"
 [ init code ]
-LOAD_STR r0, "init"
+MOVE r0, "init"
 
 [ runtime code ]
-LOAD_STR r1, "runtime"
+MOVE r1, "runtime"
 "#;
         let program = assemble_source(source).unwrap();
         assert_eq!(program.items.len(), 2);

@@ -18,7 +18,7 @@ pub enum VMError {
         actual: usize,
     },
     /// Expected a register operand (e.g., `r0`) but got something else.
-    #[error("expected register operand (e.g., r0) but got '{0}'")]
+    #[error("expected register operand (e.g., r0) but got '{0}', did you mean 'r{0}' ?")]
     ExpectedRegister(String),
     /// Register index out of range or malformed.
     #[error("register or reference '{token}' is invalid or malformed")]
@@ -64,10 +64,11 @@ pub enum VMError {
     #[error("attempted division or modulo by zero during execution")]
     DivisionByZero,
     /// Assembly error with line/column context.
-    #[error("assembly error at line {line}, column {offset}: {source}")]
+    #[error("assembly error at line {line}, column {offset}-{offset + length}: {source}")]
     AssemblyError {
         line: usize,
         offset: usize,
+        length: usize,
         source: String,
     },
     /// File I/O error during assembly.

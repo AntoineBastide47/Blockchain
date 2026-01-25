@@ -18,35 +18,40 @@
 //! - Comments start with `#`
 //! - Commas between operands are optional
 
-use crate::define_instructions;
 use crate::for_each_instruction;
+use crate::utils::log::SHOW_TYPE;
 use crate::virtual_machine::errors::VMError;
 use crate::virtual_machine::isa::Instruction;
 use crate::virtual_machine::program::DeployProgram;
+use crate::{define_instructions, error};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::Ordering;
 
 const COMMENT_CHAR: char = '#';
 const LABEL_SUFFIX: char = ':';
 const SECTION_INIT: &str = "[ init code ]";
 const SECTION_RUNTIME: &str = "[ runtime code ]";
 
-/// Return the line/column/message triple for assembly-related errors.
-fn assembly_error_location(err: &VMError) -> Option<(usize, usize, String)> {
-    match err {
-        VMError::AssemblyError {
-            line,
-            offset,
-            source,
-        } => Some((*line, *offset, source.clone())),
-        VMError::ParseError {
-            line,
-            offset,
-            message,
-        } => Some((*line, *offset, message.to_string())),
-        _ => None,
+/// Tracks line offset introduced by dispatcher code insertion.
+#[derive(Debug, Clone, Copy)]
+struct DispatcherInfo {
+    /// Line number (1-indexed) after which dispatcher was inserted.
+    insert_after: usize,
+    /// Number of lines added by the dispatcher.
+    lines_added: usize,
+}
+
+impl DispatcherInfo {
+    /// Adjusts a processed-source line number back to original source line number.
+    fn adjust_line(&self, processed_line: usize) -> usize {
+        if processed_line > self.insert_after {
+            processed_line.saturating_sub(self.lines_added)
+        } else {
+            processed_line
+        }
     }
 }
 
@@ -56,32 +61,104 @@ fn render_assembly_diagnostic(
     source: &str,
     line: usize,
     offset: usize,
+    length: usize,
     message: &str,
-) -> String {
-    let mut diag = String::new();
-    let _ = writeln!(diag, "error: {message}");
-    let _ = writeln!(diag, " --> {file}:{line}:{offset}");
+) {
+    error!("{message}");
+    eprintln!(" --> {file}:{line}:{offset}");
 
     if let Some(raw_line) = source.lines().nth(line.saturating_sub(1)) {
-        let line_text = raw_line.trim_end_matches('\r');
         let underline = " ".repeat(offset.saturating_sub(1));
-        let _ = writeln!(diag, "  |");
-        let _ = writeln!(diag, "{:>4} | {}", line, line_text);
-        let _ = writeln!(diag, "  | {}^", underline);
+        let carets = "^".repeat(length.max(1));
+        eprintln!("{:>4} | {}", line, raw_line.trim_end_matches('\r'));
+        eprint!("     |");
+        SHOW_TYPE.store(false, Ordering::Relaxed);
+        error!(" {}{} {}", underline, carets, message);
+        SHOW_TYPE.store(true, Ordering::Relaxed);
     }
-
-    diag
 }
 
-/// Emit a helpful diagnostic to stderr for assembly errors.
-fn log_assembly_error(file: &str, source: &str, err: &VMError) {
-    if let Some((line, offset, message)) = assembly_error_location(err) {
-        eprintln!(
-            "{}",
-            render_assembly_diagnostic(file, source, line, offset, &message)
-        );
+/// Emit helpful diagnostics to stderr for multiple assembly errors.
+///
+/// If dispatcher info is provided, adjusts line numbers for errors occurring
+/// after the dispatcher insertion point.
+fn log_assembly_errors(
+    file: &str,
+    source: &str,
+    errors: &[VMError],
+    dispatcher: Option<DispatcherInfo>,
+) {
+    for err in errors {
+        log_assembly_error_adjusted(file, source, err, dispatcher);
+    }
+    if errors.len() > 1 {
+        error!("aborting due to {} previous errors", errors.len());
+    }
+}
+
+/// Adjusts line numbers in an error based on dispatcher offset.
+fn adjust_error_line(err: VMError, dispatcher: Option<DispatcherInfo>) -> VMError {
+    let Some(info) = dispatcher else {
+        return err;
+    };
+    match err {
+        VMError::AssemblyError {
+            line,
+            offset,
+            length,
+            source,
+        } => VMError::AssemblyError {
+            line: info.adjust_line(line),
+            offset,
+            length,
+            source,
+        },
+        VMError::ParseError {
+            line,
+            offset,
+            message,
+        } => VMError::ParseError {
+            line: info.adjust_line(line),
+            offset,
+            message,
+        },
+        other => other,
+    }
+}
+
+/// Logs a single assembly error, adjusting line number if dispatcher info is provided.
+fn log_assembly_error_adjusted(
+    file: &str,
+    source: &str,
+    err: &VMError,
+    dispatcher: Option<DispatcherInfo>,
+) {
+    // Extract line/offset/length/message, adjusting line if needed
+    let location = match err {
+        VMError::AssemblyError {
+            line,
+            offset,
+            length,
+            source: msg,
+        } => {
+            let adjusted_line = dispatcher.map_or(*line, |d| d.adjust_line(*line));
+            Some((adjusted_line, *offset, *length, msg.clone()))
+        }
+        VMError::ParseError {
+            line,
+            offset,
+            message,
+        } => {
+            let adjusted_line = dispatcher.map_or(*line, |d| d.adjust_line(*line));
+            Some((adjusted_line, *offset, 1, message.to_string()))
+        }
+        _ => None,
+    };
+
+    if let Some((line, offset, length, message)) = location {
+        render_assembly_diagnostic(file, source, line, offset, length, &message);
     } else {
-        eprintln!("error: {err}");
+        error!("{err}");
     }
 }
 
@@ -303,6 +380,19 @@ pub(crate) fn parse_i64_or_label(
     Ok(target as i64 - current_global_offset as i64)
 }
 
+/// Extracts the token text that caused an error, if available.
+fn error_token_text(err: &VMError) -> Option<&str> {
+    match err {
+        VMError::ExpectedRegister(tok) => Some(tok),
+        VMError::InvalidRegister { token } => Some(token),
+        VMError::ArgcOutOfRange { actual } => Some(actual),
+        VMError::TypeMismatch { actual, .. } => Some(actual),
+        VMError::UndefinedLabel { label } => Some(label),
+        VMError::UndefinedFunction { function } => Some(function),
+        _ => None,
+    }
+}
+
 /// Checks if a token is a label definition (ends with `:`)
 fn is_label_def(tok: &str) -> bool {
     tok.ends_with(LABEL_SUFFIX) && tok.len() > 1
@@ -488,7 +578,13 @@ for_each_instruction!(define_parse_instruction);
 /// (`__resolver_jump_table`) that dispatches to public functions based on a
 /// selector in `r0`. The generated dispatcher is inserted at the start of the
 /// `[ runtime code ]` section.
-fn assemble_source_step_1(source: String) -> Result<String, VMError> {
+///
+/// Collects tokenization errors into the provided vector and continues processing.
+/// Returns the processed source and optional dispatcher info for line adjustment.
+fn assemble_source_step_1(
+    source: String,
+    errors: &mut Vec<VMError>,
+) -> (String, Option<DispatcherInfo>) {
     // Track where to insert the dispatcher (line number of `[ runtime code ]`)
     let mut insert_point = 0usize;
     // Collect all public label names (including trailing ':')
@@ -504,7 +600,13 @@ fn assemble_source_step_1(source: String) -> Result<String, VMError> {
             continue;
         }
 
-        let tokens = tokenize(line_no + 1, line)?;
+        let tokens = match tokenize(line_no + 1, line) {
+            Ok(t) => t,
+            Err(e) => {
+                errors.push(e);
+                continue;
+            }
+        };
         if tokens.is_empty() {
             continue;
         }
@@ -522,7 +624,7 @@ fn assemble_source_step_1(source: String) -> Result<String, VMError> {
     }
 
     if public_labels.is_empty() {
-        return Ok(source);
+        return (source, None);
     }
 
     let mut base = String::new();
@@ -551,10 +653,13 @@ fn assemble_source_step_1(source: String) -> Result<String, VMError> {
         base.push_str("HALT\n");
     }
 
+    // Count lines added by dispatcher (+1 for the extra newline after base)
+    let lines_added = base.lines().count() + 1;
+
     // Reassemble source with dispatcher inserted at the runtime section marker
     let mut out = String::with_capacity(source.len() + base.len());
     for (i, line) in source.lines().enumerate() {
-        out.push_str(line.split(COMMENT_CHAR).next().unwrap_or("").trim());
+        out.push_str(line.split(COMMENT_CHAR).next().unwrap_or(""));
         out.push('\n');
         // Insert dispatcher just after the `[ runtime code ]` line
         if i == insert_point {
@@ -563,7 +668,12 @@ fn assemble_source_step_1(source: String) -> Result<String, VMError> {
         }
     }
 
-    Ok(out)
+    let dispatcher_info = DispatcherInfo {
+        insert_after: insert_point + 1, // 1-indexed, after the section marker
+        lines_added,
+    };
+
+    (out, Some(dispatcher_info))
 }
 
 /// Performs two-pass assembly on preprocessed source.
@@ -573,7 +683,9 @@ fn assemble_source_step_1(source: String) -> Result<String, VMError> {
 /// concatenated address space (init || runtime).
 ///
 /// Pass 2: Parses instructions with label resolution and emits bytecode.
-fn assemble_source_step_2(source: String) -> Result<DeployProgram, VMError> {
+///
+/// Collects all errors into the provided vector and continues processing where possible.
+fn assemble_source_step_2(source: String, errors: &mut Vec<VMError>) -> Option<DeployProgram> {
     let mut asm_context = AsmContext::new();
 
     // First pass: tokenize all lines, detect sections, compute global offsets
@@ -586,7 +698,8 @@ fn assemble_source_step_2(source: String) -> Result<DeployProgram, VMError> {
     let mut runtime_size = 0usize;
 
     // Temporary label storage: (name, global_offset, line_no, tok_offset)
-    let mut pending_labels: Vec<(String, Section, usize, usize, usize)> = Vec::new();
+    // (name, section, local_offset, line_no, tok_offset, tok_len)
+    let mut pending_labels: Vec<(String, Section, usize, usize, usize, usize)> = Vec::new();
 
     for (line_no, line) in source.lines().enumerate() {
         // Check for section markers first
@@ -595,7 +708,13 @@ fn assemble_source_step_2(source: String) -> Result<DeployProgram, VMError> {
             continue;
         }
 
-        let tokens = tokenize(line_no + 1, line)?;
+        let tokens = match tokenize(line_no + 1, line) {
+            Ok(t) => t,
+            Err(e) => {
+                errors.push(e);
+                continue;
+            }
+        };
         if tokens.is_empty() {
             continue;
         }
@@ -620,55 +739,56 @@ fn assemble_source_step_2(source: String) -> Result<DeployProgram, VMError> {
         };
 
         // Check if first token is a label definition
+        let mut instr_start = 0;
         if tokens.len() > label_idx && is_label_def(tokens[label_idx].text) {
-            let name = label_name(tokens[label_idx].text).to_string();
+            let label_tok = &tokens[label_idx];
+            let name = label_name(label_tok.text).to_string();
             pending_labels.push((
                 name,
                 effective_section,
                 *local_offset,
                 line_no + 1,
-                tokens[0].offset,
+                label_tok.offset,
+                label_tok.text.len(),
             ));
 
             // If there are more tokens after the label, treat them as an instruction
-            let instr_start = label_idx + 1;
-            if tokens.len() > instr_start {
-                let instr_tokens: Vec<Token> = tokens[instr_start..].to_vec();
-                let instr = instruction_from_str(instr_tokens[0].text).map_err(|e| {
-                    VMError::AssemblyError {
+            instr_start = label_idx + 1;
+        }
+
+        if instr_start == 0 || tokens.len() > instr_start {
+            let instr_tokens: Vec<Token> = tokens[instr_start..].to_vec();
+            match instruction_from_str(instr_tokens[0].text) {
+                Ok(instr) => {
+                    *local_offset += instruction_size(instr);
+                    parsed_lines.push((line_no, instr_tokens, effective_section));
+                }
+                Err(e) => {
+                    errors.push(VMError::AssemblyError {
                         line: line_no + 1,
                         offset: instr_tokens[0].offset,
+                        length: instr_tokens[0].text.len(),
                         source: e.to_string(),
-                    }
-                })?;
-                *local_offset += instruction_size(instr);
-                parsed_lines.push((line_no, instr_tokens, effective_section));
+                    });
+                }
             }
-        } else {
-            let instr =
-                instruction_from_str(tokens[0].text).map_err(|e| VMError::AssemblyError {
-                    line: line_no + 1,
-                    offset: tokens[0].offset,
-                    source: e.to_string(),
-                })?;
-            *local_offset += instruction_size(instr);
-            parsed_lines.push((line_no, tokens, effective_section));
         }
     }
 
     // Register labels with global offsets (init || runtime address space).
-    for (name, section, local_offset, line_no, tok_offset) in pending_labels {
+    for (name, section, local_offset, line_no, tok_offset, tok_len) in pending_labels {
         let global_offset = match section {
             Section::Init => local_offset,
             Section::Runtime | Section::None => init_size + local_offset,
         };
-        asm_context
-            .define_label(name, global_offset)
-            .map_err(|e| VMError::AssemblyError {
+        if let Err(e) = asm_context.define_label(name, global_offset) {
+            errors.push(VMError::AssemblyError {
                 line: line_no,
                 offset: tok_offset,
+                length: tok_len,
                 source: e.to_string(),
-            })?;
+            });
+        }
     }
 
     // Second pass: parse instructions and emit bytecode to separate vectors
@@ -687,21 +807,40 @@ fn assemble_source_step_2(source: String) -> Result<DeployProgram, VMError> {
             Section::Runtime | Section::None => init_size + bytecode.len(),
         };
 
-        let instr = parse_instruction(&mut asm_context, &tokens, global_offset).map_err(|e| {
-            VMError::AssemblyError {
-                line: line_no + 1,
-                offset: tokens.first().map(|t| t.offset).unwrap_or(1),
-                source: e.to_string(),
+        match parse_instruction(&mut asm_context, &tokens, global_offset) {
+            Ok(instr) => instr.assemble(bytecode),
+            Err(e) => {
+                // Find the token that caused the error for accurate cursor positioning
+                let error_tok =
+                    error_token_text(&e).and_then(|text| tokens.iter().find(|t| t.text == text));
+                let (offset, length) =
+                    error_tok
+                        .map(|t| (t.offset, t.text.len()))
+                        .unwrap_or_else(|| {
+                            tokens
+                                .first()
+                                .map(|t| (t.offset, t.text.len()))
+                                .unwrap_or((1, 1))
+                        });
+                errors.push(VMError::AssemblyError {
+                    line: line_no + 1,
+                    offset,
+                    length,
+                    source: e.to_string(),
+                });
             }
-        })?;
-        instr.assemble(bytecode);
+        }
     }
 
-    Ok(DeployProgram {
-        init_code: init_bytecode,
-        runtime_code: runtime_bytecode,
-        items: asm_context.items,
-    })
+    if errors.is_empty() {
+        Some(DeployProgram {
+            init_code: init_bytecode,
+            runtime_code: runtime_bytecode,
+            items: asm_context.items,
+        })
+    } else {
+        None
+    }
 }
 
 /// Assemble a full source string into bytecode.
@@ -724,22 +863,28 @@ pub fn assemble_source(source: impl Into<String>) -> Result<DeployProgram, VMErr
 
 /// Assembles source with an associated filename for error diagnostics.
 ///
-/// Runs both assembly passes and logs a compiler-style diagnostic to stderr
-/// on failure, including source location information.
+/// Runs both assembly passes and logs compiler-style diagnostics to stderr
+/// on failure, including source location information for all errors found.
 fn assemble_source_with_name(source: String, source_name: &str) -> Result<DeployProgram, VMError> {
-    let mut processed = None;
-    let result = (|| {
-        let dispatcher = assemble_source_step_1(source.clone())?;
-        processed = Some(dispatcher.clone());
-        assemble_source_step_2(dispatcher)
-    })();
+    let mut errors = Vec::new();
 
-    if let Err(err) = &result {
-        let display_source = processed.as_deref().unwrap_or(&source);
-        log_assembly_error(source_name, display_source, err);
+    let (processed, dispatcher_info) = assemble_source_step_1(source.clone(), &mut errors);
+    let result = assemble_source_step_2(processed, &mut errors);
+
+    if !errors.is_empty() {
+        // Use original source for error display, with line adjustment for dispatcher
+        log_assembly_errors(source_name, &source, &errors, dispatcher_info);
+        // Return the first error with adjusted line number
+        let first_err = errors.into_iter().next().unwrap();
+        return Err(adjust_error_line(first_err, dispatcher_info));
     }
 
-    result
+    result.ok_or_else(|| VMError::AssemblyError {
+        line: 0,
+        offset: 0,
+        length: 1,
+        source: "assembly failed".to_string(),
+    })
 }
 
 /// Convenience: assemble directly from file path
@@ -831,7 +976,7 @@ mod tests {
         let err = assemble_source("INVALID r0").unwrap_err();
         assert!(matches!(
             err,
-            VMError::AssemblyError { line: 1, offset: _, ref source } if source.contains("unknown instruction")
+            VMError::AssemblyError { line: 1, offset: _, ref source,.. } if source.contains("unknown instruction")
         ));
     }
 
@@ -840,7 +985,7 @@ mod tests {
         let err = assemble_source("ADD r0, r1").unwrap_err();
         assert!(matches!(
             err,
-            VMError::AssemblyError { line: 1, offset: _, ref source } if source.contains("operand count mismatch")
+            VMError::AssemblyError { line: 1, offset: _, ref source,.. } if source.contains("operand count mismatch")
         ));
     }
 
@@ -1149,7 +1294,7 @@ mod tests {
         let err = assemble_source(source).unwrap_err();
         assert!(matches!(
             err,
-            VMError::AssemblyError { line: 2, offset: _, ref source } if source.contains("duplicate")
+            VMError::AssemblyError { line: 2, offset: _, ref source,.. } if source.contains("duplicate")
         ));
     }
 
@@ -1159,7 +1304,7 @@ mod tests {
         let err = assemble_source(source).unwrap_err();
         assert!(matches!(
             err,
-            VMError::AssemblyError { line: 1, offset: _, ref source } if source.contains("undefined")
+            VMError::AssemblyError { line: 1, offset: _, ref source,.. } if source.contains("undefined")
         ));
     }
 

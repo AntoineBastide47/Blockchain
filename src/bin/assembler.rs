@@ -11,7 +11,7 @@
 //! - `input.asm`: Assembly source file to compile
 //!
 //! # Options
-//! - `-o, --output <file>`: Output file path (defaults to `<input>.bin`)
+//! - `-o, --output <file>`: Optional output file path
 //! - `-p, --predict [price] [func(args)...]`: Estimate gas costs (price defaults to 1)
 //!
 //! # Gas Prediction
@@ -39,6 +39,7 @@ use blockchain::storage::main_storage::MainStorage;
 use blockchain::storage::state_view::StateViewProvider;
 use blockchain::storage::storage_trait::Storage;
 use blockchain::types::hash::Hash;
+use blockchain::utils::log::SHOW_TIMESTAMP;
 use blockchain::virtual_machine::assembler::assemble_file;
 use blockchain::virtual_machine::program::ExecuteProgram;
 use blockchain::virtual_machine::state::OverlayState;
@@ -49,6 +50,7 @@ use std::env;
 use std::fs;
 use std::path::Path;
 use std::process;
+use std::sync::atomic::Ordering;
 
 /// Parses a function call specification like "func(1,2,3)" or "func()".
 ///
@@ -189,23 +191,16 @@ fn main() {
         process::exit(1);
     }
 
-    let output_path = output_path.unwrap_or_else(|| {
-        let p = Path::new(input_path);
-        let stem = p.file_stem().unwrap_or_default().to_string_lossy();
-        let parent = p.parent().unwrap_or(Path::new("."));
-        parent
-            .join(format!("{}.bin", stem))
-            .to_string_lossy()
-            .into_owned()
-    });
-
-    if let Some(parent) = Path::new(&output_path).parent()
+    if let Some(ref path) = output_path
+        && let Some(parent) = Path::new(&path).parent()
         && !parent.as_os_str().is_empty()
         && !parent.exists()
     {
         error!("Output directory does not exist: {}", parent.display());
         process::exit(1);
     }
+
+    SHOW_TIMESTAMP.store(false, Ordering::Relaxed);
 
     let program = match assemble_file(input_path) {
         Ok(p) => p,
@@ -217,17 +212,26 @@ fn main() {
 
     let program_bytes = program.to_bytes();
 
-    if let Err(e) = fs::write(&output_path, program_bytes.as_slice()) {
+    if let Some(ref path) = output_path
+        && let Err(e) = fs::write(path, program_bytes.as_slice())
+    {
         error!("Failed to write output file: {}", e);
         process::exit(1);
     }
 
-    info!(
-        "Compiled {} -> {} ({} bytes)",
-        input_path,
-        output_path,
-        program_bytes.len()
-    );
+    match output_path {
+        None => {
+            info!("Compiled {} ({} bytes)", input_path, program_bytes.len());
+        }
+        Some(ref path) => {
+            info!(
+                "Compiled {} -> {} ({} bytes)",
+                input_path,
+                path,
+                program_bytes.len()
+            );
+        }
+    }
 
     if predict {
         let ms = MainStorage::new(Server::<Libp2pTransport>::genesis_block(0, &[]), 0, &[]);
@@ -443,7 +447,7 @@ ARGS:
     <input.asm>    Assembly source file to compile
 
 OPTIONS:
-    -o, --output <file>                   Output file path (defaults to <input>.bin)
+    -o, --output <file>                   Optional output file path
     -p, --predict [price] [func(args)...] Estimate gas costs
     -h, --help                            Print this help message
 
@@ -459,7 +463,7 @@ EXAMPLES:
     # Compile to default output name
     {program} program.asm
 
-    # Compile with explicit output
+    # Compile and save the output
     {program} program.asm -o output.bin
 
     # Predict deployment only (price = 1)

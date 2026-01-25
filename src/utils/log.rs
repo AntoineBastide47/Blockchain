@@ -2,6 +2,7 @@
 
 use std::fmt::Display;
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 
 /// Log level for filtering messages.
@@ -39,6 +40,9 @@ fn days_to_date(days: u64) -> (u32, u32, u32) {
     (y as u32, m, d)
 }
 
+pub static SHOW_TIMESTAMP: AtomicBool = AtomicBool::new(true);
+pub static SHOW_TYPE: AtomicBool = AtomicBool::new(true);
+
 /// Internal logging function. Use the `info!`, `warn!`, or `error!` macros instead.
 #[doc(hidden)]
 pub fn log(level: Level, message: &str) {
@@ -67,11 +71,18 @@ pub fn log(level: Level, message: &str) {
         }
     }
     let _ = stderr.set_color(&spec);
-    let _ = writeln!(
-        stderr,
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03} [{:5}] {}",
-        year, month, day, hours, mins, s, millis, level, message
-    );
+
+    if SHOW_TIMESTAMP.load(Ordering::Relaxed) {
+        let _ = write!(
+            stderr,
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03} ",
+            year, month, day, hours, mins, s, millis
+        );
+    }
+    if SHOW_TYPE.load(Ordering::Relaxed) {
+        let _ = write!(stderr, "[{:5}] ", level);
+    }
+    let _ = writeln!(stderr, "{}", message);
     let _ = stderr.reset();
 }
 

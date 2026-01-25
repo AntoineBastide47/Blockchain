@@ -28,8 +28,10 @@
 //! - Struct variants with named args: `#[error("expected {expected}")]`
 
 use proc_macro::TokenStream;
+use proc_macro2::Span;
 use quote::{quote, ToTokens};
-use syn::{parse_macro_input, Data, DeriveInput, Fields, Lit, Meta};
+use std::collections::HashSet;
+use syn::{parse_macro_input, Data, DeriveInput, Expr, Fields, Lit, Meta};
 
 /// Derives `Display` and `Error` for an enum or struct.
 ///
@@ -69,16 +71,51 @@ fn expand_error_derive(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStr
                             let field_names: Vec<_> = (0..fields.unnamed.len())
                                 .map(|i| quote::format_ident!("f{}", i))
                                 .collect();
-                            let format_str =
-                                convert_positional_to_named(&error_msg, fields.unnamed.len());
+                            let positional_names: Vec<String> =
+                                field_names.iter().map(|f| f.to_string()).collect();
+                            let rewritten =
+                                rewrite_format_string(&error_msg, Some(&positional_names))?;
+                            let expr_lets = rewritten
+                                .expr_bindings
+                                .iter()
+                                .map(|(ident, expr)| quote! { let #ident = #expr; });
+                            let used_args = select_used_args(
+                                &rewritten.placeholder_names,
+                                &field_names,
+                                &rewritten.expr_bindings,
+                            );
+                            let format_str = rewritten.format_str;
                             quote! {
-                                Self::#variant_name(#(#field_names),*) => write!(f, #format_str, #(#field_names = #field_names),*),
+                                #[allow(unused_variables)]
+                                Self::#variant_name(#(#field_names),*) => {
+                                    #(#expr_lets)*
+                                    write!(f, #format_str, #(#used_args = #used_args),*)
+                                },
                             }
                         }
                         Fields::Named(fields) => {
-                            let field_names: Vec<_> = fields.named.iter().map(|f| &f.ident).collect();
+                            let field_names: Vec<_> = fields
+                                .named
+                                .iter()
+                                .map(|f| f.ident.clone().unwrap())
+                                .collect();
+                            let rewritten = rewrite_format_string(&error_msg, None)?;
+                            let expr_lets = rewritten
+                                .expr_bindings
+                                .iter()
+                                .map(|(ident, expr)| quote! { let #ident = #expr; });
+                            let used_args = select_used_args(
+                                &rewritten.placeholder_names,
+                                &field_names,
+                                &rewritten.expr_bindings,
+                            );
+                            let format_str = rewritten.format_str;
                             quote! {
-                                Self::#variant_name { #(#field_names),* } => write!(f, #error_msg, #(#field_names = #field_names),*),
+                                #[allow(unused_variables)]
+                                Self::#variant_name { #(#field_names),* } => {
+                                    #(#expr_lets)*
+                                    write!(f, #format_str, #(#used_args = #used_args),*)
+                                },
                             }
                         }
                     };
@@ -113,21 +150,51 @@ fn expand_error_derive(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStr
                     }
                 }
                 Fields::Named(fields) => {
-                    let field_names: Vec<_> = fields.named.iter().map(|f| &f.ident).collect();
+                    let field_names: Vec<_> = fields
+                        .named
+                        .iter()
+                        .map(|f| f.ident.clone().unwrap())
+                        .collect();
+                    let rewritten = rewrite_format_string(&error_msg, None)?;
+                    let expr_lets = rewritten
+                        .expr_bindings
+                        .iter()
+                        .map(|(ident, expr)| quote! { let #ident = #expr; });
+                    let used_args = select_used_args(
+                        &rewritten.placeholder_names,
+                        &field_names,
+                        &rewritten.expr_bindings,
+                    );
+                    let format_str = rewritten.format_str;
                     quote! {
-                        write!(f, #error_msg, #(#field_names = self.#field_names),*)
+                        #[allow(unused_variables)]
+                        let Self { #(#field_names),* } = self;
+                        #(#expr_lets)*
+                        write!(f, #format_str, #(#used_args = #used_args),*)
                     }
                 }
                 Fields::Unnamed(fields) => {
-                    let field_idents: Vec<_> = (0..fields.unnamed.len())
+                    let field_names: Vec<_> = (0..fields.unnamed.len())
                         .map(|i| quote::format_ident!("f{}", i))
                         .collect();
-                    let field_indices: Vec<_> = (0..fields.unnamed.len())
-                        .map(syn::Index::from)
-                        .collect();
-                    let format_str = convert_positional_to_named(&error_msg, fields.unnamed.len());
+                    let positional_names: Vec<String> =
+                        field_names.iter().map(|f| f.to_string()).collect();
+                    let rewritten = rewrite_format_string(&error_msg, Some(&positional_names))?;
+                    let expr_lets = rewritten
+                        .expr_bindings
+                        .iter()
+                        .map(|(ident, expr)| quote! { let #ident = #expr; });
+                    let used_args = select_used_args(
+                        &rewritten.placeholder_names,
+                        &field_names,
+                        &rewritten.expr_bindings,
+                    );
+                    let format_str = rewritten.format_str;
                     quote! {
-                        write!(f, #format_str, #(#field_idents = self.#field_indices),*)
+                        #[allow(unused_variables)]
+                        let Self(#(#field_names),*) = self;
+                        #(#expr_lets)*
+                        write!(f, #format_str, #(#used_args = #used_args),*)
                     }
                 }
             };
@@ -204,13 +271,158 @@ fn extract_error_message_from_attrs<T: ToTokens>(
     ))
 }
 
-/// Converts positional format args `{0}`, `{1}` to named args `{f0}`, `{f1}`.
-fn convert_positional_to_named(format_str: &str, field_count: usize) -> String {
-    let mut result = format_str.to_string();
-    for i in (0..field_count).rev() {
-        let positional = format!("{{{}}}", i);
-        let named = format!("{{f{}}}", i);
-        result = result.replace(&positional, &named);
+struct RewrittenFormat {
+    format_str: String,
+    expr_bindings: Vec<(syn::Ident, Expr)>,
+    placeholder_names: Vec<String>,
+}
+
+fn rewrite_format_string(
+    format_str: &str,
+    positional_map: Option<&[String]>,
+) -> syn::Result<RewrittenFormat> {
+    let mut output = String::with_capacity(format_str.len());
+    let mut expr_bindings = Vec::new();
+    let mut placeholder_names = Vec::new();
+    let mut expr_count = 0;
+
+    let mut chars = format_str.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '{' => {
+                if chars.peek() == Some(&'{') {
+                    output.push('{');
+                    output.push('{');
+                    chars.next();
+                    continue;
+                }
+
+                let mut content = String::new();
+                let mut closed = false;
+                while let Some(next) = chars.next() {
+                    if next == '}' {
+                        closed = true;
+                        break;
+                    }
+                    content.push(next);
+                }
+
+                if !closed {
+                    return Err(syn::Error::new(
+                        Span::call_site(),
+                        "unterminated format placeholder in #[error] attribute",
+                    ));
+                }
+
+                let (arg, spec) = split_arg_and_spec(&content);
+                let arg_trim = arg.trim();
+                if arg_trim.is_empty() {
+                    output.push('{');
+                    output.push_str(&content);
+                    output.push('}');
+                    continue;
+                }
+
+                let mut replaced = None;
+                if let Ok(index) = arg_trim.parse::<usize>() {
+                    if let Some(map) = positional_map {
+                        if let Some(name) = map.get(index) {
+                            replaced = Some(name.clone());
+                        }
+                    }
+                }
+
+                let name = if let Some(name) = replaced {
+                    name
+                } else if is_simple_ident(arg_trim) {
+                    arg_trim.to_string()
+                } else {
+                    let expr: Expr = syn::parse_str(arg_trim).map_err(|_| {
+                        syn::Error::new(
+                            Span::call_site(),
+                            format!(
+                                "unsupported format expression `{}` in #[error] attribute",
+                                arg_trim
+                            ),
+                        )
+                    })?;
+                    let ident = quote::format_ident!("__expr{}", expr_count as u64);
+                    expr_count += 1;
+                    expr_bindings.push((ident.clone(), expr));
+                    ident.to_string()
+                };
+
+                output.push('{');
+                output.push_str(&name);
+                output.push_str(spec);
+                output.push('}');
+                placeholder_names.push(name);
+            }
+            '}' => {
+                if chars.peek() == Some(&'}') {
+                    output.push('}');
+                    output.push('}');
+                    chars.next();
+                } else {
+                    output.push('}');
+                }
+            }
+            _ => output.push(ch),
+        }
     }
-    result
+
+    Ok(RewrittenFormat {
+        format_str: output,
+        expr_bindings,
+        placeholder_names,
+    })
+}
+
+fn split_arg_and_spec(content: &str) -> (&str, &str) {
+    if let Some(idx) = content.find(':') {
+        (&content[..idx], &content[idx..])
+    } else {
+        (content, "")
+    }
+}
+
+fn select_used_args(
+    placeholders: &[String],
+    field_names: &[syn::Ident],
+    expr_bindings: &[(syn::Ident, Expr)],
+) -> Vec<syn::Ident> {
+    let mut used = Vec::new();
+    let mut seen = HashSet::new();
+    let field_set: HashSet<String> = field_names.iter().map(|f| f.to_string()).collect();
+    let expr_set: HashSet<String> = expr_bindings.iter().map(|(f, _)| f.to_string()).collect();
+
+    for name in placeholders {
+        if !field_set.contains(name) && !expr_set.contains(name) {
+            continue;
+        }
+        if seen.insert(name.clone()) {
+            used.push(quote::format_ident!("{}", name));
+        }
+    }
+
+    used
+}
+
+fn is_simple_ident(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !is_ident_start(first) {
+        return false;
+    }
+    chars.all(is_ident_continue)
+}
+
+fn is_ident_start(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphabetic()
+}
+
+fn is_ident_continue(ch: char) -> bool {
+    is_ident_start(ch) || ch.is_ascii_digit()
 }

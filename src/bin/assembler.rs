@@ -395,11 +395,10 @@ fn print_gas_profile(
     println!("\n{title}:");
     println!("{}", "-".repeat(dash_w));
 
-    for (category, amount) in profile.iter() {
-        if amount == 0 {
-            continue;
-        }
+    let mut entries: Vec<_> = profile.iter().filter(|(_, amount)| *amount > 0).collect();
+    entries.sort_by(|a, b| b.1.cmp(&a.1));
 
+    for (category, amount) in entries {
         let percent = if total > 0.0 {
             (amount as f64 / total) * 100.0
         } else {

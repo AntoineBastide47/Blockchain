@@ -195,9 +195,14 @@ impl AsmContext {
     }
 
     /// Adds a string to the pool, returning its index.
+    /// Returns existing index if the string was already interned.
     pub fn intern_string(&mut self, s: String) -> u32 {
+        let bytes = s.into_bytes();
+        if let Some(idx) = self.items.iter().position(|item| *item == bytes) {
+            return idx as u32;
+        }
         let id = self.items.len() as u32;
-        self.items.push(s.into_bytes());
+        self.items.push(bytes);
         id
     }
 

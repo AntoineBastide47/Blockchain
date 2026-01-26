@@ -279,8 +279,8 @@ impl Value {
         }
     }
 
-    pub fn equals(va: Value, vb: Value) -> Result<Value, VMError> {
-        Ok(Value::Bool(match (va, vb) {
+    pub fn equals(va: Value, vb: Value) -> Result<bool, VMError> {
+        Ok(match (va, vb) {
             (Value::Bool(b1), Value::Bool(b2)) => b1 == b2,
             (Value::Ref(r1), Value::Ref(r2)) => r1 == r2,
             (Value::Int(i1), Value::Int(i2)) => i1 == i2,
@@ -290,7 +290,7 @@ impl Value {
                     type2: vb.type_name(),
                 });
             }
-        }))
+        })
     }
 }
 
@@ -1075,6 +1075,7 @@ impl VM {
             instr = instruction,
             {
                 // Store and Load
+                Move => op_move(rd: Reg, rs: Src),
                 DeleteState => op_delete_state(state, ctx; rd: Src),
                 StoreI64 => op_store_i64(state, ctx; key: Src, value: Src),
                 LoadI64State => op_load_i64_state(state, ctx; rd: Reg, key: Src),
@@ -1084,8 +1085,7 @@ impl VM {
                 LoadStrState => op_load_str_state(state, ctx; rd: Reg, key: Src),
                 StoreHash => op_store_hash(state, ctx; key: Src, value: Src),
                 LoadHashState => op_load_hash_state(state, ctx; rd: Reg, key: Src),
-                // Moves / casts
-                Move => op_move(rd: Reg, rs: Src),
+                // Casts
                 I64ToBool => op_i64_to_bool(rd: Reg, rs: Src),
                 BoolToI64 => op_bool_to_i64(rd: Reg, rs: Src),
                 StrToI64 => op_str_to_i64(rd: Reg, rs: Src),
@@ -1104,20 +1104,26 @@ impl VM {
                 Max => op_max(rd: Reg, rs1: Src, rs2: Src),
                 Shl => op_shl(rd: Reg, rs1: Src, rs2: Src),
                 Shr => op_shr(rd: Reg, rs1: Src, rs2: Src),
+                Inc => op_inc(rd: Reg),
+                Dec => op_dec(rd: Reg),
                 // Boolean / comparison
                 Not => op_not(rd: Reg, rs: Src),
                 And => op_and(rd: Reg, rs1: Src, rs2: Src),
                 Or => op_or(rd: Reg, rs1: Src, rs2: Src),
                 Xor => op_xor(rd: Reg, rs1: Src, rs2: Src),
                 Eq => op_eq(rd: Reg, rs1: Src, rs2: Src),
+                Ne => op_ne(rd: Reg, rs1: Src, rs2: Src),
                 Lt => op_lt(rd: Reg, rs1: Src, rs2: Src),
                 Le => op_le(rd: Reg, rs1: Src, rs2: Src),
                 Gt => op_gt(rd: Reg, rs1: Src, rs2: Src),
                 Ge => op_ge(rd: Reg, rs1: Src, rs2: Src),
                 // Control Flow
                 CallHost => op_call_host(dst: Reg, fn_id: RefU32, argc: ImmU8, argv: Reg),
+                CallHost0 => op_call_host0(dst: Reg, fn_id: RefU32),
+                CallHost1 => op_call_host1(dst: Reg, fn_id: RefU32, arg: Src),
                 Call => op_call(dst: Reg, offset: ImmI64, argc: ImmU8, argv: Reg),
                 Call0 => op_call0(dst: Reg, fn_id: ImmI64),
+                Call1 => op_call1(dst: Reg, fn_id: ImmI64, arg: Reg),
                 Jal => op_jal(rd: Reg, offset: ImmI64),
                 Jalr => op_jalr(rd: Reg, rs: Reg, offset: ImmI64),
                 Beq => op_beq(rs1: Src, rs2: Src, offset: ImmI64),
@@ -1572,6 +1578,16 @@ impl VM {
             .set(dst, Value::Int(va.wrapping_shr(vb as u32)))
     }
 
+    fn op_inc(&mut self, instr: &'static str, dst: u8) -> Result<(), VMError> {
+        let r = self.registers.get_int(dst, instr)?;
+        self.op_load_i64(instr, dst, r.wrapping_add(1))
+    }
+
+    fn op_dec(&mut self, instr: &'static str, dst: u8) -> Result<(), VMError> {
+        let r = self.registers.get_int(dst, instr)?;
+        self.op_load_i64(instr, dst, r.wrapping_sub(1))
+    }
+
     fn op_not(&mut self, instr: &'static str, dst: u8, src: SrcOperand) -> Result<(), VMError> {
         let v = self.bool_from_operand(src, instr, 1)?;
         self.registers.set(dst, Value::Bool(!v))
@@ -1622,7 +1638,20 @@ impl VM {
     ) -> Result<(), VMError> {
         let va = self.value_from_operand(a)?;
         let vb = self.value_from_operand(b)?;
-        self.registers.set(dst, Value::equals(va, vb)?)
+        self.registers.set(dst, Value::Bool(Value::equals(va, vb)?))
+    }
+
+    fn op_ne(
+        &mut self,
+        _instr: &'static str,
+        dst: u8,
+        a: SrcOperand,
+        b: SrcOperand,
+    ) -> Result<(), VMError> {
+        let va = self.value_from_operand(a)?;
+        let vb = self.value_from_operand(b)?;
+        self.registers
+            .set(dst, Value::Bool(!Value::equals(va, vb)?))
     }
 
     fn op_lt(
@@ -1726,13 +1755,6 @@ impl VM {
         }
 
         match fn_name.as_str() {
-            k @ "len" => {
-                arg_len_check(1, args.len(), k)?;
-                let str_ref = get_ref(args[0])?;
-                let len = self.heap.get_raw_ref(str_ref)?.len();
-                self.charge_gas_categorized(len as u64, GasCategory::HostFunction)?;
-                self.op_load_i64(instr, dst, self.heap.get_raw_ref(str_ref)?.len() as i64)
-            }
             k @ "slice" => {
                 arg_len_check(3, args.len(), k)?;
                 let str_ref = get_ref(args[0])?;
@@ -1783,9 +1805,34 @@ impl VM {
                 };
                 self.op_load_i64(instr, dst, cmp)
             }
-            k @ "hash" => {
-                arg_len_check(1, args.len(), k)?;
-                let len = match args[0] {
+            _ => Err(VMError::InvalidCallHostFunction { name: fn_name }),
+        }
+    }
+
+    fn op_call_host0(&mut self, instr: &'static str, dst: u8, fn_id: u32) -> Result<(), VMError> {
+        self.op_call_host(instr, dst, fn_id, 0, 0)
+    }
+
+    fn op_call_host1(
+        &mut self,
+        instr: &'static str,
+        dst: u8,
+        fn_id: u32,
+        arg: SrcOperand,
+    ) -> Result<(), VMError> {
+        self.charge_call(1, 5, self.call_stack.len(), 10)?;
+        let fn_name = self.heap_get_string(fn_id)?;
+
+        match fn_name.as_str() {
+            "len" => {
+                let str_ref = self.ref_from_operand(arg, instr, 1)?;
+                let len = self.heap.get_raw_ref(str_ref)?.len();
+                self.charge_gas_categorized(len as u64, GasCategory::HostFunction)?;
+                self.op_load_i64(instr, dst, self.heap.get_raw_ref(str_ref)?.len() as i64)
+            }
+            "hash" => {
+                let value = self.value_from_operand(arg)?;
+                let len = match value {
                     Value::Zero => 0,
                     Value::Bool(_) => 1,
                     Value::Int(_) => 8,
@@ -1793,7 +1840,7 @@ impl VM {
                 };
                 self.charge_gas_categorized(len as u64, GasCategory::HostFunction)?;
 
-                let hash = match args[0] {
+                let hash = match value {
                     Value::Zero => Hash::sha3().chain(&[]).finalize(),
                     Value::Bool(b) => Hash::sha3().chain(&[b as u8]).finalize(),
                     Value::Ref(r) => Hash::sha3().chain(self.heap.get_raw_ref(r)?).finalize(),
@@ -1835,6 +1882,16 @@ impl VM {
         self.op_call(instr, dst, fn_id, 0, 0)
     }
 
+    fn op_call1(
+        &mut self,
+        instr: &'static str,
+        dst: u8,
+        fn_id: i64,
+        arg: u8,
+    ) -> Result<(), VMError> {
+        self.op_call(instr, dst, fn_id, 1, arg)
+    }
+
     fn op_jal(&mut self, instr: &'static str, rd: u8, offset: i64) -> Result<(), VMError> {
         self.registers.set(rd, Value::Int(self.ip as i64))?;
         self.op_jump(instr, offset)
@@ -1857,7 +1914,7 @@ impl VM {
         let va = self.value_from_operand(rs1)?;
         let vb = self.value_from_operand(rs2)?;
 
-        if Value::equals(va, vb)? == Value::Bool(true) {
+        if Value::equals(va, vb)? {
             self.op_jump(instr, offset)?;
         }
         Ok(())
@@ -1873,7 +1930,7 @@ impl VM {
         let va = self.value_from_operand(rs1)?;
         let vb = self.value_from_operand(rs2)?;
 
-        if Value::equals(va, vb)? != Value::Bool(true) {
+        if !Value::equals(va, vb)? {
             self.op_jump(instr, offset)?;
         }
         Ok(())
@@ -2316,6 +2373,48 @@ mod tests {
     }
 
     #[test]
+    fn inc() {
+        assert_eq!(run_and_get_int("MOVE r0, 0\nINC r0", 0), 1);
+        assert_eq!(run_and_get_int("MOVE r0, 41\nINC r0", 0), 42);
+        assert_eq!(run_and_get_int("MOVE r0, -1\nINC r0", 0), 0);
+    }
+
+    #[test]
+    fn dec() {
+        assert_eq!(run_and_get_int("MOVE r0, 1\nDEC r0", 0), 0);
+        assert_eq!(run_and_get_int("MOVE r0, 43\nDEC r0", 0), 42);
+        assert_eq!(run_and_get_int("MOVE r0, 0\nDEC r0", 0), -1);
+    }
+
+    #[test]
+    fn inc_wrapping() {
+        let source = "MOVE r0, 9223372036854775807\nINC r0";
+        assert_eq!(run_and_get_int(source, 0), i64::MIN);
+    }
+
+    #[test]
+    fn dec_wrapping() {
+        let source = "MOVE r0, -9223372036854775808\nDEC r0";
+        assert_eq!(run_and_get_int(source, 0), i64::MAX);
+    }
+
+    #[test]
+    fn inc_type_error() {
+        assert!(matches!(
+            run_expect_err("MOVE r0, true\nINC r0"),
+            VMError::TypeMismatchStatic { .. }
+        ));
+    }
+
+    #[test]
+    fn dec_type_error() {
+        assert!(matches!(
+            run_expect_err("MOVE r0, true\nDEC r0"),
+            VMError::TypeMismatchStatic { .. }
+        ));
+    }
+
+    #[test]
     fn immediate_arithmetic_and_logic() {
         assert_eq!(run_and_get_int("MOVE r0, 5\nADD r1, r0, -2", 1), 3);
         assert_eq!(run_and_get_int("MOVE r0, 10\nSUB r1, r0, 4", 1), 6);
@@ -2399,6 +2498,207 @@ MOVE r1, 11
         assert_eq!(run_and_get_int(source, 1), 11);
     }
 
+    // ==================== Src Operand Encoding ====================
+
+    #[test]
+    fn src_operand_i64_both_positions() {
+        // Both operands as immediate i64
+        assert_eq!(run_and_get_int("ADD r0, 10, 32", 0), 42);
+        assert_eq!(run_and_get_int("SUB r0, 50, 8", 0), 42);
+        assert_eq!(run_and_get_int("MUL r0, 6, 7", 0), 42);
+    }
+
+    #[test]
+    fn src_operand_i64_first_position() {
+        // First operand immediate, second register
+        assert_eq!(run_and_get_int("MOVE r1, 32\nADD r0, 10, r1", 0), 42);
+        assert_eq!(run_and_get_int("MOVE r1, 8\nSUB r0, 50, r1", 0), 42);
+    }
+
+    #[test]
+    fn src_operand_bool_immediate() {
+        // Boolean immediates in logic operations
+        assert!(run_and_get_bool("AND r0, true, true", 0));
+        assert!(!run_and_get_bool("AND r0, true, false", 0));
+        assert!(run_and_get_bool("OR r0, false, true", 0));
+        assert!(!run_and_get_bool("OR r0, false, false", 0));
+        assert!(run_and_get_bool("XOR r0, true, false", 0));
+        assert!(!run_and_get_bool("XOR r0, true, true", 0));
+    }
+
+    #[test]
+    fn src_operand_bool_mixed() {
+        // Mix of register and immediate bool
+        assert!(run_and_get_bool("MOVE r1, true\nAND r0, r1, true", 0));
+        assert!(run_and_get_bool("MOVE r1, true\nAND r0, true, r1", 0));
+        assert!(!run_and_get_bool("MOVE r1, false\nOR r0, r1, false", 0));
+    }
+
+    #[test]
+    fn src_operand_string_ref_comparison() {
+        // String refs in EQ/NE
+        assert!(run_and_get_bool(r#"EQ r0, "hello", "hello""#, 0));
+        assert!(!run_and_get_bool(r#"EQ r0, "hello", "world""#, 0));
+        assert!(run_and_get_bool(r#"NE r0, "foo", "bar""#, 0));
+        assert!(!run_and_get_bool(r#"NE r0, "same", "same""#, 0));
+    }
+
+    #[test]
+    fn src_operand_string_ref_mixed() {
+        // Mix register and immediate string
+        assert!(run_and_get_bool(
+            r#"MOVE r1, "test"
+EQ r0, r1, "test""#,
+            0
+        ));
+        assert!(run_and_get_bool(
+            r#"MOVE r1, "test"
+EQ r0, "test", r1"#,
+            0
+        ));
+    }
+
+    #[test]
+    fn src_operand_branch_both_immediate() {
+        // Both branch operands as immediate
+        let source = r#"
+BEQ 5, 5, target
+MOVE r0, 0
+HALT
+target:
+MOVE r0, 1
+"#;
+        assert_eq!(run_and_get_int(source, 0), 1);
+
+        let source = r#"
+BNE 5, 6, target
+MOVE r0, 0
+HALT
+target:
+MOVE r0, 1
+"#;
+        assert_eq!(run_and_get_int(source, 0), 1);
+
+        let source = r#"
+BLT 3, 5, target
+MOVE r0, 0
+HALT
+target:
+MOVE r0, 1
+"#;
+        assert_eq!(run_and_get_int(source, 0), 1);
+    }
+
+    #[test]
+    fn src_operand_branch_bool_immediate() {
+        let source = r#"
+BEQ true, true, target
+MOVE r0, 0
+HALT
+target:
+MOVE r0, 1
+"#;
+        assert_eq!(run_and_get_int(source, 0), 1);
+
+        let source = r#"
+BNE true, false, target
+MOVE r0, 0
+HALT
+target:
+MOVE r0, 1
+"#;
+        assert_eq!(run_and_get_int(source, 0), 1);
+    }
+
+    #[test]
+    fn src_operand_move_all_types() {
+        // MOVE with immediate i64
+        assert_eq!(run_and_get_int("MOVE r0, 42", 0), 42);
+        assert_eq!(run_and_get_int("MOVE r0, -100", 0), -100);
+
+        // MOVE with immediate bool
+        assert!(run_and_get_bool("MOVE r0, true", 0));
+        assert!(!run_and_get_bool("MOVE r0, false", 0));
+
+        // MOVE with immediate string
+        assert_eq!(run_and_get_str(r#"MOVE r0, "hello""#, 0), "hello");
+
+        // MOVE from register
+        assert_eq!(run_and_get_int("MOVE r0, 99\nMOVE r1, r0", 1), 99);
+    }
+
+    #[test]
+    fn src_operand_store_immediate_key() {
+        // Store with immediate string key
+        let vm = run_vm(
+            r#"STORE_I64 "mykey", 123
+LOAD_I64_STATE r0, "mykey""#,
+        );
+        assert_eq!(vm.registers.get_int(0, "").unwrap(), 123);
+    }
+
+    #[test]
+    fn src_operand_store_immediate_value() {
+        // Store with immediate value
+        let vm = run_vm(
+            r#"MOVE r0, "counter"
+STORE_I64 r0, 999
+LOAD_I64_STATE r1, r0"#,
+        );
+        assert_eq!(vm.registers.get_int(1, "").unwrap(), 999);
+    }
+
+    #[test]
+    fn src_operand_store_both_immediate() {
+        // Both key and value immediate
+        let vm = run_vm(
+            r#"STORE_BOOL "flag", true
+LOAD_BOOL_STATE r0, "flag""#,
+        );
+        assert!(vm.registers.get_bool(0, "").unwrap());
+    }
+
+    #[test]
+    fn src_operand_cast_immediate() {
+        // Cast from immediate value
+        assert!(run_and_get_bool("I64_TO_BOOL r0, 1", 0));
+        assert!(!run_and_get_bool("I64_TO_BOOL r0, 0", 0));
+        assert_eq!(run_and_get_int("BOOL_TO_I64 r0, true", 0), 1);
+        assert_eq!(run_and_get_int("BOOL_TO_I64 r0, false", 0), 0);
+    }
+
+    #[test]
+    fn src_operand_not_immediate() {
+        assert!(!run_and_get_bool("NOT r0, true", 0));
+        assert!(run_and_get_bool("NOT r0, false", 0));
+    }
+
+    #[test]
+    fn src_operand_neg_abs_immediate() {
+        assert_eq!(run_and_get_int("NEG r0, 42", 0), -42);
+        assert_eq!(run_and_get_int("NEG r0, -42", 0), 42);
+        assert_eq!(run_and_get_int("ABS r0, -42", 0), 42);
+        assert_eq!(run_and_get_int("ABS r0, 42", 0), 42);
+    }
+
+    #[test]
+    fn src_operand_min_max_immediate() {
+        assert_eq!(run_and_get_int("MIN r0, 10, 5", 0), 5);
+        assert_eq!(run_and_get_int("MIN r0, 5, 10", 0), 5);
+        assert_eq!(run_and_get_int("MAX r0, 10, 5", 0), 10);
+        assert_eq!(run_and_get_int("MAX r0, 5, 10", 0), 10);
+    }
+
+    #[test]
+    fn src_operand_shift_immediate() {
+        assert_eq!(run_and_get_int("SHL r0, 1, 4", 0), 16);
+        assert_eq!(run_and_get_int("SHR r0, 16, 2", 0), 4);
+        // Mix: first immediate, second register
+        assert_eq!(run_and_get_int("MOVE r1, 3\nSHL r0, 1, r1", 0), 8);
+        // Mix: first register, second immediate
+        assert_eq!(run_and_get_int("MOVE r1, 32\nSHR r0, r1, 2", 0), 8);
+    }
+
     // ==================== Boolean ====================
 
     #[test]
@@ -2450,6 +2750,43 @@ MOVE r1, 11
         assert!(run_and_get_bool("MOVE r0, 5\nMOVE r1, 5\nEQ r2, r0, r1", 2));
         assert!(!run_and_get_bool(
             "MOVE r0, 5\nMOVE r1, 6\nEQ r2, r0, r1",
+            2
+        ));
+    }
+
+    #[test]
+    fn ne() {
+        assert!(run_and_get_bool("MOVE r0, 5\nMOVE r1, 6\nNE r2, r0, r1", 2));
+        assert!(!run_and_get_bool(
+            "MOVE r0, 5\nMOVE r1, 5\nNE r2, r0, r1",
+            2
+        ));
+    }
+
+    #[test]
+    fn ne_with_bool() {
+        assert!(run_and_get_bool(
+            "MOVE r0, true\nMOVE r1, false\nNE r2, r0, r1",
+            2
+        ));
+        assert!(!run_and_get_bool(
+            "MOVE r0, true\nMOVE r1, true\nNE r2, r0, r1",
+            2
+        ));
+    }
+
+    #[test]
+    fn ne_with_string() {
+        assert!(run_and_get_bool(
+            r#"MOVE r0, "hello"
+MOVE r1, "world"
+NE r2, r0, r1"#,
+            2
+        ));
+        assert!(!run_and_get_bool(
+            r#"MOVE r0, "same"
+MOVE r1, "same"
+NE r2, r0, r1"#,
             2
         ));
     }
@@ -2518,6 +2855,27 @@ MOVE r1, 11
         ));
     }
 
+    #[test]
+    fn invalid_operand_for_int_op() {
+        let source = r#"ADD r0, "hi", 1"#;
+        assert!(matches!(
+            run_expect_err(source),
+            VMError::InvalidOperand {
+                instruction: "ADD",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn invalid_comparison_types() {
+        let source = "EQ r0, 1, true";
+        assert!(matches!(
+            run_expect_err(source),
+            VMError::InvalidComparison { .. }
+        ));
+    }
+
     // ==================== Error Cases ====================
 
     #[test]
@@ -2536,6 +2894,17 @@ MOVE r1, 11
             vm.run(&mut TestState::new(), EXECUTION_CONTEXT),
             Err(VMError::InvalidInstruction { opcode: 0xFF, .. })
         ));
+    }
+
+    #[test]
+    fn invalid_operand_tag() {
+        let bytecode = vec![Instruction::Move as u8, 0, 9];
+        let mut vm = VM::new_with_init(DeployProgram::new(vec![], bytecode), 0, BLOCK_GAS_LIMIT)
+            .expect("vm new failed");
+        let err = vm
+            .run(&mut TestState::new(), EXECUTION_CONTEXT)
+            .expect_err("expected error");
+        assert!(matches!(err, VMError::InvalidOperandTag { tag: 9, .. }));
     }
 
     #[test]
@@ -2626,6 +2995,15 @@ STORE_I64 r0, r1"#,
     }
 
     #[test]
+    fn store_i64_inline_key() {
+        let vm = run_vm(
+            r#"STORE_I64 "counter", 42
+LOAD_I64_STATE r0, "counter""#,
+        );
+        assert_eq!(vm.registers.get_int(0, "").unwrap(), 42);
+    }
+
+    #[test]
     fn store_str() {
         let state = run_vm_with_state(
             r#"MOVE r0, "name"
@@ -2648,6 +3026,12 @@ STORE_HASH r0, r1"#,
         let value = state.get(key).expect("key not found");
         let expected = Hash::from_slice(b"00000000000000000000000000000000").unwrap();
         assert_eq!(value, expected.to_vec());
+    }
+
+    #[test]
+    fn store_hash_invalid_literal() {
+        let err = run_expect_err(r#"STORE_HASH "hash_key", "short""#);
+        assert!(matches!(err, VMError::InvalidHash { .. }));
     }
 
     #[test]
@@ -3541,7 +3925,7 @@ LOAD_HASH_STATE r2, r0"#,
     fn host_len_empty_string() {
         let source = r#"
             MOVE r1, ""
-            CALL_HOST r0, "len", 1, r1
+            CALL_HOST1 r0, "len", r1
         "#;
         assert_eq!(run_and_get_int(source, 0), 0);
     }
@@ -3550,7 +3934,7 @@ LOAD_HASH_STATE r2, r0"#,
     fn host_len_ascii_string() {
         let source = r#"
             MOVE r1, "hello"
-            CALL_HOST r0, "len", 1, r1
+            CALL_HOST1 r0, "len", r1
         "#;
         assert_eq!(run_and_get_int(source, 0), 5);
     }
@@ -3559,7 +3943,7 @@ LOAD_HASH_STATE r2, r0"#,
     fn host_len_single_char() {
         let source = r#"
             MOVE r1, "x"
-            CALL_HOST r0, "len", 1, r1
+            CALL_HOST1 r0, "len", r1
         "#;
         assert_eq!(run_and_get_int(source, 0), 1);
     }
@@ -3573,7 +3957,7 @@ LOAD_HASH_STATE r2, r0"#,
         "#;
         assert!(matches!(
             run_expect_err(source),
-            VMError::ArityMismatch { .. }
+            VMError::InvalidCallHostFunction { .. }
         ));
     }
 
@@ -3581,7 +3965,7 @@ LOAD_HASH_STATE r2, r0"#,
     fn host_len_wrong_type() {
         let source = r#"
             MOVE r1, 42
-            CALL_HOST r0, "len", 1, r1
+            CALL_HOST1 r0, "len", r1
         "#;
         assert!(matches!(
             run_expect_err(source),
@@ -3847,7 +4231,7 @@ LOAD_HASH_STATE r2, r0"#,
     fn host_hash_returns_ref() {
         let source = r#"
             MOVE r1, "hello"
-            CALL_HOST r0, "hash", 1, r1
+            CALL_HOST1 r0, "hash", r1
         "#;
         let vm = run_vm(source);
         assert!(matches!(vm.registers.get(0).unwrap(), Value::Ref(_)));
@@ -3857,9 +4241,9 @@ LOAD_HASH_STATE r2, r0"#,
     fn host_hash_consistent() {
         let source = r#"
             MOVE r1, "test"
-            CALL_HOST r1, "hash", 1, r1
+            CALL_HOST1 r1, "hash", r1
             MOVE r2, "test"
-            CALL_HOST r2, "hash", 1, r2
+            CALL_HOST1 r2, "hash", r2
             CALL_HOST r0, "compare", 2, r1
         "#;
         assert_eq!(run_and_get_int(source, 0), 0);
@@ -3869,9 +4253,9 @@ LOAD_HASH_STATE r2, r0"#,
     fn host_hash_different_inputs() {
         let source = r#"
             MOVE r1, "abc"
-            CALL_HOST r2, "hash", 1, r1
+            CALL_HOST1 r2, "hash", r1
             MOVE r3, "abd"
-            CALL_HOST r4, "hash", 1, r3
+            CALL_HOST1 r4, "hash", r3
             CALL_HOST r0, "compare", 2, r2
         "#;
         // Different inputs should produce different hashes
@@ -3882,7 +4266,7 @@ LOAD_HASH_STATE r2, r0"#,
     fn host_hash_empty_string() {
         let source = r#"
             MOVE r1, ""
-            CALL_HOST r0, "hash", 1, r1
+            CALL_HOST1 r0, "hash", r1
         "#;
         let vm = run_vm(source);
         let ref_id = vm.registers.get_ref(0, "").unwrap();
@@ -3896,7 +4280,7 @@ LOAD_HASH_STATE r2, r0"#,
     fn host_hash_known_value() {
         let source = r#"
             MOVE r1, "hello"
-            CALL_HOST r0, "hash", 1, r1
+            CALL_HOST1 r0, "hash", r1
         "#;
         let vm = run_vm(source);
         let ref_id = vm.registers.get_ref(0, "").unwrap();
@@ -3914,7 +4298,7 @@ LOAD_HASH_STATE r2, r0"#,
         "#;
         assert!(matches!(
             run_expect_err(source),
-            VMError::ArityMismatch { .. }
+            VMError::InvalidCallHostFunction { .. }
         ));
     }
 
@@ -3922,7 +4306,7 @@ LOAD_HASH_STATE r2, r0"#,
     fn host_hash_wrong_type() {
         let source = r#"
             MOVE r1, 123
-            CALL_HOST r0, "hash", 1, r1
+            CALL_HOST1 r0, "hash", r1
         "#;
         let vm = run_vm(source);
         let ref_id = vm.registers.get_ref(0, "").unwrap();
@@ -3944,5 +4328,88 @@ LOAD_HASH_STATE r2, r0"#,
             run_expect_err(source),
             VMError::InvalidCallHostFunction { .. }
         ));
+    }
+
+    // --- CallHost0 ---
+
+    #[test]
+    fn call_host0_invalid_function() {
+        let source = r#"CALL_HOST0 r0, "nonexistent""#;
+        assert!(matches!(
+            run_expect_err(source),
+            VMError::InvalidCallHostFunction { .. }
+        ));
+    }
+
+    // --- CallHost1 ---
+
+    #[test]
+    fn call_host1_len() {
+        let source = r#"
+            MOVE r1, "test"
+            CALL_HOST1 r0, "len", r1
+        "#;
+        assert_eq!(run_and_get_int(source, 0), 4);
+    }
+
+    #[test]
+    fn call_host1_len_with_immediate_string() {
+        let source = r#"CALL_HOST1 r0, "len", "hello world""#;
+        assert_eq!(run_and_get_int(source, 0), 11);
+    }
+
+    #[test]
+    fn call_host1_hash_with_immediate_string() {
+        let source = r#"CALL_HOST1 r0, "hash", "test""#;
+        let vm = run_vm(source);
+        let ref_id = vm.registers.get_ref(0, "").unwrap();
+        let hash_bytes = vm.heap.get_raw_ref(ref_id).unwrap();
+        let expected = Hash::sha3().chain(b"test").finalize();
+        assert_eq!(hash_bytes, expected.as_slice());
+    }
+
+    #[test]
+    fn call_host1_hash_with_immediate_bool() {
+        let source = "CALL_HOST1 r0, \"hash\", true";
+        let vm = run_vm(source);
+        let ref_id = vm.registers.get_ref(0, "").unwrap();
+        let hash_bytes = vm.heap.get_raw_ref(ref_id).unwrap();
+        let expected = Hash::sha3().chain(&[1u8]).finalize();
+        assert_eq!(hash_bytes, expected.as_slice());
+    }
+
+    #[test]
+    fn call_host1_hash_with_immediate_int() {
+        let source = "CALL_HOST1 r0, \"hash\", 42";
+        let vm = run_vm(source);
+        let ref_id = vm.registers.get_ref(0, "").unwrap();
+        let hash_bytes = vm.heap.get_raw_ref(ref_id).unwrap();
+        let expected = Hash::sha3().chain(&42i64.to_le_bytes()).finalize();
+        assert_eq!(hash_bytes, expected.as_slice());
+    }
+
+    #[test]
+    fn call_host1_invalid_function() {
+        let source = r#"CALL_HOST1 r0, "nonexistent", "arg""#;
+        assert!(matches!(
+            run_expect_err(source),
+            VMError::InvalidCallHostFunction { .. }
+        ));
+    }
+
+    // --- Call1 ---
+
+    #[test]
+    fn call1_basic() {
+        let source = r#"
+            JUMP skip_fn
+            my_func:
+                MOVE r0, 100
+                RET r0
+            skip_fn:
+            MOVE r2, 99
+            CALL1 r1, my_func, r2
+        "#;
+        assert_eq!(run_and_get_int(source, 1), 100);
     }
 }

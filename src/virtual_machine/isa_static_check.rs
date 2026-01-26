@@ -12,24 +12,24 @@ mod tests {
     #[test]
     fn instruction_opcodes_unchanged() {
         // Store and Load
-        assert_eq!(Instruction::DeleteState as u8, 0x00);
-        assert_eq!(Instruction::StoreI64 as u8, 0x01);
-        assert_eq!(Instruction::LoadI64State as u8, 0x02);
-        assert_eq!(Instruction::StoreBool as u8, 0x03);
-        assert_eq!(Instruction::LoadBoolState as u8, 0x04);
-        assert_eq!(Instruction::StoreStr as u8, 0x05);
-        assert_eq!(Instruction::LoadStrState as u8, 0x06);
-        assert_eq!(Instruction::StoreHash as u8, 0x07);
-        assert_eq!(Instruction::LoadHashState as u8, 0x08);
+        assert_eq!(Instruction::Move as u8, 0x00);
+        assert_eq!(Instruction::DeleteState as u8, 0x01);
+        assert_eq!(Instruction::StoreI64 as u8, 0x02);
+        assert_eq!(Instruction::LoadI64State as u8, 0x03);
+        assert_eq!(Instruction::StoreBool as u8, 0x04);
+        assert_eq!(Instruction::LoadBoolState as u8, 0x05);
+        assert_eq!(Instruction::StoreStr as u8, 0x06);
+        assert_eq!(Instruction::LoadStrState as u8, 0x07);
+        assert_eq!(Instruction::StoreHash as u8, 0x08);
+        assert_eq!(Instruction::LoadHashState as u8, 0x09);
 
-        // Moves / casts
-        assert_eq!(Instruction::Move as u8, 0x10);
-        assert_eq!(Instruction::I64ToBool as u8, 0x11);
-        assert_eq!(Instruction::BoolToI64 as u8, 0x12);
-        assert_eq!(Instruction::StrToI64 as u8, 0x13);
-        assert_eq!(Instruction::I64ToStr as u8, 0x14);
-        assert_eq!(Instruction::StrToBool as u8, 0x15);
-        assert_eq!(Instruction::BoolToStr as u8, 0x16);
+        // Casts
+        assert_eq!(Instruction::I64ToBool as u8, 0x10);
+        assert_eq!(Instruction::BoolToI64 as u8, 0x11);
+        assert_eq!(Instruction::StrToI64 as u8, 0x12);
+        assert_eq!(Instruction::I64ToStr as u8, 0x13);
+        assert_eq!(Instruction::StrToBool as u8, 0x14);
+        assert_eq!(Instruction::BoolToStr as u8, 0x15);
 
         // Integer arithmetic
         assert_eq!(Instruction::Add as u8, 0x20);
@@ -43,6 +43,8 @@ mod tests {
         assert_eq!(Instruction::Max as u8, 0x28);
         assert_eq!(Instruction::Shl as u8, 0x29);
         assert_eq!(Instruction::Shr as u8, 0x2A);
+        assert_eq!(Instruction::Inc as u8, 0x2B);
+        assert_eq!(Instruction::Dec as u8, 0x2C);
 
         // Boolean / comparison
         assert_eq!(Instruction::Not as u8, 0x30);
@@ -50,32 +52,37 @@ mod tests {
         assert_eq!(Instruction::Or as u8, 0x32);
         assert_eq!(Instruction::Xor as u8, 0x33);
         assert_eq!(Instruction::Eq as u8, 0x34);
-        assert_eq!(Instruction::Lt as u8, 0x35);
+        assert_eq!(Instruction::Ne as u8, 0x35);
+        assert_eq!(Instruction::Lt as u8, 0x36);
         assert_eq!(Instruction::Le as u8, 0x37);
         assert_eq!(Instruction::Gt as u8, 0x38);
         assert_eq!(Instruction::Ge as u8, 0x39);
 
         // Control Flow
         assert_eq!(Instruction::CallHost as u8, 0x40);
-        assert_eq!(Instruction::Call as u8, 0x41);
-        assert_eq!(Instruction::Call0 as u8, 0x42);
-        assert_eq!(Instruction::Jal as u8, 0x43);
-        assert_eq!(Instruction::Jalr as u8, 0x44);
-        assert_eq!(Instruction::Beq as u8, 0x45);
-        assert_eq!(Instruction::Bne as u8, 0x46);
-        assert_eq!(Instruction::Blt as u8, 0x47);
-        assert_eq!(Instruction::Bge as u8, 0x48);
-        assert_eq!(Instruction::Bltu as u8, 0x49);
-        assert_eq!(Instruction::Bgeu as u8, 0x4A);
-        assert_eq!(Instruction::Jump as u8, 0x4B);
-        assert_eq!(Instruction::Ret as u8, 0x4C);
-        assert_eq!(Instruction::Halt as u8, 0x4D);
+        assert_eq!(Instruction::CallHost0 as u8, 0x41);
+        assert_eq!(Instruction::CallHost1 as u8, 0x42);
+        assert_eq!(Instruction::Call as u8, 0x43);
+        assert_eq!(Instruction::Call0 as u8, 0x44);
+        assert_eq!(Instruction::Call1 as u8, 0x45);
+        assert_eq!(Instruction::Jal as u8, 0x46);
+        assert_eq!(Instruction::Jalr as u8, 0x47);
+        assert_eq!(Instruction::Beq as u8, 0x48);
+        assert_eq!(Instruction::Bne as u8, 0x49);
+        assert_eq!(Instruction::Blt as u8, 0x4A);
+        assert_eq!(Instruction::Bge as u8, 0x4B);
+        assert_eq!(Instruction::Bltu as u8, 0x4C);
+        assert_eq!(Instruction::Bgeu as u8, 0x4D);
+        assert_eq!(Instruction::Jump as u8, 0x4E);
+        assert_eq!(Instruction::Ret as u8, 0x4F);
+        assert_eq!(Instruction::Halt as u8, 0x50);
     }
 
     /// Verifies that all instruction mnemonics match their expected values.
     #[test]
     fn instruction_mnemonics_unchanged() {
         // Store and Load
+        assert_eq!(Instruction::Move.mnemonic(), "MOVE");
         assert_eq!(Instruction::DeleteState.mnemonic(), "DELETE_STATE");
         assert_eq!(Instruction::StoreI64.mnemonic(), "STORE_I64");
         assert_eq!(Instruction::LoadI64State.mnemonic(), "LOAD_I64_STATE");
@@ -86,8 +93,7 @@ mod tests {
         assert_eq!(Instruction::StoreHash.mnemonic(), "STORE_HASH");
         assert_eq!(Instruction::LoadHashState.mnemonic(), "LOAD_HASH_STATE");
 
-        // Moves / casts
-        assert_eq!(Instruction::Move.mnemonic(), "MOVE");
+        // Casts
         assert_eq!(Instruction::I64ToBool.mnemonic(), "I64_TO_BOOL");
         assert_eq!(Instruction::BoolToI64.mnemonic(), "BOOL_TO_I64");
         assert_eq!(Instruction::StrToI64.mnemonic(), "STR_TO_I64");
@@ -107,6 +113,8 @@ mod tests {
         assert_eq!(Instruction::Max.mnemonic(), "MAX");
         assert_eq!(Instruction::Shl.mnemonic(), "SHL");
         assert_eq!(Instruction::Shr.mnemonic(), "SHR");
+        assert_eq!(Instruction::Inc.mnemonic(), "INC");
+        assert_eq!(Instruction::Dec.mnemonic(), "DEC");
 
         // Boolean / comparison
         assert_eq!(Instruction::Not.mnemonic(), "NOT");
@@ -114,6 +122,7 @@ mod tests {
         assert_eq!(Instruction::Or.mnemonic(), "OR");
         assert_eq!(Instruction::Xor.mnemonic(), "XOR");
         assert_eq!(Instruction::Eq.mnemonic(), "EQ");
+        assert_eq!(Instruction::Ne.mnemonic(), "NE");
         assert_eq!(Instruction::Lt.mnemonic(), "LT");
         assert_eq!(Instruction::Le.mnemonic(), "LE");
         assert_eq!(Instruction::Gt.mnemonic(), "GT");
@@ -121,8 +130,11 @@ mod tests {
 
         // Control Flow
         assert_eq!(Instruction::CallHost.mnemonic(), "CALL_HOST");
+        assert_eq!(Instruction::CallHost0.mnemonic(), "CALL_HOST0");
+        assert_eq!(Instruction::CallHost1.mnemonic(), "CALL_HOST1");
         assert_eq!(Instruction::Call.mnemonic(), "CALL");
         assert_eq!(Instruction::Call0.mnemonic(), "CALL0");
+        assert_eq!(Instruction::Call1.mnemonic(), "CALL1");
         assert_eq!(Instruction::Jal.mnemonic(), "JAL");
         assert_eq!(Instruction::Jalr.mnemonic(), "JALR");
         assert_eq!(Instruction::Beq.mnemonic(), "BEQ");
@@ -140,6 +152,7 @@ mod tests {
     #[test]
     fn instruction_gas_costs_unchanged() {
         // Store and Load
+        assert_eq!(Instruction::Move.base_gas(), 1);
         assert_eq!(Instruction::DeleteState.base_gas(), 2000);
         assert_eq!(Instruction::StoreI64.base_gas(), 2000);
         assert_eq!(Instruction::LoadI64State.base_gas(), 50);
@@ -150,8 +163,7 @@ mod tests {
         assert_eq!(Instruction::StoreHash.base_gas(), 2000);
         assert_eq!(Instruction::LoadHashState.base_gas(), 50);
 
-        // Moves / casts
-        assert_eq!(Instruction::Move.base_gas(), 1);
+        // Casts
         assert_eq!(Instruction::I64ToBool.base_gas(), 1);
         assert_eq!(Instruction::BoolToI64.base_gas(), 1);
         assert_eq!(Instruction::StrToI64.base_gas(), 30);
@@ -171,6 +183,8 @@ mod tests {
         assert_eq!(Instruction::Max.base_gas(), 3);
         assert_eq!(Instruction::Shl.base_gas(), 3);
         assert_eq!(Instruction::Shr.base_gas(), 3);
+        assert_eq!(Instruction::Inc.base_gas(), 1);
+        assert_eq!(Instruction::Dec.base_gas(), 1);
 
         // Boolean / comparison
         assert_eq!(Instruction::Not.base_gas(), 1);
@@ -178,6 +192,7 @@ mod tests {
         assert_eq!(Instruction::Or.base_gas(), 2);
         assert_eq!(Instruction::Xor.base_gas(), 2);
         assert_eq!(Instruction::Eq.base_gas(), 3);
+        assert_eq!(Instruction::Ne.base_gas(), 3);
         assert_eq!(Instruction::Lt.base_gas(), 3);
         assert_eq!(Instruction::Le.base_gas(), 3);
         assert_eq!(Instruction::Gt.base_gas(), 3);
@@ -185,8 +200,11 @@ mod tests {
 
         // Control Flow
         assert_eq!(Instruction::CallHost.base_gas(), 100);
+        assert_eq!(Instruction::CallHost0.base_gas(), 100);
+        assert_eq!(Instruction::CallHost1.base_gas(), 100);
         assert_eq!(Instruction::Call.base_gas(), 50);
         assert_eq!(Instruction::Call0.base_gas(), 50);
+        assert_eq!(Instruction::Call1.base_gas(), 50);
         assert_eq!(Instruction::Jal.base_gas(), 5);
         assert_eq!(Instruction::Jalr.base_gas(), 5);
         assert_eq!(Instruction::Beq.base_gas(), 5);
@@ -203,7 +221,7 @@ mod tests {
     /// Verifies the total instruction count has not changed.
     #[test]
     fn instruction_count_unchanged() {
-        const EXPECTED_COUNT: usize = 50;
+        const EXPECTED_COUNT: usize = 56;
 
         // Count by verifying TryFrom succeeds for expected opcodes
         let mut count = 0;

@@ -29,6 +29,7 @@ impl SrcOperand {
 }
 
 #[repr(u8)]
+#[derive(Debug)]
 pub enum OperandTag {
     Register = 0,
     Boolean = 1,
@@ -49,6 +50,60 @@ impl TryFrom<u8> for OperandTag {
                 tag: value,
                 offset: 0,
             }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn src_operand_size_reg() {
+        assert_eq!(SrcOperand::Reg(0).size(), 2);
+        assert_eq!(SrcOperand::Reg(255).size(), 2);
+    }
+
+    #[test]
+    fn src_operand_size_bool() {
+        assert_eq!(SrcOperand::Bool(true).size(), 2);
+        assert_eq!(SrcOperand::Bool(false).size(), 2);
+    }
+
+    #[test]
+    fn src_operand_size_i64() {
+        assert_eq!(SrcOperand::I64(0).size(), 9);
+        assert_eq!(SrcOperand::I64(i64::MAX).size(), 9);
+        assert_eq!(SrcOperand::I64(i64::MIN).size(), 9);
+    }
+
+    #[test]
+    fn src_operand_size_ref() {
+        assert_eq!(SrcOperand::Ref(0).size(), 5);
+        assert_eq!(SrcOperand::Ref(u32::MAX).size(), 5);
+    }
+
+    #[test]
+    fn src_operand_to_string() {
+        assert_eq!(SrcOperand::Reg(0).to_string(), "Register");
+        assert_eq!(SrcOperand::Bool(true).to_string(), "Boolean");
+        assert_eq!(SrcOperand::I64(42).to_string(), "Integer");
+        assert_eq!(SrcOperand::Ref(100).to_string(), "Reference");
+    }
+
+    #[test]
+    fn operand_tag_try_from_valid() {
+        assert_eq!(OperandTag::try_from(0).unwrap() as u8, 0);
+        assert_eq!(OperandTag::try_from(1).unwrap() as u8, 1);
+        assert_eq!(OperandTag::try_from(2).unwrap() as u8, 2);
+        assert_eq!(OperandTag::try_from(3).unwrap() as u8, 3);
+    }
+
+    #[test]
+    fn operand_tag_try_from_invalid() {
+        for tag in 4..=255u8 {
+            let err = OperandTag::try_from(tag).unwrap_err();
+            assert!(matches!(err, VMError::InvalidOperandTag { tag: t, .. } if t == tag));
         }
     }
 }

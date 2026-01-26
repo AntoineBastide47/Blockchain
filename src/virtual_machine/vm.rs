@@ -258,8 +258,6 @@ const READ_BYTE_COST: u64 = 5;
 /// Runtime value stored in registers and used for typed call arguments.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, BinaryCodec)]
 pub enum Value {
-    /// Uninitialized or zero value.
-    Zero,
     /// Boolean value.
     Bool(bool),
     /// Reference to a heap-allocated object (string pool index).
@@ -272,7 +270,6 @@ impl Value {
     /// Returns the type name for error messages.
     pub fn type_name(&self) -> &'static str {
         match self {
-            Value::Zero => "Zero",
             Value::Bool(_) => "Boolean",
             Value::Ref(_) => "Reference",
             Value::Int(_) => "Integer",
@@ -306,7 +303,7 @@ impl Registers {
     /// Creates a new register file with `count` registers.
     pub fn new() -> Self {
         Self {
-            regs: vec![Value::Zero; 256],
+            regs: vec![Value::Int(0); 256],
         }
     }
 
@@ -915,7 +912,6 @@ impl VM {
     fn bytes_from_operand(&mut self, src_operand: SrcOperand) -> Result<Vec<u8>, VMError> {
         Ok(match src_operand {
             SrcOperand::Reg(idx) => match self.registers.get(idx)? {
-                Value::Zero => Vec::new(),
                 Value::Bool(b) => vec![*b as u8],
                 Value::Ref(r) => self.heap_get_raw_ref(*r)?,
                 Value::Int(i) => i.to_le_bytes().to_vec(),
@@ -1833,7 +1829,6 @@ impl VM {
             "hash" => {
                 let value = self.value_from_operand(arg)?;
                 let len = match value {
-                    Value::Zero => 0,
                     Value::Bool(_) => 1,
                     Value::Int(_) => 8,
                     Value::Ref(r) => self.heap.get_raw_ref(r)?.len(),
@@ -1841,7 +1836,6 @@ impl VM {
                 self.charge_gas_categorized(len as u64, GasCategory::HostFunction)?;
 
                 let hash = match value {
-                    Value::Zero => Hash::sha3().chain(&[]).finalize(),
                     Value::Bool(b) => Hash::sha3().chain(&[b as u8]).finalize(),
                     Value::Ref(r) => Hash::sha3().chain(self.heap.get_raw_ref(r)?).finalize(),
                     Value::Int(i) => Hash::sha3().chain(&i.to_le_bytes()).finalize(),
@@ -2880,10 +2874,7 @@ NE r2, r0, r1"#,
 
     #[test]
     fn read_uninitialized_register() {
-        assert!(matches!(
-            run_expect_err("ADD r2, r0, r1"),
-            VMError::TypeMismatchStatic { .. }
-        ));
+        assert_eq!(run_and_get_int("ADD r2, r0, r1", 2), 0);
     }
 
     #[test]
@@ -3267,7 +3258,7 @@ LOAD_HASH_STATE r2, r0"#,
         "#;
         let vm = run_vm(source);
         // r1 should still be zero (skipped)
-        assert_eq!(vm.registers.get(1).unwrap(), &Value::Zero);
+        assert_eq!(vm.registers.get(1).unwrap(), &Value::Int(0));
         // r2 should be 42
         assert_eq!(vm.registers.get_int(2, "").unwrap(), 42);
     }
@@ -3290,7 +3281,7 @@ LOAD_HASH_STATE r2, r0"#,
             skip: MOVE r3, 42
         "#;
         let vm = run_vm(source);
-        assert_eq!(vm.registers.get(2).unwrap(), &Value::Zero);
+        assert_eq!(vm.registers.get(2).unwrap(), &Value::Int(0));
         assert_eq!(vm.registers.get_int(3, "").unwrap(), 42);
     }
 
@@ -3319,7 +3310,7 @@ LOAD_HASH_STATE r2, r0"#,
             skip: MOVE r3, 42
         "#;
         let vm = run_vm(source);
-        assert_eq!(vm.registers.get(2).unwrap(), &Value::Zero);
+        assert_eq!(vm.registers.get(2).unwrap(), &Value::Int(0));
         assert_eq!(vm.registers.get_int(3, "").unwrap(), 42);
     }
 
@@ -3346,7 +3337,7 @@ LOAD_HASH_STATE r2, r0"#,
             skip: MOVE r3, 42
         "#;
         let vm = run_vm(source);
-        assert_eq!(vm.registers.get(2).unwrap(), &Value::Zero);
+        assert_eq!(vm.registers.get(2).unwrap(), &Value::Int(0));
         assert_eq!(vm.registers.get_int(3, "").unwrap(), 42);
     }
 
@@ -3374,7 +3365,7 @@ LOAD_HASH_STATE r2, r0"#,
             skip: MOVE r3, 42
         "#;
         let vm = run_vm(source);
-        assert_eq!(vm.registers.get(2).unwrap(), &Value::Zero);
+        assert_eq!(vm.registers.get(2).unwrap(), &Value::Int(0));
     }
 
     #[test]
@@ -3387,7 +3378,7 @@ LOAD_HASH_STATE r2, r0"#,
             skip: MOVE r3, 42
         "#;
         let vm = run_vm(source);
-        assert_eq!(vm.registers.get(2).unwrap(), &Value::Zero);
+        assert_eq!(vm.registers.get(2).unwrap(), &Value::Int(0));
     }
 
     #[test]
@@ -3400,7 +3391,7 @@ LOAD_HASH_STATE r2, r0"#,
             skip: MOVE r3, 42
         "#;
         let vm = run_vm(source);
-        assert_eq!(vm.registers.get(2).unwrap(), &Value::Zero);
+        assert_eq!(vm.registers.get(2).unwrap(), &Value::Int(0));
     }
 
     #[test]
@@ -3430,7 +3421,7 @@ LOAD_HASH_STATE r2, r0"#,
         "#;
         let vm = run_vm(source);
         // Branch taken because -1 as u64 > 1
-        assert_eq!(vm.registers.get(2).unwrap(), &Value::Zero);
+        assert_eq!(vm.registers.get(2).unwrap(), &Value::Int(0));
     }
 
     #[test]
@@ -3473,7 +3464,7 @@ LOAD_HASH_STATE r2, r0"#,
         "#;
         let vm = run_vm(source);
         // Should skip MOVE r2, 99 and execute MOVE r3, 42
-        assert_eq!(vm.registers.get(2).unwrap(), &Value::Zero);
+        assert_eq!(vm.registers.get(2).unwrap(), &Value::Int(0));
         assert_eq!(vm.registers.get_int(3, "").unwrap(), 42);
     }
 
@@ -3853,7 +3844,7 @@ LOAD_HASH_STATE r2, r0"#,
             end:
         "#;
         let vm = run_vm(source);
-        assert_eq!(vm.registers.get(1).unwrap(), &Value::Zero);
+        assert_eq!(vm.registers.get(1).unwrap(), &Value::Int(0));
     }
 
     #[test]

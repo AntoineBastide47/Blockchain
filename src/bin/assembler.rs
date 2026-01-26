@@ -40,12 +40,11 @@ use blockchain::storage::state_view::StateViewProvider;
 use blockchain::storage::storage_trait::Storage;
 use blockchain::types::hash::Hash;
 use blockchain::utils::log::SHOW_TIMESTAMP;
-use blockchain::virtual_machine::assembler::assemble_file;
+use blockchain::virtual_machine::assembler::{assemble_file, extract_public_labels};
 use blockchain::virtual_machine::program::ExecuteProgram;
 use blockchain::virtual_machine::state::OverlayState;
 use blockchain::virtual_machine::vm::{BLOCK_GAS_LIMIT, ExecContext, GasCategory, VM, Value};
 use blockchain::{error, info, warn};
-use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -83,42 +82,6 @@ fn parse_function_call(s: &str) -> Option<(String, Vec<i64>)> {
     };
 
     Some((name, args))
-}
-
-/// Extracts public function names from assembly source.
-///
-/// Scans for `pub label:` patterns and returns the names sorted alphabetically.
-fn extract_public_functions(source: &str) -> Vec<String> {
-    let mut public_labels: HashSet<String> = HashSet::new();
-
-    for line in source.lines() {
-        let trimmed = line.trim();
-        // Skip comments and empty lines
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-
-        // Tokenize: split by whitespace/comma, ignoring comments
-        let comment_pos = line.find('#').unwrap_or(line.len());
-        let tokens: Vec<&str> = line[..comment_pos]
-            .split(|c: char| c.is_whitespace() || c == ',')
-            .filter(|t| !t.is_empty())
-            .collect();
-
-        if tokens.is_empty() {
-            continue;
-        }
-
-        // Check for `pub label:` pattern
-        if tokens[0] == "pub" && tokens.len() > 1 && tokens[1].ends_with(':') {
-            let label_name = tokens[1].strip_suffix(':').unwrap();
-            public_labels.insert(label_name.to_string());
-        }
-    }
-
-    let mut labels: Vec<String> = public_labels.into_iter().collect();
-    labels.sort();
-    labels
 }
 
 fn main() {
@@ -276,7 +239,13 @@ fn main() {
                 error!("Failed to read source file: {}", e);
                 process::exit(1);
             });
-            let public_functions = extract_public_functions(&source);
+            let mut insert_point = 0usize;
+            let public_functions: Vec<&str> = extract_public_labels(&source, &mut insert_point)
+                .unwrap()
+                .0
+                .iter()
+                .copied()
+                .collect();
 
             // Validate and build list of (fn_name, fn_index, args) to predict
             let mut calls_to_predict: Vec<(String, usize, Vec<i64>)> = Vec::new();

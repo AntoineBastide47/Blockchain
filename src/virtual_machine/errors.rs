@@ -108,6 +108,13 @@ pub enum VMError {
         offset: usize,
         message: &'static str,
     },
+    #[error("parse error at line {line}, column {offset}-{offset+length}: {message}")]
+    ParseErrorString {
+        line: usize,
+        offset: usize,
+        length: usize,
+        message: String,
+    },
     #[error("invalid hash format: expected {expected_len} bytes but got {actual_len}")]
     InvalidHash {
         expected_len: usize,

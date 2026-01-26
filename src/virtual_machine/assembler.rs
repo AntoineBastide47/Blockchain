@@ -123,6 +123,17 @@ fn adjust_error_line(err: VMError, dispatcher: Option<DispatcherInfo>) -> VMErro
             offset,
             message,
         },
+        VMError::ParseErrorString {
+            line,
+            offset,
+            length,
+            message,
+        } => VMError::ParseErrorString {
+            line: info.adjust_line(line),
+            offset,
+            length,
+            message,
+        },
         other => other,
     }
 }
@@ -152,6 +163,15 @@ fn log_assembly_error_adjusted(
         } => {
             let adjusted_line = dispatcher.map_or(*line, |d| d.adjust_line(*line));
             Some((adjusted_line, *offset, 1, message.to_string()))
+        }
+        VMError::ParseErrorString {
+            line,
+            offset,
+            length,
+            message,
+        } => {
+            let adjusted_line = dispatcher.map_or(*line, |d| d.adjust_line(*line));
+            Some((adjusted_line, *offset, *length, message.to_string()))
         }
         _ => None,
     };
@@ -237,6 +257,198 @@ struct Token<'a> {
     text: &'a str,
     /// 1-based column offset in the line.
     offset: usize,
+}
+
+/// Represents a parsed function label from assembly source.
+///
+/// Labels define entry points in assembly code with optional parameter specifications.
+/// The format is: `[pub] name[(argc, rN)]:` where:
+/// - `pub` marks the label as a public entry point
+/// - `argc` is the number of arguments the function expects
+/// - `rN` specifies the first register containing arguments
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct Label<'a> {
+    /// Whether this label is marked as public (`pub` prefix).
+    pub public: bool,
+    /// The label identifier.
+    pub name: &'a str,
+    /// Number of arguments the function expects (0 if no parameter spec).
+    pub argc: u8,
+    /// First register containing arguments (0 if no parameter spec).
+    pub argr: u8,
+}
+
+/// Returns true if the byte is a valid identifier character.
+///
+/// Valid characters are: `a-z`, `A-Z`, `0-9`, and `_`.
+fn is_ident_char(c: u8) -> bool {
+    (c | 0x20).is_ascii_lowercase() || c.is_ascii_digit() || c == b'_'
+}
+
+/// Parses a label definition line into a [`Label`] struct.
+///
+/// Accepts labels in these formats:
+/// - `name:` - simple label
+/// - `pub name:` - public label
+/// - `name(N, rM):` - label with N arguments starting at register rM
+/// - `pub name(N, rM):` - public label with parameter specification
+///
+/// Leading spaces are allowed. Returns an error if the line does not
+/// contain a valid label definition.
+fn tokenize_label(line_no: usize, line: &str) -> Result<Label<'_>, VMError> {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+
+    // skip leading spaces
+    while i < bytes.len() && bytes[i] == b' ' {
+        i += 1;
+    }
+
+    // pub
+    let public = bytes.get(i..i + 4) == Some(b"pub ");
+    if public {
+        i += 4;
+    }
+
+    // name
+    let start = i;
+    while i < bytes.len() && is_ident_char(bytes[i]) {
+        i += 1;
+    }
+
+    if start == i {
+        return Err(VMError::ParseError {
+            line: line_no,
+            offset: i,
+            message: "expected label name",
+        });
+    }
+
+    let name = &line[start..i];
+
+    if i >= bytes.len() {
+        return Err(VMError::ParseError {
+            line: line_no,
+            offset: i,
+            message: "unexpected end of label, expected '(' or ':'",
+        });
+    }
+
+    // no args
+    if bytes[i] == LABEL_SUFFIX as u8 {
+        return Ok(Label {
+            public,
+            name,
+            argc: 0,
+            argr: 0,
+        });
+    }
+
+    // args
+    if bytes[i] != b'(' {
+        return Err(VMError::ParseError {
+            line: line_no,
+            offset: i,
+            message: "expected '(' or ':' after label name",
+        });
+    }
+    i += 1;
+
+    let arg_start = i;
+    while i < bytes.len() && bytes[i] != b')' {
+        i += 1;
+    }
+
+    if i >= bytes.len() {
+        return Err(VMError::ParseError {
+            line: line_no,
+            offset: i,
+            message: "unclosed '(' in label parameters",
+        });
+    }
+
+    let arg_data = &line[arg_start..i];
+    i += 1;
+
+    if i >= bytes.len() || bytes[i] != b':' {
+        return Err(VMError::ParseError {
+            line: line_no,
+            offset: i,
+            message: "expected ':' after label parameters",
+        });
+    }
+
+    let mut j = 0;
+    let ab = arg_data.as_bytes();
+
+    while j < ab.len() && ab[j] == b' ' {
+        j += 1;
+    }
+    let n_start = j;
+
+    while j < ab.len() && ab[j].is_ascii_digit() {
+        j += 1;
+    }
+    let argc = parse_u8(&arg_data[n_start..j]).map_err(|e| VMError::ParseErrorString {
+        line: line_no,
+        offset: arg_start + n_start + 1,
+        length: j - n_start,
+        message: e.to_string(),
+    })?;
+
+    while j < ab.len() && ab[j] == b' ' {
+        j += 1;
+    }
+    if j >= ab.len() || ab[j] != b',' {
+        return Err(VMError::ParseError {
+            line: line_no,
+            offset: arg_start + j,
+            message: "expected 'N, rM' format in label parameters",
+        });
+    }
+    j += 1;
+
+    while j < ab.len() && ab[j] == b' ' {
+        j += 1;
+    }
+    if j >= ab.len() || ab[j] != b'r' {
+        return Err(VMError::ParseError {
+            line: line_no,
+            offset: arg_start + j,
+            message: "expected register 'rN' in label parameters",
+        });
+    }
+    j += 1;
+
+    let r_start = j;
+    while j < ab.len() && ab[j].is_ascii_digit() {
+        j += 1;
+    }
+    let argr = parse_u8(&arg_data[r_start..j]).map_err(|e| VMError::ParseErrorString {
+        line: line_no,
+        offset: arg_start + r_start + 1,
+        length: j - r_start,
+        message: e.to_string(),
+    })?;
+
+    while j < ab.len() {
+        if ab[j] != b' ' {
+            return Err(VMError::ParseError {
+                line: line_no,
+                offset: arg_start + j,
+                message: "unexpected character after label parameters",
+            });
+        }
+        j += 1;
+    }
+
+    Ok(Label {
+        public,
+        name,
+        argc,
+        argr,
+    })
 }
 
 /// Tokenize a single line of assembly.
@@ -413,9 +625,39 @@ fn error_token_text(err: &VMError) -> Option<&str> {
     }
 }
 
-/// Checks if a token is a label definition (ends with `:`)
-fn is_label_def(tok: &str) -> bool {
-    tok.ends_with(LABEL_SUFFIX) && tok.len() > 1
+/// Checks if a line appears to be a label definition attempt.
+///
+/// Returns `true` for valid patterns like `name:`, `pub name:`, `name(N, rM):`,
+/// and also for malformed attempts like `pub name(` so that `tokenize_label`
+/// can produce a proper error message.
+fn is_label_def(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let is_pub = trimmed.starts_with("pub ");
+    let after_pub = trimmed.strip_prefix("pub ").unwrap_or(trimmed);
+
+    // Find identifier start
+    let bytes = after_pub.as_bytes();
+    if bytes.is_empty() || !is_ident_char(bytes[0]) {
+        return false;
+    }
+
+    // Skip identifier
+    let mut i = 0;
+    while i < bytes.len() && is_ident_char(bytes[i]) {
+        i += 1;
+    }
+
+    // `pub name...` is always a label attempt
+    if is_pub {
+        return true;
+    }
+
+    if i >= bytes.len() {
+        return false;
+    }
+
+    // After identifier: `:` or `(` indicates label
+    bytes[i] == LABEL_SUFFIX as u8 || bytes[i] == b'('
 }
 
 /// Computes the encoded size of a Src operand from its token text.
@@ -436,11 +678,6 @@ fn src_size_from_token(tok: &str) -> usize {
     } else {
         9 // tag + i64 (numbers and labels)
     }
-}
-
-/// Extracts the label name from a label definition token.
-fn label_name(tok: &str) -> &str {
-    &tok[..tok.len() - 1]
 }
 
 /// Checks if a line is a section marker and returns the section type if so.
@@ -633,6 +870,44 @@ macro_rules! define_parse_instruction {
 
 for_each_instruction!(define_parse_instruction);
 
+/// Extracts all labels from assembly source, identifying public entry points.
+///
+/// Scans the source for label definitions and returns:
+/// - A set of public label names (those prefixed with `pub`)
+/// - A vector of all parsed [`Label`] structs
+///
+/// Also updates `insert_point` to the line number of the `[ runtime code ]`
+/// section marker, which is used for dispatcher insertion.
+pub fn extract_public_labels<'a>(
+    source: &'a str,
+    insert_point: &mut usize,
+) -> Result<(HashSet<&'a str>, Vec<Label<'a>>), VMError> {
+    let mut public_labels: HashSet<&str> = HashSet::new();
+    let mut public_label_data: Vec<Label> = Vec::new();
+
+    // First pass: scan source to find public labels and the runtime section marker
+    for (line_no, line) in source.lines().enumerate() {
+        // Check for section markers first
+        if let Some(section) = parse_section_marker(line) {
+            if section == Section::Runtime {
+                *insert_point = line_no;
+            }
+            continue;
+        }
+
+        if is_label_def(line) {
+            // Check if this is a public label definition (`pub label_name(N, reg):`)
+            let label = tokenize_label(line_no + 1, line)?;
+            if label.public {
+                public_labels.insert(label.name);
+            }
+            public_label_data.push(label);
+        }
+    }
+
+    Ok((public_labels, public_label_data))
+}
+
 /// Preprocesses assembly source to generate a dispatcher for public entry points.
 ///
 /// Scans the source for labels prefixed with `pub` and generates a jump table
@@ -642,50 +917,28 @@ for_each_instruction!(define_parse_instruction);
 ///
 /// Collects tokenization errors into the provided vector and continues processing.
 /// Returns the processed source and optional dispatcher info for line adjustment.
-fn assemble_source_step_1(
-    source: String,
+fn assemble_source_step_1<'a>(
+    source: &'a str,
     errors: &mut Vec<VMError>,
-) -> (String, Option<DispatcherInfo>) {
+) -> (
+    Option<String>,
+    Option<DispatcherInfo>,
+    Option<Vec<Label<'a>>>,
+) {
     // Track where to insert the dispatcher (line number of `[ runtime code ]`)
     let mut insert_point = 0usize;
     // Collect all public label names (including trailing ':')
-    let mut public_labels: HashSet<&str> = HashSet::new();
-
-    // First pass: scan source to find public labels and the runtime section marker
-    for (line_no, line) in source.lines().enumerate() {
-        // Check for section markers first
-        if let Some(section) = parse_section_marker(line) {
-            if section == Section::Runtime {
-                insert_point = line_no;
-            }
-            continue;
+    let (public_labels, public_label_data) = match extract_public_labels(source, &mut insert_point)
+    {
+        Ok(p) => p,
+        Err(e) => {
+            errors.push(e);
+            return (None, None, None);
         }
-
-        let tokens = match tokenize(line_no + 1, line) {
-            Ok(t) => t,
-            Err(e) => {
-                errors.push(e);
-                continue;
-            }
-        };
-        if tokens.is_empty() {
-            continue;
-        }
-
-        let (is_pub, label_idx) = if tokens[0].text == "pub" && tokens.len() > 1 {
-            (true, 1)
-        } else {
-            (false, 0)
-        };
-
-        // Check if this is a public label definition (`pub label_name:`)
-        if tokens.len() > label_idx && is_pub && is_label_def(tokens[label_idx].text) {
-            public_labels.insert(tokens[label_idx].text);
-        }
-    }
+    };
 
     if public_labels.is_empty() {
-        return (source, None);
+        return (None, None, None);
     }
 
     let mut base = String::new();
@@ -720,7 +973,7 @@ fn assemble_source_step_1(
     // Reassemble source with dispatcher inserted at the runtime section marker
     let mut out = String::with_capacity(source.len() + base.len());
     for (i, line) in source.lines().enumerate() {
-        out.push_str(line.split(COMMENT_CHAR).next().unwrap_or(""));
+        out.push_str(line.split(COMMENT_CHAR).next().unwrap_or("").trim());
         out.push('\n');
         // Insert dispatcher just after the `[ runtime code ]` line
         if i == insert_point {
@@ -734,7 +987,7 @@ fn assemble_source_step_1(
         lines_added,
     };
 
-    (out, Some(dispatcher_info))
+    (Some(out), Some(dispatcher_info), Some(public_label_data))
 }
 
 /// Performs two-pass assembly on preprocessed source.
@@ -746,7 +999,11 @@ fn assemble_source_step_1(
 /// Pass 2: Parses instructions with label resolution and emits bytecode.
 ///
 /// Collects all errors into the provided vector and continues processing where possible.
-fn assemble_source_step_2(source: String, errors: &mut Vec<VMError>) -> Option<DeployProgram> {
+fn assemble_source_step_2(
+    source: String,
+    _label_data: Vec<Label>,
+    errors: &mut Vec<VMError>,
+) -> Option<DeployProgram> {
     let mut asm_context = AsmContext::new();
 
     // First pass: tokenize all lines, detect sections, compute global offsets
@@ -769,17 +1026,6 @@ fn assemble_source_step_2(source: String, errors: &mut Vec<VMError>) -> Option<D
             continue;
         }
 
-        let tokens = match tokenize(line_no + 1, line) {
-            Ok(t) => t,
-            Err(e) => {
-                errors.push(e);
-                continue;
-            }
-        };
-        if tokens.is_empty() {
-            continue;
-        }
-
         // Determine which section this code belongs to
         let effective_section = match current_section {
             Section::None | Section::Runtime => Section::Runtime,
@@ -792,46 +1038,53 @@ fn assemble_source_step_2(source: String, errors: &mut Vec<VMError>) -> Option<D
             Section::Runtime | Section::None => &mut runtime_size,
         };
 
-        // Detect pub prefix and label position
-        let label_idx = if tokens[0].text == "pub" && tokens.len() > 1 {
-            1
-        } else {
-            0
-        };
-
         // Check if first token is a label definition
         let mut instr_start = 0;
-        if tokens.len() > label_idx && is_label_def(tokens[label_idx].text) {
-            let label_tok = &tokens[label_idx];
-            let name = label_name(label_tok.text).to_string();
+        if is_label_def(line) {
+            let label = match tokenize_label(line_no + 1, line) {
+                Ok(l) => l,
+                Err(e) => {
+                    errors.push(e);
+                    continue;
+                }
+            };
+
             pending_labels.push((
-                name,
+                label.name.to_string(),
                 effective_section,
                 *local_offset,
                 line_no + 1,
-                label_tok.offset,
-                label_tok.text.len(),
+                if label.public { 4 } else { 0 },
+                label.name.len(),
             ));
 
             // If there are more tokens after the label, treat them as an instruction
-            instr_start = label_idx + 1;
+            instr_start = line.find(':').unwrap() + 1;
         }
 
-        if instr_start == 0 || tokens.len() > instr_start {
-            let instr_tokens: Vec<Token> = tokens[instr_start..].to_vec();
-            match instruction_size_from_tokens(&instr_tokens) {
-                Ok(size) => {
-                    *local_offset += size;
-                    parsed_lines.push((line_no, instr_tokens, effective_section));
-                }
-                Err(e) => {
-                    errors.push(VMError::AssemblyError {
-                        line: line_no + 1,
-                        offset: instr_tokens[0].offset,
-                        length: instr_tokens[0].text.len(),
-                        source: e.to_string(),
-                    });
-                }
+        let tokens = match tokenize(line_no + 1, &line[instr_start..]) {
+            Ok(t) => t,
+            Err(e) => {
+                errors.push(e);
+                continue;
+            }
+        };
+        if tokens.is_empty() {
+            continue;
+        }
+
+        match instruction_size_from_tokens(&tokens) {
+            Ok(size) => {
+                *local_offset += size;
+                parsed_lines.push((line_no, tokens, effective_section));
+            }
+            Err(e) => {
+                errors.push(VMError::AssemblyError {
+                    line: line_no + 1,
+                    offset: tokens[0].offset,
+                    length: tokens[0].text.len(),
+                    source: e.to_string(),
+                });
             }
         }
     }
@@ -929,9 +1182,29 @@ pub fn assemble_source(source: impl Into<String>) -> Result<DeployProgram, VMErr
 fn assemble_source_with_name(source: String, source_name: &str) -> Result<DeployProgram, VMError> {
     let mut errors = Vec::new();
 
-    let (processed, dispatcher_info) = assemble_source_step_1(source.clone(), &mut errors);
-    let result = assemble_source_step_2(processed, &mut errors);
+    let (processed, dispatcher_info, label_data) = assemble_source_step_1(&source, &mut errors);
+    if processed.is_none() && !errors.is_empty() {
+        // Use original source for error display, with line adjustment for dispatcher
+        log_assembly_errors(source_name, &source, &errors, dispatcher_info);
+        // Return the first error with adjusted line number
+        let first_err = errors.into_iter().next().unwrap();
+        return Err(adjust_error_line(first_err, dispatcher_info));
+    }
 
+    let not_empty = processed.is_some();
+    let result = assemble_source_step_2(
+        if not_empty {
+            processed.unwrap()
+        } else {
+            source.clone()
+        },
+        if not_empty {
+            label_data.unwrap()
+        } else {
+            vec![]
+        },
+        &mut errors,
+    );
     if !errors.is_empty() {
         // Use original source for error display, with line adjustment for dispatcher
         log_assembly_errors(source_name, &source, &errors, dispatcher_info);
@@ -1187,9 +1460,22 @@ mod tests {
 
     #[test]
     fn is_label_def_valid() {
+        // Simple labels
         assert!(is_label_def("start:"));
         assert!(is_label_def("_loop:"));
         assert!(is_label_def("label123:"));
+        // Public labels
+        assert!(is_label_def("pub start:"));
+        assert!(is_label_def("pub _func:"));
+        // Labels with params
+        assert!(is_label_def("func(1, r2):"));
+        assert!(is_label_def("pub func(1, r2):"));
+        // Labels with instructions after
+        assert!(is_label_def("start: MOVE r0, 1"));
+        assert!(is_label_def("pub func(1, r2): MOVE r0, 1"));
+        // Leading whitespace
+        assert!(is_label_def("    start:"));
+        assert!(is_label_def("  pub func(1, r2):"));
     }
 
     #[test]
@@ -1197,6 +1483,17 @@ mod tests {
         assert!(!is_label_def(":"));
         assert!(!is_label_def("label"));
         assert!(!is_label_def(""));
+        assert!(!is_label_def("MOVE r0, 1"));
+        assert!(!is_label_def("pub"));
+    }
+
+    #[test]
+    fn is_label_def_malformed_attempts() {
+        // These are malformed but still recognized as label attempts
+        // so tokenize_label can produce proper error messages
+        assert!(is_label_def("func(1, r2)")); // missing `:` after `)`
+        assert!(is_label_def("pub func(1, r2")); // missing `):`
+        assert!(is_label_def("pub func")); // `pub` prefix = label attempt
     }
 
     #[test]
@@ -1346,5 +1643,173 @@ MOVE r1, "runtime"
         assert_eq!(program.items.len(), 2);
         assert_eq!(program.items[0], b"init");
         assert_eq!(program.items[1], b"runtime");
+    }
+
+    // ==================== Label Tokenization ====================
+
+    #[test]
+    fn tokenize_label_simple() {
+        let label = tokenize_label(1, "name:").unwrap();
+        assert!(!label.public);
+        assert_eq!(label.name, "name");
+        assert_eq!(label.argc, 0);
+        assert_eq!(label.argr, 0);
+    }
+
+    #[test]
+    fn tokenize_label_public() {
+        let label = tokenize_label(1, "pub name:").unwrap();
+        assert!(label.public);
+        assert_eq!(label.name, "name");
+        assert_eq!(label.argc, 0);
+        assert_eq!(label.argr, 0);
+    }
+
+    #[test]
+    fn tokenize_label_with_params() {
+        let label = tokenize_label(1, "func(3, r5):").unwrap();
+        assert!(!label.public);
+        assert_eq!(label.name, "func");
+        assert_eq!(label.argc, 3);
+        assert_eq!(label.argr, 5);
+    }
+
+    #[test]
+    fn tokenize_label_public_with_params() {
+        let label = tokenize_label(1, "pub func(10, r0):").unwrap();
+        assert!(label.public);
+        assert_eq!(label.name, "func");
+        assert_eq!(label.argc, 10);
+        assert_eq!(label.argr, 0);
+    }
+
+    #[test]
+    fn tokenize_label_max_params() {
+        let label = tokenize_label(1, "f(255, r255):").unwrap();
+        assert_eq!(label.argc, 255);
+        assert_eq!(label.argr, 255);
+    }
+
+    #[test]
+    fn tokenize_label_leading_spaces() {
+        let label = tokenize_label(1, "    name:").unwrap();
+        assert_eq!(label.name, "name");
+
+        let label = tokenize_label(1, "  pub func(1, r2):").unwrap();
+        assert!(label.public);
+        assert_eq!(label.name, "func");
+    }
+
+    #[test]
+    fn tokenize_label_underscore_and_numbers() {
+        let label = tokenize_label(1, "_private:").unwrap();
+        assert_eq!(label.name, "_private");
+
+        let label = tokenize_label(1, "func123:").unwrap();
+        assert_eq!(label.name, "func123");
+
+        let label = tokenize_label(1, "_123_abc_:").unwrap();
+        assert_eq!(label.name, "_123_abc_");
+    }
+
+    #[test]
+    fn tokenize_label_params_with_spaces() {
+        let label = tokenize_label(1, "f( 1 , r2 ):").unwrap();
+        assert_eq!(label.argc, 1);
+        assert_eq!(label.argr, 2);
+
+        let label = tokenize_label(1, "f(  5  ,  r10  ):").unwrap();
+        assert_eq!(label.argc, 5);
+        assert_eq!(label.argr, 10);
+    }
+
+    #[test]
+    fn tokenize_label_missing_name() {
+        let err = tokenize_label(1, ":").unwrap_err();
+        assert!(matches!(err, VMError::ParseError { line: 1, .. }));
+
+        let err = tokenize_label(1, "pub :").unwrap_err();
+        assert!(matches!(err, VMError::ParseError { line: 1, .. }));
+    }
+
+    #[test]
+    fn tokenize_label_missing_colon() {
+        let err = tokenize_label(1, "name").unwrap_err();
+        assert!(matches!(err, VMError::ParseError { line: 1, .. }));
+
+        let err = tokenize_label(1, "pub name").unwrap_err();
+        assert!(matches!(err, VMError::ParseError { line: 1, .. }));
+    }
+
+    #[test]
+    fn tokenize_label_unclosed_paren() {
+        let err = tokenize_label(1, "f(1, r2").unwrap_err();
+        assert!(matches!(err, VMError::ParseError { line: 1, .. }));
+    }
+
+    #[test]
+    fn tokenize_label_missing_colon_after_params() {
+        let err = tokenize_label(1, "f(1, r2)").unwrap_err();
+        assert!(matches!(err, VMError::ParseError { line: 1, .. }));
+
+        let err = tokenize_label(1, "f(1, r2)x").unwrap_err();
+        assert!(matches!(err, VMError::ParseError { line: 1, .. }));
+    }
+
+    #[test]
+    fn tokenize_label_invalid_param_format() {
+        // Missing comma
+        let err = tokenize_label(1, "f(1 r2):").unwrap_err();
+        assert!(matches!(err, VMError::ParseError { line: 1, .. }));
+
+        // Missing register prefix
+        let err = tokenize_label(1, "f(1, 2):").unwrap_err();
+        assert!(matches!(err, VMError::ParseError { line: 1, .. }));
+
+        // Empty params
+        let err = tokenize_label(1, "f():").unwrap_err();
+        assert!(matches!(err, VMError::ParseErrorString { line: 1, .. }));
+    }
+
+    #[test]
+    fn tokenize_label_argc_overflow() {
+        let err = tokenize_label(1, "f(256, r0):").unwrap_err();
+        assert!(matches!(err, VMError::ParseErrorString { line: 1, .. }));
+
+        let err = tokenize_label(1, "f(999, r0):").unwrap_err();
+        assert!(matches!(err, VMError::ParseErrorString { line: 1, .. }));
+    }
+
+    #[test]
+    fn tokenize_label_argr_overflow() {
+        let err = tokenize_label(1, "f(0, r256):").unwrap_err();
+        assert!(matches!(err, VMError::ParseErrorString { line: 1, .. }));
+
+        let err = tokenize_label(1, "f(1, r999):").unwrap_err();
+        assert!(matches!(err, VMError::ParseErrorString { line: 1, .. }));
+    }
+
+    #[test]
+    fn tokenize_label_extra_chars_in_params() {
+        let err = tokenize_label(1, "f(1, r2 x):").unwrap_err();
+        assert!(matches!(err, VMError::ParseError { line: 1, .. }));
+    }
+
+    #[test]
+    fn tokenize_label_invalid_char_after_name() {
+        let err = tokenize_label(1, "name!:").unwrap_err();
+        assert!(matches!(err, VMError::ParseError { line: 1, .. }));
+
+        let err = tokenize_label(1, "name@(1, r2):").unwrap_err();
+        assert!(matches!(err, VMError::ParseError { line: 1, .. }));
+    }
+
+    #[test]
+    fn tokenize_label_preserves_line_number() {
+        let err = tokenize_label(42, ":").unwrap_err();
+        assert!(matches!(err, VMError::ParseError { line: 42, .. }));
+
+        let err = tokenize_label(100, "f(999, r0):").unwrap_err();
+        assert!(matches!(err, VMError::ParseErrorString { line: 100, .. }));
     }
 }

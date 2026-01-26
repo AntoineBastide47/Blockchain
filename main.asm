@@ -9,8 +9,8 @@ main:                            # Equivalent to a contract constructor
 [ runtime code ]
 # factorial(n): computes n! iteratively
 # input: r1 = n, output: r3 = n!
-pub factorial:
-    MOVE r3, 1                  # result = 1
+pub factorial(1, r1):
+    INC r3                      # result = 1
     fact_loop:
         MUL r3, r3, r1          # result *= i
         DEC r1                  # i--

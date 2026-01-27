@@ -15,6 +15,35 @@ use crate::virtual_machine::state::State;
 use blockchain_derive::BinaryCodec;
 use std::sync::atomic::Ordering;
 
+/// Defines host function name constants and a lookup table of `(name, argc)` pairs.
+macro_rules! host_functions {
+      ($($const_name:ident = $name:literal => $argc:literal),* $(,)?) => {
+          $(pub const $const_name: &str = $name;)*
+          pub const HOST_FUNCTIONS: &[(&str, u8)] = &[$(($name, $argc)),*];
+      };
+  }
+
+host_functions! {
+    LEN     = "len"     => 1,
+    HASH    = "hash"    => 1,
+    SLICE   = "slice"   => 3,
+    CONCAT  = "concat"  => 2,
+    COMPARE = "compare" => 2,
+}
+
+/// Returns the expected argument count for a host function by name.
+///
+/// # Panics
+///
+/// Panics if `name` does not match any registered host function.
+pub fn host_func_argc(name: &str) -> u8 {
+    HOST_FUNCTIONS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, c)| *c)
+        .unwrap()
+}
+
 /// Reads `len` bytes from `data` starting at `cursor`, advancing the cursor.
 ///
 /// Returns an error if reading would exceed the data bounds.
@@ -1130,7 +1159,7 @@ impl VM {
                 Ret => op_ret(rs: Reg),
                 Halt => op_halt(),
                 // Data access
-                CallDataLoad => op_calldata_load(rd: Reg),
+                CallDataLoad => op_call_data_load(rd: Reg),
             }
         }
     }
@@ -1713,7 +1742,7 @@ impl VM {
             .collect::<Result<_, _>>()?;
 
         /// Returns an error if actual != expected
-        fn arg_len_check(expected: usize, actual: usize, name: &str) -> Result<(), VMError> {
+        fn arg_len_check(expected: u8, actual: u8, name: &str) -> Result<(), VMError> {
             if actual != expected {
                 return Err(VMError::ArityMismatch {
                     instruction: format!("CALL_HOST reg, \"{name}\""),
@@ -1751,8 +1780,8 @@ impl VM {
         }
 
         match fn_name.as_str() {
-            k @ "slice" => {
-                arg_len_check(3, args.len(), k)?;
+            SLICE => {
+                arg_len_check(host_func_argc(SLICE), args.len() as u8, SLICE)?;
                 let str_ref = get_ref(args[0])?;
                 let start = get_i64(args[1])? as usize;
                 let end = get_i64(args[2])? as usize;
@@ -1768,8 +1797,8 @@ impl VM {
                 let new_ref = self.heap_index(sliced)?;
                 self.op_load_str(instr, dst, new_ref)
             }
-            k @ "concat" => {
-                arg_len_check(2, args.len(), k)?;
+            CONCAT => {
+                arg_len_check(host_func_argc(CONCAT), args.len() as u8, CONCAT)?;
                 let ref1 = get_ref(args[0])?;
                 let ref2 = get_ref(args[1])?;
 
@@ -1783,8 +1812,8 @@ impl VM {
                 let new_ref = self.heap.index(result);
                 self.op_load_str(instr, dst, new_ref)
             }
-            k @ "compare" => {
-                arg_len_check(2, args.len(), k)?;
+            COMPARE => {
+                arg_len_check(host_func_argc(COMPARE), args.len() as u8, COMPARE)?;
                 let ref1 = get_ref(args[0])?;
                 let ref2 = get_ref(args[1])?;
 
@@ -1820,18 +1849,13 @@ impl VM {
         let fn_name = self.heap_get_string(fn_id)?;
 
         match fn_name.as_str() {
-            "len" => {
+            LEN => {
                 let str_ref = self.ref_from_operand(arg, instr, 1)?;
                 let len = self.heap.get_raw_ref(str_ref)?.len();
                 self.charge_gas_categorized(len as u64, GasCategory::HostFunction)?;
                 self.op_load_i64(instr, dst, self.heap.get_raw_ref(str_ref)?.len() as i64)
             }
-            "log" => {
-                let value = self.value_from_operand(arg)?;
-                error!("{:?}", value);
-                Ok(())
-            }
-            "hash" => {
+            HASH => {
                 let value = self.value_from_operand(arg)?;
                 let len = match value {
                     Value::Bool(_) => 1,
@@ -2027,7 +2051,7 @@ impl VM {
 
     /// Loads program call arguments into consecutive registers starting at `dst`,
     /// remapping `Value::Ref` indices to account for the heap base offset.
-    fn op_calldata_load(&mut self, _instr: &'static str, dst: u8) -> Result<(), VMError> {
+    fn op_call_data_load(&mut self, _instr: &'static str, dst: u8) -> Result<(), VMError> {
         let mut i = dst;
         for arg in &self.args {
             let mapped = match arg {
@@ -3966,7 +3990,7 @@ LOAD_HASH_STATE r2, r0"#,
         "#;
         assert!(matches!(
             run_expect_err(source),
-            VMError::InvalidCallHostFunction { .. }
+            VMError::ParseErrorString { .. }
         ));
     }
 
@@ -4071,7 +4095,7 @@ LOAD_HASH_STATE r2, r0"#,
         "#;
         assert!(matches!(
             run_expect_err(source),
-            VMError::ArityMismatch { .. }
+            VMError::ParseErrorString { .. }
         ));
     }
 
@@ -4133,7 +4157,7 @@ LOAD_HASH_STATE r2, r0"#,
         "#;
         assert!(matches!(
             run_expect_err(source),
-            VMError::ArityMismatch { .. }
+            VMError::ParseErrorString { .. }
         ));
     }
 
@@ -4230,7 +4254,7 @@ LOAD_HASH_STATE r2, r0"#,
         "#;
         assert!(matches!(
             run_expect_err(source),
-            VMError::ArityMismatch { .. }
+            VMError::ParseErrorString { .. }
         ));
     }
 
@@ -4307,7 +4331,7 @@ LOAD_HASH_STATE r2, r0"#,
         "#;
         assert!(matches!(
             run_expect_err(source),
-            VMError::InvalidCallHostFunction { .. }
+            VMError::ParseErrorString { .. }
         ));
     }
 
@@ -4412,7 +4436,7 @@ LOAD_HASH_STATE r2, r0"#,
     fn call1_basic() {
         let source = r#"
             JUMP skip_fn
-            my_func:
+            my_func(1, r0):
                 MOVE r0, 100
                 RET r0
             skip_fn:
@@ -4505,5 +4529,22 @@ LOAD_HASH_STATE r2, r0"#,
         );
         assert_eq!(vm.registers.get_int(250, "").unwrap(), 7);
         assert_eq!(vm.registers.get_int(251, "").unwrap(), 8);
+    }
+
+    // ==================== host_func_argc ====================
+
+    #[test]
+    fn host_func_argc_known_functions() {
+        assert_eq!(host_func_argc("len"), 1);
+        assert_eq!(host_func_argc("hash"), 1);
+        assert_eq!(host_func_argc("slice"), 3);
+        assert_eq!(host_func_argc("concat"), 2);
+        assert_eq!(host_func_argc("compare"), 2);
+    }
+
+    #[test]
+    #[should_panic]
+    fn host_func_argc_unknown_panics() {
+        host_func_argc("nonexistent");
     }
 }

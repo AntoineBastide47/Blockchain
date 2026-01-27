@@ -14,8 +14,8 @@ pub enum VMError {
     #[error("operand count mismatch for {instruction}: expected {expected}, got {actual}")]
     ArityMismatch {
         instruction: String,
-        expected: usize,
-        actual: usize,
+        expected: u8,
+        actual: u8,
     },
     /// Expected a register operand (e.g., `r0`) but got something else.
     #[error("expected register operand (e.g., r0) but got '{0}', did you mean 'r{0}' ?")]

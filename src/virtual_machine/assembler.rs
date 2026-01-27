@@ -24,6 +24,7 @@ use crate::virtual_machine::errors::VMError;
 use crate::virtual_machine::isa::Instruction;
 use crate::virtual_machine::operand::SrcOperand;
 use crate::virtual_machine::program::DeployProgram;
+use crate::virtual_machine::vm::HOST_FUNCTIONS;
 use crate::{define_instructions, error};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
@@ -35,6 +36,7 @@ const COMMENT_CHAR: char = '#';
 const LABEL_SUFFIX: char = ':';
 const SECTION_INIT: &str = "[ init code ]";
 const SECTION_RUNTIME: &str = "[ runtime code ]";
+const SECTION_DISPATCHER: &str = "[ dispatcher code ]";
 
 /// Tracks line offset introduced by dispatcher code insertion.
 #[derive(Debug, Clone, Copy)]
@@ -192,6 +194,8 @@ pub enum Section {
     Init,
     /// Inside `[ runtime code ]` section.
     Runtime,
+    /// Inside `[ dispatcher code ]` section.
+    Dispatcher,
 }
 
 /// Assembly context for heap items interning and label tracking during compilation.
@@ -484,7 +488,6 @@ fn tokenize(line_no: usize, line: &str) -> Result<Vec<Token<'_>>, VMError> {
                 in_str = !in_str;
                 i += 1;
             }
-
             b',' | b' ' | b'\t' if !in_str => {
                 if let Some(s) = start {
                     let text = &line[s..i];
@@ -499,7 +502,6 @@ fn tokenize(line_no: usize, line: &str) -> Result<Vec<Token<'_>>, VMError> {
                 }
                 i += 1;
             }
-
             _ => {
                 if start.is_none() {
                     start = Some(i);
@@ -687,6 +689,8 @@ fn parse_section_marker(line: &str) -> Option<Section> {
         Some(Section::Init)
     } else if trimmed.eq_ignore_ascii_case(SECTION_RUNTIME) {
         Some(Section::Runtime)
+    } else if trimmed.eq_ignore_ascii_case(SECTION_DISPATCHER) {
+        Some(Section::Dispatcher)
     } else {
         None
     }
@@ -761,8 +765,8 @@ macro_rules! define_parse_instruction {
                         if tokens.len() != EXPECTED {
                             return Err(VMError::ArityMismatch {
                                 instruction: tokens[0].text.to_string(),
-                                expected: EXPECTED - 1,
-                                actual: tokens.len() - 1,
+                                expected: EXPECTED as u8 - 1,
+                                actual: tokens.len() as u8 - 1,
                             });
                         }
                         1usize $( + define_parse_instruction!(@token_size $kind, tok_iter) )*
@@ -798,8 +802,8 @@ macro_rules! define_parse_instruction {
                         if tokens.len() != EXPECTED {
                             return Err(VMError::ArityMismatch {
                                 instruction: tokens[0].text.to_string(),
-                                expected: EXPECTED - 1,
-                                actual: tokens.len() - 1,
+                                expected: EXPECTED as u8 - 1,
+                                actual: tokens.len() as u8 - 1,
                             });
                         }
 
@@ -883,7 +887,7 @@ pub fn extract_public_labels<'a>(
     insert_point: &mut usize,
 ) -> Result<(HashSet<&'a str>, Vec<Label<'a>>), VMError> {
     let mut public_labels: HashSet<&str> = HashSet::new();
-    let mut public_label_data: Vec<Label> = Vec::new();
+    let mut label_data: Vec<Label> = Vec::new();
 
     // First pass: scan source to find public labels and the runtime section marker
     for (line_no, line) in source.lines().enumerate() {
@@ -901,11 +905,11 @@ pub fn extract_public_labels<'a>(
             if label.public {
                 public_labels.insert(label.name);
             }
-            public_label_data.push(label);
+            label_data.push(label);
         }
     }
 
-    Ok((public_labels, public_label_data))
+    Ok((public_labels, label_data))
 }
 
 /// Preprocesses assembly source to generate a dispatcher for public entry points.
@@ -928,8 +932,7 @@ fn assemble_source_step_1<'a>(
     // Track where to insert the dispatcher (line number of `[ runtime code ]`)
     let mut insert_point = 0usize;
     // Collect all public label names (including trailing ':')
-    let (public_labels, public_label_data) = match extract_public_labels(source, &mut insert_point)
-    {
+    let (public_labels, label_data) = match extract_public_labels(source, &mut insert_point) {
         Ok(p) => p,
         Err(e) => {
             errors.push(e);
@@ -938,7 +941,7 @@ fn assemble_source_step_1<'a>(
     };
 
     if public_labels.is_empty() {
-        return (None, None, None);
+        return (None, None, Some(label_data));
     }
 
     let mut base = String::new();
@@ -947,7 +950,7 @@ fn assemble_source_step_1<'a>(
 
     let mut labels = Vec::<Label>::with_capacity(label_names.len());
     for name in label_names {
-        for label in &public_label_data {
+        for label in &label_data {
             if label.name == name {
                 labels.push(label.clone())
             }
@@ -983,13 +986,15 @@ fn assemble_source_step_1<'a>(
     // Reassemble source with dispatcher inserted at the runtime section marker
     let mut out = String::with_capacity(source.len() + base.len());
     for (i, line) in source.lines().enumerate() {
-        out.push_str(line.split(COMMENT_CHAR).next().unwrap_or("").trim());
-        out.push('\n');
-        // Insert dispatcher just after the `[ runtime code ]` line
+        // Insert dispatcher just before the `[ runtime code ]` line
         if i == insert_point {
+            out.push_str(SECTION_DISPATCHER);
+            out.push('\n');
             out.push_str(&base);
             out.push('\n');
         }
+        out.push_str(line.split(COMMENT_CHAR).next().unwrap_or(""));
+        out.push('\n');
     }
 
     let dispatcher_info = DispatcherInfo {
@@ -997,7 +1002,88 @@ fn assemble_source_step_1<'a>(
         lines_added,
     };
 
-    (Some(out), Some(dispatcher_info), Some(public_label_data))
+    (Some(out), Some(dispatcher_info), Some(label_data))
+}
+
+/// Validates that a `CALL` instruction's argument count matches the target label's declared argc.
+fn check_call_argc(
+    tokens: &[Token],
+    label_data: &[Label],
+    line_no: usize,
+    argc: u8,
+) -> Result<(), VMError> {
+    let func_name = tokens[2].text;
+    for label in label_data {
+        if label.name == func_name && label.argc != argc {
+            return Err(VMError::ParseErrorString {
+                line: line_no + 1,
+                offset: tokens[0].offset,
+                length: tokens[0].text.len(),
+                message: if argc == 1 {
+                    format!(
+                        "function '{}' expects {} argument, but 1 was provided",
+                        label.name, label.argc
+                    )
+                } else {
+                    format!(
+                        "function '{}' expects {} argument, but {} were provided",
+                        label.name, label.argc, argc
+                    )
+                },
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Validates that a `CALL_HOST` instruction's argument count matches the host function's expected argc.
+fn check_call_host_argc(tokens: &[Token], line_no: usize, argc: u8) -> Result<(), VMError> {
+    let func_name = &tokens[2].text[1..tokens[2].text.len() - 1];
+    for (name, func_argc) in HOST_FUNCTIONS {
+        if *name == func_name && *func_argc != argc {
+            return Err(VMError::ParseErrorString {
+                line: line_no + 1,
+                offset: tokens[0].offset,
+                length: tokens[0].text.len(),
+                message: if argc == 1 {
+                    format!(
+                        "host function '{}' expects {} argument, but 1 was provided",
+                        *name, *func_argc
+                    )
+                } else {
+                    format!(
+                        "host function '{}' expects {} argument, but {} were provided",
+                        *name, *func_argc, argc
+                    )
+                },
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Extracts the argument count from a call instruction token by matching against the
+/// zero-arg, one-arg, and n-arg instruction variants.
+fn extract_argc(
+    tokens: &[Token],
+    line_no: usize,
+    instr_0: Instruction,
+    instr_1: Instruction,
+    instr_n: Instruction,
+) -> Result<u8, VMError> {
+    Ok(match tokens[0] {
+        Token { text, .. } if text == instr_0.mnemonic() => 0,
+        Token { text, .. } if text == instr_1.mnemonic() => 1,
+        Token { text, .. } if text == instr_n.mnemonic() => {
+            parse_u8(tokens[3].text).map_err(|e| VMError::ParseErrorString {
+                line: line_no + 1,
+                offset: tokens[3].offset,
+                length: tokens[3].text.len(),
+                message: e.to_string(),
+            })?
+        }
+        _ => 0,
+    })
 }
 
 /// Performs two-pass assembly on preprocessed source.
@@ -1011,7 +1097,7 @@ fn assemble_source_step_1<'a>(
 /// Collects all errors into the provided vector and continues processing where possible.
 fn assemble_source_step_2(
     source: String,
-    _label_data: Vec<Label>,
+    label_data: Vec<Label>,
     errors: &mut Vec<VMError>,
 ) -> Option<DeployProgram> {
     let mut asm_context = AsmContext::new();
@@ -1029,23 +1115,33 @@ fn assemble_source_step_2(
     // (name, section, local_offset, line_no, tok_offset, tok_len)
     let mut pending_labels: Vec<(String, Section, usize, usize, usize, usize)> = Vec::new();
 
+    let mut skip_call_checks = false;
     for (line_no, line) in source.lines().enumerate() {
         // Check for section markers first
         if let Some(section) = parse_section_marker(line) {
-            current_section = section;
+            current_section = match section {
+                Section::Dispatcher => {
+                    skip_call_checks = true;
+                    Section::Runtime
+                }
+                _ => {
+                    skip_call_checks = false;
+                    section
+                }
+            };
             continue;
         }
 
         // Determine which section this code belongs to
         let effective_section = match current_section {
-            Section::None | Section::Runtime => Section::Runtime,
+            Section::None | Section::Runtime | Section::Dispatcher => Section::Runtime,
             Section::Init => Section::Init,
         };
 
         // Get the offset pointer for the current section
         let local_offset = match effective_section {
             Section::Init => &mut init_size,
-            Section::Runtime | Section::None => &mut runtime_size,
+            Section::Runtime | Section::None | Section::Dispatcher => &mut runtime_size,
         };
 
         // Check if first token is a label definition
@@ -1083,6 +1179,61 @@ fn assemble_source_step_2(
             continue;
         }
 
+        // Validate CALL and CALL_HOST argc
+        if !skip_call_checks {
+            match tokens[0] {
+                Token { text, .. }
+                    if text == Instruction::Call0.mnemonic()
+                        || text == Instruction::Call1.mnemonic()
+                        || text == Instruction::Call.mnemonic() =>
+                {
+                    let argc = match extract_argc(
+                        &tokens,
+                        line_no,
+                        Instruction::Call0,
+                        Instruction::Call1,
+                        Instruction::Call,
+                    ) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            errors.push(e);
+                            continue;
+                        }
+                    };
+
+                    if let Err(e) = check_call_argc(&tokens, &label_data, line_no, argc) {
+                        errors.push(e);
+                        continue;
+                    }
+                }
+                Token { text, .. }
+                    if text == Instruction::CallHost0.mnemonic()
+                        || text == Instruction::CallHost1.mnemonic()
+                        || text == Instruction::CallHost.mnemonic() =>
+                {
+                    let argc = match extract_argc(
+                        &tokens,
+                        line_no,
+                        Instruction::CallHost0,
+                        Instruction::CallHost1,
+                        Instruction::CallHost,
+                    ) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            errors.push(e);
+                            continue;
+                        }
+                    };
+
+                    if let Err(e) = check_call_host_argc(&tokens, line_no, argc) {
+                        errors.push(e);
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+        }
+
         match instruction_size_from_tokens(&tokens) {
             Ok(size) => {
                 *local_offset += size;
@@ -1103,7 +1254,7 @@ fn assemble_source_step_2(
     for (name, section, local_offset, line_no, tok_offset, tok_len) in pending_labels {
         let global_offset = match section {
             Section::Init => local_offset,
-            Section::Runtime | Section::None => init_size + local_offset,
+            Section::Runtime | Section::None | Section::Dispatcher => init_size + local_offset,
         };
         if let Err(e) = asm_context.define_label(name, global_offset) {
             errors.push(VMError::AssemblyError {
@@ -1122,13 +1273,13 @@ fn assemble_source_step_2(
     for (line_no, tokens, section) in parsed_lines {
         let bytecode = match section {
             Section::Init => &mut init_bytecode,
-            Section::Runtime | Section::None => &mut runtime_bytecode,
+            Section::Runtime | Section::None | Section::Dispatcher => &mut runtime_bytecode,
         };
 
         // Compute global offset for label resolution
         let global_offset = match section {
             Section::Init => bytecode.len(),
-            Section::Runtime | Section::None => init_size + bytecode.len(),
+            Section::Runtime | Section::None | Section::Dispatcher => init_size + bytecode.len(),
         };
 
         match parse_instruction(&mut asm_context, &tokens, global_offset) {
@@ -1201,18 +1352,9 @@ fn assemble_source_with_name(source: String, source_name: &str) -> Result<Deploy
         return Err(adjust_error_line(first_err, dispatcher_info));
     }
 
-    let not_empty = processed.is_some();
     let result = assemble_source_step_2(
-        if not_empty {
-            processed.unwrap()
-        } else {
-            source.clone()
-        },
-        if not_empty {
-            label_data.unwrap()
-        } else {
-            vec![]
-        },
+        processed.unwrap_or_else(|| source.clone()),
+        label_data.unwrap_or_default(),
         &mut errors,
     );
     if !errors.is_empty() {
@@ -1535,7 +1677,7 @@ mod tests {
     #[test]
     fn assemble_call_argc_u8() {
         // CALL: opcode(1) + dst(1) + fn_id(8) + argc(1) + argv(1) = 12 bytes
-        let program = assemble_source("my_func:\nCALL r0, my_func, 5, r2").unwrap();
+        let program = assemble_source("my_func(5, r2):\nCALL r0, my_func, 5, r2").unwrap();
         assert_eq!(program.runtime_code[0], Instruction::Call as u8);
         assert_eq!(program.runtime_code[1], 0); // dst = r0
         assert_eq!(program.runtime_code[10], 5); // argc = 5 (single byte)
@@ -1553,7 +1695,7 @@ mod tests {
     fn assemble_call_argc_overflow() {
         // 256 exceeds u8 range
         let err = assemble_source(r#"CALL_HOST r0, "fn", 256, r0"#).unwrap_err();
-        assert!(matches!(err, VMError::AssemblyError { .. }));
+        assert!(matches!(err, VMError::ParseErrorString { .. }));
     }
 
     // ==================== Sections ====================
@@ -1570,6 +1712,10 @@ mod tests {
             Some(Section::Init)
         );
         assert_eq!(parse_section_marker("[ INIT CODE ]"), Some(Section::Init));
+        assert_eq!(
+            parse_section_marker("[ dispatcher code ]"),
+            Some(Section::Dispatcher)
+        );
     }
 
     #[test]
@@ -1821,5 +1967,62 @@ MOVE r1, "runtime"
 
         let err = tokenize_label(100, "f(999, r0):").unwrap_err();
         assert!(matches!(err, VMError::ParseErrorString { line: 100, .. }));
+    }
+
+    // ==================== Call argc validation ====================
+
+    #[test]
+    fn call0_argc_mismatch() {
+        let source = "add(2, r0):\nRET r0\nCALL0 r1, add";
+        let err = assemble_source(source).unwrap_err();
+        assert!(matches!(err, VMError::ParseErrorString { .. }));
+    }
+
+    #[test]
+    fn call1_argc_mismatch() {
+        let source = "add(2, r0):\nRET r0\nCALL1 r1, add, r2";
+        let err = assemble_source(source).unwrap_err();
+        assert!(matches!(err, VMError::ParseErrorString { .. }));
+    }
+
+    #[test]
+    fn call_argc_mismatch() {
+        let source = "add(2, r0):\nRET r0\nCALL r1, add, 3, r2";
+        let err = assemble_source(source).unwrap_err();
+        assert!(matches!(err, VMError::ParseErrorString { .. }));
+    }
+
+    #[test]
+    fn call_argc_correct() {
+        let source = "add(2, r0):\nADD r0, r0, r1\nRET r0\nCALL r1, add, 2, r2";
+        assert!(assemble_source(source).is_ok());
+    }
+
+    #[test]
+    fn call_host0_argc_mismatch() {
+        let source = r#"CALL_HOST0 r0, "len""#;
+        let err = assemble_source(source).unwrap_err();
+        assert!(matches!(err, VMError::ParseErrorString { .. }));
+    }
+
+    #[test]
+    fn call_host1_argc_mismatch() {
+        let source = r#"CALL_HOST1 r0, "slice", r1"#;
+        let err = assemble_source(source).unwrap_err();
+        assert!(matches!(err, VMError::ParseErrorString { .. }));
+    }
+
+    #[test]
+    fn call_host_argc_mismatch() {
+        let source = r#"CALL_HOST r0, "len", 2, r1"#;
+        let err = assemble_source(source).unwrap_err();
+        assert!(matches!(err, VMError::ParseErrorString { .. }));
+    }
+
+    #[test]
+    fn call_host_argc_correct() {
+        let source = r#"MOVE r1, "hello"
+CALL_HOST1 r0, "len", r1"#;
+        assert!(assemble_source(source).is_ok());
     }
 }

@@ -76,6 +76,9 @@ mod tests {
         assert_eq!(Instruction::Jump as u8, 0x4E);
         assert_eq!(Instruction::Ret as u8, 0x4F);
         assert_eq!(Instruction::Halt as u8, 0x50);
+
+        // Data access
+        assert_eq!(Instruction::CallDataLoad as u8, 0x51);
     }
 
     /// Verifies that all instruction mnemonics match their expected values.
@@ -146,6 +149,9 @@ mod tests {
         assert_eq!(Instruction::Jump.mnemonic(), "JUMP");
         assert_eq!(Instruction::Ret.mnemonic(), "RET");
         assert_eq!(Instruction::Halt.mnemonic(), "HALT");
+
+        // Data access
+        assert_eq!(Instruction::CallDataLoad.mnemonic(), "CALLDATA_LOAD");
     }
 
     /// Verifies that all instruction base gas costs match their expected values.
@@ -216,12 +222,15 @@ mod tests {
         assert_eq!(Instruction::Jump.base_gas(), 5);
         assert_eq!(Instruction::Ret.base_gas(), 5);
         assert_eq!(Instruction::Halt.base_gas(), 1);
+
+        // Data access
+        assert_eq!(Instruction::CallDataLoad.base_gas(), 3);
     }
 
     /// Verifies the total instruction count has not changed.
     #[test]
     fn instruction_count_unchanged() {
-        const EXPECTED_COUNT: usize = 56;
+        const EXPECTED_COUNT: usize = 57;
 
         // Count by verifying TryFrom succeeds for expected opcodes
         let mut count = 0;

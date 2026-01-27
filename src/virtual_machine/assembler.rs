@@ -266,7 +266,7 @@ struct Token<'a> {
 /// - `pub` marks the label as a public entry point
 /// - `argc` is the number of arguments the function expects
 /// - `rN` specifies the first register containing arguments
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct Label<'a> {
     /// Whether this label is marked as public (`pub` prefix).
@@ -942,8 +942,18 @@ fn assemble_source_step_1<'a>(
     }
 
     let mut base = String::new();
-    let mut labels: Vec<&str> = public_labels.iter().copied().collect();
-    labels.sort();
+    let mut label_names: Vec<&str> = public_labels.iter().copied().collect();
+    label_names.sort();
+
+    let mut labels = Vec::<Label>::with_capacity(label_names.len());
+    for name in label_names {
+        for label in &public_label_data {
+            if label.name == name {
+                labels.push(label.clone())
+            }
+        }
+    }
+
     let has_multiple = labels.len() > 1;
     if has_multiple {
         // Jump over the entries while capturing the base address (r254) of
@@ -953,15 +963,15 @@ fn assemble_source_step_1<'a>(
     }
 
     for label in labels.iter() {
-        let name = label.strip_suffix(':').unwrap_or(label);
         // Use CALL0 to keep per-entry size minimal (11 bytes with HALT) while leaving
         // argument registers untouched for the callee.
-        writeln!(base, "CALL0 r0, {name}\nHALT\n").unwrap();
+        writeln!(base, "CALLDATA_LOAD r{}", label.argr).unwrap();
+        writeln!(base, "CALL0 r0, {}\nHALT", label.name).unwrap();
     }
 
     if has_multiple {
         base.push_str("__dispatch_header:\n");
-        base.push_str("MUL r253, r0, 11\n"); // byte offset into table
+        base.push_str("MUL r253, r0, 13\n"); // byte offset into table
         base.push_str("ADD r253, r253, r254\n"); // absolute addr of target entry
         base.push_str("JALR r255, r253, 0\n");
         base.push_str("HALT\n");
@@ -983,7 +993,7 @@ fn assemble_source_step_1<'a>(
     }
 
     let dispatcher_info = DispatcherInfo {
-        insert_after: insert_point + 1, // 1-indexed, after the section marker
+        insert_after: insert_point + 1,
         lines_added,
     };
 

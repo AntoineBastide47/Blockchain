@@ -252,7 +252,7 @@ async fn main() {
             }
 
             // Wait for deployment to be mined
-            sleep(Duration::from_secs(5)).await;
+            sleep(Duration::from_secs(6)).await;
 
             // Now invoke the contract repeatedly
             loop {

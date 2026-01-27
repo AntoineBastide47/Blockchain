@@ -303,7 +303,7 @@ pub mod tests {
 
     #[test]
     fn dispatcher_uses_compact_call0_entries() {
-        // Two public functions -> prologue JAL (10 bytes), 2 entries (11 bytes each),
+        // Two public functions -> prologue JAL (10 bytes), 2 entries (13 bytes each),
         // and a compact header (31 bytes) that reuses the captured return address as
         // the base of the dispatch table.
         let source = r#"
@@ -319,23 +319,25 @@ pub bar:
         // Prologue captures entry base via return address
         assert_eq!(bc[0], Instruction::Jal as u8); // JAL r254, __dispatch_header
 
-        // Entries (stride 11 bytes)
-        assert_eq!(bc[10], Instruction::Call0 as u8);
-        assert_eq!(bc[20], Instruction::Halt as u8);
-        assert_eq!(bc[21], Instruction::Call0 as u8);
-        assert_eq!(bc[31], Instruction::Halt as u8);
+        // Entries (stride 13 bytes: CALLDATA_LOAD 2 + CALL0 10 + HALT 1)
+        assert_eq!(bc[10], Instruction::CallDataLoad as u8);
+        assert_eq!(bc[12], Instruction::Call0 as u8);
+        assert_eq!(bc[22], Instruction::Halt as u8);
+        assert_eq!(bc[23], Instruction::CallDataLoad as u8);
+        assert_eq!(bc[25], Instruction::Call0 as u8);
+        assert_eq!(bc[35], Instruction::Halt as u8);
 
-        // Header (starts at offset 32)
-        assert_eq!(bc[32], Instruction::Mul as u8); // MUL r253, r0, 11
-        assert_eq!(bc[45], Instruction::Add as u8); // ADD r253, r253, r254
-        assert_eq!(bc[51], Instruction::Jalr as u8); // JALR r255, r253, 0
-        assert_eq!(bc[62], Instruction::Halt as u8); // HALT
+        // Header (starts at offset 36)
+        assert_eq!(bc[36], Instruction::Mul as u8); // MUL r253, r0, 13
+        assert_eq!(bc[49], Instruction::Add as u8); // ADD r253, r253, r254
+        assert_eq!(bc[55], Instruction::Jalr as u8); // JALR r255, r253, 0
+        assert_eq!(bc[66], Instruction::Halt as u8); // HALT
 
         // Original function bodies still present after dispatcher (one HALT each)
-        assert_eq!(bc[63], Instruction::Halt as u8);
-        assert_eq!(bc[64], Instruction::Halt as u8);
+        assert_eq!(bc[67], Instruction::Halt as u8);
+        assert_eq!(bc[68], Instruction::Halt as u8);
 
-        assert_eq!(bc.len(), 65);
+        assert_eq!(bc.len(), 69);
     }
 
     #[test]
@@ -363,15 +365,16 @@ pub only:
         let program = assemble_source(source).unwrap();
         let bc = &program.runtime_code;
 
-        // Layout: entry (CALL0 + HALT, 11 bytes) -> body HALT (1 byte)
-        assert_eq!(bc[0], Instruction::Call0 as u8);
-        assert_eq!(bc[10], Instruction::Halt as u8);
-        assert_eq!(bc[11], Instruction::Halt as u8);
+        // Layout: entry (CALLDATA_LOAD 2 + CALL0 10 + HALT 1 = 13 bytes) -> body HALT (1 byte)
+        assert_eq!(bc[0], Instruction::CallDataLoad as u8);
+        assert_eq!(bc[2], Instruction::Call0 as u8);
+        assert_eq!(bc[12], Instruction::Halt as u8);
+        assert_eq!(bc[13], Instruction::Halt as u8);
 
-        // CALL0 immediate points to the function body (offset 11 - after call size).
-        let imm = i64::from_le_bytes(bc[2..10].try_into().expect("immediate slice"));
+        // CALL0 immediate points to the function body (offset from end of CALL0).
+        let imm = i64::from_le_bytes(bc[4..12].try_into().expect("immediate slice"));
         assert_eq!(imm, 1);
-        assert_eq!(bc.len(), 12);
+        assert_eq!(bc.len(), 14);
     }
 
     #[test]
@@ -388,11 +391,12 @@ pub alpha:
         let bc = &program.runtime_code;
 
         // Entry 0 targets `alpha`, entry 1 targets `zebra`.
-        let entry0_imm = i64::from_le_bytes(bc[12..20].try_into().expect("entry0 immediate slice"));
-        let entry1_imm = i64::from_le_bytes(bc[23..31].try_into().expect("entry1 immediate slice"));
+        // Entry 0 CALL0 at offset 12, ends at 22; entry 1 CALL0 at offset 25, ends at 35.
+        let entry0_imm = i64::from_le_bytes(bc[14..22].try_into().expect("entry0 immediate slice"));
+        let entry1_imm = i64::from_le_bytes(bc[27..35].try_into().expect("entry1 immediate slice"));
 
-        assert_eq!(entry0_imm, 44); // alpha at offset 64, entry0 resolves from ip+10 -> 64-20
-        assert_eq!(entry1_imm, 32); // zebra at offset 63, entry1 resolves from ip+10 -> 63-31
+        assert_eq!(entry0_imm, 46); // alpha body at 68, CALL0 ends at 22 -> 68-22=46
+        assert_eq!(entry1_imm, 32); // zebra body at 67, CALL0 ends at 35 -> 67-35=32
     }
 
     #[test]

@@ -158,6 +158,11 @@ macro_rules! for_each_instruction {
             Ret = 0x4F, "RET" => [rs: Reg], 5,
             /// HALT ; stop execution immediately
             Halt = 0x50, "HALT" => [], 1,
+            // =========================
+            // Data access
+            // =========================
+            /// CALLDATA_LOAD rd ; load call arguments into registers starting at rd, remapping heap refs
+            CallDataLoad = 0x51, "CALLDATA_LOAD" => [rd: Reg], 3,
         }
     };
 }

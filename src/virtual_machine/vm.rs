@@ -557,6 +557,10 @@ pub struct VM {
     max_gas: u64,
     /// Gas consumption breakdown by category.
     gas_profile: GasProfile,
+    /// Arguments passed to the program, loaded into registers by `CALLDATA_LOAD`.
+    args: Vec<Value>,
+    /// Heap offset at which argument-referenced items were inserted.
+    heap_arg_base: u32,
 }
 
 /// impl block for basic VM functions
@@ -585,6 +589,8 @@ impl VM {
             gas_used: 0,
             max_gas,
             gas_profile: GasProfile::new(),
+            args: vec![],
+            heap_arg_base: 0,
         };
 
         vm.charge_gas_categorized(20_000 + total_bytes as u64 * 200, GasCategory::Deploy)?;
@@ -615,26 +621,18 @@ impl VM {
             gas_used: 0,
             max_gas,
             gas_profile: GasProfile::new(),
+            args: program.args,
+            heap_arg_base: 0,
         };
 
         // Load argument-specific heap items so Value::Ref can target them.
-        let arg_items_len = program.arg_items.len();
-        let arg_ref_base = vm.heap.len() as u32;
+        vm.charge_call(program.arg_items.len() as u8, 5, 0, 0)?;
+        vm.heap_arg_base = vm.heap.len() as u32;
         for item in program.arg_items {
             vm.heap.index(item);
         }
 
         vm.registers.set(0, Value::Int(program.function_id))?;
-        let mut i = 1u8;
-        for arg in program.args {
-            let mapped = match arg {
-                Value::Ref(r) if (r as usize) < arg_items_len => Value::Ref(arg_ref_base + r),
-                other => other,
-            };
-            vm.registers.set(i, mapped)?;
-            i += 1;
-        }
-
         Ok(vm)
     }
 
@@ -1131,6 +1129,8 @@ impl VM {
                 Jump => op_jump(offset: ImmI64),
                 Ret => op_ret(rs: Reg),
                 Halt => op_halt(),
+                // Data access
+                CallDataLoad => op_calldata_load(rd: Reg),
             }
         }
     }
@@ -1826,6 +1826,11 @@ impl VM {
                 self.charge_gas_categorized(len as u64, GasCategory::HostFunction)?;
                 self.op_load_i64(instr, dst, self.heap.get_raw_ref(str_ref)?.len() as i64)
             }
+            "log" => {
+                let value = self.value_from_operand(arg)?;
+                error!("{:?}", value);
+                Ok(())
+            }
             "hash" => {
                 let value = self.value_from_operand(arg)?;
                 let len = match value {
@@ -2003,12 +2008,6 @@ impl VM {
         Ok(())
     }
 
-    fn op_halt(&mut self, _instr: &'static str) -> Result<(), VMError> {
-        // Move IP to the end to exit the execution loop cleanly.
-        self.ip = self.data.len();
-        Ok(())
-    }
-
     fn op_ret(&mut self, _instr: &'static str, rs: u8) -> Result<(), VMError> {
         let frame = self.call_stack.pop().ok_or(VMError::ReturnWithoutCall {
             call_depth: self.call_stack.len(),
@@ -2017,6 +2016,29 @@ impl VM {
         let ret_val = *self.registers.get(rs)?;
         self.registers.set(frame.dst_reg, ret_val)?;
         self.ip = frame.return_addr;
+        Ok(())
+    }
+
+    fn op_halt(&mut self, _instr: &'static str) -> Result<(), VMError> {
+        // Move IP to the end to exit the execution loop cleanly.
+        self.ip = self.data.len();
+        Ok(())
+    }
+
+    /// Loads program call arguments into consecutive registers starting at `dst`,
+    /// remapping `Value::Ref` indices to account for the heap base offset.
+    fn op_calldata_load(&mut self, _instr: &'static str, dst: u8) -> Result<(), VMError> {
+        let mut i = dst;
+        for arg in &self.args {
+            let mapped = match arg {
+                Value::Ref(r) if (*r as usize) < self.args.len() => {
+                    Value::Ref(self.heap_arg_base + r)
+                }
+                other => *other,
+            };
+            self.registers.set(i, mapped)?;
+            i += 1;
+        }
         Ok(())
     }
 }
@@ -2050,6 +2072,8 @@ mod tests {
                 gas_used: 0,
                 max_gas,
                 gas_profile: GasProfile::new(),
+                args: vec![],
+                heap_arg_base: 0,
             };
 
             vm.charge_gas_categorized(init_cost, GasCategory::Deploy)?;
@@ -3886,26 +3910,20 @@ LOAD_HASH_STATE r2, r0"#,
     }
 
     #[test]
-    fn new_execute_loads_typed_args_and_arg_items() {
-        let exec = ExecuteProgram::new(
-            Hash::zero(),
-            3,
-            vec![Value::Ref(0), Value::Int(7), Value::Bool(true)],
-            vec![b"hello".to_vec()],
-        );
+    fn new_execute_stores_args_for_calldata_load() {
+        let args = vec![Value::Ref(0), Value::Int(7), Value::Bool(true)];
+        let exec = ExecuteProgram::new(Hash::zero(), 3, args.clone(), vec![b"hello".to_vec()]);
         let base_items = vec![b"base".to_vec()];
         let vm = VM::new_execute(exec, Vec::new(), base_items, BLOCK_GAS_LIMIT).unwrap();
 
+        // r0 holds the function selector
         assert_eq!(vm.registers.get_int(0, "").unwrap(), 3);
-        assert_eq!(vm.registers.get(1).unwrap(), &Value::Ref(1));
-        assert_eq!(vm.registers.get_int(2, "").unwrap(), 7);
-        assert!(vm.registers.get_bool(3, "").unwrap());
-
-        let ref_id = match vm.registers.get(1).unwrap() {
-            Value::Ref(r) => *r,
-            other => panic!("expected ref, got {:?}", other),
-        };
-        assert_eq!(vm.heap.get_string(ref_id).unwrap(), "hello");
+        // Args are stored for later CALLDATA_LOAD, not pre-loaded into registers
+        assert_eq!(vm.args, args);
+        // heap_arg_base points past the base items (1 base item -> index 1)
+        assert_eq!(vm.heap_arg_base, 1);
+        // The arg item was appended to the heap
+        assert_eq!(vm.heap.get_string(1).unwrap(), "hello");
     }
 
     // ==================== Host Functions ====================
@@ -4402,5 +4420,90 @@ LOAD_HASH_STATE r2, r0"#,
             CALL1 r1, my_func, r2
         "#;
         assert_eq!(run_and_get_int(source, 1), 100);
+    }
+
+    // ==================== CallDataLoad ====================
+
+    fn run_vm_with_args(source: &str, args: Vec<Value>, arg_items: Vec<Vec<u8>>) -> VM {
+        let program = assemble_source(source).expect("assembly failed");
+        let mut data = program.init_code;
+        data.extend(program.runtime_code);
+
+        let heap_items = program.items;
+        let mut vm = VM {
+            data,
+            ip: 0,
+            instr_offset: 0,
+            registers: Registers::new(),
+            heap: Heap::new(heap_items),
+            call_stack: Vec::new(),
+            gas_used: 0,
+            max_gas: BLOCK_GAS_LIMIT,
+            gas_profile: GasProfile::new(),
+            args,
+            heap_arg_base: 0,
+        };
+
+        let base = vm.heap.len() as u32;
+        for item in arg_items {
+            vm.heap.index(item);
+        }
+        vm.heap_arg_base = base;
+
+        vm.run(&mut TestState::new(), EXECUTION_CONTEXT)
+            .expect("vm run failed");
+        vm
+    }
+
+    #[test]
+    fn calldata_load_int_args() {
+        let vm = run_vm_with_args(
+            "CALLDATA_LOAD r1",
+            vec![Value::Int(10), Value::Int(20)],
+            vec![],
+        );
+        assert_eq!(vm.registers.get_int(1, "").unwrap(), 10);
+        assert_eq!(vm.registers.get_int(2, "").unwrap(), 20);
+    }
+
+    #[test]
+    fn calldata_load_mixed_args() {
+        let vm = run_vm_with_args(
+            "CALLDATA_LOAD r0",
+            vec![Value::Int(42), Value::Bool(true)],
+            vec![],
+        );
+        assert_eq!(vm.registers.get_int(0, "").unwrap(), 42);
+        assert!(vm.registers.get_bool(1, "").unwrap());
+    }
+
+    #[test]
+    fn calldata_load_remaps_refs() {
+        // arg_items inserts one heap item; Value::Ref(0) should be remapped to heap_arg_base.
+        let vm = run_vm_with_args(
+            "CALLDATA_LOAD r0",
+            vec![Value::Ref(0)],
+            vec![b"hello".to_vec()],
+        );
+        let r = vm.registers.get_ref(0, "").unwrap();
+        assert_eq!(vm.heap.get_string(r).unwrap(), "hello");
+    }
+
+    #[test]
+    fn calldata_load_no_args_is_noop() {
+        // With no args, registers should remain at their default (Int(0)).
+        let vm = run_vm_with_args("CALLDATA_LOAD r5\nMOVE r0, 1", vec![], vec![]);
+        assert_eq!(vm.registers.get_int(0, "").unwrap(), 1);
+    }
+
+    #[test]
+    fn calldata_load_at_high_register() {
+        let vm = run_vm_with_args(
+            "CALLDATA_LOAD r250",
+            vec![Value::Int(7), Value::Int(8)],
+            vec![],
+        );
+        assert_eq!(vm.registers.get_int(250, "").unwrap(), 7);
+        assert_eq!(vm.registers.get_int(251, "").unwrap(), 8);
     }
 }

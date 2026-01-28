@@ -131,29 +131,29 @@ macro_rules! for_each_instruction {
             /// CALL_HOST1 dst, fn, arg ; call host function fn with a single argument ; return -> dst
             CallHost1 = 0x42, "CALL_HOST1" => [dst: Reg, fn_id: RefU32, arg: Src], 100,
             /// CALL dst, fn, argc, argv ; call function fn with argc args from regs[argv...] ; return -> dst
-            Call = 0x43, "CALL" => [dst: Reg, fn_id: ImmI64, argc: ImmU8, argv: Reg], 50,
+            Call = 0x43, "CALL" => [dst: Reg, fn_id: ImmI32, argc: ImmU8, argv: Reg], 50,
             /// CALL0 dst, fn ; call function fn without any arguments ; return -> dst
-            Call0 = 0x44, "CALL0" => [dst: Reg, fn_id: ImmI64], 50,
+            Call0 = 0x44, "CALL0" => [dst: Reg, fn_id: ImmI32], 50,
             /// CALL1 dst, fn, arg ; call function fn with a single argument ; return -> dst
-            Call1 = 0x45, "CALL1" => [dst: Reg, fn_id: ImmI64, arg: Reg], 50,
+            Call1 = 0x45, "CALL1" => [dst: Reg, fn_id: ImmI32, arg: Reg], 50,
             /// JAL rd, offset ; rd = PC + instr_size; PC += offset (jump and link)
-            Jal = 0x46, "JAL" => [rd: Reg, offset: ImmI64], 5,
+            Jal = 0x46, "JAL" => [rd: Reg, offset: ImmI32], 5,
             /// JALR rd, rs, offset ; rd = PC + instr_size; PC = rs + offset (jump and link register)
-            Jalr = 0x47, "JALR" => [rd: Reg, rs: Reg, offset: ImmI64], 5,
+            Jalr = 0x47, "JALR" => [rd: Reg, rs: Reg, offset: ImmI32], 5,
             /// BEQ rs1, rs2, offset ; if rs1 == rs2 then PC += offset
-            Beq = 0x48, "BEQ" => [rs1: Src, rs2: Src, offset: ImmI64], 5,
+            Beq = 0x48, "BEQ" => [rs1: Src, rs2: Src, offset: ImmI32], 5,
             /// BNE rs1, rs2, offset ; if rs1 != rs2 then PC += offset
-            Bne = 0x49, "BNE" => [rs1: Src, rs2: Src, offset: ImmI64], 5,
+            Bne = 0x49, "BNE" => [rs1: Src, rs2: Src, offset: ImmI32], 5,
             /// BLT rs1, rs2, offset ; if rs1 < rs2 (signed) then PC += offset
-            Blt = 0x4A, "BLT" => [rs1: Src, rs2: Src, offset: ImmI64], 5,
+            Blt = 0x4A, "BLT" => [rs1: Src, rs2: Src, offset: ImmI32], 5,
             /// BGE rs1, rs2, offset ; if rs1 >= rs2 (signed) then PC += offset
-            Bge = 0x4B, "BGE" => [rs1: Src, rs2: Src, offset: ImmI64], 5,
+            Bge = 0x4B, "BGE" => [rs1: Src, rs2: Src, offset: ImmI32], 5,
             /// BLTU rs1, rs2, offset ; if rs1 < rs2 (unsigned) then PC += offset
-            Bltu = 0x4C, "BLTU" => [rs1: Src, rs2: Src, offset: ImmI64], 5,
+            Bltu = 0x4C, "BLTU" => [rs1: Src, rs2: Src, offset: ImmI32], 5,
             /// BGEU rs1, rs2, offset ; if rs1 >= rs2 (unsigned) then PC += offset
-            Bgeu = 0x4D, "BGEU" => [rs1: Src, rs2: Src, offset: ImmI64], 5,
+            Bgeu = 0x4D, "BGEU" => [rs1: Src, rs2: Src, offset: ImmI32], 5,
             /// JUMP offset ; PC += offset (unconditional jump)
-            Jump = 0x4E, "JUMP" => [offset: ImmI64], 5,
+            Jump = 0x4E, "JUMP" => [offset: ImmI32], 5,
             /// RET rs ; return from function call with value in rs
             Ret = 0x4F, "RET" => [rs: Reg], 5,
             /// HALT ; stop execution immediately
@@ -186,6 +186,8 @@ macro_rules! define_instructions {
                 $(#[$doc])*
                 $name = $opcode,
             )*
+            /// DISPATCH count, (offset, argr)... ; dispatch to public function by selector index
+            Dispatch = 0xFF,
         }
 
         impl TryFrom<u8> for Instruction {
@@ -194,6 +196,7 @@ macro_rules! define_instructions {
             fn try_from(value: u8) -> Result<Self, Self::Error> {
                 match value {
                     $( $opcode => Ok(Instruction::$name), )*
+                    0xFF => Ok(Instruction::Dispatch),
                     _ => Err(VMError::InvalidInstruction {
                         opcode: value,
                         offset: 0,
@@ -207,6 +210,7 @@ macro_rules! define_instructions {
             pub const fn mnemonic(&self) -> &'static str {
                 match self {
                     $( Instruction::$name => $mnemonic, )*
+                    Instruction::Dispatch => "DISPATCH",
                 }
             }
 
@@ -214,6 +218,7 @@ macro_rules! define_instructions {
             pub const fn base_gas(&self) -> u64 {
                 match self {
                     $( Instruction::$name => $gas, )*
+                    Instruction::Dispatch => 10,
                 }
             }
         }
@@ -223,7 +228,7 @@ macro_rules! define_instructions {
     (@ty Reg)    => { u8 };
     (@ty ImmU8)  => { u8 };
     (@ty RefU32) => { u32 };
-    (@ty ImmI64) => { i64 };
+    (@ty ImmI32) => { i32 };
     (@ty Src) => { SrcOperand };
 
     // ---------- encoding ----------
@@ -235,7 +240,7 @@ macro_rules! define_instructions {
         $out.push(*$v);
     };
 
-    (@emit $out:ident, ImmI64, $v:ident) => {
+    (@emit $out:ident, ImmI32, $v:ident) => {
         $out.extend_from_slice(&$v.to_le_bytes());
     };
 
@@ -274,8 +279,8 @@ mod tests {
     #[test]
     fn instruction_try_from_invalid() {
         assert!(matches!(
-            Instruction::try_from(0xFF),
-            Err(VMError::InvalidInstruction { opcode: 0xFF, .. })
+            Instruction::try_from(0xFE),
+            Err(VMError::InvalidInstruction { opcode: 0xFE, .. })
         ));
     }
 }

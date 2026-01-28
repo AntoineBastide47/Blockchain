@@ -103,6 +103,19 @@ macro_rules! define_instruction_decoder {
                         )?
                     }
                 ),*
+                Instruction::Dispatch => {
+                    let count = read_u8(data, &mut cursor, start)?;
+                    let mut parts = Vec::new();
+                    parts.push(count.to_string());
+                    for _ in 0..count {
+                        let bytes = read_bytes(data, &mut cursor, 4, start)?;
+                        let offset = i32::from_le_bytes(bytes.try_into().unwrap());
+                        let argr = read_u8(data, &mut cursor, start)?;
+                        parts.push(offset.to_string());
+                        parts.push(format!("r{}", argr));
+                    }
+                    format!("DISPATCH {}", parts.join(", "))
+                }
             };
 
             Ok((text, cursor - start))
@@ -135,6 +148,11 @@ macro_rules! define_instruction_decoder {
     (@read $data:ident $cursor:ident $start:ident RefU32) => {{
         let bytes = read_bytes($data, &mut $cursor, 4, $start)?;
         Ok::<String, VMError>(format!("@{}", u32::from_le_bytes(bytes.try_into().unwrap())))
+    }};
+
+    (@read $data:ident $cursor:ident $start:ident ImmI32) => {{
+        let bytes = read_bytes($data, &mut $cursor, 4, $start)?;
+        Ok::<String, VMError>(i32::from_le_bytes(bytes.try_into().unwrap()).to_string())
     }};
 
     (@read $data:ident $cursor:ident $start:ident ImmI64) => {{
@@ -503,6 +521,12 @@ macro_rules! exec_vm {
     // Decode a u8 immediate (1 byte)
     (@read $vm:ident, ImmU8) => {{
         Ok::<u8, VMError>($vm.read_exact(1)?[0])
+    }};
+
+    // Decode an i32 immediate (little-endian, 4 bytes)
+    (@read $vm:ident, ImmI32) => {{
+        let bytes = $vm.read_exact(4)?;
+        Ok::<i32, VMError>(i32::from_le_bytes(bytes.try_into().unwrap()))
     }};
 
     // Decode an i64 immediate (little-endian, 8 bytes)
@@ -1144,22 +1168,23 @@ impl VM {
                 CallHost => op_call_host(dst: Reg, fn_id: RefU32, argc: ImmU8, argv: Reg),
                 CallHost0 => op_call_host0(dst: Reg, fn_id: RefU32),
                 CallHost1 => op_call_host1(dst: Reg, fn_id: RefU32, arg: Src),
-                Call => op_call(dst: Reg, offset: ImmI64, argc: ImmU8, argv: Reg),
-                Call0 => op_call0(dst: Reg, fn_id: ImmI64),
-                Call1 => op_call1(dst: Reg, fn_id: ImmI64, arg: Reg),
-                Jal => op_jal(rd: Reg, offset: ImmI64),
-                Jalr => op_jalr(rd: Reg, rs: Reg, offset: ImmI64),
-                Beq => op_beq(rs1: Src, rs2: Src, offset: ImmI64),
-                Bne => op_bne(rs1: Src, rs2: Src, offset: ImmI64),
-                Blt => op_blt(rs1: Src, rs2: Src, offset: ImmI64),
-                Bge => op_bge(rs1: Src, rs2: Src, offset: ImmI64),
-                Bltu => op_bltu(rs1: Src, rs2: Src, offset: ImmI64),
-                Bgeu => op_bgeu(rs1: Src, rs2: Src, offset: ImmI64),
-                Jump => op_jump(offset: ImmI64),
+                Call => op_call(dst: Reg, offset: ImmI32, argc: ImmU8, argv: Reg),
+                Call0 => op_call0(dst: Reg, fn_id: ImmI32),
+                Call1 => op_call1(dst: Reg, fn_id: ImmI32, arg: Reg),
+                Jal => op_jal(rd: Reg, offset: ImmI32),
+                Jalr => op_jalr(rd: Reg, rs: Reg, offset: ImmI32),
+                Beq => op_beq(rs1: Src, rs2: Src, offset: ImmI32),
+                Bne => op_bne(rs1: Src, rs2: Src, offset: ImmI32),
+                Blt => op_blt(rs1: Src, rs2: Src, offset: ImmI32),
+                Bge => op_bge(rs1: Src, rs2: Src, offset: ImmI32),
+                Bltu => op_bltu(rs1: Src, rs2: Src, offset: ImmI32),
+                Bgeu => op_bgeu(rs1: Src, rs2: Src, offset: ImmI32),
+                Jump => op_jump(offset: ImmI32),
                 Ret => op_ret(rs: Reg),
                 Halt => op_halt(),
                 // Data access
                 CallDataLoad => op_call_data_load(rd: Reg),
+                Dispatch => op_dispatch(),
             }
         }
     }
@@ -1880,7 +1905,7 @@ impl VM {
         &mut self,
         instr: &'static str,
         dst: u8,
-        offset: i64,
+        offset: i32,
         argc: u8,
         _argv: u8,
     ) -> Result<(), VMError> {
@@ -1901,7 +1926,7 @@ impl VM {
         self.op_jump(instr, offset)
     }
 
-    fn op_call0(&mut self, instr: &'static str, dst: u8, fn_id: i64) -> Result<(), VMError> {
+    fn op_call0(&mut self, instr: &'static str, dst: u8, fn_id: i32) -> Result<(), VMError> {
         self.op_call(instr, dst, fn_id, 0, 0)
     }
 
@@ -1909,18 +1934,18 @@ impl VM {
         &mut self,
         instr: &'static str,
         dst: u8,
-        fn_id: i64,
+        fn_id: i32,
         arg: u8,
     ) -> Result<(), VMError> {
         self.op_call(instr, dst, fn_id, 1, arg)
     }
 
-    fn op_jal(&mut self, instr: &'static str, rd: u8, offset: i64) -> Result<(), VMError> {
+    fn op_jal(&mut self, instr: &'static str, rd: u8, offset: i32) -> Result<(), VMError> {
         self.registers.set(rd, Value::Int(self.ip as i64))?;
         self.op_jump(instr, offset)
     }
 
-    fn op_jalr(&mut self, instr: &'static str, rd: u8, rs: u8, offset: i64) -> Result<(), VMError> {
+    fn op_jalr(&mut self, instr: &'static str, rd: u8, rs: u8, offset: i32) -> Result<(), VMError> {
         let base = self.registers.get_int(rs, instr)?;
         self.registers.set(rd, Value::Int(self.ip as i64))?;
         self.ip = base as usize;
@@ -1932,7 +1957,7 @@ impl VM {
         instr: &'static str,
         rs1: SrcOperand,
         rs2: SrcOperand,
-        offset: i64,
+        offset: i32,
     ) -> Result<(), VMError> {
         let va = self.value_from_operand(rs1)?;
         let vb = self.value_from_operand(rs2)?;
@@ -1948,7 +1973,7 @@ impl VM {
         instr: &'static str,
         rs1: SrcOperand,
         rs2: SrcOperand,
-        offset: i64,
+        offset: i32,
     ) -> Result<(), VMError> {
         let va = self.value_from_operand(rs1)?;
         let vb = self.value_from_operand(rs2)?;
@@ -1964,7 +1989,7 @@ impl VM {
         instr: &'static str,
         rs1: SrcOperand,
         rs2: SrcOperand,
-        offset: i64,
+        offset: i32,
     ) -> Result<(), VMError> {
         let a = self.int_from_operand(rs1, instr, 1)?;
         let b = self.int_from_operand(rs2, instr, 2)?;
@@ -1979,7 +2004,7 @@ impl VM {
         instr: &'static str,
         rs1: SrcOperand,
         rs2: SrcOperand,
-        offset: i64,
+        offset: i32,
     ) -> Result<(), VMError> {
         let a = self.int_from_operand(rs1, instr, 1)?;
         let b = self.int_from_operand(rs2, instr, 2)?;
@@ -1994,7 +2019,7 @@ impl VM {
         instr: &'static str,
         rs1: SrcOperand,
         rs2: SrcOperand,
-        offset: i64,
+        offset: i32,
     ) -> Result<(), VMError> {
         let a = self.int_from_operand(rs1, instr, 1)? as u64;
         let b = self.int_from_operand(rs2, instr, 1)? as u64;
@@ -2009,7 +2034,7 @@ impl VM {
         instr: &'static str,
         rs1: SrcOperand,
         rs2: SrcOperand,
-        offset: i64,
+        offset: i32,
     ) -> Result<(), VMError> {
         let a = self.int_from_operand(rs1, instr, 1)? as u64;
         let b = self.int_from_operand(rs2, instr, 1)? as u64;
@@ -2019,12 +2044,12 @@ impl VM {
         Ok(())
     }
 
-    fn op_jump(&mut self, _instr: &'static str, offset: i64) -> Result<(), VMError> {
-        let new_ip = self.ip as i64 + offset;
+    fn op_jump(&mut self, _instr: &'static str, offset: i32) -> Result<(), VMError> {
+        let new_ip = self.ip as i32 + offset;
         if new_ip < 0 || new_ip as usize > self.data.len() {
             return Err(VMError::JumpOutOfBounds {
                 from: self.ip,
-                to: new_ip,
+                to: new_ip as usize,
                 max: self.data.len(),
             });
         }
@@ -2041,6 +2066,52 @@ impl VM {
         self.registers.set(frame.dst_reg, ret_val)?;
         self.ip = frame.return_addr;
         Ok(())
+    }
+
+    /// Dispatches to a public function by selector index.
+    ///
+    /// Reads an inline table of `(offset_i32, argr)` entries from bytecode.
+    /// Uses `r0` as the selector index, loads call arguments via `CALLDATA_LOAD`
+    /// semantics into the entry's `argr`, calls the target function, and halts.
+    fn op_dispatch(&mut self, instr: &'static str) -> Result<(), VMError> {
+        let count = self.read_exact(1)?[0] as usize;
+        let selector = match self.registers.get(0)? {
+            Value::Int(i) => *i as usize,
+            other => {
+                return Err(VMError::TypeMismatch {
+                    instruction: instr,
+                    arg_index: 0,
+                    expected: "Integer",
+                    actual: other.type_name().to_string(),
+                });
+            }
+        };
+        if selector >= count {
+            return Err(VMError::DispatchOutOfBounds { selector, count });
+        }
+        // Skip entries before the selected one (each entry = 4 + 1 = 5 bytes)
+        if selector > 0 {
+            self.read_exact(selector * 5)?;
+        }
+        // Read the selected entry
+        let entry_bytes = self.read_exact(5)?;
+        let offset = i32::from_le_bytes(entry_bytes[0..4].try_into().unwrap());
+        let argr = entry_bytes[4];
+        // Skip remaining entries
+        let remaining = count - selector - 1;
+        if remaining > 0 {
+            self.read_exact(remaining * 5)?;
+        }
+        // Load call arguments into registers starting at argr
+        self.op_call_data_load(instr, argr)?;
+        // Push a call frame whose return address is past all bytecode,
+        // so RET will cause the main loop to exit cleanly (like HALT).
+        self.call_stack.push(CallFrame {
+            return_addr: self.data.len(),
+            dst_reg: 0,
+        });
+        // Jump to the target function
+        self.op_jump(instr, offset)
     }
 
     fn op_halt(&mut self, _instr: &'static str) -> Result<(), VMError> {
@@ -2927,11 +2998,11 @@ NE r2, r0, r1"#,
 
     #[test]
     fn invalid_opcode() {
-        let mut vm = VM::new_with_init(DeployProgram::new(vec![], vec![0xFF]), 0, BLOCK_GAS_LIMIT)
+        let mut vm = VM::new_with_init(DeployProgram::new(vec![], vec![0xFE]), 0, BLOCK_GAS_LIMIT)
             .expect("vm new failed");
         assert!(matches!(
             vm.run(&mut TestState::new(), EXECUTION_CONTEXT),
-            Err(VMError::InvalidInstruction { opcode: 0xFF, .. })
+            Err(VMError::InvalidInstruction { opcode: 0xFE, .. })
         ));
     }
 
@@ -3292,8 +3363,8 @@ LOAD_HASH_STATE r2, r0"#,
         // JAL saves the address after the instruction to rd
         // JAL r0, 0 means jump to current position (no-op) but save return addr
         let vm = run_vm("JAL r0, 0");
-        // After JAL (10 bytes), ip should be saved as 10
-        assert_eq!(vm.registers.get_int(0, "").unwrap(), 10);
+        // After JAL (6 bytes: opcode + reg + i32), ip should be saved as 6
+        assert_eq!(vm.registers.get_int(0, "").unwrap(), 6);
     }
 
     #[test]
@@ -3502,10 +3573,10 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn jalr_indirect_jump() {
         // JALR jumps to address in register + offset
-        // MOVE: 11 bytes, JALR: 11 bytes
-        // Offsets: MOVE[0-10], JALR[11-21], MOVE r2[22-32], MOVE r3[33-43]
+        // MOVE: 11 bytes (opcode + reg + src_tag + i64), JALR: 7 bytes (opcode + reg + reg + i32)
+        // Offsets: MOVE[0-10], JALR[11-17], MOVE r2[18-28], MOVE r3[29-39]
         let source = r#"
-            MOVE r1, 32
+            MOVE r1, 28
             JALR r0, r1, 1
             MOVE r2, 99
             MOVE r3, 42

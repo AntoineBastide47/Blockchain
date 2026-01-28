@@ -551,14 +551,14 @@ pub(crate) fn parse_i64(tok: &str) -> Result<i64, VMError> {
 }
 
 /// Parse a u8 immediate
-pub(crate) fn parse_u8(tok: &str) -> Result<u8, VMError> {
+fn parse_u8(tok: &str) -> Result<u8, VMError> {
     tok.parse::<u8>().map_err(|_| VMError::ArgcOutOfRange {
         actual: tok.to_string(),
     })
 }
 
 /// Parse a reference token like `@0`, `@123`.
-pub(crate) fn parse_ref_u32(tok: &str) -> Result<u32, VMError> {
+fn parse_ref_u32(tok: &str) -> Result<u32, VMError> {
     tok.strip_prefix('@')
         .ok_or_else(|| VMError::InvalidRegister {
             token: tok.to_string(),
@@ -569,12 +569,29 @@ pub(crate) fn parse_ref_u32(tok: &str) -> Result<u32, VMError> {
         })
 }
 
+/// Parses an i32 immediate or a label reference.
+///
+/// If `tok` parses as an integer, returns it directly. Otherwise, resolves
+/// `tok` as a label name and computes a PC-relative offset in the global
+/// address space (init || runtime).
+fn parse_i32_or_label(
+    tok: &str,
+    ctx: &AsmContext,
+    current_global_offset: usize,
+) -> Result<i32, VMError> {
+    if let Ok(v) = tok.parse::<i32>() {
+        return Ok(v);
+    }
+    let target = ctx.resolve_label(tok)?;
+    Ok(target as i32 - current_global_offset as i32)
+}
+
 /// Parses an i64 immediate or a label reference.
 ///
 /// If `tok` parses as an integer, returns it directly. Otherwise, resolves
 /// `tok` as a label name and computes a PC-relative offset in the global
 /// address space (init || runtime).
-pub(crate) fn parse_i64_or_label(
+fn parse_i64_or_label(
     tok: &str,
     ctx: &AsmContext,
     current_global_offset: usize,
@@ -716,6 +733,10 @@ macro_rules! define_parse_instruction {
                     $( $field: define_instructions!(@ty $kind) ),*
                 },
             )*
+            /// Variadic dispatcher: entries are (target_offset_i32, argr).
+            Dispatch {
+                entries: Vec<(i64, u8)>,
+            },
         }
 
         impl AsmInstr {
@@ -730,6 +751,14 @@ macro_rules! define_parse_instruction {
                             )*
                         }
                     ),*
+                    AsmInstr::Dispatch { entries } => {
+                        out.push(Instruction::Dispatch as u8);
+                        out.push(entries.len() as u8);
+                        for (offset, argr) in entries {
+                            out.extend_from_slice(&(*offset as i32).to_le_bytes());
+                            out.push(*argr);
+                        }
+                    }
                 }
             }
         }
@@ -737,6 +766,7 @@ macro_rules! define_parse_instruction {
         fn instruction_from_str(name: &str) -> Result<Instruction, VMError> {
             match name {
                 $( $mnemonic => Ok(Instruction::$name), )*
+                "DISPATCH" => Ok(Instruction::Dispatch),
                 _ => Err(VMError::InvalidInstructionName {
                     name: name.to_string(),
                 }),
@@ -772,6 +802,30 @@ macro_rules! define_parse_instruction {
                         1usize $( + define_parse_instruction!(@token_size $kind, tok_iter) )*
                     }
                 ),*
+                Instruction::Dispatch => {
+                    // DISPATCH count, label0, reg0, label1, reg1, ...
+                    // Token layout: ["DISPATCH", count, (label, reg)*]
+                    if tokens.len() < 2 {
+                        return Err(VMError::ArityMismatch {
+                            instruction: tokens[0].text.to_string(),
+                            expected: 2,
+                            actual: tokens.len() as u8 - 1,
+                        });
+                    }
+                    let count = tokens[1].text.parse::<u8>().map_err(|_| {
+                        VMError::InvalidInstructionName { name: tokens[1].text.to_string() }
+                    })?;
+                    let expected = 2 + count as usize * 2;
+                    if tokens.len() != expected {
+                        return Err(VMError::ArityMismatch {
+                            instruction: tokens[0].text.to_string(),
+                            expected: expected as u8 - 1,
+                            actual: tokens.len() as u8 - 1,
+                        });
+                    }
+                    // opcode(1) + count(1) + count * (i32(4) + reg(1))
+                    2 + count as usize * 5
+                }
             })
         }
 
@@ -812,6 +866,33 @@ macro_rules! define_parse_instruction {
                         )
                     }
                 ),*
+                Instruction::Dispatch => {
+                    if tokens.len() < 2 {
+                        return Err(VMError::ArityMismatch {
+                            instruction: tokens[0].text.to_string(),
+                            expected: 2,
+                            actual: tokens.len() as u8 - 1,
+                        });
+                    }
+                    let count = parse_u8(&tokens[1].text)?;
+                    let expected = 2 + count as usize * 2;
+                    if tokens.len() != expected {
+                        return Err(VMError::ArityMismatch {
+                            instruction: tokens[0].text.to_string(),
+                            expected: expected as u8 - 1,
+                            actual: tokens.len() as u8 - 1,
+                        });
+                    }
+                    let mut entries = Vec::with_capacity(count as usize);
+                    for i in 0..count as usize {
+                        let target = parse_i64_or_label(
+                            &tokens[2 + i * 2].text, ctx, offset,
+                        )?;
+                        let argr = parse_reg(&tokens[3 + i * 2].text)?;
+                        entries.push((target, argr));
+                    }
+                    Ok(AsmInstr::Dispatch { entries })
+                }
             }
         }
     };
@@ -827,7 +908,7 @@ macro_rules! define_parse_instruction {
     (@token_size Reg, $iter:ident) => { { $iter.next(); 1usize } };
     (@token_size RefU32, $iter:ident) => { { $iter.next(); 4usize } };
     (@token_size ImmU8, $iter:ident) => { { $iter.next(); 1usize } };
-    (@token_size ImmI64, $iter:ident) => { { $iter.next(); 8usize } };
+    (@token_size ImmI32, $iter:ident) => { { $iter.next(); 4usize } };
     (@token_size Src, $iter:ident) => { { src_size_from_token($iter.next().unwrap().text) } };
 
     // ---------- parsing ----------
@@ -854,8 +935,8 @@ macro_rules! define_parse_instruction {
         parse_u8(&$tok.text)
     };
 
-    (@parse_operand ImmI64, $tok:expr, $ctx:expr, $current_offset:expr) => {
-        parse_i64_or_label(&$tok.text, $ctx, $current_offset)
+    (@parse_operand ImmI32, $tok:expr, $ctx:expr, $current_offset:expr) => {
+        parse_i32_or_label(&$tok.text, $ctx, $current_offset)
     };
 
     (@parse_operand RefU32, $tok:expr, $ctx:expr, $current_offset:expr) => {{
@@ -957,28 +1038,13 @@ fn assemble_source_step_1<'a>(
         }
     }
 
-    let has_multiple = labels.len() > 1;
-    if has_multiple {
-        // Jump over the entries while capturing the base address (r254) of
-        // `__dispatch_header` via the JAL return address. Entries sit right
-        // after this instruction so the captured address is the entry base.
-        base.push_str("JAL r254, __dispatch_header\n");
-    }
-
+    // Emit a single DISPATCH instruction with all public entry points.
+    // Format: DISPATCH count, label0, r{argr0}, label1, r{argr1}, ...
+    write!(base, "DISPATCH {}", labels.len()).unwrap();
     for label in labels.iter() {
-        // Use CALL0 to keep per-entry size minimal (11 bytes with HALT) while leaving
-        // argument registers untouched for the callee.
-        writeln!(base, "CALLDATA_LOAD r{}", label.argr).unwrap();
-        writeln!(base, "CALL0 r0, {}\nHALT", label.name).unwrap();
+        write!(base, ", {}, r{}", label.name, label.argr).unwrap();
     }
-
-    if has_multiple {
-        base.push_str("__dispatch_header:\n");
-        base.push_str("MUL r253, r0, 13\n"); // byte offset into table
-        base.push_str("ADD r253, r253, r254\n"); // absolute addr of target entry
-        base.push_str("JALR r255, r253, 0\n");
-        base.push_str("HALT\n");
-    }
+    base.push('\n');
 
     // Count lines added by dispatcher (+1 for the extra newline after base)
     let lines_added = base.lines().count() + 1;
@@ -1115,19 +1181,12 @@ fn assemble_source_step_2(
     // (name, section, local_offset, line_no, tok_offset, tok_len)
     let mut pending_labels: Vec<(String, Section, usize, usize, usize, usize)> = Vec::new();
 
-    let mut skip_call_checks = false;
     for (line_no, line) in source.lines().enumerate() {
         // Check for section markers first
         if let Some(section) = parse_section_marker(line) {
             current_section = match section {
-                Section::Dispatcher => {
-                    skip_call_checks = true;
-                    Section::Runtime
-                }
-                _ => {
-                    skip_call_checks = false;
-                    section
-                }
+                Section::Dispatcher => Section::Runtime,
+                _ => section,
             };
             continue;
         }
@@ -1180,58 +1239,56 @@ fn assemble_source_step_2(
         }
 
         // Validate CALL and CALL_HOST argc
-        if !skip_call_checks {
-            match tokens[0] {
-                Token { text, .. }
-                    if text == Instruction::Call0.mnemonic()
-                        || text == Instruction::Call1.mnemonic()
-                        || text == Instruction::Call.mnemonic() =>
-                {
-                    let argc = match extract_argc(
-                        &tokens,
-                        line_no,
-                        Instruction::Call0,
-                        Instruction::Call1,
-                        Instruction::Call,
-                    ) {
-                        Ok(n) => n,
-                        Err(e) => {
-                            errors.push(e);
-                            continue;
-                        }
-                    };
-
-                    if let Err(e) = check_call_argc(&tokens, &label_data, line_no, argc) {
+        match tokens[0] {
+            Token { text, .. }
+                if text == Instruction::Call0.mnemonic()
+                    || text == Instruction::Call1.mnemonic()
+                    || text == Instruction::Call.mnemonic() =>
+            {
+                let argc = match extract_argc(
+                    &tokens,
+                    line_no,
+                    Instruction::Call0,
+                    Instruction::Call1,
+                    Instruction::Call,
+                ) {
+                    Ok(n) => n,
+                    Err(e) => {
                         errors.push(e);
                         continue;
                     }
-                }
-                Token { text, .. }
-                    if text == Instruction::CallHost0.mnemonic()
-                        || text == Instruction::CallHost1.mnemonic()
-                        || text == Instruction::CallHost.mnemonic() =>
-                {
-                    let argc = match extract_argc(
-                        &tokens,
-                        line_no,
-                        Instruction::CallHost0,
-                        Instruction::CallHost1,
-                        Instruction::CallHost,
-                    ) {
-                        Ok(n) => n,
-                        Err(e) => {
-                            errors.push(e);
-                            continue;
-                        }
-                    };
+                };
 
-                    if let Err(e) = check_call_host_argc(&tokens, line_no, argc) {
-                        errors.push(e);
-                        continue;
-                    }
+                if let Err(e) = check_call_argc(&tokens, &label_data, line_no, argc) {
+                    errors.push(e);
+                    continue;
                 }
-                _ => {}
             }
+            Token { text, .. }
+                if text == Instruction::CallHost0.mnemonic()
+                    || text == Instruction::CallHost1.mnemonic()
+                    || text == Instruction::CallHost.mnemonic() =>
+            {
+                let argc = match extract_argc(
+                    &tokens,
+                    line_no,
+                    Instruction::CallHost0,
+                    Instruction::CallHost1,
+                    Instruction::CallHost,
+                ) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        errors.push(e);
+                        continue;
+                    }
+                };
+
+                if let Err(e) = check_call_host_argc(&tokens, line_no, argc) {
+                    errors.push(e);
+                    continue;
+                }
+            }
+            _ => {}
         }
 
         match instruction_size_from_tokens(&tokens) {
@@ -1676,13 +1733,13 @@ mod tests {
 
     #[test]
     fn assemble_call_argc_u8() {
-        // CALL: opcode(1) + dst(1) + fn_id(8) + argc(1) + argv(1) = 12 bytes
+        // CALL: opcode(1) + dst(1) + fn_id(4) + argc(1) + argv(1) = 8 bytes
         let program = assemble_source("my_func(5, r2):\nCALL r0, my_func, 5, r2").unwrap();
         assert_eq!(program.runtime_code[0], Instruction::Call as u8);
         assert_eq!(program.runtime_code[1], 0); // dst = r0
-        assert_eq!(program.runtime_code[10], 5); // argc = 5 (single byte)
-        assert_eq!(program.runtime_code[11], 2); // argv = r2
-        assert_eq!(program.runtime_code.len(), 12);
+        assert_eq!(program.runtime_code[6], 5); // argc = 5 (single byte)
+        assert_eq!(program.runtime_code[7], 2); // argv = r2
+        assert_eq!(program.runtime_code.len(), 8);
     }
 
     #[test]

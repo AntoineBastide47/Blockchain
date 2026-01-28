@@ -121,7 +121,9 @@ pub enum VMError {
         actual_len: usize,
     },
     #[error("jump target is out of bounds: from {from} to {to} max {max}")]
-    JumpOutOfBounds { from: usize, to: i64, max: usize },
+    JumpOutOfBounds { from: usize, to: usize, max: usize },
+    #[error("dispatch selector {selector} out of bounds, table has {count} entries")]
+    DispatchOutOfBounds { selector: usize, count: usize },
     #[error("out of gas: used {used}, limit {limit}")]
     OutOfGas { used: u64, limit: u64 },
     #[error("reference out of bounds, max: {max} got: {reference}")]

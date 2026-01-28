@@ -79,6 +79,9 @@ mod tests {
 
         // Data access
         assert_eq!(Instruction::CallDataLoad as u8, 0x51);
+
+        // Special Dispatch instruction
+        assert_eq!(Instruction::Dispatch as u8, 0xFF);
     }
 
     /// Verifies that all instruction mnemonics match their expected values.
@@ -152,6 +155,9 @@ mod tests {
 
         // Data access
         assert_eq!(Instruction::CallDataLoad.mnemonic(), "CALLDATA_LOAD");
+
+        // Special Dispatch instruction
+        assert_eq!(Instruction::Dispatch.mnemonic(), "DISPATCH");
     }
 
     /// Verifies that all instruction base gas costs match their expected values.
@@ -225,12 +231,15 @@ mod tests {
 
         // Data access
         assert_eq!(Instruction::CallDataLoad.base_gas(), 3);
+
+        // Special Dispatch instruction
+        assert_eq!(Instruction::Dispatch.base_gas(), 10);
     }
 
     /// Verifies the total instruction count has not changed.
     #[test]
     fn instruction_count_unchanged() {
-        const EXPECTED_COUNT: usize = 57;
+        const EXPECTED_COUNT: usize = 58;
 
         // Count by verifying TryFrom succeeds for expected opcodes
         let mut count = 0;

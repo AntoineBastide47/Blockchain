@@ -302,10 +302,9 @@ pub mod tests {
     }
 
     #[test]
-    fn dispatcher_uses_compact_call0_entries() {
-        // Two public functions -> prologue JAL (10 bytes), 2 entries (13 bytes each),
-        // and a compact header (31 bytes) that reuses the captured return address as
-        // the base of the dispatch table.
+    fn dispatcher_uses_dispatch_opcode() {
+        // Two public functions -> single DISPATCH instruction with 2 entries.
+        // DISPATCH: opcode(1) + count(1) + 2 * (offset_i32(4) + argr(1)) = 12 bytes
         let source = r#"
 [ runtime code ]
 pub foo:
@@ -316,28 +315,16 @@ pub bar:
         let program = assemble_source(source).unwrap();
         let bc = &program.runtime_code;
 
-        // Prologue captures entry base via return address
-        assert_eq!(bc[0], Instruction::Jal as u8); // JAL r254, __dispatch_header
+        // DISPATCH opcode
+        assert_eq!(bc[0], Instruction::Dispatch as u8);
+        // count = 2
+        assert_eq!(bc[1], 2);
 
-        // Entries (stride 13 bytes: CALLDATA_LOAD 2 + CALL0 10 + HALT 1)
-        assert_eq!(bc[10], Instruction::CallDataLoad as u8);
-        assert_eq!(bc[12], Instruction::Call0 as u8);
-        assert_eq!(bc[22], Instruction::Halt as u8);
-        assert_eq!(bc[23], Instruction::CallDataLoad as u8);
-        assert_eq!(bc[25], Instruction::Call0 as u8);
-        assert_eq!(bc[35], Instruction::Halt as u8);
+        // Function bodies after the DISPATCH instruction (12 bytes)
+        assert_eq!(bc[12], Instruction::Halt as u8); // bar (sorted first)
+        assert_eq!(bc[13], Instruction::Halt as u8); // foo
 
-        // Header (starts at offset 36)
-        assert_eq!(bc[36], Instruction::Mul as u8); // MUL r253, r0, 13
-        assert_eq!(bc[49], Instruction::Add as u8); // ADD r253, r253, r254
-        assert_eq!(bc[55], Instruction::Jalr as u8); // JALR r255, r253, 0
-        assert_eq!(bc[66], Instruction::Halt as u8); // HALT
-
-        // Original function bodies still present after dispatcher (one HALT each)
-        assert_eq!(bc[67], Instruction::Halt as u8);
-        assert_eq!(bc[68], Instruction::Halt as u8);
-
-        assert_eq!(bc.len(), 69);
+        assert_eq!(bc.len(), 14);
     }
 
     #[test]
@@ -356,7 +343,9 @@ foo:
     }
 
     #[test]
-    fn dispatcher_single_entry_is_direct_jump() {
+    fn dispatcher_single_entry() {
+        // Single public function -> DISPATCH with 1 entry.
+        // DISPATCH: opcode(1) + count(1) + 1 * (offset_i32(4) + argr(1)) = 7 bytes
         let source = r#"
 [ runtime code ]
 pub only:
@@ -365,21 +354,18 @@ pub only:
         let program = assemble_source(source).unwrap();
         let bc = &program.runtime_code;
 
-        // Layout: entry (CALLDATA_LOAD 2 + CALL0 10 + HALT 1 = 13 bytes) -> body HALT (1 byte)
-        assert_eq!(bc[0], Instruction::CallDataLoad as u8);
-        assert_eq!(bc[2], Instruction::Call0 as u8);
-        assert_eq!(bc[12], Instruction::Halt as u8);
-        assert_eq!(bc[13], Instruction::Halt as u8);
+        assert_eq!(bc[0], Instruction::Dispatch as u8);
+        assert_eq!(bc[1], 1); // count
 
-        // CALL0 immediate points to the function body (offset from end of CALL0).
-        let imm = i64::from_le_bytes(bc[4..12].try_into().expect("immediate slice"));
-        assert_eq!(imm, 1);
-        assert_eq!(bc.len(), 14);
+        // Function body after DISPATCH (7 bytes)
+        assert_eq!(bc[7], Instruction::Halt as u8);
+        assert_eq!(bc.len(), 8);
     }
 
     #[test]
     fn dispatcher_sorts_public_labels_for_entries() {
         // Source order is z then a; entries should be sorted alphabetically (a, z).
+        // DISPATCH: opcode(1) + count(1) + 2 * (offset_i32(4) + argr(1)) = 12 bytes
         let source = r#"
 [ runtime code ]
 pub zebra:
@@ -390,13 +376,18 @@ pub alpha:
         let program = assemble_source(source).unwrap();
         let bc = &program.runtime_code;
 
-        // Entry 0 targets `alpha`, entry 1 targets `zebra`.
-        // Entry 0 CALL0 at offset 12, ends at 22; entry 1 CALL0 at offset 25, ends at 35.
-        let entry0_imm = i64::from_le_bytes(bc[14..22].try_into().expect("entry0 immediate slice"));
-        let entry1_imm = i64::from_le_bytes(bc[27..35].try_into().expect("entry1 immediate slice"));
+        assert_eq!(bc[0], Instruction::Dispatch as u8);
+        assert_eq!(bc[1], 2); // count
 
-        assert_eq!(entry0_imm, 46); // alpha body at 68, CALL0 ends at 22 -> 68-22=46
-        assert_eq!(entry1_imm, 32); // zebra body at 67, CALL0 ends at 35 -> 67-35=32
+        // Entry 0 = alpha (sorted first), entry 1 = zebra
+        // Each entry: offset_i32(4) + argr(1) = 5 bytes, starting at byte 2
+        let entry0_offset = i32::from_le_bytes(bc[2..6].try_into().unwrap());
+        let entry1_offset = i32::from_le_bytes(bc[7..11].try_into().unwrap());
+
+        // Bodies: alpha at 13 (second HALT, source order: zebra=12, alpha=13)
+        // Offsets are PC-relative from end of DISPATCH (byte 12)
+        assert_eq!(entry0_offset, 1); // alpha body at 13, from ip=12 -> 1
+        assert_eq!(entry1_offset, 0); // zebra body at 12, from ip=12 -> 0
     }
 
     #[test]

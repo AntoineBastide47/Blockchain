@@ -146,6 +146,8 @@ pub enum VMError {
         type1: &'static str,
         type2: &'static str,
     },
+    #[error("trying to read out of memory bounds, memory size: {max} read index: {got}")]
+    MemoryOOBRead { got: usize, max: usize },
 }
 
 impl From<DecodeError> for VMError {

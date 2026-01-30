@@ -6,7 +6,7 @@
 use crate::error;
 use crate::types::hash::{HASH_LEN, Hash};
 use crate::utils::log::SHOW_TYPE;
-use crate::virtual_machine::assembler::parse_i64;
+use crate::virtual_machine::assembler::parse_i64_or_hex;
 use crate::virtual_machine::errors::VMError;
 use crate::virtual_machine::isa::Instruction;
 use crate::virtual_machine::operand::SrcOperand;
@@ -14,6 +14,8 @@ use crate::virtual_machine::program::{DeployProgram, ExecuteProgram};
 use crate::virtual_machine::state::State;
 use blockchain_derive::BinaryCodec;
 use std::sync::atomic::Ordering;
+
+const WORD_SIZE: usize = 8;
 
 /// Defines host function name constants and a lookup table of `(name, argc)` pairs.
 macro_rules! host_functions {
@@ -150,6 +152,11 @@ macro_rules! define_instruction_decoder {
         Ok::<String, VMError>(format!("@{}", u32::from_le_bytes(bytes.try_into().unwrap())))
     }};
 
+    (@read $data:ident $cursor:ident $start:ident AddrU32) => {{
+        let bytes = read_bytes($data, &mut $cursor, 4, $start)?;
+        Ok::<String, VMError>(u32::from_le_bytes(bytes.try_into().unwrap()).to_string())
+    }};
+
     (@read $data:ident $cursor:ident $start:ident ImmI32) => {{
         let bytes = read_bytes($data, &mut $cursor, 4, $start)?;
         Ok::<String, VMError>(i32::from_le_bytes(bytes.try_into().unwrap()).to_string())
@@ -198,6 +205,8 @@ pub enum GasCategory {
     CallOverhead,
     /// Cost for host function execution.
     HostFunction,
+    /// Cost for memory interactions.
+    Memory,
 }
 
 impl GasCategory {
@@ -212,6 +221,7 @@ impl GasCategory {
             GasCategory::HeapAllocation => "Heap Allocation",
             GasCategory::CallOverhead => "Call Overhead",
             GasCategory::HostFunction => "Host Function",
+            GasCategory::Memory => "Memory",
         }
     }
 }
@@ -231,6 +241,7 @@ pub struct GasProfile {
     heap_allocation: u64,
     call_overhead: u64,
     host_function: u64,
+    memory: u64,
 }
 
 impl GasProfile {
@@ -259,6 +270,7 @@ impl GasProfile {
             GasCategory::HostFunction => {
                 self.host_function = self.host_function.saturating_add(amount)
             }
+            GasCategory::Memory => self.memory = self.memory.saturating_add(amount),
         }
     }
 
@@ -273,6 +285,7 @@ impl GasProfile {
             .saturating_add(self.heap_allocation)
             .saturating_add(self.call_overhead)
             .saturating_add(self.host_function)
+            .saturating_add(self.memory)
     }
 
     /// Returns an iterator over all categories and their gas costs.
@@ -287,6 +300,7 @@ impl GasProfile {
             (GasCategory::HeapAllocation, self.heap_allocation),
             (GasCategory::CallOverhead, self.call_overhead),
             (GasCategory::HostFunction, self.host_function),
+            (GasCategory::Memory, self.memory),
         ]
         .into_iter()
     }
@@ -541,6 +555,12 @@ macro_rules! exec_vm {
         Ok::<u32, VMError>(u32::from_le_bytes(bytes.try_into().unwrap()))
     }};
 
+    // Decode a u32 (little-endian, 4 bytes)
+    (@read $vm:ident, AddrU32) => {{
+        let bytes = $vm.read_exact(4)?;
+        Ok::<u32, VMError>(u32::from_le_bytes(bytes.try_into().unwrap()))
+    }};
+
     // Decode a bool (1 byte, 0 = false, nonzero = true)
     (@read $vm:ident, Src) => {{
       let tag = $vm.read_exact(1)?[0];
@@ -548,7 +568,7 @@ macro_rules! exec_vm {
           0 => Ok::<SrcOperand, VMError>(SrcOperand::Reg(exec_vm!(@read $vm, Reg)?)),
           1 => Ok::<SrcOperand, VMError>(SrcOperand::Bool(exec_vm!(@read $vm, Reg)? == 1)),
           2 => Ok::<SrcOperand, VMError>(SrcOperand::I64(exec_vm!(@read $vm, ImmI64)?)),
-          3 => Ok::<SrcOperand, VMError>(SrcOperand::Ref(exec_vm!(@read $vm, RefU32)?)),
+          3 => Ok::<SrcOperand, VMError>(SrcOperand::Ref(exec_vm!(@read $vm, AddrU32)?)),
           _ => Err(VMError::InvalidOperandTag { tag, offset: $vm.ip })
       }
   }}
@@ -614,6 +634,8 @@ pub struct VM {
     args: Vec<Value>,
     /// Heap offset at which argument-referenced items were inserted.
     heap_arg_base: u32,
+    /// The VM's memory used in transactions
+    memory: Vec<u8>,
 }
 
 /// impl block for basic VM functions
@@ -644,6 +666,7 @@ impl VM {
             gas_profile: GasProfile::new(),
             args: vec![],
             heap_arg_base: 0,
+            memory: vec![],
         };
 
         vm.charge_gas_categorized(20_000 + total_bytes as u64 * 200, GasCategory::Deploy)?;
@@ -676,6 +699,7 @@ impl VM {
             gas_profile: GasProfile::new(),
             args: program.args,
             heap_arg_base: 0,
+            memory: vec![],
         };
 
         // Load argument-specific heap items so Value::Ref can target them.
@@ -1184,6 +1208,12 @@ impl VM {
                 Halt => op_halt(),
                 // Data access
                 CallDataLoad => op_call_data_load(rd: Reg),
+                // Memory access
+                MemLoad => op_memload(rd: Reg, addr: AddrU32),
+                MemStore => op_memstore(addr: AddrU32, rs: Src),
+                MemCpy => op_memcpy(dst: AddrU32, src: AddrU32, len: AddrU32),
+                MemSet => op_memset(dst: AddrU32, len: AddrU32, val: ImmU8),
+                // Special Op Codes
                 Dispatch => op_dispatch(),
             }
         }
@@ -1396,7 +1426,7 @@ impl VM {
     ) -> Result<(), VMError> {
         let reg = self.ref_from_operand(src, instr, 1)?;
         let str = self.heap_get_string(reg)?;
-        self.op_load_i64(instr, dst, parse_i64(&str)?)
+        self.op_load_i64(instr, dst, parse_i64_or_hex(&str, 0, 0)?)
     }
 
     /// Returns the number of characters in the decimal string representation of `n`.
@@ -2068,6 +2098,118 @@ impl VM {
         Ok(())
     }
 
+    fn op_halt(&mut self, _instr: &'static str) -> Result<(), VMError> {
+        // Move IP to the end to exit the execution loop cleanly.
+        self.ip = self.data.len();
+        Ok(())
+    }
+
+    /// Loads program call arguments into consecutive registers starting at `dst`,
+    /// remapping `Value::Ref` indices to account for the heap base offset.
+    fn op_call_data_load(&mut self, _instr: &'static str, dst: u8) -> Result<(), VMError> {
+        let mut i = dst;
+        for arg in &self.args {
+            let mapped = match arg {
+                Value::Ref(r) if (*r as usize) < self.args.len() => {
+                    Value::Ref(self.heap_arg_base + r)
+                }
+                other => *other,
+            };
+            self.registers.set(i, mapped)?;
+            i += 1;
+        }
+        Ok(())
+    }
+
+    fn expand_memory(&mut self, base: usize, len: usize) -> Result<(), VMError> {
+        let max = base.saturating_add(len);
+        if self.memory.len() < max {
+            let expanded = max.saturating_sub(self.memory.len()).div_ceil(WORD_SIZE) * WORD_SIZE;
+            self.charge_gas_categorized(expanded as u64 * 5, GasCategory::Memory)?;
+            self.memory
+                .resize(self.memory.len().saturating_add(expanded), 0);
+        }
+
+        Ok(())
+    }
+
+    fn op_memload(&mut self, _instr: &'static str, rd: u8, addr: u32) -> Result<(), VMError> {
+        let addr = addr as usize;
+        if addr + WORD_SIZE > self.memory.len() {
+            return Err(VMError::MemoryOOBRead {
+                got: addr + WORD_SIZE,
+                max: self.memory.len(),
+            });
+        }
+
+        let data: [u8; WORD_SIZE] = self.memory[addr..addr + WORD_SIZE].try_into().unwrap();
+        self.registers.set(rd, Value::Int(i64::from_le_bytes(data)))
+    }
+
+    fn op_memstore(
+        &mut self,
+        instr: &'static str,
+        addr: u32,
+        rs: SrcOperand,
+    ) -> Result<(), VMError> {
+        let addr = addr as usize;
+        self.expand_memory(addr, WORD_SIZE)?;
+
+        let value = self.int_from_operand(rs, instr, 2)?;
+        let data = value.to_le_bytes();
+        self.memory[addr..addr + WORD_SIZE].copy_from_slice(&data);
+
+        Ok(())
+    }
+
+    fn op_memcpy(
+        &mut self,
+        _instr: &'static str,
+        dst: u32,
+        src: u32,
+        len: u32,
+    ) -> Result<(), VMError> {
+        if len == 0 {
+            return Ok(());
+        }
+
+        let dst = dst as usize;
+        let len = len as usize;
+        let src = src as usize;
+        self.expand_memory(dst, len)?;
+
+        if self.memory.len() < src.saturating_add(len) {
+            return Err(VMError::MemoryOOBRead {
+                got: src.saturating_add(len),
+                max: self.memory.len(),
+            });
+        }
+
+        self.charge_gas_categorized(len as u64 * 3, GasCategory::Memory)?;
+        self.memory.copy_within(src..src + len, dst);
+
+        Ok(())
+    }
+
+    fn op_memset(
+        &mut self,
+        _instr: &'static str,
+        dst: u32,
+        len: u32,
+        val: u8,
+    ) -> Result<(), VMError> {
+        if len == 0 {
+            return Ok(());
+        }
+
+        let dst = dst as usize;
+        let len = len as usize;
+        self.expand_memory(dst, len)?;
+        self.charge_gas_categorized(len as u64 * 3, GasCategory::Memory)?;
+        self.memory[dst..dst + len].fill(val);
+        Ok(())
+    }
+
     /// Dispatches to a public function by selector index.
     ///
     /// Reads an inline table of `(offset_i32, argr)` entries from bytecode.
@@ -2113,29 +2255,6 @@ impl VM {
         // Jump to the target function
         self.op_jump(instr, offset)
     }
-
-    fn op_halt(&mut self, _instr: &'static str) -> Result<(), VMError> {
-        // Move IP to the end to exit the execution loop cleanly.
-        self.ip = self.data.len();
-        Ok(())
-    }
-
-    /// Loads program call arguments into consecutive registers starting at `dst`,
-    /// remapping `Value::Ref` indices to account for the heap base offset.
-    fn op_call_data_load(&mut self, _instr: &'static str, dst: u8) -> Result<(), VMError> {
-        let mut i = dst;
-        for arg in &self.args {
-            let mapped = match arg {
-                Value::Ref(r) if (*r as usize) < self.args.len() => {
-                    Value::Ref(self.heap_arg_base + r)
-                }
-                other => *other,
-            };
-            self.registers.set(i, mapped)?;
-            i += 1;
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -2169,6 +2288,7 @@ mod tests {
                 gas_profile: GasProfile::new(),
                 args: vec![],
                 heap_arg_base: 0,
+                memory: vec![],
             };
 
             vm.charge_gas_categorized(init_cost, GasCategory::Deploy)?;
@@ -2310,7 +2430,7 @@ mod tests {
                 STR_TO_I64 r1, r0
             "#
             ),
-            VMError::InvalidRegister { .. }
+            VMError::ParseErrorString { .. }
         ));
     }
 
@@ -4537,6 +4657,7 @@ LOAD_HASH_STATE r2, r0"#,
             gas_profile: GasProfile::new(),
             args,
             heap_arg_base: 0,
+            memory: vec![],
         };
 
         let base = vm.heap.len() as u32;
@@ -4617,5 +4738,159 @@ LOAD_HASH_STATE r2, r0"#,
     #[should_panic]
     fn host_func_argc_unknown_panics() {
         host_func_argc("nonexistent");
+    }
+
+    #[test]
+    fn expand_mem_test() {
+        let mut vm = run_vm("");
+        vm.expand_memory(0, 8).unwrap();
+        assert_eq!(vm.memory.len(), 8);
+    }
+
+    #[test]
+    fn memstore_test() {
+        let code = r#"
+        MEM_STORE 0, 1
+        MEM_STORE 64, 2
+        "#;
+        let vm = run_vm(code);
+        assert_eq!(vm.memory.len(), 72);
+    }
+
+    #[test]
+    fn memload_test() {
+        let code = r#"
+        MEM_STORE 0, 12
+        MEM_LOAD r0, 0
+        "#;
+        let vm = run_vm(code);
+        assert_eq!(vm.memory.len(), 8);
+        assert_eq!(&vm.memory, &12i64.to_le_bytes());
+        assert_eq!(vm.registers.get(0).unwrap(), &Value::Int(12));
+    }
+
+    #[test]
+    fn memset_test() {
+        let code = r#"
+        MEM_SET 0, 64, 255
+        "#;
+        let vm = run_vm(code);
+        assert_eq!(vm.memory.len(), 64);
+        assert_eq!(&vm.memory, &[255u8; 64]);
+    }
+
+    #[test]
+    fn memcpy_test() {
+        let code = r#"
+        MEM_SET 0, 64, 255
+        MEM_COPY 128, 0, 64
+        "#;
+        let vm = run_vm(code);
+        assert_eq!(vm.memory.len(), 192);
+        assert_eq!(&vm.memory[0..64], &[255u8; 64]);
+        assert_eq!(&vm.memory[64..128], &[0u8; 64]);
+        assert_eq!(&vm.memory[128..192], &[255u8; 64]);
+    }
+
+    #[test]
+    fn memload_oob() {
+        let err = run_expect_err("MEM_LOAD r0, 0");
+        assert!(matches!(err, VMError::MemoryOOBRead { .. }));
+    }
+
+    #[test]
+    fn memcpy_overlapping_forward() {
+        // dst < src: copy [8..24] to [0..16], should work correctly
+        let code = r#"
+        MEM_SET 0, 24, 0
+        MEM_SET 8, 16, 171
+        MEM_COPY 0, 8, 16
+        "#;
+        let vm = run_vm(code);
+        assert_eq!(&vm.memory[0..16], &[171u8; 16]);
+        assert_eq!(&vm.memory[16..24], &[171u8; 8]);
+    }
+
+    #[test]
+    fn memcpy_overlapping_backward() {
+        // dst > src: copy [0..16] to [8..24], should work correctly
+        let code = r#"
+        MEM_SET 0, 16, 205
+        MEM_COPY 8, 0, 16
+        "#;
+        let vm = run_vm(code);
+        assert_eq!(&vm.memory[0..8], &[205u8; 8]);
+        assert_eq!(&vm.memory[8..24], &[205u8; 16]);
+    }
+
+    #[test]
+    fn memcpy_oob_read() {
+        let code = r#"
+        MEM_SET 0, 8, 0
+        MEM_COPY 16, 64, 8
+        "#;
+        let err = run_expect_err(code);
+        assert!(matches!(err, VMError::MemoryOOBRead { .. }));
+    }
+
+    #[test]
+    fn memset_zero_length() {
+        let vm = run_vm("MEM_SET 0, 0, 255");
+        assert_eq!(vm.memory.len(), 0);
+    }
+
+    #[test]
+    fn memcpy_zero_length() {
+        let code = r#"
+        MEM_SET 0, 8, 170
+        MEM_COPY 0, 0, 0
+        "#;
+        let vm = run_vm(code);
+        assert_eq!(&vm.memory, &[170u8; 8]);
+    }
+
+    #[test]
+    fn expand_memory_alignment() {
+        // Storing at offset 1 should expand to at least 9 bytes, rounded up to 16
+        let mut vm = run_vm("");
+        vm.expand_memory(1, 8).unwrap();
+        assert_eq!(vm.memory.len(), 16);
+    }
+
+    #[test]
+    fn memset_hex_addr_and_len() {
+        let code = "MEM_SET 0x10, 0x20, 0xAB";
+        let vm = run_vm(code);
+        assert_eq!(vm.memory.len(), 0x10 + 0x20);
+        assert_eq!(&vm.memory[0x10..0x30], &[0xABu8; 0x20]);
+    }
+
+    #[test]
+    fn memcpy_hex_params() {
+        let code = r#"
+        MEM_SET 0x00, 0x10, 0xFF
+        MEM_COPY 0x20, 0x00, 0x10
+        "#;
+        let vm = run_vm(code);
+        assert_eq!(&vm.memory[0x00..0x10], &[0xFFu8; 0x10]);
+        assert_eq!(&vm.memory[0x20..0x30], &[0xFFu8; 0x10]);
+    }
+
+    #[test]
+    fn memstore_hex_addr() {
+        let code = "MEM_STORE 0x40, 0x1234";
+        let vm = run_vm(code);
+        assert_eq!(vm.memory.len(), 0x48);
+        assert_eq!(&vm.memory[0x40..0x48], &0x1234i64.to_le_bytes());
+    }
+
+    #[test]
+    fn memload_hex_addr() {
+        let code = r#"
+        MEM_STORE 0x08, 0xDEAD
+        MEM_LOAD r0, 0x08
+        "#;
+        let vm = run_vm(code);
+        assert_eq!(vm.registers.get(0).unwrap(), &Value::Int(0xDEAD));
     }
 }

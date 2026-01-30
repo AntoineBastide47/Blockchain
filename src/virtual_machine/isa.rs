@@ -163,6 +163,17 @@ macro_rules! for_each_instruction {
             // =========================
             /// CALLDATA_LOAD rd ; load call arguments into registers starting at rd, remapping heap refs
             CallDataLoad = 0x51, "CALLDATA_LOAD" => [rd: Reg], 3,
+            // =========================
+            // Memory access
+            // =========================
+            /// MEM_LOAD rd, addr ; rd = memory[addr .. addr + 8]
+            MemLoad = 0x60, "MEM_LOAD" => [rd: Reg, addr: AddrU32], 2,
+            /// MEM_STORE addr, rs ; memory[addr .. addr + WORD_SIZE] = rs
+            MemStore = 0x61, "MEM_STORE" => [addr: AddrU32, rs: Src], 3,
+            /// MEM_COPY dst, src, len ; memory[dst .. dst+len] = memory[src .. src+len]
+            MemCpy = 0x62, "MEM_COPY" => [dst: AddrU32, src: AddrU32, len: AddrU32], 3,
+            /// MEM_SET dst, val, len ; for i in 0..len: memory[dst+i] = val
+            MemSet = 0x63, "MEM_SET" => [dst: AddrU32, len: AddrU32, val: ImmU8], 3,
         }
     };
 }
@@ -228,25 +239,17 @@ macro_rules! define_instructions {
     (@ty Reg)    => { u8 };
     (@ty ImmU8)  => { u8 };
     (@ty RefU32) => { u32 };
+    (@ty AddrU32) => { u32 };
     (@ty ImmI32) => { i32 };
     (@ty Src) => { SrcOperand };
 
     // ---------- encoding ----------
-    (@emit $out:ident, Reg, $v:ident) => {
-        $out.push(*$v);
-    };
+    (@emit $out:ident, Reg, $v:ident) => { $out.push(*$v); };
+    (@emit $out:ident, ImmU8, $v:ident) => { $out.push(*$v); };
 
-    (@emit $out:ident, ImmU8, $v:ident) => {
-        $out.push(*$v);
-    };
-
-    (@emit $out:ident, ImmI32, $v:ident) => {
-        $out.extend_from_slice(&$v.to_le_bytes());
-    };
-
-    (@emit $out:ident, RefU32, $v:ident) => {
-        $out.extend_from_slice(&$v.to_le_bytes());
-    };
+    (@emit $out:ident, ImmI32, $v:ident) => { $out.extend_from_slice(&$v.to_le_bytes()); };
+    (@emit $out:ident, RefU32, $v:ident) => { $out.extend_from_slice(&$v.to_le_bytes()); };
+    (@emit $out:ident, AddrU32, $v:ident) => { $out.extend_from_slice(&$v.to_le_bytes()); };
 
     (@emit $out:ident, Src, $v:ident) => {
       match $v {

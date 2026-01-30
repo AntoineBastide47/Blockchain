@@ -80,6 +80,12 @@ mod tests {
         // Data access
         assert_eq!(Instruction::CallDataLoad as u8, 0x51);
 
+        // Memory access
+        assert_eq!(Instruction::MemLoad as u8, 0x60);
+        assert_eq!(Instruction::MemStore as u8, 0x61);
+        assert_eq!(Instruction::MemCpy as u8, 0x62);
+        assert_eq!(Instruction::MemSet as u8, 0x63);
+
         // Special Dispatch instruction
         assert_eq!(Instruction::Dispatch as u8, 0xFF);
     }
@@ -155,6 +161,12 @@ mod tests {
 
         // Data access
         assert_eq!(Instruction::CallDataLoad.mnemonic(), "CALLDATA_LOAD");
+
+        // Memory access
+        assert_eq!(Instruction::MemLoad.mnemonic(), "MEM_LOAD");
+        assert_eq!(Instruction::MemStore.mnemonic(), "MEM_STORE");
+        assert_eq!(Instruction::MemCpy.mnemonic(), "MEM_COPY");
+        assert_eq!(Instruction::MemSet.mnemonic(), "MEM_SET");
 
         // Special Dispatch instruction
         assert_eq!(Instruction::Dispatch.mnemonic(), "DISPATCH");
@@ -232,6 +244,12 @@ mod tests {
         // Data access
         assert_eq!(Instruction::CallDataLoad.base_gas(), 3);
 
+        // Memory access
+        assert_eq!(Instruction::MemLoad.base_gas(), 2);
+        assert_eq!(Instruction::MemStore.base_gas(), 3);
+        assert_eq!(Instruction::MemCpy.base_gas(), 3);
+        assert_eq!(Instruction::MemSet.base_gas(), 3);
+
         // Special Dispatch instruction
         assert_eq!(Instruction::Dispatch.base_gas(), 10);
     }
@@ -239,7 +257,7 @@ mod tests {
     /// Verifies the total instruction count has not changed.
     #[test]
     fn instruction_count_unchanged() {
-        const EXPECTED_COUNT: usize = 58;
+        const EXPECTED_COUNT: usize = 62;
 
         // Count by verifying TryFrom succeeds for expected opcodes
         let mut count = 0;

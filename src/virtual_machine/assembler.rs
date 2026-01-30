@@ -394,12 +394,7 @@ fn tokenize_label(line_no: usize, line: &str) -> Result<Label<'_>, VMError> {
     while j < ab.len() && ab[j].is_ascii_digit() {
         j += 1;
     }
-    let argc = parse_u8(&arg_data[n_start..j]).map_err(|e| VMError::ParseErrorString {
-        line: line_no,
-        offset: arg_start + n_start + 1,
-        length: j - n_start,
-        message: e.to_string(),
-    })?;
+    let argc = parse_u8_or_hex(&arg_data[n_start..j], line_no, arg_start + n_start + 1)?;
 
     while j < ab.len() && ab[j] == b' ' {
         j += 1;
@@ -429,12 +424,7 @@ fn tokenize_label(line_no: usize, line: &str) -> Result<Label<'_>, VMError> {
     while j < ab.len() && ab[j].is_ascii_digit() {
         j += 1;
     }
-    let argr = parse_u8(&arg_data[r_start..j]).map_err(|e| VMError::ParseErrorString {
-        line: line_no,
-        offset: arg_start + r_start + 1,
-        length: j - r_start,
-        message: e.to_string(),
-    })?;
+    let argr = parse_u8_or_hex(&arg_data[r_start..j], line_no, arg_start + r_start + 1)?;
 
     while j < ab.len() {
         if ab[j] != b' ' {
@@ -543,20 +533,6 @@ pub(crate) fn parse_reg(tok: &str) -> Result<u8, VMError> {
         })
 }
 
-/// Parse an i64 immediate
-pub(crate) fn parse_i64(tok: &str) -> Result<i64, VMError> {
-    tok.parse::<i64>().map_err(|_| VMError::InvalidRegister {
-        token: tok.to_string(),
-    })
-}
-
-/// Parse a u8 immediate
-fn parse_u8(tok: &str) -> Result<u8, VMError> {
-    tok.parse::<u8>().map_err(|_| VMError::ArgcOutOfRange {
-        actual: tok.to_string(),
-    })
-}
-
 /// Parse a reference token like `@0`, `@123`.
 fn parse_ref_u32(tok: &str) -> Result<u32, VMError> {
     tok.strip_prefix('@')
@@ -569,6 +545,46 @@ fn parse_ref_u32(tok: &str) -> Result<u32, VMError> {
         })
 }
 
+macro_rules! define_parse_int_or_hex {
+    (
+        $(
+             $vis:vis $name:ident : $ty:ty
+        ),+ $(,)?
+    ) => {
+        $(
+            $vis fn $name(
+                tok: &str,
+                line: usize,
+                current_global_offset: usize,
+            ) -> Result<$ty, VMError> {
+                let (s, radix) = if let Some(hex) = tok.strip_prefix("0x") {
+                    (hex, 16)
+                } else {
+                    (tok, 10)
+                };
+
+                <$ty>::from_str_radix(s, radix).map_err(|_| VMError::ParseErrorString {
+                    line,
+                    offset: current_global_offset,
+                    length: tok.len(),
+                    message: format!(
+                        "invalid {} literal '{}'",
+                        stringify!($ty),
+                        tok
+                    ),
+                })
+            }
+        )+
+    };
+}
+
+define_parse_int_or_hex! {
+    parse_u8_or_hex: u8,
+    parse_u32_or_hex: u32,
+    parse_i32_or_hex: i32,
+    pub(crate) parse_i64_or_hex: i64,
+}
+
 /// Parses an i32 immediate or a label reference.
 ///
 /// If `tok` parses as an integer, returns it directly. Otherwise, resolves
@@ -577,9 +593,10 @@ fn parse_ref_u32(tok: &str) -> Result<u32, VMError> {
 fn parse_i32_or_label(
     tok: &str,
     ctx: &AsmContext,
+    line: usize,
     current_global_offset: usize,
 ) -> Result<i32, VMError> {
-    if let Ok(v) = tok.parse::<i32>() {
+    if let Ok(v) = parse_i32_or_hex(tok, line, current_global_offset) {
         return Ok(v);
     }
     let target = ctx.resolve_label(tok)?;
@@ -594,9 +611,10 @@ fn parse_i32_or_label(
 fn parse_i64_or_label(
     tok: &str,
     ctx: &AsmContext,
+    line: usize,
     current_global_offset: usize,
 ) -> Result<i64, VMError> {
-    if let Ok(v) = tok.parse::<i64>() {
+    if let Ok(v) = parse_i64_or_hex(tok, line, current_global_offset) {
         return Ok(v);
     }
     let target = ctx.resolve_label(tok)?;
@@ -606,6 +624,7 @@ fn parse_i64_or_label(
 fn parse_src(
     tok: &str,
     ctx: &mut AsmContext,
+    line: usize,
     current_offset: usize,
 ) -> Result<SrcOperand, VMError> {
     // Register: r0, r1, ...
@@ -627,6 +646,7 @@ fn parse_src(
     Ok(SrcOperand::I64(parse_i64_or_label(
         tok,
         ctx,
+        line,
         current_offset,
     )?))
 }
@@ -836,6 +856,7 @@ macro_rules! define_parse_instruction {
         fn parse_instruction(
             ctx: &mut AsmContext,
             tokens: &[Token],
+            line: usize,
             current_global_offset: usize,
         ) -> Result<AsmInstr, VMError> {
             if tokens.is_empty() {
@@ -862,7 +883,7 @@ macro_rules! define_parse_instruction {
                         }
 
                         define_parse_instruction!(
-                            @construct ctx offset tokens; $name $( $field : $kind ),*
+                            @construct ctx line offset tokens; $name $( $field : $kind ),*
                         )
                     }
                 ),*
@@ -874,7 +895,7 @@ macro_rules! define_parse_instruction {
                             actual: tokens.len() as u8 - 1,
                         });
                     }
-                    let count = parse_u8(&tokens[1].text)?;
+                    let count = parse_u8_or_hex(&tokens[1].text, line, offset)?;
                     let expected = 2 + count as usize * 2;
                     if tokens.len() != expected {
                         return Err(VMError::ArityMismatch {
@@ -886,7 +907,7 @@ macro_rules! define_parse_instruction {
                     let mut entries = Vec::with_capacity(count as usize);
                     for i in 0..count as usize {
                         let target = parse_i64_or_label(
-                            &tokens[2 + i * 2].text, ctx, offset,
+                            &tokens[2 + i * 2].text, ctx, line, offset,
                         )?;
                         let argr = parse_reg(&tokens[3 + i * 2].text)?;
                         entries.push((target, argr));
@@ -898,48 +919,39 @@ macro_rules! define_parse_instruction {
     };
 
     // ---------- counting ----------
-    (@count $( $x:ident ),* ) => {
-        <[()]>::len(&[ $( define_parse_instruction!(@unit $x) ),* ])
-    };
-
+    (@count $( $x:ident ),* ) => { <[()]>::len(&[ $( define_parse_instruction!(@unit $x) ),* ]) };
     (@unit $x:ident) => { () };
 
     // ---------- operand sizes from tokens ----------
     (@token_size Reg, $iter:ident) => { { $iter.next(); 1usize } };
-    (@token_size RefU32, $iter:ident) => { { $iter.next(); 4usize } };
     (@token_size ImmU8, $iter:ident) => { { $iter.next(); 1usize } };
+
+    (@token_size RefU32, $iter:ident) => { { $iter.next(); 4usize } };
+    (@token_size AddrU32, $iter:ident) => { { $iter.next(); 4usize } };
     (@token_size ImmI32, $iter:ident) => { { $iter.next(); 4usize } };
-    (@token_size Src, $iter:ident) => { { src_size_from_token($iter.next().unwrap().text) } };
+
+    (@token_size Src, $iter:ident) => { src_size_from_token($iter.next().unwrap().text) };
 
     // ---------- parsing ----------
-    (@construct $ctx:ident $offset:ident $tokens:ident; $name:ident) => {
-        Ok(AsmInstr::$name { })
-    };
+    (@construct $ctx:ident $line:ident $offset:ident $tokens:ident; $name:ident) => { Ok(AsmInstr::$name { }) };
 
-    (@construct $ctx:ident $offset:ident $tokens:ident; $name:ident $( $field:ident : $kind:ident ),+ ) => {{
+    (@construct $ctx:ident $line:ident $offset:ident $tokens:ident; $name:ident $( $field:ident : $kind:ident ),+ ) => {{
         let mut it = $tokens.iter().skip(1);
         Ok(AsmInstr::$name {
             $(
                 $field: define_parse_instruction!(
-                    @parse_operand $kind, it.next().unwrap(), $ctx, $offset
+                    @parse_operand $kind, it.next().unwrap(), $ctx, $line, $offset
                 )?,
             )*
         })
     }};
 
-    (@parse_operand Reg, $tok:expr, $ctx:expr, $current_offset:expr) => {{
-          parse_reg(&$tok.text)
-      }};
+    (@parse_operand Reg, $tok:expr, $ctx:expr, $line:ident, $offset:expr) => { parse_reg(&$tok.text) };
+    (@parse_operand ImmU8, $tok:expr, $ctx:expr, $line:ident, $offset:expr) => { parse_u8_or_hex(&$tok.text, $line, $offset) };
 
-    (@parse_operand ImmU8, $tok:expr, $ctx:expr, $current_offset:expr) => {
-        parse_u8(&$tok.text)
-    };
-
-    (@parse_operand ImmI32, $tok:expr, $ctx:expr, $current_offset:expr) => {
-        parse_i32_or_label(&$tok.text, $ctx, $current_offset)
-    };
-
-    (@parse_operand RefU32, $tok:expr, $ctx:expr, $current_offset:expr) => {{
+    (@parse_operand ImmI32, $tok:expr, $ctx:expr, $line:ident, $offset:expr) => { parse_i32_or_label(&$tok.text, $ctx, $line, $offset) };
+    (@parse_operand AddrU32, $tok:expr, $ctx:expr, $line:ident, $offset:expr) => { parse_u32_or_hex(&$tok.text, $line, $offset) };
+    (@parse_operand RefU32, $tok:expr, $ctx:expr, $line:ident, $offset:expr) => {{
         let tok = &$tok.text;
         if let Some(s) = tok.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
             Ok($ctx.intern_string(s.to_string()))
@@ -948,9 +960,7 @@ macro_rules! define_parse_instruction {
         }
     }};
 
-    (@parse_operand Src, $tok:expr, $ctx:expr, $current_offset:expr) => {
-        parse_src(&$tok.text, $ctx, $current_offset)
-    };
+    (@parse_operand Src, $tok:expr, $ctx:expr, $line:ident, $offset:expr) => { parse_src(&$tok.text, $ctx, $line, $offset) };
 }
 
 for_each_instruction!(define_parse_instruction);
@@ -1141,12 +1151,7 @@ fn extract_argc(
         Token { text, .. } if text == instr_0.mnemonic() => 0,
         Token { text, .. } if text == instr_1.mnemonic() => 1,
         Token { text, .. } if text == instr_n.mnemonic() => {
-            parse_u8(tokens[3].text).map_err(|e| VMError::ParseErrorString {
-                line: line_no + 1,
-                offset: tokens[3].offset,
-                length: tokens[3].text.len(),
-                message: e.to_string(),
-            })?
+            parse_u8_or_hex(tokens[3].text, line_no + 1, tokens[3].offset)?
         }
         _ => 0,
     })
@@ -1339,7 +1344,7 @@ fn assemble_source_step_2(
             Section::Runtime | Section::None | Section::Dispatcher => init_size + bytecode.len(),
         };
 
-        match parse_instruction(&mut asm_context, &tokens, global_offset) {
+        match parse_instruction(&mut asm_context, &tokens, line_no + 1, global_offset) {
             Ok(instr) => instr.assemble(bytecode),
             Err(e) => {
                 // Find the token that caused the error for accurate cursor positioning
@@ -1568,7 +1573,7 @@ mod tests {
     #[test]
     fn instruction_parse_empty() {
         assert!(matches!(
-            parse_instruction(&mut AsmContext::new(), &[], 0),
+            parse_instruction(&mut AsmContext::new(), &[], 0, 0),
             Err(VMError::ArityMismatch { .. })
         ));
     }
@@ -1593,7 +1598,7 @@ mod tests {
                 offset: 13,
             },
         ];
-        let instr = parse_instruction(&mut AsmContext::new(), &tokens, 0).unwrap();
+        let instr = parse_instruction(&mut AsmContext::new(), &tokens, 0, 0).unwrap();
         match instr {
             AsmInstr::Add { rd, rs1, rs2 } => {
                 assert_eq!(rd, 0);
@@ -1707,17 +1712,17 @@ mod tests {
 
     #[test]
     fn parse_u8_valid() {
-        assert_eq!(parse_u8("0").unwrap(), 0);
-        assert_eq!(parse_u8("255").unwrap(), 255);
-        assert_eq!(parse_u8("42").unwrap(), 42);
+        assert_eq!(parse_u8_or_hex("0", 0, 0).unwrap(), 0);
+        assert_eq!(parse_u8_or_hex("255", 0, 0).unwrap(), 255);
+        assert_eq!(parse_u8_or_hex("42", 0, 0).unwrap(), 42);
     }
 
     #[test]
     fn parse_u8_invalid() {
-        assert!(parse_u8("256").is_err());
-        assert!(parse_u8("-1").is_err());
-        assert!(parse_u8("abc").is_err());
-        assert!(parse_u8("").is_err());
+        assert!(parse_u8_or_hex("256", 0, 0).is_err());
+        assert!(parse_u8_or_hex("-1", 0, 0).is_err());
+        assert!(parse_u8_or_hex("abc", 0, 0).is_err());
+        assert!(parse_u8_or_hex("", 0, 0).is_err());
     }
 
     #[test]

@@ -47,8 +47,8 @@ pub struct DeployProgram {
     pub init_code: Vec<u8>,
     /// Compiled runtime instruction bytecode.
     pub runtime_code: Vec<u8>,
-    /// Interned string literals referenced by index.
-    pub items: Vec<Vec<u8>>,
+    /// The initial const memory of the program containing interned items.
+    pub memory: Vec<u8>,
 }
 
 impl DeployProgram {
@@ -192,30 +192,55 @@ pub mod tests {
     use crate::virtual_machine::assembler::assemble_source;
     use crate::virtual_machine::isa::Instruction;
     use crate::virtual_machine::vm::Value;
+    use std::collections::HashSet;
 
     impl DeployProgram {
         /// Creates a new program from pre-assembled components.
-        pub(crate) fn new(strings: Vec<Vec<u8>>, bytecode: Vec<u8>) -> DeployProgram {
+        pub(crate) fn new(
+            memory: Vec<u8>,
+            init_code: Vec<u8>,
+            runtime_code: Vec<u8>,
+        ) -> DeployProgram {
             Self {
-                items: strings,
-                init_code: Vec::new(),
-                runtime_code: bytecode,
+                init_code,
+                runtime_code,
+                memory,
             }
+        }
+
+        /// Converts a list of byte items into const memory format.
+        ///
+        /// Deduplicates items and encodes each with a length prefix.
+        pub(crate) fn items_to_memory(mut items: Vec<Vec<u8>>) -> Vec<u8> {
+            let mut seen: HashSet<Vec<u8>> = HashSet::new();
+            items.retain(|x| seen.insert(x.clone()));
+
+            let mut capacity = 0usize;
+            for vec in &items {
+                capacity += vec.byte_size();
+            }
+
+            let mut memory = Vec::with_capacity(capacity);
+            for vec in &items {
+                vec.encode(&mut memory);
+            }
+
+            memory
         }
     }
 
     #[test]
     fn roundtrip_empty_program() {
-        let program = DeployProgram::new(vec![], vec![]);
+        let program = DeployProgram::new(vec![], vec![], vec![]);
         let bytes = program.to_bytes();
         let decoded = DeployProgram::from_bytes(&bytes).unwrap();
-        assert!(decoded.items.is_empty());
+        assert!(decoded.memory.is_empty());
         assert!(decoded.runtime_code.is_empty());
     }
 
     #[test]
     fn roundtrip_with_bytecode() {
-        let program = DeployProgram::new(vec![], vec![0x00, 0x01, 0x02]);
+        let program = DeployProgram::new(vec![], vec![], vec![0x00, 0x01, 0x02]);
         let bytes = program.to_bytes();
         let decoded = DeployProgram::from_bytes(&bytes).unwrap();
         assert_eq!(decoded.runtime_code, vec![0x00, 0x01, 0x02]);
@@ -223,10 +248,11 @@ pub mod tests {
 
     #[test]
     fn roundtrip_with_strings() {
-        let program = DeployProgram::new(vec!["hello".into(), "world".into()], vec![0x01, 0x00]);
+        let memory = DeployProgram::items_to_memory(vec!["hello".into(), "world".into()]);
+        let program = DeployProgram::new(memory.clone(), vec![], vec![0x01, 0x00]);
         let bytes = program.to_bytes();
         let decoded = DeployProgram::from_bytes(&bytes).unwrap();
-        assert_eq!(decoded.items, vec![b"hello", b"world"]);
+        assert_eq!(decoded.memory, memory);
         assert_eq!(decoded.runtime_code, vec![0x01, 0x00]);
     }
 
@@ -253,7 +279,7 @@ pub mod tests {
 
     #[test]
     fn from_bytes_trailing_bytes() {
-        let program = DeployProgram::new(vec![], vec![]);
+        let program = DeployProgram::new(vec![], vec![], vec![]);
         let mut bytes = program.to_bytes().to_vec();
         bytes.push(0xFF);
         let err = DeployProgram::from_bytes(&bytes).unwrap_err();

@@ -127,7 +127,7 @@ pub enum VMError {
     #[error("out of gas: used {used}, limit {limit}")]
     OutOfGas { used: u64, limit: u64 },
     #[error("reference out of bounds, max: {max} got: {reference}")]
-    ReferenceOutOfBounds { reference: u32, max: usize },
+    ReferenceOutOfBounds { reference: usize, max: usize },
     #[error("call stack overflow got {actual} while max is {max}")]
     CallStackOverflow { max: usize, actual: usize },
     #[error("invalid operand tag got {tag} at offset {offset}")]

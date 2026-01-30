@@ -19,6 +19,7 @@
 //! - Commas between operands are optional
 
 use crate::for_each_instruction;
+use crate::types::encoding::Encode;
 use crate::utils::log::SHOW_TYPE;
 use crate::virtual_machine::errors::VMError;
 use crate::virtual_machine::isa::Instruction;
@@ -202,31 +203,36 @@ pub enum Section {
 ///
 /// Tracks heap items and labels encountered during assembly, assigning each
 /// heap items a unique index that becomes part of the compiled [`DeployProgram`].
-pub struct AsmContext {
-    /// Accumulated heap items.
-    pub items: Vec<Vec<u8>>,
+struct AsmContext {
+    /// Maps interned byte sequences to their offset in `memory`.
+    items: HashMap<Vec<u8>, u32>,
+    /// Const memory buffer containing length-prefixed interned items.
+    memory: Vec<u8>,
     /// Label definitions mapping names to global bytecode offsets (init || runtime).
-    pub(crate) labels: HashMap<String, usize>,
+    labels: HashMap<String, usize>,
 }
 
 impl AsmContext {
     /// Creates an empty assembly context.
     pub fn new() -> Self {
         Self {
-            items: Vec::new(),
+            items: HashMap::new(),
+            memory: Vec::new(),
             labels: HashMap::new(),
         }
     }
 
-    /// Adds a string to the pool, returning its index.
-    /// Returns existing index if the string was already interned.
+    /// Interns a string literal into const memory.
+    ///
+    /// Returns the byte offset of the string. If already interned, returns the existing offset.
     pub fn intern_string(&mut self, s: String) -> u32 {
-        let bytes = s.into_bytes();
-        if let Some(idx) = self.items.iter().position(|item| *item == bytes) {
-            return idx as u32;
+        let bytes = s.to_vec();
+        if let Some((_, idx)) = self.items.iter().find(|item| *item.0 == bytes) {
+            return *idx;
         }
-        let id = self.items.len() as u32;
-        self.items.push(bytes);
+        let id = self.memory.len() as u32;
+        self.memory.extend_from_slice(&bytes);
+        self.items.insert(bytes, id);
         id
     }
 
@@ -973,7 +979,7 @@ for_each_instruction!(define_parse_instruction);
 ///
 /// Also updates `insert_point` to the line number of the `[ runtime code ]`
 /// section marker, which is used for dispatcher insertion.
-pub fn extract_public_labels<'a>(
+pub fn extract_label_data<'a>(
     source: &'a str,
     insert_point: &mut usize,
 ) -> Result<(HashSet<&'a str>, Vec<Label<'a>>), VMError> {
@@ -991,8 +997,13 @@ pub fn extract_public_labels<'a>(
         }
 
         if is_label_def(line) {
-            // Check if this is a public label definition (`pub label_name(N, reg):`)
+            // Skip compiler generated internal labels
             let label = tokenize_label(line_no + 1, line)?;
+            if label.name.starts_with("__") {
+                continue;
+            }
+
+            // Check if this is a public label definition (`pub label_name(N, reg):`)
             if label.public {
                 public_labels.insert(label.name);
             }
@@ -1023,7 +1034,7 @@ fn assemble_source_step_1<'a>(
     // Track where to insert the dispatcher (line number of `[ runtime code ]`)
     let mut insert_point = 0usize;
     // Collect all public label names (including trailing ':')
-    let (public_labels, label_data) = match extract_public_labels(source, &mut insert_point) {
+    let (public_labels, label_data) = match extract_label_data(source, &mut insert_point) {
         Ok(p) => p,
         Err(e) => {
             errors.push(e);
@@ -1373,7 +1384,7 @@ fn assemble_source_step_2(
         Some(DeployProgram {
             init_code: init_bytecode,
             runtime_code: runtime_bytecode,
-            items: asm_context.items,
+            memory: asm_context.memory,
         })
     } else {
         None
@@ -1547,8 +1558,8 @@ mod tests {
         "#;
         let program = assemble_source(source).unwrap();
         assert_eq!(
-            program.items,
-            vec!["first".as_bytes().to_vec(), "second".as_bytes().to_vec()]
+            program.memory,
+            DeployProgram::items_to_memory(vec!["first".into(), "second".into()])
         );
     }
 
@@ -1858,9 +1869,9 @@ MOVE r0, "init"
 MOVE r1, "runtime"
 "#;
         let program = assemble_source(source).unwrap();
-        assert_eq!(program.items.len(), 2);
-        assert_eq!(program.items[0], b"init");
-        assert_eq!(program.items[1], b"runtime");
+        assert_eq!(program.memory.len(), 8 + 4 + 8 + 7);
+        assert_eq!(&program.memory[8..12], b"init");
+        assert_eq!(&program.memory[20..27], b"runtime");
     }
 
     // ==================== Label Tokenization ====================

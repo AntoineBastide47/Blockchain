@@ -40,7 +40,7 @@ use blockchain::storage::state_view::StateViewProvider;
 use blockchain::storage::storage_trait::Storage;
 use blockchain::types::hash::Hash;
 use blockchain::utils::log::SHOW_TIMESTAMP;
-use blockchain::virtual_machine::assembler::{assemble_file, extract_public_labels};
+use blockchain::virtual_machine::assembler::{assemble_file, extract_label_data};
 use blockchain::virtual_machine::program::ExecuteProgram;
 use blockchain::virtual_machine::state::OverlayState;
 use blockchain::virtual_machine::vm::{BLOCK_GAS_LIMIT, ExecContext, GasCategory, VM, Value};
@@ -240,7 +240,7 @@ fn main() {
                 process::exit(1);
             });
             let mut insert_point = 0usize;
-            let public_functions: Vec<&str> = extract_public_labels(&source, &mut insert_point)
+            let public_functions: Vec<&str> = extract_label_data(&source, &mut insert_point)
                 .unwrap()
                 .0
                 .iter()
@@ -284,8 +284,7 @@ fn main() {
 
                 let mut vm = VM::new_execute(
                     exec_program,
-                    program.runtime_code.clone(),
-                    program.items.clone(),
+                    program.clone(),
                     BLOCK_GAS_LIMIT - exec_intrinsic,
                 )
                 .unwrap_or_else(|e| {

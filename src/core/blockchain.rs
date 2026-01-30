@@ -185,7 +185,7 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
                 to.1.credit(transaction.amount)
             }
             TransactionType::DeployContract => {
-                let program = DeployProgram::from_bytes(transaction.data.as_slice())?;
+                let mut program = DeployProgram::from_bytes(transaction.data.as_slice())?;
 
                 // Compute remaining gas after intrinsic costs
                 let max_gas =
@@ -213,12 +213,10 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
                         // Charge sender for amount transferred to contract
                         from.1.charge(transaction.amount)?;
 
-                        // Persist runtime bytecode + heap items under namespaced hash
-                        let mut stored_code = Vec::new();
-                        program.items.encode(&mut stored_code);
-                        stored_code.extend(&program.runtime_code);
+                        // Persist runtime bytecode + const memory under namespaced hash
                         let code_hash = Self::code_hash(&program.runtime_code);
-                        tx_overlay.push(code_hash, stored_code);
+                        program.init_code = vec![];
+                        tx_overlay.push(code_hash, program.to_vec());
 
                         // Create contract account with code_hash reference
                         tx_overlay.push(
@@ -254,17 +252,16 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
                     .storage
                     .get_account(contract_id)
                     .ok_or(StorageError::MissingAccount(contract_id))?;
-                let stored_code = self
-                    .storage
-                    .get(contract.code_hash())
-                    .ok_or(StorageError::MissingCode(contract_id))?;
+                let deploy = DeployProgram::decode(
+                    &mut self
+                        .storage
+                        .get(contract.code_hash())
+                        .ok_or(StorageError::MissingCode(contract_id))?
+                        .as_slice(),
+                )?;
 
                 // Decode stored format: max_register + items + runtime_code
-                let mut cursor = stored_code.as_slice();
-                let items = Vec::<Vec<u8>>::decode(&mut cursor)?;
-                let runtime_code = cursor.to_vec();
-
-                let mut vm = VM::new_execute(program, runtime_code, items, max_gas)?;
+                let mut vm = VM::new_execute(program, deploy, max_gas)?;
                 let ctx = ExecContext {
                     chain_id: self.id,
                     contract_id,
@@ -1263,9 +1260,9 @@ mod tests {
         let bc = with_validator_and_storage(TEST_CHAIN_ID, AcceptAllValidator, storage);
 
         let program = assemble_source("MOVE r0, 42").expect("assemble failed");
-        let mut expected_runtime = Vec::new();
-        program.items.encode(&mut expected_runtime);
-        expected_runtime.extend(program.runtime_code.clone());
+        let mut pg2 = program.clone();
+        pg2.init_code = vec![];
+        let expected_runtime = program.to_vec();
         let expected_code_hash =
             Blockchain::<AcceptAllValidator, TestStorage>::code_hash(&program.runtime_code);
 
@@ -1351,9 +1348,8 @@ MOVE r1, 2
         assert_eq!(contract.code_hash(), expected_code_hash);
 
         let stored_code = overlay.get(expected_code_hash).expect("code should exist");
-        let mut expected = Vec::new();
-        program.items.encode(&mut expected);
-        expected.extend(program.runtime_code);
-        assert_eq!(stored_code, expected);
+        let mut pg2 = program.clone();
+        pg2.init_code = vec![];
+        assert_eq!(stored_code, pg2.to_vec());
     }
 }

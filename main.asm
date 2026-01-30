@@ -11,8 +11,8 @@ main:                            # Equivalent to a contract constructor
 # input: r1 = n, output: r3 = n!
 pub factorial(1, r1):
     INC r3                      # result = 1
-    fact_loop:
+    __fact_loop:
         MUL r3, r3, r1          # result *= i
         DEC r1                  # i--
-        BGE r1, 1, fact_loop    # while n >= 1
+        BGE r1, 1, __fact_loop    # while n >= 1
     RET r3

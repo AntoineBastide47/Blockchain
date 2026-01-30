@@ -4,6 +4,7 @@
 //! registers. All arithmetic uses wrapping semantics to prevent overflow panics.
 
 use crate::error;
+use crate::types::encoding::{Decode, Encode};
 use crate::types::hash::{HASH_LEN, Hash};
 use crate::utils::log::SHOW_TYPE;
 use crate::virtual_machine::assembler::parse_i64_or_hex;
@@ -13,6 +14,7 @@ use crate::virtual_machine::operand::SrcOperand;
 use crate::virtual_machine::program::{DeployProgram, ExecuteProgram};
 use crate::virtual_machine::state::State;
 use blockchain_derive::BinaryCodec;
+use std::ops::{Index, IndexMut, RangeBounds};
 use std::sync::atomic::Ordering;
 
 const WORD_SIZE: usize = 8;
@@ -442,53 +444,138 @@ impl Registers {
     }
 }
 
-/// Heap storage for reference-counted objects.
+/// Unified memory for the VM, combining constant and execution regions.
 ///
-/// Currently, holds only the string pool loaded from the program.
-struct Heap(Vec<Vec<u8>>);
+/// Memory layout: `[const region][execution region]`
+/// - **Const region**: Interned string literals and other constant data loaded from the program.
+/// - **Execution region**: Dynamic memory allocated during transaction execution.
+///
+/// The `exec_offset` marks the boundary between const and execution memory. Indexing
+/// operations (`[]`) access only the execution region for memory instructions.
+struct Heap {
+    /// Raw memory buffer containing both const and execution regions.
+    memory: Vec<u8>,
+    /// Byte offset where execution memory begins (equals const region size).
+    exec_offset: usize,
+}
 
 impl Heap {
-    fn new(items: Vec<Vec<u8>>) -> Self {
-        Self(items)
+    /// Creates a new heap with the given const memory.
+    ///
+    /// The execution region starts empty, immediately after the const region.
+    fn new(memory: Vec<u8>) -> Self {
+        Self {
+            exec_offset: memory.len(),
+            memory,
+        }
     }
 
-    /// Add the given item and returns it's index
-    fn index(&mut self, item: Vec<u8>) -> u32 {
-        self.0.push(item);
-        (self.len() - 1) as u32
+    /// Appends an item to memory with length-prefix encoding.
+    ///
+    /// Returns the byte offset where the item was stored.
+    fn append(&mut self, item: Vec<u8>) -> u32 {
+        let index = self.memory.len();
+        item.encode(&mut self.memory);
+        index as u32
     }
 
-    /// Returns a reference to the raw [`Vec<u8>`] stored at the given index
-    fn get_raw_ref(&self, reference: u32) -> Result<&Vec<u8>, VMError> {
-        self.0
-            .get(reference as usize)
+    /// Returns a reference to the raw [`Vec<u8>`] stored at the given index.
+    /// Includes the length prefix.
+    fn get_raw_ref(&self, reference: u32) -> Result<&[u8], VMError> {
+        let reference = reference as usize;
+        self.memory
+            .get(reference)
             .ok_or(VMError::ReferenceOutOfBounds {
                 reference,
-                max: self.len() - 1,
-            })
+                max: self.memory.len() - 1,
+            })?;
+        let data: [u8; WORD_SIZE] = self.memory[reference..reference + WORD_SIZE]
+            .try_into()
+            .unwrap();
+        let size = usize::from_le_bytes(data);
+
+        let bound = reference + WORD_SIZE + size;
+        if bound > self.memory.len() {
+            return Err(VMError::MemoryOOBRead {
+                got: bound,
+                max: self.memory.len(),
+            });
+        }
+
+        Ok(&self.memory[reference..bound])
     }
 
-    /// Returns how many items are stored in this heap
+    /// Returns just the data bytes stored at the given index (without length prefix).
+    fn get_data(&self, reference: u32) -> Result<&[u8], VMError> {
+        let raw = self.get_raw_ref(reference)?;
+        Ok(&raw[WORD_SIZE..])
+    }
+
+    /// Returns the size of the execution memory region in bytes.
     fn len(&self) -> usize {
-        self.0.len()
+        self.memory.len().saturating_sub(self.exec_offset)
+    }
+
+    /// Resizes the total memory buffer to `new_len`, filling new bytes with `value`.
+    fn resize(&mut self, new_len: usize, value: u8) {
+        self.memory.resize(new_len, value);
+    }
+
+    /// Copies bytes within the memory buffer from `src` range to `dest` offset.
+    fn copy_within<R: RangeBounds<usize>>(&mut self, src: R, dest: usize) {
+        self.memory.copy_within(src, dest);
     }
 
     /// Retrieves a string by its reference index.
     fn get_string(&self, id: u32) -> Result<String, VMError> {
-        String::from_utf8(self.0[id as usize].clone())
-            .map_err(|_| VMError::InvalidUtf8 { string_ref: id })
+        let mut bytes = self.get_raw_ref(id)?;
+        String::decode(&mut bytes).map_err(|_| VMError::InvalidUtf8 { string_ref: id })
     }
 
     /// Retrieves a hash by its reference index.
     fn get_hash(&self, id: u32) -> Result<Hash, VMError> {
-        let bytes = &self.0[id as usize];
-        match Hash::from_slice(bytes) {
+        let bytes = self.get_raw_ref(id)?;
+        match Hash::from_slice(&bytes[WORD_SIZE..]) {
             None => Err(VMError::InvalidHash {
                 expected_len: HASH_LEN,
                 actual_len: bytes.len(),
             }),
             Some(hash) => Ok(hash),
         }
+    }
+
+    /// Returns a slice of the execution memory (memory after exec_offset).
+    #[cfg(test)]
+    fn exec_memory(&self) -> &[u8] {
+        &self.memory[self.exec_offset..]
+    }
+
+    /// Returns the total size of the heap memory.
+    #[cfg(test)]
+    fn total_len(&self) -> usize {
+        self.memory.len()
+    }
+}
+
+/// Indexes into the execution memory region (not the const region).
+impl<T> Index<T> for Heap
+where
+    [u8]: Index<T>,
+{
+    type Output = <[u8] as Index<T>>::Output;
+
+    fn index(&self, index: T) -> &Self::Output {
+        &self.memory[self.exec_offset..][index]
+    }
+}
+
+/// Mutably indexes into the execution memory region (not the const region).
+impl<T> IndexMut<T> for Heap
+where
+    [u8]: IndexMut<T>,
+{
+    fn index_mut(&mut self, index: T) -> &mut Self::Output {
+        &mut self.memory[self.exec_offset..][index]
     }
 }
 
@@ -620,7 +707,7 @@ pub struct VM {
     instr_offset: usize,
     /// Register file (256 registers).
     registers: Registers,
-    /// Heap for string pool and future allocations.
+    /// Heap for const and execution memory.
     heap: Heap,
     /// Call stack for function calls.
     call_stack: Vec<CallFrame>,
@@ -634,8 +721,6 @@ pub struct VM {
     args: Vec<Value>,
     /// Heap offset at which argument-referenced items were inserted.
     heap_arg_base: u32,
-    /// The VM's memory used in transactions
-    memory: Vec<u8>,
 }
 
 /// impl block for basic VM functions
@@ -659,14 +744,13 @@ impl VM {
             ip: 0,
             instr_offset: 0,
             registers: Registers::new(),
-            heap: Heap::new(program.items),
+            heap: Heap::new(program.memory),
             call_stack: Vec::new(),
             gas_used: 0,
             max_gas,
             gas_profile: GasProfile::new(),
             args: vec![],
             heap_arg_base: 0,
-            memory: vec![],
         };
 
         vm.charge_gas_categorized(20_000 + total_bytes as u64 * 200, GasCategory::Deploy)?;
@@ -679,37 +763,34 @@ impl VM {
     /// provided arguments. Heap items from the stored contract and any argument
     /// refs are merged so `Value::Ref` indices resolve correctly.
     pub fn new_execute(
-        program: ExecuteProgram,
-        data: Vec<u8>,
-        items: Vec<Vec<u8>>,
+        execute: ExecuteProgram,
+        deploy: DeployProgram,
         max_gas: u64,
     ) -> Result<Self, VMError> {
         // Build a VM for runtime execution, seeding registers with typed args and extending
         // the heap with any argument-owned items referenced via Value::Ref.
         // Labels are resolved as PC-relative offsets, so init_size is not needed.
+        let mut heap = Heap::new(deploy.memory);
+        let heap_arg_base = heap.memory.len() as u32;
+        for item in execute.arg_items {
+            heap.append(item);
+        }
+
         let mut vm = Self {
-            data,
+            data: deploy.runtime_code,
             ip: 0,
             instr_offset: 0,
             registers: Registers::new(),
-            heap: Heap::new(items),
+            heap,
             call_stack: Vec::new(),
             gas_used: 0,
             max_gas,
             gas_profile: GasProfile::new(),
-            args: program.args,
-            heap_arg_base: 0,
-            memory: vec![],
+            args: execute.args,
+            heap_arg_base,
         };
 
-        // Load argument-specific heap items so Value::Ref can target them.
-        vm.charge_call(program.arg_items.len() as u8, 5, 0, 0)?;
-        vm.heap_arg_base = vm.heap.len() as u32;
-        for item in program.arg_items {
-            vm.heap.index(item);
-        }
-
-        vm.registers.set(0, Value::Int(program.function_id))?;
+        vm.registers.set(0, Value::Int(execute.function_id))?;
         Ok(vm)
     }
 
@@ -988,12 +1069,12 @@ impl VM {
         Ok(match src_operand {
             SrcOperand::Reg(idx) => match self.registers.get(idx)? {
                 Value::Bool(b) => vec![*b as u8],
-                Value::Ref(r) => self.heap_get_raw_ref(*r)?,
+                Value::Ref(r) => self.heap_get_data(*r)?.to_vec(),
                 Value::Int(i) => i.to_le_bytes().to_vec(),
             },
             SrcOperand::Bool(b) => vec![b as u8],
             SrcOperand::I64(i) => i.to_le_bytes().to_vec(),
-            SrcOperand::Ref(r) => self.heap_get_raw_ref(r)?,
+            SrcOperand::Ref(r) => self.heap_get_data(r)?.to_vec(),
         })
     }
 }
@@ -1005,13 +1086,13 @@ impl VM {
     /// Charges gas proportional to the item's byte length.
     fn heap_index(&mut self, item: Vec<u8>) -> Result<u32, VMError> {
         self.charge_gas_categorized(item.len() as u64, GasCategory::HeapAllocation)?;
-        Ok(self.heap.index(item))
+        Ok(self.heap.append(item))
     }
 
-    fn heap_get_raw_ref(&mut self, id: u32) -> Result<Vec<u8>, VMError> {
-        let size = self.heap.get_raw_ref(id)?.len();
-        self.charge_gas_categorized(size as u64, GasCategory::HeapAllocation)?;
-        self.heap.get_raw_ref(id).cloned()
+    fn heap_get_data(&mut self, id: u32) -> Result<&[u8], VMError> {
+        let data = self.heap.get_data(id)?;
+        self.charge_gas_categorized(data.len() as u64, GasCategory::HeapAllocation)?;
+        self.heap.get_data(id)
     }
 
     /// Retrieves a string from the heap by reference index with gas charging.
@@ -1491,7 +1572,7 @@ impl VM {
         let reg = self.int_from_operand(src, instr, 1)?;
         // Charge gas manually before allocation instead of using heap_index()
         self.charge_gas_categorized(Self::digits_i64(reg), GasCategory::HeapAllocation)?;
-        let str_ref = self.heap.index(reg.to_string().into_bytes());
+        let str_ref = self.heap.append(reg.to_string().into_bytes());
         self.op_load_str(instr, dst, str_ref)
     }
 
@@ -1528,7 +1609,7 @@ impl VM {
         // Charge gas manually before allocation instead of using heap_index()
         self.charge_gas_categorized(if reg { 4 } else { 5 }, GasCategory::HeapAllocation)?;
         let str = (if reg { "true" } else { "false" }).to_string();
-        let bool_ref = self.heap.index(str.into_bytes());
+        let bool_ref = self.heap.append(str.into_bytes());
         self.op_load_str(instr, dst, bool_ref)
     }
 
@@ -1841,14 +1922,14 @@ impl VM {
                 let start = get_i64(args[1])? as usize;
                 let end = get_i64(args[2])? as usize;
 
-                let len = self.heap.get_raw_ref(str_ref)?.len();
+                let len = self.heap.get_data(str_ref)?.len();
                 self.charge_gas_categorized(len as u64, GasCategory::HostFunction)?;
 
-                let bytes = self.heap.get_raw_ref(str_ref)?;
-                let end = end.min(bytes.len());
+                let data = self.heap.get_data(str_ref)?;
+                let end = end.min(data.len());
                 let start = start.min(end);
 
-                let sliced = bytes[start..end].to_vec();
+                let sliced = data[start..end].to_vec();
                 let new_ref = self.heap_index(sliced)?;
                 self.op_load_str(instr, dst, new_ref)
             }
@@ -1857,14 +1938,14 @@ impl VM {
                 let ref1 = get_ref(args[0])?;
                 let ref2 = get_ref(args[1])?;
 
-                let mut result = self.heap.get_raw_ref(ref1)?.len();
-                result += self.heap.get_raw_ref(ref2)?.len();
-                self.charge_gas_categorized(result as u64, GasCategory::HostFunction)?;
+                let len1 = self.heap.get_data(ref1)?.len();
+                let len2 = self.heap.get_data(ref2)?.len();
+                self.charge_gas_categorized((len1 + len2) as u64, GasCategory::HostFunction)?;
 
-                let mut result = self.heap.get_raw_ref(ref1)?.clone();
-                result.extend_from_slice(self.heap.get_raw_ref(ref2)?);
+                let mut result = self.heap.get_data(ref1)?.to_vec();
+                result.extend_from_slice(self.heap.get_data(ref2)?);
 
-                let new_ref = self.heap.index(result);
+                let new_ref = self.heap_index(result)?;
                 self.op_load_str(instr, dst, new_ref)
             }
             COMPARE => {
@@ -1872,12 +1953,12 @@ impl VM {
                 let ref1 = get_ref(args[0])?;
                 let ref2 = get_ref(args[1])?;
 
-                let l1 = self.heap.get_raw_ref(ref1)?.len();
-                let l2 = self.heap.get_raw_ref(ref2)?.len();
-                self.charge_gas_categorized((l1 + l2) as u64, GasCategory::HostFunction)?;
+                let len1 = self.heap.get_data(ref1)?.len();
+                let len2 = self.heap.get_data(ref2)?.len();
+                self.charge_gas_categorized((len1 + len2) as u64, GasCategory::HostFunction)?;
 
-                let s1 = self.heap.get_raw_ref(ref1)?;
-                let s2 = self.heap.get_raw_ref(ref2)?;
+                let s1 = self.heap.get_data(ref1)?;
+                let s2 = self.heap.get_data(ref2)?;
                 let cmp = match s1.cmp(s2) {
                     std::cmp::Ordering::Less => -1,
                     std::cmp::Ordering::Equal => 0,
@@ -1906,22 +1987,22 @@ impl VM {
         match fn_name.as_str() {
             LEN => {
                 let str_ref = self.ref_from_operand(arg, instr, 1)?;
-                let len = self.heap.get_raw_ref(str_ref)?.len();
+                let len = self.heap.get_data(str_ref)?.len();
                 self.charge_gas_categorized(len as u64, GasCategory::HostFunction)?;
-                self.op_load_i64(instr, dst, self.heap.get_raw_ref(str_ref)?.len() as i64)
+                self.op_load_i64(instr, dst, len as i64)
             }
             HASH => {
                 let value = self.value_from_operand(arg)?;
                 let len = match value {
                     Value::Bool(_) => 1,
                     Value::Int(_) => 8,
-                    Value::Ref(r) => self.heap.get_raw_ref(r)?.len(),
+                    Value::Ref(r) => self.heap.get_data(r)?.len(),
                 };
                 self.charge_gas_categorized(len as u64, GasCategory::HostFunction)?;
 
                 let hash = match value {
                     Value::Bool(b) => Hash::sha3().chain(&[b as u8]).finalize(),
-                    Value::Ref(r) => Hash::sha3().chain(self.heap.get_raw_ref(r)?).finalize(),
+                    Value::Ref(r) => Hash::sha3().chain(self.heap.get_data(r)?).finalize(),
                     Value::Int(i) => Hash::sha3().chain(&i.to_le_bytes()).finalize(),
                 };
                 let new_ref = self.heap_index(hash.to_vec())?;
@@ -2123,11 +2204,11 @@ impl VM {
 
     fn expand_memory(&mut self, base: usize, len: usize) -> Result<(), VMError> {
         let max = base.saturating_add(len);
-        if self.memory.len() < max {
-            let expanded = max.saturating_sub(self.memory.len()).div_ceil(WORD_SIZE) * WORD_SIZE;
+        if self.heap.len() < max {
+            let expanded = max.saturating_sub(self.heap.len()).div_ceil(WORD_SIZE) * WORD_SIZE;
             self.charge_gas_categorized(expanded as u64 * 5, GasCategory::Memory)?;
-            self.memory
-                .resize(self.memory.len().saturating_add(expanded), 0);
+            self.heap
+                .resize(self.heap.len().saturating_add(expanded), 0);
         }
 
         Ok(())
@@ -2135,14 +2216,14 @@ impl VM {
 
     fn op_memload(&mut self, _instr: &'static str, rd: u8, addr: u32) -> Result<(), VMError> {
         let addr = addr as usize;
-        if addr + WORD_SIZE > self.memory.len() {
+        if addr + WORD_SIZE > self.heap.len() {
             return Err(VMError::MemoryOOBRead {
                 got: addr + WORD_SIZE,
-                max: self.memory.len(),
+                max: self.heap.len(),
             });
         }
 
-        let data: [u8; WORD_SIZE] = self.memory[addr..addr + WORD_SIZE].try_into().unwrap();
+        let data: [u8; WORD_SIZE] = self.heap[addr..addr + WORD_SIZE].try_into().unwrap();
         self.registers.set(rd, Value::Int(i64::from_le_bytes(data)))
     }
 
@@ -2157,7 +2238,7 @@ impl VM {
 
         let value = self.int_from_operand(rs, instr, 2)?;
         let data = value.to_le_bytes();
-        self.memory[addr..addr + WORD_SIZE].copy_from_slice(&data);
+        self.heap[addr..addr + WORD_SIZE].copy_from_slice(&data);
 
         Ok(())
     }
@@ -2178,15 +2259,15 @@ impl VM {
         let src = src as usize;
         self.expand_memory(dst, len)?;
 
-        if self.memory.len() < src.saturating_add(len) {
+        if self.heap.len() < src.saturating_add(len) {
             return Err(VMError::MemoryOOBRead {
                 got: src.saturating_add(len),
-                max: self.memory.len(),
+                max: self.heap.len(),
             });
         }
 
         self.charge_gas_categorized(len as u64 * 3, GasCategory::Memory)?;
-        self.memory.copy_within(src..src + len, dst);
+        self.heap.copy_within(src..src + len, dst);
 
         Ok(())
     }
@@ -2206,7 +2287,7 @@ impl VM {
         let len = len as usize;
         self.expand_memory(dst, len)?;
         self.charge_gas_categorized(len as u64 * 3, GasCategory::Memory)?;
-        self.memory[dst..dst + len].fill(val);
+        self.heap[dst..dst + len].fill(val);
         Ok(())
     }
 
@@ -2281,18 +2362,22 @@ mod tests {
                 ip: 0,
                 instr_offset: 0,
                 registers: Registers::new(),
-                heap: Heap::new(program.items),
+                heap: Heap::new(program.memory),
                 call_stack: Vec::new(),
                 gas_used: 0,
                 max_gas,
                 gas_profile: GasProfile::new(),
                 args: vec![],
                 heap_arg_base: 0,
-                memory: vec![],
             };
 
             vm.charge_gas_categorized(init_cost, GasCategory::Deploy)?;
             Ok(vm)
+        }
+
+        /// Returns a slice of the execution memory.
+        fn exec_memory(&self) -> &[u8] {
+            self.heap.exec_memory()
         }
     }
 
@@ -3118,8 +3203,12 @@ NE r2, r0, r1"#,
 
     #[test]
     fn invalid_opcode() {
-        let mut vm = VM::new_with_init(DeployProgram::new(vec![], vec![0xFE]), 0, BLOCK_GAS_LIMIT)
-            .expect("vm new failed");
+        let mut vm = VM::new_with_init(
+            DeployProgram::new(vec![], vec![], vec![0xFE]),
+            0,
+            BLOCK_GAS_LIMIT,
+        )
+        .expect("vm new failed");
         assert!(matches!(
             vm.run(&mut TestState::new(), EXECUTION_CONTEXT),
             Err(VMError::InvalidInstruction { opcode: 0xFE, .. })
@@ -3129,8 +3218,12 @@ NE r2, r0, r1"#,
     #[test]
     fn invalid_operand_tag() {
         let bytecode = vec![Instruction::Move as u8, 0, 9];
-        let mut vm = VM::new_with_init(DeployProgram::new(vec![], bytecode), 0, BLOCK_GAS_LIMIT)
-            .expect("vm new failed");
+        let mut vm = VM::new_with_init(
+            DeployProgram::new(vec![], vec![], bytecode),
+            0,
+            BLOCK_GAS_LIMIT,
+        )
+        .expect("vm new failed");
         let err = vm
             .run(&mut TestState::new(), EXECUTION_CONTEXT)
             .expect_err("expected error");
@@ -3140,7 +3233,7 @@ NE r2, r0, r1"#,
     #[test]
     fn truncated_bytecode() {
         let mut vm = VM::new_with_init(
-            DeployProgram::new(vec![], vec![0x01, 0x00]),
+            DeployProgram::new(vec![], vec![], vec![0x01, 0x00]),
             0,
             BLOCK_GAS_LIMIT,
         )
@@ -3155,14 +3248,18 @@ NE r2, r0, r1"#,
 
     #[test]
     fn vm_new_charges_init_cost() {
-        let vm =
-            VM::new_with_init(DeployProgram::new(vec![], vec![]), 100, BLOCK_GAS_LIMIT).unwrap();
+        let vm = VM::new_with_init(
+            DeployProgram::new(vec![], vec![], vec![]),
+            100,
+            BLOCK_GAS_LIMIT,
+        )
+        .unwrap();
         assert_eq!(vm.gas_used(), 100);
     }
 
     #[test]
     fn vm_new_fails_when_init_cost_exceeds_max_gas() {
-        let result = VM::new_with_init(DeployProgram::new(vec![], vec![]), 1000, 500);
+        let result = VM::new_with_init(DeployProgram::new(vec![], vec![], vec![]), 1000, 500);
         assert!(matches!(
             result,
             Err(VMError::OutOfGas {
@@ -3174,7 +3271,7 @@ NE r2, r0, r1"#,
 
     #[test]
     fn vm_new_succeeds_when_init_cost_equals_max_gas() {
-        let vm = VM::new_with_init(DeployProgram::new(vec![], vec![]), 500, 500).unwrap();
+        let vm = VM::new_with_init(DeployProgram::new(vec![], vec![], vec![]), 500, 500).unwrap();
         assert_eq!(vm.gas_used(), 500);
     }
 
@@ -3200,7 +3297,7 @@ NE r2, r0, r1"#,
 
     fn make_test_key(user_key: &[u8]) -> Result<Hash, VMError> {
         VM::new_with_init(
-            DeployProgram::new(Vec::new(), Vec::new()),
+            DeployProgram::new(vec![], vec![], vec![]),
             0,
             BLOCK_GAS_LIMIT,
         )
@@ -4128,17 +4225,17 @@ LOAD_HASH_STATE r2, r0"#,
     fn new_execute_stores_args_for_calldata_load() {
         let args = vec![Value::Ref(0), Value::Int(7), Value::Bool(true)];
         let exec = ExecuteProgram::new(Hash::zero(), 3, args.clone(), vec![b"hello".to_vec()]);
-        let base_items = vec![b"base".to_vec()];
-        let vm = VM::new_execute(exec, Vec::new(), base_items, BLOCK_GAS_LIMIT).unwrap();
+        let deploy = DeployProgram::new(vec![], vec![], vec![]);
+        let vm = VM::new_execute(exec, deploy, BLOCK_GAS_LIMIT).unwrap();
 
         // r0 holds the function selector
         assert_eq!(vm.registers.get_int(0, "").unwrap(), 3);
         // Args are stored for later CALLDATA_LOAD, not pre-loaded into registers
         assert_eq!(vm.args, args);
-        // heap_arg_base points past the base items (1 base item -> index 1)
-        assert_eq!(vm.heap_arg_base, 1);
-        // The arg item was appended to the heap
-        assert_eq!(vm.heap.get_string(1).unwrap(), "hello");
+        // heap_arg_base points to start of arg items (no base items)
+        assert_eq!(vm.heap_arg_base, 0);
+        // The arg item was appended to the heap at heap_arg_base
+        assert_eq!(vm.heap.get_string(0).unwrap(), "hello");
     }
 
     // ==================== Host Functions ====================
@@ -4508,9 +4605,9 @@ LOAD_HASH_STATE r2, r0"#,
         "#;
         let vm = run_vm(source);
         let ref_id = vm.registers.get_ref(0, "").unwrap();
-        let hash_bytes = vm.heap.get_raw_ref(ref_id).unwrap();
+        let hash_bytes = vm.heap.get_hash(ref_id).unwrap();
         let expected = Hash::sha3().chain(b"hello").finalize();
-        assert_eq!(hash_bytes, expected.as_slice());
+        assert_eq!(hash_bytes.as_slice(), expected.as_slice());
     }
 
     #[test]
@@ -4534,10 +4631,10 @@ LOAD_HASH_STATE r2, r0"#,
         "#;
         let vm = run_vm(source);
         let ref_id = vm.registers.get_ref(0, "").unwrap();
-        let hash_bytes = vm.heap.get_raw_ref(ref_id).unwrap();
+        let hash_bytes = vm.heap.get_hash(ref_id).unwrap();
         let reg = vm.registers.get_int(1, "").unwrap();
         let expected = Hash::sha3().chain(&reg.to_le_bytes()).finalize();
-        assert_eq!(hash_bytes, expected.as_slice());
+        assert_eq!(hash_bytes.as_slice(), expected.as_slice());
     }
 
     // --- invalid host function ---
@@ -4587,9 +4684,9 @@ LOAD_HASH_STATE r2, r0"#,
         let source = r#"CALL_HOST1 r0, "hash", "test""#;
         let vm = run_vm(source);
         let ref_id = vm.registers.get_ref(0, "").unwrap();
-        let hash_bytes = vm.heap.get_raw_ref(ref_id).unwrap();
+        let hash_bytes = vm.heap.get_hash(ref_id).unwrap();
         let expected = Hash::sha3().chain(b"test").finalize();
-        assert_eq!(hash_bytes, expected.as_slice());
+        assert_eq!(hash_bytes.as_slice(), expected.as_slice());
     }
 
     #[test]
@@ -4597,9 +4694,9 @@ LOAD_HASH_STATE r2, r0"#,
         let source = "CALL_HOST1 r0, \"hash\", true";
         let vm = run_vm(source);
         let ref_id = vm.registers.get_ref(0, "").unwrap();
-        let hash_bytes = vm.heap.get_raw_ref(ref_id).unwrap();
+        let hash_bytes = vm.heap.get_hash(ref_id).unwrap();
         let expected = Hash::sha3().chain(&[1u8]).finalize();
-        assert_eq!(hash_bytes, expected.as_slice());
+        assert_eq!(hash_bytes.as_slice(), expected.as_slice());
     }
 
     #[test]
@@ -4607,9 +4704,9 @@ LOAD_HASH_STATE r2, r0"#,
         let source = "CALL_HOST1 r0, \"hash\", 42";
         let vm = run_vm(source);
         let ref_id = vm.registers.get_ref(0, "").unwrap();
-        let hash_bytes = vm.heap.get_raw_ref(ref_id).unwrap();
+        let hash_bytes = vm.heap.get_hash(ref_id).unwrap();
         let expected = Hash::sha3().chain(&42i64.to_le_bytes()).finalize();
-        assert_eq!(hash_bytes, expected.as_slice());
+        assert_eq!(hash_bytes.as_slice(), expected.as_slice());
     }
 
     #[test]
@@ -4644,27 +4741,25 @@ LOAD_HASH_STATE r2, r0"#,
         let mut data = program.init_code;
         data.extend(program.runtime_code);
 
-        let heap_items = program.items;
+        let mut heap = Heap::new(program.memory);
+        let base = heap.total_len() as u32;
+        for item in arg_items {
+            heap.append(item);
+        }
+
         let mut vm = VM {
             data,
             ip: 0,
             instr_offset: 0,
             registers: Registers::new(),
-            heap: Heap::new(heap_items),
+            heap,
             call_stack: Vec::new(),
             gas_used: 0,
             max_gas: BLOCK_GAS_LIMIT,
             gas_profile: GasProfile::new(),
             args,
-            heap_arg_base: 0,
-            memory: vec![],
+            heap_arg_base: base,
         };
-
-        let base = vm.heap.len() as u32;
-        for item in arg_items {
-            vm.heap.index(item);
-        }
-        vm.heap_arg_base = base;
 
         vm.run(&mut TestState::new(), EXECUTION_CONTEXT)
             .expect("vm run failed");
@@ -4744,7 +4839,7 @@ LOAD_HASH_STATE r2, r0"#,
     fn expand_mem_test() {
         let mut vm = run_vm("");
         vm.expand_memory(0, 8).unwrap();
-        assert_eq!(vm.memory.len(), 8);
+        assert_eq!(vm.exec_memory().len(), 8);
     }
 
     #[test]
@@ -4754,7 +4849,7 @@ LOAD_HASH_STATE r2, r0"#,
         MEM_STORE 64, 2
         "#;
         let vm = run_vm(code);
-        assert_eq!(vm.memory.len(), 72);
+        assert_eq!(vm.exec_memory().len(), 72);
     }
 
     #[test]
@@ -4764,8 +4859,8 @@ LOAD_HASH_STATE r2, r0"#,
         MEM_LOAD r0, 0
         "#;
         let vm = run_vm(code);
-        assert_eq!(vm.memory.len(), 8);
-        assert_eq!(&vm.memory, &12i64.to_le_bytes());
+        assert_eq!(vm.exec_memory().len(), 8);
+        assert_eq!(&vm.exec_memory(), &12i64.to_le_bytes());
         assert_eq!(vm.registers.get(0).unwrap(), &Value::Int(12));
     }
 
@@ -4775,8 +4870,8 @@ LOAD_HASH_STATE r2, r0"#,
         MEM_SET 0, 64, 255
         "#;
         let vm = run_vm(code);
-        assert_eq!(vm.memory.len(), 64);
-        assert_eq!(&vm.memory, &[255u8; 64]);
+        assert_eq!(vm.exec_memory().len(), 64);
+        assert_eq!(&vm.exec_memory(), &[255u8; 64]);
     }
 
     #[test]
@@ -4786,10 +4881,10 @@ LOAD_HASH_STATE r2, r0"#,
         MEM_COPY 128, 0, 64
         "#;
         let vm = run_vm(code);
-        assert_eq!(vm.memory.len(), 192);
-        assert_eq!(&vm.memory[0..64], &[255u8; 64]);
-        assert_eq!(&vm.memory[64..128], &[0u8; 64]);
-        assert_eq!(&vm.memory[128..192], &[255u8; 64]);
+        assert_eq!(vm.exec_memory().len(), 192);
+        assert_eq!(&vm.exec_memory()[0..64], &[255u8; 64]);
+        assert_eq!(&vm.exec_memory()[64..128], &[0u8; 64]);
+        assert_eq!(&vm.exec_memory()[128..192], &[255u8; 64]);
     }
 
     #[test]
@@ -4807,8 +4902,8 @@ LOAD_HASH_STATE r2, r0"#,
         MEM_COPY 0, 8, 16
         "#;
         let vm = run_vm(code);
-        assert_eq!(&vm.memory[0..16], &[171u8; 16]);
-        assert_eq!(&vm.memory[16..24], &[171u8; 8]);
+        assert_eq!(&vm.exec_memory()[0..16], &[171u8; 16]);
+        assert_eq!(&vm.exec_memory()[16..24], &[171u8; 8]);
     }
 
     #[test]
@@ -4819,8 +4914,8 @@ LOAD_HASH_STATE r2, r0"#,
         MEM_COPY 8, 0, 16
         "#;
         let vm = run_vm(code);
-        assert_eq!(&vm.memory[0..8], &[205u8; 8]);
-        assert_eq!(&vm.memory[8..24], &[205u8; 16]);
+        assert_eq!(&vm.exec_memory()[0..8], &[205u8; 8]);
+        assert_eq!(&vm.exec_memory()[8..24], &[205u8; 16]);
     }
 
     #[test]
@@ -4836,7 +4931,7 @@ LOAD_HASH_STATE r2, r0"#,
     #[test]
     fn memset_zero_length() {
         let vm = run_vm("MEM_SET 0, 0, 255");
-        assert_eq!(vm.memory.len(), 0);
+        assert_eq!(vm.exec_memory().len(), 0);
     }
 
     #[test]
@@ -4846,7 +4941,7 @@ LOAD_HASH_STATE r2, r0"#,
         MEM_COPY 0, 0, 0
         "#;
         let vm = run_vm(code);
-        assert_eq!(&vm.memory, &[170u8; 8]);
+        assert_eq!(&vm.exec_memory(), &[170u8; 8]);
     }
 
     #[test]
@@ -4854,15 +4949,15 @@ LOAD_HASH_STATE r2, r0"#,
         // Storing at offset 1 should expand to at least 9 bytes, rounded up to 16
         let mut vm = run_vm("");
         vm.expand_memory(1, 8).unwrap();
-        assert_eq!(vm.memory.len(), 16);
+        assert_eq!(vm.exec_memory().len(), 16);
     }
 
     #[test]
     fn memset_hex_addr_and_len() {
         let code = "MEM_SET 0x10, 0x20, 0xAB";
         let vm = run_vm(code);
-        assert_eq!(vm.memory.len(), 0x10 + 0x20);
-        assert_eq!(&vm.memory[0x10..0x30], &[0xABu8; 0x20]);
+        assert_eq!(vm.exec_memory().len(), 0x10 + 0x20);
+        assert_eq!(&vm.exec_memory()[0x10..0x30], &[0xABu8; 0x20]);
     }
 
     #[test]
@@ -4872,16 +4967,16 @@ LOAD_HASH_STATE r2, r0"#,
         MEM_COPY 0x20, 0x00, 0x10
         "#;
         let vm = run_vm(code);
-        assert_eq!(&vm.memory[0x00..0x10], &[0xFFu8; 0x10]);
-        assert_eq!(&vm.memory[0x20..0x30], &[0xFFu8; 0x10]);
+        assert_eq!(&vm.exec_memory()[0x00..0x10], &[0xFFu8; 0x10]);
+        assert_eq!(&vm.exec_memory()[0x20..0x30], &[0xFFu8; 0x10]);
     }
 
     #[test]
     fn memstore_hex_addr() {
         let code = "MEM_STORE 0x40, 0x1234";
         let vm = run_vm(code);
-        assert_eq!(vm.memory.len(), 0x48);
-        assert_eq!(&vm.memory[0x40..0x48], &0x1234i64.to_le_bytes());
+        assert_eq!(vm.exec_memory().len(), 0x48);
+        assert_eq!(&vm.exec_memory()[0x40..0x48], &0x1234i64.to_le_bytes());
     }
 
     #[test]

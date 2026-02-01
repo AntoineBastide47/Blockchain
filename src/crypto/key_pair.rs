@@ -156,7 +156,7 @@ const NONCE_LEN: usize = 24;
 /// Path: `~/.blockchain/{chain_id}/{node_name}/validator.key`
 fn validator_key_path(chain_id: u64, node_name: &str) -> io::Result<PathBuf> {
     let home =
-        dirs::home_dir().ok_or_else(|| io::Error::other("cannot determine home directory"))?;
+        dirs_next::home_dir().ok_or_else(|| io::Error::other("cannot determine home directory"))?;
     Ok(home
         .join(".blockchain")
         .join(chain_id.to_string())

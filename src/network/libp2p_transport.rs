@@ -85,7 +85,7 @@ const DERIVED_KEY_LEN: usize = 32;
 /// Creates the directory if it doesn't exist.
 #[cfg(not(test))]
 fn node_data_dir(chain_id: u64, node_name: &str) -> io::Result<PathBuf> {
-    let home = dirs::home_dir()
+    let home = dirs_next::home_dir()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory not found"))?;
     let node_dir = home
         .join(".blockchain")

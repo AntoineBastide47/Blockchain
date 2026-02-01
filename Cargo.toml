@@ -1,26 +1,43 @@
 [package]
 name = "blockchain"
-version = "0.17.1"
+version = "0.17.2"
 edition = "2024"
 default-run = "blockchain"
 
 [dependencies]
-tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util", "signal"] }
-sha3 = "0.10.8"
-k256 = "=0.13.4"
+# Async runtime and utilities.
+futures = { version = "0.3.31", default-features = false, features = ["async-await"] }
+tokio = { version = "1.49.0", default-features = false, features = ["macros", "rt-multi-thread", "sync", "time", "signal"] }
+
+# Networking (libp2p transport and protocols).
+libp2p = { version = "0.56.0", default-features = false, features = ["tcp", "noise", "yamux", "request-response", "identify", "tokio", "macros"] }
+
+# Cryptography: hashing, signatures, KDF, encryption, zeroization.
 rand_core = "=0.6.4"
-blockchain_derive = { path = "blockchain_derive" }
-dashmap = "6.1.0"
-futures = "0.3.31"
-libp2p = { version = "0.56.0", features = ["tcp", "noise", "yamux", "request-response", "identify", "tokio", "macros"] }
-termcolor = "1.4.1"
-dirs = "6.0.0"
+zeroize = { version = "1.8.2", default-features = false }
+sha3 = { version = "0.10.8", default-features = false }
+argon2 = { version = "0.5.3", default-features = false, features = ["alloc"] }
+chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["alloc"] }
+k256 = { version = "=0.13.4", default-features = false, features = ["ecdsa", "schnorr"] }
+
+# Storage and data structures.
 fs2 = "0.4.3"
-argon2 = "0.5.3"
-chacha20poly1305 = "0.10.1"
-zeroize = { version = "1.8.2", features = ["derive"] }
+dashmap = "6.1.0"
+sparse-merkle-tree = { version = "0.6.1", default-features = false }
+
+# CLI and system utilities.
+termcolor = "1.4.1"
+dirs-next = "2.0.0"
 rpassword = "7.4.0"
-sparse-merkle-tree = "0.6.1"
+
+# Local procedural macros.
+blockchain_derive = { path = "blockchain_derive" }
 
 [dev-dependencies]
 tempfile = "3.24.0"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"

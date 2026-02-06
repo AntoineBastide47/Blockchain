@@ -5,7 +5,10 @@
 
 use crate::core::block::Block;
 use crate::core::transaction::Transaction;
-use crate::network::message::{GetBlocksMessage, SendBlocksMessage, SendStatusMessage};
+use crate::network::message::{
+    GetBlocksMessage, GetHeadersMessage, GetSnapshotStateMessage, SendBlocksMessage,
+    SendHeadersMessage, SendSnapshotStateMessage, SendSyncStatusMessage,
+};
 use crate::types::bytes::Bytes;
 use crate::types::hash::Hash;
 use crate::types::wrapper_types::BoxFuture;
@@ -64,14 +67,22 @@ pub enum DecodedMessageData {
     Transaction(Transaction),
     /// A deserialized block.
     Block(Block),
-    /// Status request from a peer.
-    GetStatus,
-    /// Status response containing peer's chain info.
-    SendStatus(SendStatusMessage),
+    /// Sync status request from a peer.
+    GetSyncStatus,
+    /// Sync status response containing peer's chain info and snapshots.
+    SendSyncStatus(SendSyncStatusMessage),
+    /// Header range request from a peer.
+    GetHeaders(GetHeadersMessage),
+    /// Header range response.
+    SendHeaders(SendHeadersMessage),
     /// Block range request from a peer.
     GetBlocks(GetBlocksMessage),
     /// Block range response.
     SendBlocks(SendBlocksMessage),
+    /// Snapshot state request from a peer.
+    GetSnapshotState(GetSnapshotStateMessage),
+    /// Snapshot state response containing full state.
+    SendSnapshotState(SendSnapshotStateMessage),
 }
 
 /// A fully decoded RPC message with sender and typed payload.
@@ -96,8 +107,8 @@ pub enum RpcError {
     Transaction(String),
     #[error("failed to decode block: {0}")]
     Block(String),
-    #[error("failed to decode status: {0}")]
-    Status(String),
+    #[error("failed to decode: {0}")]
+    Decode(String),
 }
 
 /// Trait for processing decoded message payloads.

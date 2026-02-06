@@ -10,6 +10,7 @@ pub struct StateView<'a, S: VmStorage> {
 }
 
 impl<'a, S: VmStorage> StateView<'a, S> {
+    /// Creates a new read-only view wrapping the given storage.
     pub fn new(storage: &'a S) -> Self {
         Self { storage }
     }

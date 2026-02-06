@@ -287,7 +287,7 @@ mod tests {
         let key = PrivateKey::new();
         let tx = new_tx(Bytes::new(b"small"), key, TEST_CHAIN_ID);
 
-        let mut encoded = tx.to_bytes().to_vec();
+        let mut encoded = tx.to_vec();
 
         // Replace length prefix with value exceeding TRANSACTION_MAX_BYTES
         let fake_len = (TRANSACTION_MAX_BYTES + 1) as u64;
@@ -308,7 +308,7 @@ mod tests {
         let key = PrivateKey::new();
         let tx = new_tx(Bytes::new(b"data"), key, TEST_CHAIN_ID);
 
-        let mut encoded = tx.to_bytes().to_vec();
+        let mut encoded = tx.to_vec();
         encoded.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
 
         // from_bytes requires all bytes to be consumed

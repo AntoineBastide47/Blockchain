@@ -33,11 +33,9 @@
 use blockchain::core::blockchain::Blockchain;
 use blockchain::core::transaction::TransactionType;
 use blockchain::core::validator::BlockValidator;
-use blockchain::network::libp2p_transport::Libp2pTransport;
-use blockchain::network::server::Server;
-use blockchain::storage::main_storage::MainStorage;
-use blockchain::storage::state_view::StateViewProvider;
-use blockchain::storage::storage_trait::Storage;
+use blockchain::storage::rocksdb_storage::RocksDbStorage;
+use blockchain::storage::state_store::{StateStore, VmStorage};
+use blockchain::storage::state_view::{StateView, StateViewProvider};
 use blockchain::types::hash::Hash;
 use blockchain::utils::log::SHOW_TIMESTAMP;
 use blockchain::virtual_machine::assembler::{assemble_file, extract_label_data};
@@ -51,37 +49,33 @@ use std::path::Path;
 use std::process;
 use std::sync::atomic::Ordering;
 
-/// Parses a function call specification like "func(1,2,3)" or "func()".
-///
-/// Returns the function name and a vector of i64 arguments.
-fn parse_function_call(s: &str) -> Option<(String, Vec<i64>)> {
-    let open = s.find('(')?;
-    let close = s.rfind(')')?;
-    if close <= open {
-        return None;
+struct EmptyStorage;
+
+impl StateStore for EmptyStorage {
+    fn preview_root(&self, _: &[(Hash, Option<Vec<u8>>)]) -> Hash {
+        Hash::zero()
     }
 
-    let name = s[..open].trim().to_string();
-    if name.is_empty() {
-        return None;
+    fn apply_batch(&self, _: Vec<(Hash, Option<Vec<u8>>)>) {}
+
+    fn state_root(&self) -> Hash {
+        Hash::zero()
     }
+}
 
-    let args_str = s[open + 1..close].trim();
-    let args = if args_str.is_empty() {
-        Vec::new()
-    } else {
-        args_str
-            .split(',')
-            .map(|a| {
-                a.trim()
-                    .parse::<i64>()
-                    .map_err(|_| format!("invalid argument: {}", a))
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .ok()?
-    };
+impl VmStorage for EmptyStorage {
+    fn contains_key(&self, _: Hash) -> bool {
+        false
+    }
+    fn get(&self, _: Hash) -> Option<Vec<u8>> {
+        None
+    }
+}
 
-    Some((name, args))
+impl StateViewProvider for EmptyStorage {
+    fn state_view(&self) -> StateView<'_, Self> {
+        StateView::new(self)
+    }
 }
 
 fn main() {
@@ -197,7 +191,7 @@ fn main() {
     }
 
     if predict {
-        let ms = MainStorage::new(Server::<Libp2pTransport>::genesis_block(0, &[]), 0, &[]);
+        let ms = EmptyStorage {};
         let base = ms.state_view();
         let ctx = ExecContext {
             chain_id: 0,
@@ -205,7 +199,7 @@ fn main() {
         };
 
         // === Deployment cost prediction ===
-        let deploy_intrinsic = Blockchain::<BlockValidator, MainStorage>::intrinsic_gas_units(
+        let deploy_intrinsic = Blockchain::<BlockValidator, RocksDbStorage>::intrinsic_gas_units(
             TransactionType::DeployContract,
             &program_bytes,
         );
@@ -269,10 +263,11 @@ fn main() {
                 let exec_program = ExecuteProgram::new(Hash::zero(), fn_idx as i64, args, vec![]);
                 let exec_data = exec_program.to_bytes();
 
-                let exec_intrinsic = Blockchain::<BlockValidator, MainStorage>::intrinsic_gas_units(
-                    TransactionType::InvokeContract,
-                    &exec_data,
-                );
+                let exec_intrinsic =
+                    Blockchain::<BlockValidator, RocksDbStorage>::intrinsic_gas_units(
+                        TransactionType::InvokeContract,
+                        &exec_data,
+                    );
 
                 if exec_intrinsic > BLOCK_GAS_LIMIT {
                     warn!(
@@ -321,6 +316,39 @@ fn main() {
 
         warn!("Actual costs will depend on chain state and function arguments.");
     }
+}
+
+/// Parses a function call specification like "func(1,2,3)" or "func()".
+///
+/// Returns the function name and a vector of i64 arguments.
+fn parse_function_call(s: &str) -> Option<(String, Vec<i64>)> {
+    let open = s.find('(')?;
+    let close = s.rfind(')')?;
+    if close <= open || close != s.len() - 1 {
+        return None;
+    }
+
+    let name = s[..open].trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+
+    let args_str = s[open + 1..close].trim();
+    let args = if args_str.is_empty() {
+        Vec::new()
+    } else {
+        args_str
+            .split(',')
+            .map(|a| {
+                a.trim()
+                    .parse::<i64>()
+                    .map_err(|_| format!("invalid argument: {}", a))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?
+    };
+
+    Some((name, args))
 }
 
 fn format_with_commas(n: u64) -> String {

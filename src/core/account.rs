@@ -74,6 +74,13 @@ impl Account {
         self.code_hash
     }
 
+    /// Returns the root hash of the contract's storage trie.
+    ///
+    /// For EOAs or contracts without storage, returns [`EMPTY_STORAGE_ROOT`](Self::EMPTY_STORAGE_ROOT).
+    pub fn storage_root(&self) -> Hash {
+        self.storage_root
+    }
+
     /// Computes (and caches) a chain-specific hash of the encoded account value.
     pub fn value_hash(&self, chain_id: u64) -> Hash {
         self.cached_hash.get_or_compute(chain_id, || {
@@ -241,6 +248,14 @@ mod tests {
         assert_eq!(account.nonce(), 5);
         assert_eq!(account.balance(), 1000);
         assert!(account.is_contract());
+    }
+
+    #[test]
+    fn storage_root_returns_configured_value() {
+        let storage_root = Hash::sha3().chain(b"custom_storage").finalize();
+        let account = Account::from(1, 42, Account::EMPTY_CODE_HASH, storage_root);
+
+        assert_eq!(account.storage_root(), storage_root);
     }
 
     #[test]

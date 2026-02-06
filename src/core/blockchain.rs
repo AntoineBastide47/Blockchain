@@ -6,7 +6,7 @@ use crate::core::transaction::{Transaction, TransactionType};
 use crate::core::validator::{BLOCK_MAX_BYTES, BlockValidator, BlockValidatorError, Validator};
 use crate::crypto::key_pair::{Address, PrivateKey};
 use crate::network::server::BLOCK_TIME;
-use crate::storage::main_storage::MainStorage;
+use crate::storage::rocksdb_storage::RocksDbStorage;
 use crate::storage::state_store::{AccountStorage, VmStorage};
 use crate::storage::state_view::StateViewProvider;
 use crate::storage::storage_trait::{Storage, StorageError};
@@ -39,6 +39,7 @@ const BASE_REWARD: u128 = 64_000_000_000;
 ///
 /// TODO: Replace with real staking accounting once the staking module is implemented.
 const TEMP_TOTAL_STAKE: u128 = 32_000_000_000 * 32;
+const TEMP_STAKER_BALANCE: u128 = 10;
 
 /// Combined storage trait for blockchain operations.
 ///
@@ -59,12 +60,17 @@ pub struct Blockchain<V: Validator, S: StorageTrait> {
     storage: S,
 }
 
-impl Blockchain<BlockValidator, MainStorage> {
-    /// Creates a new blockchain with default validator and in-memory storage.
+impl Blockchain<BlockValidator, RocksDbStorage> {
+    /// Creates a new blockchain with default validator and RocksDB storage.
     ///
     /// The `id` parameter is the chain identifier used for transaction signing
     /// and verification, preventing replay attacks across different chains.
-    pub fn new(id: u64, genesis: Block, initial_accounts: &[(Address, Account)]) -> Self {
+    pub fn new(
+        id: u64,
+        db: Arc<rocksdb::DB>,
+        genesis: Block,
+        initial_accounts: &[(Address, Account)],
+    ) -> Result<Self, StorageError> {
         info!(
             "Initializing blockchain with genesis block: height={} hash={} transactions={}",
             genesis.header.height,
@@ -72,11 +78,74 @@ impl Blockchain<BlockValidator, MainStorage> {
             genesis.transactions.len()
         );
 
-        Self {
+        Ok(Self {
             id,
-            storage: MainStorage::new(genesis, id, initial_accounts),
+            storage: RocksDbStorage::new(db, genesis, id, initial_accounts)?,
             validator: BlockValidator,
-        }
+        })
+    }
+
+    /// Resets storage to the given genesis block and initial accounts.
+    pub fn reset_to_genesis(
+        &self,
+        genesis: Block,
+        initial_accounts: &[(Address, Account)],
+    ) -> Result<(), StorageError> {
+        self.storage.reset(genesis, self.id, initial_accounts)
+    }
+
+    /// Returns available snapshot heights (ascending).
+    pub fn snapshot_heights(&self) -> Result<Vec<u64>, StorageError> {
+        self.storage.snapshot_heights()
+    }
+
+    /// Returns the tip hash recorded for a snapshot at the given height.
+    pub fn snapshot_tip(&self, height: u64) -> Result<Option<Hash>, StorageError> {
+        self.storage.snapshot_tip(height)
+    }
+
+    /// Resets chain state to the snapshot at the given height.
+    pub fn reset_to_snapshot(&self, height: u64) -> Result<(), StorageError> {
+        self.storage.reset_to_snapshot(height)
+    }
+
+    /// Exports all state entries from the snapshot at the given height.
+    ///
+    /// Returns a vector of (key, value) pairs for state sync.
+    pub fn export_snapshot(&self, height: u64) -> Result<Vec<(Hash, Vec<u8>)>, StorageError> {
+        self.storage.export_snapshot(height)
+    }
+
+    /// Imports a snapshot received from a peer.
+    ///
+    /// Replaces current state with the snapshot state and sets the tip to the snapshot block.
+    pub fn import_snapshot(
+        &self,
+        height: u64,
+        block: Block,
+        entries: Vec<(Hash, Vec<u8>)>,
+    ) -> Result<(), StorageError> {
+        self.storage
+            .import_snapshot(height, block, entries, self.id)
+    }
+
+    /// Returns the height of the highest header we have stored.
+    ///
+    /// This may be higher than `height()` during header-first sync.
+    pub fn header_height(&self) -> u64 {
+        self.storage.header_height()
+    }
+
+    /// Returns the header at the given height, if it exists.
+    pub fn get_header_by_height(&self, height: u64) -> Option<Header> {
+        self.storage.get_header_by_height(height)
+    }
+
+    /// Stores multiple headers and validates the chain.
+    ///
+    /// Used during header-first sync to store headers before downloading blocks.
+    pub fn store_headers(&self, headers: &[Header]) -> Result<(), StorageError> {
+        self.storage.store_headers(headers, self.id)
     }
 }
 
@@ -99,6 +168,16 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
     /// Returns the block with the given hash, if it exists.
     pub fn get_block(&self, hash: Hash) -> Option<Arc<Block>> {
         self.storage.get_block(hash)
+    }
+
+    /// Returns the header with the given hash, if it exists.
+    pub fn get_header(&self, hash: Hash) -> Option<Header> {
+        self.storage.get_header(hash)
+    }
+
+    /// Returns the current state root from storage.
+    pub fn state_root(&self) -> Hash {
+        self.storage.state_root()
     }
 
     pub fn get_account(&self, address: Address) -> Option<Account> {
@@ -151,7 +230,15 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
     ) -> Result<Account, StorageError> {
         match overlay.get(address) {
             Some(b) => {
-                Account::from_bytes(&b).map_err(|e| StorageError::DecodeError(e.to_string()))
+                let mut slice: &[u8] = b.as_slice();
+                let original_len = slice.len();
+                let slice_ref: &mut &[u8] = &mut slice;
+                Account::decode(slice_ref).map_err(|e| {
+                    warn!(
+                        "try_get_account_overlay decode failed for {address}: {e} (len={original_len}, from overlay)"
+                    );
+                    StorageError::DecodeError(e.to_string())
+                })
             }
             None => self
                 .storage
@@ -219,6 +306,12 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
                         tx_overlay.push(code_hash, program.to_vec());
 
                         // Create contract account with code_hash reference
+                        //error!("Creating contract account with bytecode len={}", Account::from(
+                        //    0,
+                        //    transaction.amount,
+                        //    code_hash,
+                        //    Account::EMPTY_STORAGE_ROOT,
+                        //).to_vec().len());
                         tx_overlay.push(
                             contract_id,
                             Account::from(
@@ -432,7 +525,7 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
                     hashes.push(hash);
                     transactions.push(tx);
                 }
-                Err(e) => warn!("{e}"),
+                Err(e) => warn!("tx {hash} failed: {e}"),
             }
         }
 
@@ -440,7 +533,7 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
         // TODO: replace with real staking instead of balance
         let mut validator_account =
             self.try_get_account_overlay(validator_address, &block_overlay)?;
-        let reward = Self::validator_reward(validator_account.balance(), TEMP_TOTAL_STAKE);
+        let reward = Self::validator_reward(TEMP_STAKER_BALANCE, TEMP_TOTAL_STAKE);
         validator_account.credit(reward + validator_fee)?;
         block_overlay.push(validator_address, validator_account.to_vec());
 
@@ -528,7 +621,7 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
         // Reward the validator for creating the block using: staking + transaction fees
         let mut validator_account =
             self.try_get_account_overlay(validator_address, &block_overlay)?;
-        let reward = Self::validator_reward(validator_account.balance(), TEMP_TOTAL_STAKE);
+        let reward = Self::validator_reward(TEMP_STAKER_BALANCE, TEMP_TOTAL_STAKE);
         validator_account.credit(reward + validator_fee)?;
         block_overlay.push(validator_address, validator_account.to_vec());
 
@@ -552,6 +645,7 @@ mod tests {
     use super::*;
     use crate::core::block::Header;
     use crate::crypto::key_pair::PrivateKey;
+    use crate::network::server::tests::test_db;
     use crate::storage::test_storage::test::TestStorage;
     use crate::types::bytes::Bytes;
     use crate::types::hash::Hash;
@@ -642,7 +736,7 @@ mod tests {
     fn new_creates_blockchain_with_genesis() {
         let block = create_genesis(TEST_CHAIN_ID);
         let hash = block.header_hash(TEST_CHAIN_ID);
-        let bc = Blockchain::new(TEST_CHAIN_ID, block, &[]);
+        let bc = Blockchain::new(TEST_CHAIN_ID, test_db(), block, &[]).unwrap();
         assert_eq!(bc.height(), 0);
         assert!(bc.get_block(hash).is_some());
     }

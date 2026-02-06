@@ -1,3 +1,8 @@
+//! In-memory storage implementation for testing.
+//!
+//! Provides a simple HashMap-backed storage that implements all storage traits.
+//! Not suitable for production due to memory constraints.
+
 #[cfg(test)]
 pub mod test {
     use crate::core::account::Account;
@@ -25,8 +30,9 @@ pub mod test {
         state_root: RwLock<Hash>,
     }
 
-    impl Storage for TestStorage {
-        fn new(genesis: Block, chain_id: u64, initial_accounts: &[(Address, Account)]) -> Self {
+    impl TestStorage {
+        /// Creates a new test storage initialized with genesis block and accounts.
+        pub fn new(genesis: Block, chain_id: u64, initial_accounts: &[(Address, Account)]) -> Self {
             let storage = Self {
                 headers: RwLock::new(HashMap::new()),
                 blocks: RwLock::new(HashMap::new()),
@@ -42,7 +48,9 @@ pub mod test {
                 .expect("append_block failed");
             storage
         }
+    }
 
+    impl Storage for TestStorage {
         fn has_block(&self, hash: Hash) -> bool {
             self.blocks.read().unwrap().contains_key(&hash)
         }

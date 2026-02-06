@@ -130,6 +130,13 @@ impl Validator for BlockValidator {
 
         let expected_nonce = account.nonce();
         if transaction.nonce != expected_nonce {
+            crate::warn!(
+                "nonce mismatch for {}: account_nonce={} tx_nonce={} account_balance={}",
+                transaction.from.address(),
+                expected_nonce,
+                transaction.nonce,
+                account.balance()
+            );
             return Err(BlockValidatorError::NonceMismatch {
                 expected: expected_nonce,
                 actual: transaction.nonce,
@@ -386,10 +393,6 @@ mod tests {
 
     struct EmptyStorage;
     impl Storage for EmptyStorage {
-        fn new(_genesis: Block, _chain_id: u64, _: &[(Address, Account)]) -> Self {
-            Self
-        }
-
         fn has_block(&self, _: Hash) -> bool {
             false
         }

@@ -34,7 +34,7 @@ impl Header {
     ///
     /// The hash includes a domain separator ("BLOCK_HEADER"), the chain ID,
     /// and all header fields to prevent cross-chain replay attacks.
-    fn compute_hash(&self, chain_id: u64) -> Hash {
+    pub fn header_hash(&self, chain_id: u64) -> Hash {
         let mut h = Hash::sha3();
         h.update(b"BLOCK_HEADER");
         chain_id.encode(&mut h);
@@ -88,7 +88,7 @@ impl Block {
             header: header.clone(),
             validator: validator.public_key(),
             signature: validator
-                .sign(block_sign_data(chain_id, &header.compute_hash(chain_id)).as_slice()),
+                .sign(block_sign_data(chain_id, &header.header_hash(chain_id)).as_slice()),
             transactions: transactions.into_boxed_slice(),
             cached_header_hash: HashCache::new(),
         }
@@ -99,7 +99,7 @@ impl Block {
     /// The hash uniquely identifies this block within the given chain.
     pub fn header_hash(&self, chain_id: u64) -> Hash {
         self.cached_header_hash
-            .get_or_compute(chain_id, || self.header.compute_hash(chain_id))
+            .get_or_compute(chain_id, || self.header.header_hash(chain_id))
     }
 
     /// Verifies the block's cryptographic integrity.
@@ -188,8 +188,8 @@ mod tests {
     fn test_different_headers_different_hashes() {
         let header1 = create_header(5, &[]);
         let header2 = create_header(5, &[]);
-        let hash1 = header1.compute_hash(TEST_CHAIN_ID);
-        let hash2 = header2.compute_hash(TEST_CHAIN_ID);
+        let hash1 = header1.header_hash(TEST_CHAIN_ID);
+        let hash2 = header2.header_hash(TEST_CHAIN_ID);
         assert_ne!(
             hash1, hash2,
             "Different headers should produce different hashes"
@@ -367,7 +367,7 @@ mod tests {
     fn decode_rejects_oversized_length_prefix() {
         let block = create_block(create_header(1, &[]), vec![]);
 
-        let mut encoded = block.to_bytes().to_vec();
+        let mut encoded = block.to_vec();
 
         // Replace length prefix with value exceeding BLOCK_MAX_BYTES
         let fake_len = (BLOCK_MAX_BYTES + 1) as u64;
@@ -387,7 +387,7 @@ mod tests {
     fn decode_rejects_trailing_bytes() {
         let block = create_block(create_header(1, &[]), vec![]);
 
-        let mut encoded = block.to_bytes().to_vec();
+        let mut encoded = block.to_vec();
         encoded.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
 
         // from_bytes requires all bytes to be consumed

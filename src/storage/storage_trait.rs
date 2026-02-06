@@ -2,9 +2,7 @@
 //!
 //! Defines the [`Storage`] trait for persisting blocks and headers.
 
-use crate::core::account::Account;
 use crate::core::block::{Block, Header};
-use crate::crypto::key_pair::Address;
 use crate::types::encoding::DecodeError;
 use crate::types::hash::Hash;
 use crate::virtual_machine::errors::VMError;
@@ -69,9 +67,6 @@ impl From<DecodeError> for StorageError {
 /// Implementations must be thread-safe (`Send + Sync`) to support
 /// concurrent access from multiple network handlers.
 pub trait Storage: Send + Sync {
-    /// Creates a new storage instance initialized with the genesis block.
-    fn new(genesis: Block, chain_id: u64, initial_accounts: &[(Address, Account)]) -> Self;
-
     /// Returns `true` if a block with the given hash exists.
     fn has_block(&self, hash: Hash) -> bool;
 

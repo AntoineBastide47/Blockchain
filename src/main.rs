@@ -31,17 +31,23 @@ use blockchain::network::message::{Message, MessageType};
 use blockchain::network::rpc::Rpc;
 use blockchain::network::server::{DEV_CHAIN_ID, Server};
 use blockchain::network::transport::Transport;
-use blockchain::storage::main_storage::MainStorage;
+use blockchain::storage::rocksdb_storage::RocksDbStorage;
+use blockchain::storage::rocksdb_storage::{
+    CF_BLOCKS, CF_HEADERS, CF_META, CF_SNAPSHOTS, CF_STATE,
+};
 use blockchain::types::encoding::{Decode, Encode};
 use blockchain::virtual_machine::assembler::assemble_file;
 use blockchain::virtual_machine::program::ExecuteProgram;
 use blockchain::virtual_machine::vm::Value;
 use blockchain::{error, info, warn};
+use rocksdb::{BlockBasedOptions, Cache, ColumnFamilyDescriptor, DB, DBCompressionType, Options};
 use rpassword::prompt_password;
 use std::env;
+use std::fs;
+use std::io;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::process;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc::channel;
 use tokio::sync::oneshot;
@@ -51,8 +57,8 @@ use zeroize::Zeroizing;
 // Add your public key here to test as a validator
 const GENESIS_VALIDATORS: &[(&[u8], u128)] = &[(
     &[
-        95, 169, 138, 128, 215, 203, 132, 243, 127, 227, 2, 228, 236, 243, 221, 50, 71, 174, 227,
-        201, 119, 121, 236, 243, 230, 151, 10, 172, 44, 10, 250, 59,
+        239, 30, 167, 202, 168, 240, 126, 255, 50, 105, 78, 37, 127, 228, 70, 28, 221, 252, 253,
+        12, 51, 148, 105, 241, 23, 128, 94, 66, 243, 140, 192, 39,
     ],
     10u128.pow(20),
 )];
@@ -131,6 +137,15 @@ async fn main() {
         process::exit(1);
     }
 
+    // Initialize RocksDB
+    let db = match rocksdb_init(DEV_CHAIN_ID, node_name) {
+        Ok(db) => std::sync::Arc::new(db),
+        Err(e) => {
+            eprintln!("Failed to initialize RocksDB: {}", e);
+            process::exit(1);
+        }
+    };
+
     // Create transport and server
     let transport =
         match Libp2pTransport::new(listen_addr, DEV_CHAIN_ID, node_name, passphrase.as_bytes()) {
@@ -161,7 +176,13 @@ async fn main() {
         })
         .collect();
 
-    let server = Server::new(transport, validator_key.clone(), None, &validators).await;
+    let server = match Server::new(transport, db, validator_key.clone(), None, &validators).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to create server: {}", e);
+            process::exit(1);
+        }
+    };
     let server_clone = server.clone();
 
     // Start server
@@ -211,18 +232,22 @@ async fn main() {
 
     // If validator: deploy a contract, then repeatedly invoke it.
     if validator_mode {
-        static TX_NONCE: AtomicU64 = AtomicU64::new(0);
-
         let server_for_txs = server.clone();
         let validator_key_clone = validator_key.clone().unwrap();
 
         tokio::spawn(async move {
+            let sender_addr = validator_key_clone.public_key().address();
+
             // Deploy contract first
             let deploy_data = assemble_file("main.asm")
                 .expect("assembly failed")
                 .to_bytes();
 
-            let deploy_nonce = TX_NONCE.fetch_add(1, Ordering::Relaxed);
+            // Get current on-chain nonce
+            let deploy_nonce = server_for_txs
+                .get_account(sender_addr)
+                .map(|acc| acc.nonce())
+                .unwrap_or(0);
             let deploy_tx = Transaction::new(
                 validator_key_clone.public_key().address(),
                 None,
@@ -238,7 +263,7 @@ async fn main() {
             );
 
             // Compute the contract_id (same as Blockchain::contract_id)
-            let contract_id = Blockchain::<BlockValidator, MainStorage>::contract_id(&deploy_tx);
+            let contract_id = Blockchain::<BlockValidator, RocksDbStorage>::contract_id(&deploy_tx);
 
             let msg = Message::new(MessageType::Transaction, deploy_tx.to_bytes());
             if let Err(e) = server_for_txs.add_to_pool(deploy_tx) {
@@ -254,8 +279,25 @@ async fn main() {
             // Wait for deployment to be mined
             sleep(Duration::from_secs(6)).await;
 
+            // Track the last nonce we submitted to avoid duplicate transactions
+            let mut last_submitted_nonce: Option<u64> = None;
+
             // Now invoke the contract repeatedly
             loop {
+                // Get current on-chain nonce
+                let chain_nonce = server_for_txs
+                    .get_account(sender_addr)
+                    .map(|acc| acc.nonce())
+                    .unwrap_or(0);
+
+                // Only create a new transaction if the previous one was included
+                // (chain_nonce advanced) or we haven't submitted one yet
+                if last_submitted_nonce.is_some_and(|n| n >= chain_nonce) {
+                    // Previous transaction not yet included, wait
+                    sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+
                 let exec_program = ExecuteProgram {
                     contract_id,
                     function_id: 0,            // First public function (factorial)
@@ -263,7 +305,6 @@ async fn main() {
                     arg_items: Vec::new(),
                 };
 
-                let nonce = TX_NONCE.fetch_add(1, Ordering::Relaxed);
                 let invoke_tx = Transaction::new(
                     contract_id,
                     None,
@@ -272,7 +313,7 @@ async fn main() {
                     0,
                     10u128.pow(9),
                     50_000,
-                    nonce,
+                    chain_nonce,
                     validator_key_clone.clone(),
                     DEV_CHAIN_ID,
                     TransactionType::InvokeContract,
@@ -281,12 +322,15 @@ async fn main() {
                 let msg = Message::new(MessageType::Transaction, invoke_tx.to_bytes());
                 if let Err(e) = server_for_txs.add_to_pool(invoke_tx) {
                     warn!("invoke tx rejected: {e}");
-                } else if let Err(e) = server_for_txs
-                    .transport()
-                    .broadcast(server_for_txs.transport().peer_id(), msg.to_bytes())
-                    .await
-                {
-                    warn!("invoke tx broadcast failed: {e}");
+                } else {
+                    last_submitted_nonce = Some(chain_nonce);
+                    if let Err(e) = server_for_txs
+                        .transport()
+                        .broadcast(server_for_txs.transport().peer_id(), msg.to_bytes())
+                        .await
+                    {
+                        warn!("invoke tx broadcast failed: {e}");
+                    }
                 }
 
                 sleep(Duration::from_secs(1)).await;
@@ -355,4 +399,83 @@ fn socket_addr_to_multiaddr(addr: SocketAddr) -> libp2p::Multiaddr {
     };
     multiaddr.push(libp2p::multiaddr::Protocol::Tcp(addr.port()));
     multiaddr
+}
+
+/// Returns the path to the node's data directory.
+///
+/// Path: `~/.blockchain/{chain_id}/{node_name}/`
+fn node_data_dir(chain_id: u64, node_name: &str) -> io::Result<PathBuf> {
+    let home = dirs_next::home_dir()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory not found"))?;
+    let node_dir = home
+        .join(".blockchain")
+        .join(chain_id.to_string())
+        .join(node_name);
+    fs::create_dir_all(&node_dir)?;
+    Ok(node_dir)
+}
+
+/// Initializes RocksDB with the required column families.
+///
+/// Database location: `~/.blockchain/{chain_id}/{node_name}/db/`
+///
+/// Column families:
+/// - `headers`: Block headers indexed by hash
+/// - `blocks`: Full blocks indexed by hash
+/// - `meta`: Metadata (tip hash, state root)
+/// - `state`: SMT key-value pairs
+fn rocksdb_init(chain_id: u64, node_name: &str) -> io::Result<DB> {
+    let db_path = node_data_dir(chain_id, node_name)?.join("db");
+
+    let parallelism = std::thread::available_parallelism()
+        .map(|n| n.get() as i32)
+        .unwrap_or(4);
+
+    // Shared block cache (512MB default, reasonable for most machines)
+    let cache = Cache::new_lru_cache(512 * 1024 * 1024);
+
+    // DB-wide options
+    let mut opts = Options::default();
+    opts.create_if_missing(true);
+    opts.create_missing_column_families(true);
+    opts.increase_parallelism(parallelism);
+    opts.set_max_background_jobs(parallelism.min(8));
+    opts.set_compression_type(DBCompressionType::Lz4);
+    opts.set_write_buffer_size(64 * 1024 * 1024);
+    opts.optimize_level_style_compaction(512 * 1024 * 1024);
+
+    // Headers CF: point lookups by hash, write-once read-many
+    let headers_opts = cf_options_with_bloom(&cache, 10.0);
+
+    // Blocks CF: large values, point lookups, heavier compression
+    let mut blocks_opts = cf_options_with_bloom(&cache, 10.0);
+    blocks_opts.set_compression_type(DBCompressionType::Zstd);
+
+    // Meta CF: tiny, frequent access (tip, state root)
+    let meta_opts = cf_options_with_bloom(&cache, 10.0);
+
+    // State CF: SMT nodes, high read/write during execution
+    let state_opts = cf_options_with_bloom(&cache, 10.0);
+
+    let cfs = vec![
+        ColumnFamilyDescriptor::new(CF_HEADERS, headers_opts),
+        ColumnFamilyDescriptor::new(CF_BLOCKS, blocks_opts),
+        ColumnFamilyDescriptor::new(CF_META, meta_opts),
+        ColumnFamilyDescriptor::new(CF_STATE, state_opts),
+        ColumnFamilyDescriptor::new(CF_SNAPSHOTS, Options::default()),
+    ];
+
+    DB::open_cf_descriptors(&opts, &db_path, cfs)
+        .map_err(|e| io::Error::other(format!("failed to open RocksDB: {}", e)))
+}
+
+/// Creates column family options with bloom filter and shared block cache.
+fn cf_options_with_bloom(cache: &Cache, bits_per_key: f64) -> Options {
+    let mut block_opts = BlockBasedOptions::default();
+    block_opts.set_block_cache(cache);
+    block_opts.set_bloom_filter(bits_per_key, false);
+
+    let mut opts = Options::default();
+    opts.set_block_based_table_factory(&block_opts);
+    opts
 }

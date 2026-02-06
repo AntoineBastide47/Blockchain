@@ -23,7 +23,7 @@ use crate::types::encoding::Encode;
 use crate::utils::log::SHOW_TYPE;
 use crate::virtual_machine::errors::VMError;
 use crate::virtual_machine::isa::Instruction;
-use crate::virtual_machine::operand::SrcOperand;
+use crate::virtual_machine::operand::{AddrOperand, SrcOperand};
 use crate::virtual_machine::program::DeployProgram;
 use crate::virtual_machine::vm::HOST_FUNCTIONS;
 use crate::{define_instructions, error};
@@ -657,6 +657,23 @@ fn parse_src(
     )?))
 }
 
+/// Parses an address operand token.
+///
+/// Accepts either a register (`r0`, `r1`, ...) or an immediate u32 value
+/// (decimal or `0x` prefixed hex).
+fn parse_addr(tok: &str, line: usize, current_offset: usize) -> Result<AddrOperand, VMError> {
+    // Register: r0, r1, ...
+    if let Ok(reg) = parse_reg(tok) {
+        return Ok(AddrOperand::Reg(reg));
+    }
+    // number or hex
+    Ok(AddrOperand::U32(parse_u32_or_hex(
+        tok,
+        line,
+        current_offset,
+    )?))
+}
+
 /// Extracts the token text that caused an error, if available.
 fn error_token_text(err: &VMError) -> Option<&str> {
     match err {
@@ -722,6 +739,18 @@ fn src_size_from_token(tok: &str) -> usize {
         5 // tag + u32 ref
     } else {
         9 // tag + i64 (numbers and labels)
+    }
+}
+
+/// Computes the encoded size of an Addr operand from its token text.
+///
+/// - Register (r0, r1, ...): tag(1) + reg(1) = 2 bytes
+/// - Immediate u32: tag(1) + u32(4) = 5 bytes
+fn addr_size_from_token(tok: &str) -> usize {
+    if tok.starts_with('r') && tok.len() > 1 && tok[1..].chars().all(|c| c.is_ascii_digit()) {
+        2 // tag + register
+    } else {
+        5 // tag + u32
     }
 }
 
@@ -933,9 +962,10 @@ macro_rules! define_parse_instruction {
     (@token_size ImmU8, $iter:ident) => { { $iter.next(); 1usize } };
 
     (@token_size RefU32, $iter:ident) => { { $iter.next(); 4usize } };
-    (@token_size AddrU32, $iter:ident) => { { $iter.next(); 4usize } };
     (@token_size ImmI32, $iter:ident) => { { $iter.next(); 4usize } };
+    (@token_size ImmU32, $iter:ident) => { { $iter.next(); 4usize } };
 
+    (@token_size Addr, $iter:ident) => { addr_size_from_token($iter.next().unwrap().text) };
     (@token_size Src, $iter:ident) => { src_size_from_token($iter.next().unwrap().text) };
 
     // ---------- parsing ----------
@@ -956,7 +986,7 @@ macro_rules! define_parse_instruction {
     (@parse_operand ImmU8, $tok:expr, $ctx:expr, $line:ident, $offset:expr) => { parse_u8_or_hex(&$tok.text, $line, $offset) };
 
     (@parse_operand ImmI32, $tok:expr, $ctx:expr, $line:ident, $offset:expr) => { parse_i32_or_label(&$tok.text, $ctx, $line, $offset) };
-    (@parse_operand AddrU32, $tok:expr, $ctx:expr, $line:ident, $offset:expr) => { parse_u32_or_hex(&$tok.text, $line, $offset) };
+    (@parse_operand ImmU32, $tok:expr, $ctx:expr, $line:ident, $offset:expr) => { parse_u32_or_hex(&$tok.text, $line, $offset) };
     (@parse_operand RefU32, $tok:expr, $ctx:expr, $line:ident, $offset:expr) => {{
         let tok = &$tok.text;
         if let Some(s) = tok.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
@@ -966,6 +996,7 @@ macro_rules! define_parse_instruction {
         }
     }};
 
+    (@parse_operand Addr, $tok:expr, $ctx:expr, $line:ident, $offset:expr) => { parse_addr(&$tok.text, $line, $offset) };
     (@parse_operand Src, $tok:expr, $ctx:expr, $line:ident, $offset:expr) => { parse_src(&$tok.text, $ctx, $line, $offset) };
 }
 

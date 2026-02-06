@@ -3,7 +3,7 @@ main:                            # Equivalent to a contract constructor
     MOVE r1, 5                   # compute 5!
     CALL1 r2, factorial, r1      # r2 now contains 120 (5!)
     CALL_HOST1 r2, "hash", r2    # hash the value
-    STORE_HASH "hash", r2        # Store the hashes value at key "hash"
+    STORE "hash", r2             # Store the hashes value at key "hash"
     HALT
 
 [ runtime code ]

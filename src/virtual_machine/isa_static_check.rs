@@ -11,25 +11,26 @@ mod tests {
     /// Verifies that all instruction opcodes match their expected values.
     #[test]
     fn instruction_opcodes_unchanged() {
-        // Store and Load
-        assert_eq!(Instruction::Move as u8, 0x00);
-        assert_eq!(Instruction::DeleteState as u8, 0x01);
-        assert_eq!(Instruction::StoreI64 as u8, 0x02);
-        assert_eq!(Instruction::LoadI64State as u8, 0x03);
-        assert_eq!(Instruction::StoreBool as u8, 0x04);
-        assert_eq!(Instruction::LoadBoolState as u8, 0x05);
-        assert_eq!(Instruction::StoreStr as u8, 0x06);
-        assert_eq!(Instruction::LoadStrState as u8, 0x07);
-        assert_eq!(Instruction::StoreHash as u8, 0x08);
-        assert_eq!(Instruction::LoadHashState as u8, 0x09);
+        // Move, Casts and Misc
+        assert_eq!(Instruction::Noop as u8, 0x00);
+        assert_eq!(Instruction::Move as u8, 0x01);
+        assert_eq!(Instruction::CMove as u8, 0x02);
+        assert_eq!(Instruction::I64ToBool as u8, 0x03);
+        assert_eq!(Instruction::BoolToI64 as u8, 0x04);
+        assert_eq!(Instruction::StrToI64 as u8, 0x05);
+        assert_eq!(Instruction::I64ToStr as u8, 0x06);
+        assert_eq!(Instruction::StrToBool as u8, 0x07);
+        assert_eq!(Instruction::BoolToStr as u8, 0x08);
 
-        // Casts
-        assert_eq!(Instruction::I64ToBool as u8, 0x10);
-        assert_eq!(Instruction::BoolToI64 as u8, 0x11);
-        assert_eq!(Instruction::StrToI64 as u8, 0x12);
-        assert_eq!(Instruction::I64ToStr as u8, 0x13);
-        assert_eq!(Instruction::StrToBool as u8, 0x14);
-        assert_eq!(Instruction::BoolToStr as u8, 0x15);
+        // Store and Load
+        assert_eq!(Instruction::DeleteState as u8, 0x10);
+        assert_eq!(Instruction::HasState as u8, 0x11);
+        assert_eq!(Instruction::StoreBytes as u8, 0x12);
+        assert_eq!(Instruction::LoadBytes as u8, 0x13);
+        assert_eq!(Instruction::LoadI64 as u8, 0x14);
+        assert_eq!(Instruction::LoadBool as u8, 0x15);
+        assert_eq!(Instruction::LoadStr as u8, 0x16);
+        assert_eq!(Instruction::LoadHash as u8, 0x17);
 
         // Integer arithmetic
         assert_eq!(Instruction::Add as u8, 0x20);
@@ -77,14 +78,20 @@ mod tests {
         assert_eq!(Instruction::Ret as u8, 0x4F);
         assert_eq!(Instruction::Halt as u8, 0x50);
 
-        // Data access
+        // Data and Memory access
         assert_eq!(Instruction::CallDataLoad as u8, 0x51);
-
-        // Memory access
-        assert_eq!(Instruction::MemLoad as u8, 0x60);
-        assert_eq!(Instruction::MemStore as u8, 0x61);
-        assert_eq!(Instruction::MemCpy as u8, 0x62);
-        assert_eq!(Instruction::MemSet as u8, 0x63);
+        assert_eq!(Instruction::CallDataCopy as u8, 0x52);
+        assert_eq!(Instruction::CallDataLen as u8, 0x53);
+        assert_eq!(Instruction::MemLoad as u8, 0x54);
+        assert_eq!(Instruction::MemStore as u8, 0x55);
+        assert_eq!(Instruction::MemCpy as u8, 0x56);
+        assert_eq!(Instruction::MemSet as u8, 0x57);
+        assert_eq!(Instruction::MemLoad8U as u8, 0x58);
+        assert_eq!(Instruction::MemLoad8S as u8, 0x59);
+        assert_eq!(Instruction::MemLoad16U as u8, 0x5A);
+        assert_eq!(Instruction::MemLoad16S as u8, 0x5B);
+        assert_eq!(Instruction::MemLoad32U as u8, 0x5C);
+        assert_eq!(Instruction::MemLoad32S as u8, 0x5D);
 
         // Special Dispatch instruction
         assert_eq!(Instruction::Dispatch as u8, 0xFF);
@@ -93,25 +100,26 @@ mod tests {
     /// Verifies that all instruction mnemonics match their expected values.
     #[test]
     fn instruction_mnemonics_unchanged() {
-        // Store and Load
+        // Move, Casts and Misc
+        assert_eq!(Instruction::Noop.mnemonic(), "NOOP");
         assert_eq!(Instruction::Move.mnemonic(), "MOVE");
-        assert_eq!(Instruction::DeleteState.mnemonic(), "DELETE_STATE");
-        assert_eq!(Instruction::StoreI64.mnemonic(), "STORE_I64");
-        assert_eq!(Instruction::LoadI64State.mnemonic(), "LOAD_I64_STATE");
-        assert_eq!(Instruction::StoreBool.mnemonic(), "STORE_BOOL");
-        assert_eq!(Instruction::LoadBoolState.mnemonic(), "LOAD_BOOL_STATE");
-        assert_eq!(Instruction::StoreStr.mnemonic(), "STORE_STR");
-        assert_eq!(Instruction::LoadStrState.mnemonic(), "LOAD_STR_STATE");
-        assert_eq!(Instruction::StoreHash.mnemonic(), "STORE_HASH");
-        assert_eq!(Instruction::LoadHashState.mnemonic(), "LOAD_HASH_STATE");
-
-        // Casts
+        assert_eq!(Instruction::CMove.mnemonic(), "CMOVE");
         assert_eq!(Instruction::I64ToBool.mnemonic(), "I64_TO_BOOL");
         assert_eq!(Instruction::BoolToI64.mnemonic(), "BOOL_TO_I64");
         assert_eq!(Instruction::StrToI64.mnemonic(), "STR_TO_I64");
         assert_eq!(Instruction::I64ToStr.mnemonic(), "I64_TO_STR");
         assert_eq!(Instruction::StrToBool.mnemonic(), "STR_TO_BOOL");
         assert_eq!(Instruction::BoolToStr.mnemonic(), "BOOL_TO_STR");
+
+        // Store and Load
+        assert_eq!(Instruction::DeleteState.mnemonic(), "DELETE_STATE");
+        assert_eq!(Instruction::HasState.mnemonic(), "HAS_STATE");
+        assert_eq!(Instruction::StoreBytes.mnemonic(), "STORE");
+        assert_eq!(Instruction::LoadBytes.mnemonic(), "LOAD");
+        assert_eq!(Instruction::LoadI64.mnemonic(), "LOAD_I64");
+        assert_eq!(Instruction::LoadBool.mnemonic(), "LOAD_BOOL");
+        assert_eq!(Instruction::LoadStr.mnemonic(), "LOAD_STR");
+        assert_eq!(Instruction::LoadHash.mnemonic(), "LOAD_HASH");
 
         // Integer arithmetic
         assert_eq!(Instruction::Add.mnemonic(), "ADD");
@@ -159,14 +167,20 @@ mod tests {
         assert_eq!(Instruction::Ret.mnemonic(), "RET");
         assert_eq!(Instruction::Halt.mnemonic(), "HALT");
 
-        // Data access
+        // Data and Memory access
         assert_eq!(Instruction::CallDataLoad.mnemonic(), "CALLDATA_LOAD");
-
-        // Memory access
+        assert_eq!(Instruction::CallDataCopy.mnemonic(), "CALLDATA_COPY");
+        assert_eq!(Instruction::CallDataLen.mnemonic(), "CALLDATA_LEN");
         assert_eq!(Instruction::MemLoad.mnemonic(), "MEM_LOAD");
         assert_eq!(Instruction::MemStore.mnemonic(), "MEM_STORE");
         assert_eq!(Instruction::MemCpy.mnemonic(), "MEM_COPY");
         assert_eq!(Instruction::MemSet.mnemonic(), "MEM_SET");
+        assert_eq!(Instruction::MemLoad8U.mnemonic(), "MEM_LOAD_8U");
+        assert_eq!(Instruction::MemLoad8S.mnemonic(), "MEM_LOAD_8S");
+        assert_eq!(Instruction::MemLoad16U.mnemonic(), "MEM_LOAD_16U");
+        assert_eq!(Instruction::MemLoad16S.mnemonic(), "MEM_LOAD_16S");
+        assert_eq!(Instruction::MemLoad32U.mnemonic(), "MEM_LOAD_32U");
+        assert_eq!(Instruction::MemLoad32S.mnemonic(), "MEM_LOAD_32S");
 
         // Special Dispatch instruction
         assert_eq!(Instruction::Dispatch.mnemonic(), "DISPATCH");
@@ -175,25 +189,26 @@ mod tests {
     /// Verifies that all instruction base gas costs match their expected values.
     #[test]
     fn instruction_gas_costs_unchanged() {
-        // Store and Load
+        // Move, Casts and Misc
+        assert_eq!(Instruction::Noop.base_gas(), 1);
         assert_eq!(Instruction::Move.base_gas(), 1);
-        assert_eq!(Instruction::DeleteState.base_gas(), 2000);
-        assert_eq!(Instruction::StoreI64.base_gas(), 2000);
-        assert_eq!(Instruction::LoadI64State.base_gas(), 50);
-        assert_eq!(Instruction::StoreBool.base_gas(), 2000);
-        assert_eq!(Instruction::LoadBoolState.base_gas(), 50);
-        assert_eq!(Instruction::StoreStr.base_gas(), 2000);
-        assert_eq!(Instruction::LoadStrState.base_gas(), 50);
-        assert_eq!(Instruction::StoreHash.base_gas(), 2000);
-        assert_eq!(Instruction::LoadHashState.base_gas(), 50);
-
-        // Casts
+        assert_eq!(Instruction::CMove.base_gas(), 5);
         assert_eq!(Instruction::I64ToBool.base_gas(), 1);
         assert_eq!(Instruction::BoolToI64.base_gas(), 1);
         assert_eq!(Instruction::StrToI64.base_gas(), 30);
         assert_eq!(Instruction::I64ToStr.base_gas(), 30);
         assert_eq!(Instruction::StrToBool.base_gas(), 20);
         assert_eq!(Instruction::BoolToStr.base_gas(), 20);
+
+        // Store and Load
+        assert_eq!(Instruction::DeleteState.base_gas(), 2000);
+        assert_eq!(Instruction::HasState.base_gas(), 50);
+        assert_eq!(Instruction::StoreBytes.base_gas(), 2000);
+        assert_eq!(Instruction::LoadBytes.base_gas(), 50);
+        assert_eq!(Instruction::LoadI64.base_gas(), 50);
+        assert_eq!(Instruction::LoadBool.base_gas(), 50);
+        assert_eq!(Instruction::LoadStr.base_gas(), 50);
+        assert_eq!(Instruction::LoadHash.base_gas(), 50);
 
         // Integer arithmetic
         assert_eq!(Instruction::Add.base_gas(), 3);
@@ -241,14 +256,20 @@ mod tests {
         assert_eq!(Instruction::Ret.base_gas(), 5);
         assert_eq!(Instruction::Halt.base_gas(), 1);
 
-        // Data access
+        // Data and Memory access
         assert_eq!(Instruction::CallDataLoad.base_gas(), 3);
-
-        // Memory access
-        assert_eq!(Instruction::MemLoad.base_gas(), 2);
-        assert_eq!(Instruction::MemStore.base_gas(), 3);
-        assert_eq!(Instruction::MemCpy.base_gas(), 3);
-        assert_eq!(Instruction::MemSet.base_gas(), 3);
+        assert_eq!(Instruction::CallDataCopy.base_gas(), 5);
+        assert_eq!(Instruction::CallDataLen.base_gas(), 1);
+        assert_eq!(Instruction::MemLoad.base_gas(), 5);
+        assert_eq!(Instruction::MemStore.base_gas(), 5);
+        assert_eq!(Instruction::MemCpy.base_gas(), 5);
+        assert_eq!(Instruction::MemSet.base_gas(), 5);
+        assert_eq!(Instruction::MemLoad8U.base_gas(), 2);
+        assert_eq!(Instruction::MemLoad8S.base_gas(), 2);
+        assert_eq!(Instruction::MemLoad16U.base_gas(), 3);
+        assert_eq!(Instruction::MemLoad16S.base_gas(), 3);
+        assert_eq!(Instruction::MemLoad32U.base_gas(), 4);
+        assert_eq!(Instruction::MemLoad32S.base_gas(), 4);
 
         // Special Dispatch instruction
         assert_eq!(Instruction::Dispatch.base_gas(), 10);
@@ -257,14 +278,12 @@ mod tests {
     /// Verifies the total instruction count has not changed.
     #[test]
     fn instruction_count_unchanged() {
-        const EXPECTED_COUNT: usize = 62;
+        const EXPECTED_COUNT: usize = 71;
 
         // Count by verifying TryFrom succeeds for expected opcodes
         let mut count = 0;
         for byte in 0..=0xFF_u8 {
-            if Instruction::try_from(byte).is_ok() {
-                count += 1;
-            }
+            count += Instruction::try_from(byte).is_ok() as usize;
         }
 
         assert_eq!(

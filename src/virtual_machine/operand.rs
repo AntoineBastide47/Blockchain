@@ -1,6 +1,6 @@
 use crate::virtual_machine::errors::VMError;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SrcOperand {
     Reg(u8),
     Bool(bool),
@@ -24,6 +24,35 @@ impl SrcOperand {
             SrcOperand::Bool(_) => "Boolean",
             SrcOperand::I64(_) => "Integer",
             SrcOperand::Ref(_) => "Reference",
+        }
+    }
+}
+
+/// Address operand for memory operations.
+///
+/// Can be either an immediate 32-bit address or a register containing the address.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AddrOperand {
+    /// Immediate 32-bit address value.
+    U32(u32),
+    /// Register index containing the address.
+    Reg(u8),
+}
+
+impl AddrOperand {
+    /// Returns the encoded byte size of this operand (tag byte + payload).
+    pub const fn size(&self) -> usize {
+        1 + match self {
+            AddrOperand::Reg(_) => 1,
+            AddrOperand::U32(_) => 4,
+        }
+    }
+
+    /// Returns a human-readable type name for error messages.
+    pub const fn to_string(&self) -> &'static str {
+        match self {
+            AddrOperand::Reg(_) => "Register",
+            AddrOperand::U32(_) => "Integer",
         }
     }
 }
@@ -105,5 +134,19 @@ mod tests {
             let err = OperandTag::try_from(tag).unwrap_err();
             assert!(matches!(err, VMError::InvalidOperandTag { tag: t, .. } if t == tag));
         }
+    }
+
+    #[test]
+    fn addr_operand_size() {
+        assert_eq!(AddrOperand::Reg(0).size(), 2);
+        assert_eq!(AddrOperand::Reg(255).size(), 2);
+        assert_eq!(AddrOperand::U32(0).size(), 5);
+        assert_eq!(AddrOperand::U32(u32::MAX).size(), 5);
+    }
+
+    #[test]
+    fn addr_operand_to_string() {
+        assert_eq!(AddrOperand::Reg(0).to_string(), "Register");
+        assert_eq!(AddrOperand::U32(42).to_string(), "Integer");
     }
 }

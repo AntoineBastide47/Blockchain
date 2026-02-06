@@ -4,20 +4,27 @@
 //! registers. All arithmetic uses wrapping semantics to prevent overflow panics.
 
 use crate::error;
-use crate::types::encoding::{Decode, Encode};
+use crate::types::encoding::{Decode, Encode, EncodeSink};
 use crate::types::hash::{HASH_LEN, Hash};
 use crate::utils::log::SHOW_TYPE;
 use crate::virtual_machine::assembler::parse_i64_or_hex;
 use crate::virtual_machine::errors::VMError;
 use crate::virtual_machine::isa::Instruction;
-use crate::virtual_machine::operand::SrcOperand;
+use crate::virtual_machine::operand::{AddrOperand, SrcOperand};
 use crate::virtual_machine::program::{DeployProgram, ExecuteProgram};
 use crate::virtual_machine::state::State;
 use blockchain_derive::BinaryCodec;
 use std::ops::{Index, IndexMut, RangeBounds};
 use std::sync::atomic::Ordering;
 
+/// Size of a VM word in bytes (64-bit).
 const WORD_SIZE: usize = 8;
+/// Half word size (32-bit) for 32-bit memory loads.
+const HALF_WORD_SIZE: usize = WORD_SIZE / 2;
+/// Quarter word size (16-bit) for 16-bit memory loads.
+const QUARTER_WORD_SIZE: usize = WORD_SIZE / 4;
+/// Single byte size for 8-bit memory loads.
+const BYTE_SIZE: usize = WORD_SIZE / 8;
 
 /// Defines host function name constants and a lookup table of `(name, argc)` pairs.
 macro_rules! host_functions {
@@ -154,19 +161,30 @@ macro_rules! define_instruction_decoder {
         Ok::<String, VMError>(format!("@{}", u32::from_le_bytes(bytes.try_into().unwrap())))
     }};
 
-    (@read $data:ident $cursor:ident $start:ident AddrU32) => {{
-        let bytes = read_bytes($data, &mut $cursor, 4, $start)?;
-        Ok::<String, VMError>(u32::from_le_bytes(bytes.try_into().unwrap()).to_string())
-    }};
-
     (@read $data:ident $cursor:ident $start:ident ImmI32) => {{
         let bytes = read_bytes($data, &mut $cursor, 4, $start)?;
         Ok::<String, VMError>(i32::from_le_bytes(bytes.try_into().unwrap()).to_string())
     }};
 
+    (@read $data:ident $cursor:ident $start:ident ImmU32) => {{
+        let bytes = read_bytes($data, &mut $cursor, 4, $start)?;
+        Ok::<String, VMError>(u32::from_le_bytes(bytes.try_into().unwrap()).to_string())
+    }};
+
     (@read $data:ident $cursor:ident $start:ident ImmI64) => {{
         let bytes = read_bytes($data, &mut $cursor, 8, $start)?;
         Ok::<String, VMError>(i64::from_le_bytes(bytes.try_into().unwrap()).to_string())
+    }};
+
+    (@read $data:ident $cursor:ident $start:ident Addr) => {{let tag = read_u8($data, &mut $cursor, $start)?;
+      match tag {
+          0 => define_instruction_decoder!(@read $data $cursor $start Reg),
+          1 => {
+              let b = read_bytes($data, &mut $cursor, 4, $start)?;
+              Ok::<String, VMError>(u32::from_le_bytes(b.try_into().unwrap()).to_string())
+          }
+          _ => Err(VMError::InvalidOperandTag { tag, offset: $start })
+      }
     }};
 
     (@read $data:ident $cursor:ident $start:ident Src) => {{
@@ -323,7 +341,7 @@ const READ_BYTE_COST: u64 = 5;
 pub enum Value {
     /// Boolean value.
     Bool(bool),
-    /// Reference to a heap-allocated object (string pool index).
+    /// Reference to a heap-allocated object.
     Ref(u32),
     /// 64-bit signed integer.
     Int(i64),
@@ -532,28 +550,10 @@ impl Heap {
         String::decode(&mut bytes).map_err(|_| VMError::InvalidUtf8 { string_ref: id })
     }
 
-    /// Retrieves a hash by its reference index.
-    fn get_hash(&self, id: u32) -> Result<Hash, VMError> {
-        let bytes = self.get_raw_ref(id)?;
-        match Hash::from_slice(&bytes[WORD_SIZE..]) {
-            None => Err(VMError::InvalidHash {
-                expected_len: HASH_LEN,
-                actual_len: bytes.len(),
-            }),
-            Some(hash) => Ok(hash),
-        }
-    }
-
     /// Returns a slice of the execution memory (memory after exec_offset).
     #[cfg(test)]
     fn exec_memory(&self) -> &[u8] {
         &self.memory[self.exec_offset..]
-    }
-
-    /// Returns the total size of the heap memory.
-    #[cfg(test)]
-    fn total_len(&self) -> usize {
-        self.memory.len()
     }
 }
 
@@ -630,6 +630,12 @@ macro_rules! exec_vm {
         Ok::<i32, VMError>(i32::from_le_bytes(bytes.try_into().unwrap()))
     }};
 
+    // Decode an u32 immediate (little-endian, 4 bytes)
+    (@read $vm:ident, ImmU32) => {{
+        let bytes = $vm.read_exact(4)?;
+        Ok::<u32, VMError>(u32::from_le_bytes(bytes.try_into().unwrap()))
+    }};
+
     // Decode an i64 immediate (little-endian, 8 bytes)
     (@read $vm:ident, ImmI64) => {{
         let bytes = $vm.read_exact(8)?;
@@ -643,22 +649,26 @@ macro_rules! exec_vm {
     }};
 
     // Decode a u32 (little-endian, 4 bytes)
-    (@read $vm:ident, AddrU32) => {{
-        let bytes = $vm.read_exact(4)?;
-        Ok::<u32, VMError>(u32::from_le_bytes(bytes.try_into().unwrap()))
+    (@read $vm:ident, Addr) => {{
+        let tag = $vm.read_exact(1)?[0];
+        match tag {
+            0 => Ok::<AddrOperand, VMError>(AddrOperand::Reg(exec_vm!(@read $vm, Reg)?)),
+            1 => Ok::<AddrOperand, VMError>(AddrOperand::U32(exec_vm!(@read $vm, RefU32)?)),
+            _ => Err(VMError::InvalidOperandTag { tag, offset: $vm.ip })
+        }
     }};
 
     // Decode a bool (1 byte, 0 = false, nonzero = true)
     (@read $vm:ident, Src) => {{
-      let tag = $vm.read_exact(1)?[0];
-      match tag {
-          0 => Ok::<SrcOperand, VMError>(SrcOperand::Reg(exec_vm!(@read $vm, Reg)?)),
-          1 => Ok::<SrcOperand, VMError>(SrcOperand::Bool(exec_vm!(@read $vm, Reg)? == 1)),
-          2 => Ok::<SrcOperand, VMError>(SrcOperand::I64(exec_vm!(@read $vm, ImmI64)?)),
-          3 => Ok::<SrcOperand, VMError>(SrcOperand::Ref(exec_vm!(@read $vm, AddrU32)?)),
-          _ => Err(VMError::InvalidOperandTag { tag, offset: $vm.ip })
-      }
-  }}
+        let tag = $vm.read_exact(1)?[0];
+        match tag {
+            0 => Ok::<SrcOperand, VMError>(SrcOperand::Reg(exec_vm!(@read $vm, Reg)?)),
+            1 => Ok::<SrcOperand, VMError>(SrcOperand::Bool(exec_vm!(@read $vm, Reg)? == 1)),
+            2 => Ok::<SrcOperand, VMError>(SrcOperand::I64(exec_vm!(@read $vm, ImmI64)?)),
+            3 => Ok::<SrcOperand, VMError>(SrcOperand::Ref(exec_vm!(@read $vm, RefU32)?)),
+            _ => Err(VMError::InvalidOperandTag { tag, offset: $vm.ip })
+        }
+    }};
 }
 
 /// Execution context passed to the VM during contract execution.
@@ -719,8 +729,6 @@ pub struct VM {
     gas_profile: GasProfile,
     /// Arguments passed to the program, loaded into registers by `CALLDATA_LOAD`.
     args: Vec<Value>,
-    /// Heap offset at which argument-referenced items were inserted.
-    heap_arg_base: u32,
 }
 
 /// impl block for basic VM functions
@@ -750,7 +758,6 @@ impl VM {
             max_gas,
             gas_profile: GasProfile::new(),
             args: vec![],
-            heap_arg_base: 0,
         };
 
         vm.charge_gas_categorized(20_000 + total_bytes as u64 * 200, GasCategory::Deploy)?;
@@ -776,6 +783,16 @@ impl VM {
             heap.append(item);
         }
 
+        // Pre-remap refs to point to their actual heap locations
+        let args: Vec<Value> = execute
+            .args
+            .into_iter()
+            .map(|arg| match arg {
+                Value::Ref(r) => Value::Ref(heap_arg_base + r),
+                other => other,
+            })
+            .collect();
+
         let mut vm = Self {
             data: deploy.runtime_code,
             ip: 0,
@@ -786,12 +803,28 @@ impl VM {
             gas_used: 0,
             max_gas,
             gas_profile: GasProfile::new(),
-            args: execute.args,
-            heap_arg_base,
+            args,
         };
 
         vm.registers.set(0, Value::Int(execute.function_id))?;
         Ok(vm)
+    }
+
+    /// Serializes call arguments into raw calldata bytes.
+    ///
+    /// `Bool` and `Int` values are encoded using the VM's `Encode` format.
+    /// `Ref` values are expanded into their heap bytes (or empty if missing),
+    /// matching the layout expected by `CALLDATA_COPY` and `CALLDATA_LEN`.
+    fn args_to_vec(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for arg in &self.args {
+            match arg {
+                Value::Bool(b) => b.encode(&mut buf),
+                Value::Int(i) => i.encode(&mut buf),
+                Value::Ref(r) => buf.write(self.heap.get_raw_ref(*r).unwrap_or(&[])),
+            }
+        }
+        buf
     }
 
     /// Formats a runtime error with bytecode context and call stack.
@@ -1105,14 +1138,6 @@ impl VM {
         self.heap.get_string(id)
     }
 
-    /// Retrieves a hash from the heap by reference index with gas charging.
-    ///
-    /// Charges gas proportional to the hash's byte length.
-    fn heap_get_hash(&mut self, id: u32) -> Result<Hash, VMError> {
-        self.charge_gas_categorized(HASH_LEN as u64, GasCategory::HeapAllocation)?;
-        self.heap.get_hash(id)
-    }
-
     /// Writes a value to state storage with gas metering.
     ///
     /// Charges gas proportional to the key and value size using [`STORE_BYTE_COST`].
@@ -1226,24 +1251,25 @@ impl VM {
             ctx = ctx,
             instr = instruction,
             {
-                // Store and Load
+                // Move, Casts and Misc
+                Noop => op_noop(),
                 Move => op_move(rd: Reg, rs: Src),
-                DeleteState => op_delete_state(state, ctx; rd: Src),
-                StoreI64 => op_store_i64(state, ctx; key: Src, value: Src),
-                LoadI64State => op_load_i64_state(state, ctx; rd: Reg, key: Src),
-                StoreBool => op_store_bool(state, ctx; key: Src, value: Src),
-                LoadBoolState => op_load_bool_state(state, ctx; rd: Reg, key: Src),
-                StoreStr => op_store_str(state, ctx; key: Src, value: Src),
-                LoadStrState => op_load_str_state(state, ctx; rd: Reg, key: Src),
-                StoreHash => op_store_hash(state, ctx; key: Src, value: Src),
-                LoadHashState => op_load_hash_state(state, ctx; rd: Reg, key: Src),
-                // Casts
+                CMove => op_cmove(rd: Reg, cond: Src, r1: Src, r2: Src),
                 I64ToBool => op_i64_to_bool(rd: Reg, rs: Src),
                 BoolToI64 => op_bool_to_i64(rd: Reg, rs: Src),
                 StrToI64 => op_str_to_i64(rd: Reg, rs: Src),
                 I64ToStr => op_i64_to_str(rd: Reg, rs: Src),
                 StrToBool => op_str_to_bool(rd: Reg, rs: Src),
                 BoolToStr => op_bool_to_str(rd: Reg, rs: Src),
+                // Store and Load
+                DeleteState => op_delete_state(state, ctx; rd: Src),
+                HasState =>  op_has_state(state, ctx; rd: Reg, key: Src),
+                StoreBytes => op_store_bytes(state, ctx; key: Src, value: Src),
+                LoadBytes => op_load_bytes(state, ctx; rd: Reg, key: Src),
+                LoadI64 => op_load_i64(state, ctx; rd: Reg, key: Src),
+                LoadBool => op_load_bool(state, ctx; rd: Reg, key: Src),
+                LoadStr => op_load_str(state, ctx; rd: Reg, key: Src),
+                LoadHash => op_load_hash(state, ctx; rd: Reg, key: Src),
                 // Integer arithmetic
                 Add => op_add(rd: Reg, rs1: Src, rs2: Src),
                 Sub => op_sub(rd: Reg, rs1: Src, rs2: Src),
@@ -1287,186 +1313,28 @@ impl VM {
                 Jump => op_jump(offset: ImmI32),
                 Ret => op_ret(rs: Reg),
                 Halt => op_halt(),
-                // Data access
+                // Data and Memory access
                 CallDataLoad => op_call_data_load(rd: Reg),
-                // Memory access
-                MemLoad => op_memload(rd: Reg, addr: AddrU32),
-                MemStore => op_memstore(addr: AddrU32, rs: Src),
-                MemCpy => op_memcpy(dst: AddrU32, src: AddrU32, len: AddrU32),
-                MemSet => op_memset(dst: AddrU32, len: AddrU32, val: ImmU8),
+                CallDataCopy => op_call_data_copy(dst: Addr),
+                CallDataLen => op_call_data_len(rd: Reg),
+                MemLoad => op_memload(rd: Reg, addr: Addr),
+                MemStore => op_memstore(addr: Addr, rs: Src),
+                MemCpy => op_memcpy(dst: Addr, src: Addr, len: Addr),
+                MemSet => op_memset(dst: Addr, len: Addr, val: ImmU8),
+                MemLoad8U => op_memload_8u(rd: Reg, addr: Addr),
+                MemLoad8S => op_memload_8s(rd: Reg, addr: Addr),
+                MemLoad16U => op_memload_16u(rd: Reg, addr: Addr),
+                MemLoad16S => op_memload_16s(rd: Reg, addr: Addr),
+                MemLoad32U => op_memload_32u(rd: Reg, addr: Addr),
+                MemLoad32S => op_memload_32s(rd: Reg, addr: Addr),
                 // Special Op Codes
                 Dispatch => op_dispatch(),
             }
         }
     }
 
-    fn op_delete_state<S: State>(
-        &mut self,
-        _instr: &'static str,
-        state: &mut S,
-        ctx: &ExecContext,
-        key: SrcOperand,
-    ) -> Result<(), VMError> {
-        let key_ref = self.bytes_from_operand(key)?;
-        let key = self.make_state_key(ctx.chain_id, &ctx.contract_id, &key_ref)?;
-        state.delete(key);
+    fn op_noop(&self, _instr: &'static str) -> Result<(), VMError> {
         Ok(())
-    }
-
-    fn op_load_i64(&mut self, _instr: &'static str, dst: u8, imm: i64) -> Result<(), VMError> {
-        self.registers.set(dst, Value::Int(imm))
-    }
-
-    fn op_store_i64<S: State>(
-        &mut self,
-        instr: &'static str,
-        state: &mut S,
-        ctx: &ExecContext,
-        key: SrcOperand,
-        value: SrcOperand,
-    ) -> Result<(), VMError> {
-        let key_ref = self.bytes_from_operand(key)?;
-        let val = self.int_from_operand(value, instr, 1)?;
-        let key = self.make_state_key(ctx.chain_id, &ctx.contract_id, &key_ref)?;
-        self.state_push(state, key, val.to_le_bytes().to_vec())
-    }
-
-    fn op_load_i64_state<S: State>(
-        &mut self,
-        instr: &'static str,
-        state: &mut S,
-        ctx: &ExecContext,
-        dst: u8,
-        key: SrcOperand,
-    ) -> Result<(), VMError> {
-        let key_ref = self.ref_from_operand(key, instr, 1)?;
-        let key_str = self.heap_get_string(key_ref)?;
-        let state_key = self.make_state_key(ctx.chain_id, &ctx.contract_id, key_str.as_bytes())?;
-        let value = self.state_get(state, state_key)?;
-        let bytes: [u8; 8] = value.try_into().map_err(|_| VMError::InvalidStateValue {
-            key: key_str.clone(),
-            expected: "8 bytes for i64",
-        })?;
-        self.registers
-            .set(dst, Value::Int(i64::from_le_bytes(bytes)))
-    }
-
-    fn op_load_bool(&mut self, _instr: &'static str, dst: u8, b: bool) -> Result<(), VMError> {
-        self.registers.set(dst, Value::Bool(b))
-    }
-
-    fn op_store_bool<S: State>(
-        &mut self,
-        instr: &'static str,
-        state: &mut S,
-        ctx: &ExecContext,
-        key: SrcOperand,
-        value: SrcOperand,
-    ) -> Result<(), VMError> {
-        let key_ref = self.bytes_from_operand(key)?;
-        let val = self.bool_from_operand(value, instr, 1)?;
-        let key = self.make_state_key(ctx.chain_id, &ctx.contract_id, &key_ref)?;
-        self.state_push(state, key, [val as u8].into())
-    }
-
-    fn op_load_bool_state<S: State>(
-        &mut self,
-        instr: &'static str,
-        state: &mut S,
-        ctx: &ExecContext,
-        dst: u8,
-        key: SrcOperand,
-    ) -> Result<(), VMError> {
-        let key_ref = self.ref_from_operand(key, instr, 1)?;
-        let key_str = self.heap_get_string(key_ref)?;
-        let state_key = self.make_state_key(ctx.chain_id, &ctx.contract_id, key_str.as_bytes())?;
-        let value = self.state_get(state, state_key)?;
-        if value.len() != 1 {
-            return Err(VMError::InvalidStateValue {
-                key: key_str,
-                expected: "1 byte for bool",
-            });
-        }
-        self.registers.set(dst, Value::Bool(value[0] != 0))
-    }
-
-    fn op_load_str(&mut self, _instr: &'static str, dst: u8, str_ref: u32) -> Result<(), VMError> {
-        self.registers.set(dst, Value::Ref(str_ref))
-    }
-
-    fn op_store_str<S: State>(
-        &mut self,
-        instr: &'static str,
-        state: &mut S,
-        ctx: &ExecContext,
-        key: SrcOperand,
-        value: SrcOperand,
-    ) -> Result<(), VMError> {
-        let key_ref = self.bytes_from_operand(key)?;
-        let val_ref = self.ref_from_operand(value, instr, 1)?;
-        let val_str = self.heap_get_string(val_ref)?;
-        let key = self.make_state_key(ctx.chain_id, &ctx.contract_id, &key_ref)?;
-        self.state_push(state, key, val_str.into_bytes())
-    }
-
-    fn op_load_str_state<S: State>(
-        &mut self,
-        instr: &'static str,
-        state: &mut S,
-        ctx: &ExecContext,
-        dst: u8,
-        key: SrcOperand,
-    ) -> Result<(), VMError> {
-        let key_ref = self.ref_from_operand(key, instr, 1)?;
-        let key_str = self.heap_get_string(key_ref)?;
-        let state_key = self.make_state_key(ctx.chain_id, &ctx.contract_id, key_str.as_bytes())?;
-        let value = state
-            .get(state_key)
-            .ok_or(VMError::KeyNotFound { key: key_str })?;
-        let str_ref = self.heap_index(value)?;
-        self.op_load_str(instr, dst, str_ref)
-    }
-
-    fn op_load_hash(
-        &mut self,
-        _instr: &'static str,
-        dst: u8,
-        hash_ref: u32,
-    ) -> Result<(), VMError> {
-        self.registers.set(dst, Value::Ref(hash_ref))
-    }
-
-    fn op_store_hash<S: State>(
-        &mut self,
-        instr: &'static str,
-        state: &mut S,
-        ctx: &ExecContext,
-        key: SrcOperand,
-        value: SrcOperand,
-    ) -> Result<(), VMError> {
-        let key_ref = self.bytes_from_operand(key)?;
-        let val_ref = self.ref_from_operand(value, instr, 1)?;
-        let val_hash = self.heap_get_hash(val_ref)?;
-        let key = self.make_state_key(ctx.chain_id, &ctx.contract_id, &key_ref)?;
-        self.state_push(state, key, val_hash.to_vec())
-    }
-
-    fn op_load_hash_state<S: State>(
-        &mut self,
-        instr: &'static str,
-        state: &mut S,
-        ctx: &ExecContext,
-        dst: u8,
-        key: SrcOperand,
-    ) -> Result<(), VMError> {
-        let key_ref = self.ref_from_operand(key, instr, 1)?;
-        let key_str = self.heap_get_string(key_ref)?;
-        let state_key = self.make_state_key(ctx.chain_id, &ctx.contract_id, key_str.as_bytes())?;
-        let value = state
-            .get(state_key)
-            .ok_or(VMError::KeyNotFound { key: key_str })?;
-        let hash_ref = self.heap_index(value)?;
-        self.op_load_hash(instr, dst, hash_ref)
     }
 
     fn op_move(&mut self, _instr: &'static str, dst: u8, src: SrcOperand) -> Result<(), VMError> {
@@ -1477,6 +1345,47 @@ impl VM {
             SrcOperand::Ref(r) => Value::Ref(r),
         };
         self.registers.set(dst, v)
+    }
+
+    /// Conditional move: `dst = cond ? r1 : r2`.
+    ///
+    /// If `cond` is truthy (non-zero integer or `true`), moves `r1` to `dst`;
+    /// otherwise moves `r2` to `dst`. Reference operands for `cond` are rejected.
+    fn op_cmove(
+        &mut self,
+        instr: &'static str,
+        dst: u8,
+        cond: SrcOperand,
+        r1: SrcOperand,
+        r2: SrcOperand,
+    ) -> Result<(), VMError> {
+        let v: bool = match cond {
+            SrcOperand::Reg(idx) => match *self.registers.get(idx)? {
+                Value::Bool(b) => b,
+                Value::Ref(_) => {
+                    return Err(VMError::TypeMismatchStatic {
+                        instruction: instr,
+                        arg_index: 2,
+                        expected: "Boolean or Integer",
+                        actual: "Reference",
+                    });
+                }
+                Value::Int(i) => i != 0,
+            },
+            SrcOperand::Bool(b) => b,
+            SrcOperand::I64(i) => i != 0,
+            SrcOperand::Ref(_) => {
+                return Err(VMError::TypeMismatchStatic {
+                    instruction: instr,
+                    arg_index: 2,
+                    expected: "Boolean or Integer",
+                    actual: "Reference",
+                });
+            }
+        };
+
+        let value = if v { r1 } else { r2 };
+        self.op_move(instr, dst, value)
     }
 
     fn op_i64_to_bool(
@@ -1507,7 +1416,8 @@ impl VM {
     ) -> Result<(), VMError> {
         let reg = self.ref_from_operand(src, instr, 1)?;
         let str = self.heap_get_string(reg)?;
-        self.op_load_i64(instr, dst, parse_i64_or_hex(&str, 0, 0)?)
+        self.registers
+            .set(dst, Value::Int(parse_i64_or_hex(&str, 0, 0)?))
     }
 
     /// Returns the number of characters in the decimal string representation of `n`.
@@ -1573,7 +1483,7 @@ impl VM {
         // Charge gas manually before allocation instead of using heap_index()
         self.charge_gas_categorized(Self::digits_i64(reg), GasCategory::HeapAllocation)?;
         let str_ref = self.heap.append(reg.to_string().into_bytes());
-        self.op_load_str(instr, dst, str_ref)
+        self.registers.set(dst, Value::Ref(str_ref))
     }
 
     fn op_str_to_bool(
@@ -1596,7 +1506,7 @@ impl VM {
                 actual: str,
             });
         };
-        self.op_load_bool(instr, dst, b)
+        self.registers.set(dst, Value::Bool(b))
     }
 
     fn op_bool_to_str(
@@ -1610,7 +1520,133 @@ impl VM {
         self.charge_gas_categorized(if reg { 4 } else { 5 }, GasCategory::HeapAllocation)?;
         let str = (if reg { "true" } else { "false" }).to_string();
         let bool_ref = self.heap.append(str.into_bytes());
-        self.op_load_str(instr, dst, bool_ref)
+        self.registers.set(dst, Value::Ref(bool_ref))
+    }
+
+    fn op_delete_state<S: State>(
+        &mut self,
+        _instr: &'static str,
+        state: &mut S,
+        ctx: &ExecContext,
+        key: SrcOperand,
+    ) -> Result<(), VMError> {
+        let key_ref = self.bytes_from_operand(key)?;
+        let key = self.make_state_key(ctx.chain_id, &ctx.contract_id, &key_ref)?;
+        state.delete(key);
+        Ok(())
+    }
+
+    fn op_has_state<S: State>(
+        &mut self,
+        _instr: &'static str,
+        state: &mut S,
+        ctx: &ExecContext,
+        dst: u8,
+        key: SrcOperand,
+    ) -> Result<(), VMError> {
+        let key_ref = self.bytes_from_operand(key)?;
+        let key = self.make_state_key(ctx.chain_id, &ctx.contract_id, &key_ref)?;
+        self.registers
+            .set(dst, Value::Bool(state.contains_key(key)))
+    }
+
+    fn op_store_bytes<S: State>(
+        &mut self,
+        _instr: &'static str,
+        state: &mut S,
+        ctx: &ExecContext,
+        key: SrcOperand,
+        value: SrcOperand,
+    ) -> Result<(), VMError> {
+        let key_ref = self.bytes_from_operand(key)?;
+        let val = self.bytes_from_operand(value)?;
+        let key = self.make_state_key(ctx.chain_id, &ctx.contract_id, &key_ref)?;
+        self.state_push(state, key, val)
+    }
+
+    fn load_state_bytes<S: State>(
+        &mut self,
+        state: &mut S,
+        ctx: &ExecContext,
+        key: SrcOperand,
+    ) -> Result<(Vec<u8>, Vec<u8>), VMError> {
+        let key_ref = self.bytes_from_operand(key)?;
+        let state_key = self.make_state_key(ctx.chain_id, &ctx.contract_id, &key_ref)?;
+        Ok((key_ref, self.state_get(state, state_key)?))
+    }
+
+    fn op_load_bytes<S: State>(
+        &mut self,
+        _instr: &'static str,
+        state: &mut S,
+        ctx: &ExecContext,
+        dst: u8,
+        key: SrcOperand,
+    ) -> Result<(), VMError> {
+        let (_, value) = self.load_state_bytes(state, ctx, key)?;
+        let index = self.heap_index(value)?;
+        self.registers.set(dst, Value::Ref(index))
+    }
+
+    fn op_load_i64<S: State>(
+        &mut self,
+        _instr: &'static str,
+        state: &mut S,
+        ctx: &ExecContext,
+        dst: u8,
+        key: SrcOperand,
+    ) -> Result<(), VMError> {
+        let (key, value) = self.load_state_bytes(state, ctx, key)?;
+        let bytes: [u8; 8] = value.try_into().map_err(|_| VMError::InvalidStateValue {
+            key: format!("{:?}", key),
+            expected: "8 bytes for i64",
+        })?;
+        self.registers
+            .set(dst, Value::Int(i64::from_le_bytes(bytes)))
+    }
+
+    fn op_load_bool<S: State>(
+        &mut self,
+        _instr: &'static str,
+        state: &mut S,
+        ctx: &ExecContext,
+        dst: u8,
+        key: SrcOperand,
+    ) -> Result<(), VMError> {
+        let (key, value) = self.load_state_bytes(state, ctx, key)?;
+        if value.len() != 1 {
+            return Err(VMError::InvalidStateValue {
+                key: format!("{:?}", key),
+                expected: "1 byte for bool",
+            });
+        }
+        self.registers.set(dst, Value::Bool(value[0] != 0))
+    }
+
+    fn op_load_str<S: State>(
+        &mut self,
+        _instr: &'static str,
+        state: &mut S,
+        ctx: &ExecContext,
+        dst: u8,
+        key: SrcOperand,
+    ) -> Result<(), VMError> {
+        let (_, value) = self.load_state_bytes(state, ctx, key)?;
+        let str_ref = self.heap_index(value)?;
+        self.registers.set(dst, Value::Ref(str_ref))
+    }
+
+    fn op_load_hash<S: State>(
+        &mut self,
+        _instr: &'static str,
+        state: &mut S,
+        ctx: &ExecContext,
+        dst: u8,
+        key: SrcOperand,
+    ) -> Result<(), VMError> {
+        let (_, value) = self.load_state_bytes(state, ctx, key)?;
+        let hash_ref = self.heap_index(value)?;
+        self.registers.set(dst, Value::Ref(hash_ref))
     }
 
     fn op_add(
@@ -1741,12 +1777,12 @@ impl VM {
 
     fn op_inc(&mut self, instr: &'static str, dst: u8) -> Result<(), VMError> {
         let r = self.registers.get_int(dst, instr)?;
-        self.op_load_i64(instr, dst, r.wrapping_add(1))
+        self.registers.set(dst, Value::Int(r.wrapping_add(1)))
     }
 
     fn op_dec(&mut self, instr: &'static str, dst: u8) -> Result<(), VMError> {
         let r = self.registers.get_int(dst, instr)?;
-        self.op_load_i64(instr, dst, r.wrapping_sub(1))
+        self.registers.set(dst, Value::Int(r.wrapping_sub(1)))
     }
 
     fn op_not(&mut self, instr: &'static str, dst: u8, src: SrcOperand) -> Result<(), VMError> {
@@ -1865,7 +1901,7 @@ impl VM {
 
     fn op_call_host(
         &mut self,
-        instr: &'static str,
+        _instr: &'static str,
         dst: u8,
         fn_id: u32,
         argc: u8,
@@ -1931,7 +1967,7 @@ impl VM {
 
                 let sliced = data[start..end].to_vec();
                 let new_ref = self.heap_index(sliced)?;
-                self.op_load_str(instr, dst, new_ref)
+                self.registers.set(dst, Value::Ref(new_ref))
             }
             CONCAT => {
                 arg_len_check(host_func_argc(CONCAT), args.len() as u8, CONCAT)?;
@@ -1946,7 +1982,7 @@ impl VM {
                 result.extend_from_slice(self.heap.get_data(ref2)?);
 
                 let new_ref = self.heap_index(result)?;
-                self.op_load_str(instr, dst, new_ref)
+                self.registers.set(dst, Value::Ref(new_ref))
             }
             COMPARE => {
                 arg_len_check(host_func_argc(COMPARE), args.len() as u8, COMPARE)?;
@@ -1964,7 +2000,7 @@ impl VM {
                     std::cmp::Ordering::Equal => 0,
                     std::cmp::Ordering::Greater => 1,
                 };
-                self.op_load_i64(instr, dst, cmp)
+                self.registers.set(dst, Value::Int(cmp))
             }
             _ => Err(VMError::InvalidCallHostFunction { name: fn_name }),
         }
@@ -1989,7 +2025,7 @@ impl VM {
                 let str_ref = self.ref_from_operand(arg, instr, 1)?;
                 let len = self.heap.get_data(str_ref)?.len();
                 self.charge_gas_categorized(len as u64, GasCategory::HostFunction)?;
-                self.op_load_i64(instr, dst, len as i64)
+                self.registers.set(dst, Value::Int(len as i64))
             }
             HASH => {
                 let value = self.value_from_operand(arg)?;
@@ -2006,7 +2042,7 @@ impl VM {
                     Value::Int(i) => Hash::sha3().chain(&i.to_le_bytes()).finalize(),
                 };
                 let new_ref = self.heap_index(hash.to_vec())?;
-                self.op_load_hash(instr, dst, new_ref)
+                self.registers.set(dst, Value::Ref(new_ref))
             }
             _ => Err(VMError::InvalidCallHostFunction { name: fn_name }),
         }
@@ -2185,27 +2221,35 @@ impl VM {
         Ok(())
     }
 
-    /// Loads program call arguments into consecutive registers starting at `dst`,
-    /// remapping `Value::Ref` indices to account for the heap base offset.
     fn op_call_data_load(&mut self, _instr: &'static str, dst: u8) -> Result<(), VMError> {
-        let mut i = dst;
-        for arg in &self.args {
-            let mapped = match arg {
-                Value::Ref(r) if (*r as usize) < self.args.len() => {
-                    Value::Ref(self.heap_arg_base + r)
-                }
-                other => *other,
-            };
-            self.registers.set(i, mapped)?;
-            i += 1;
+        for (i, arg) in self.args.iter().enumerate() {
+            self.registers.set(dst + i as u8, *arg)?;
         }
         Ok(())
     }
 
+    fn op_call_data_copy(&mut self, instr: &'static str, dst: AddrOperand) -> Result<(), VMError> {
+        let bytes = self.args_to_vec();
+        let len = bytes.len() as u32;
+        self.op_memset(instr, dst.clone(), AddrOperand::U32(len), 0x00)?;
+        let dst = self.addr_operand_to_u32(instr, dst)? as usize;
+        self.heap[dst..dst + bytes.len()].copy_from_slice(&bytes);
+        Ok(())
+    }
+
+    fn op_call_data_len(&mut self, _instr: &'static str, dst: u8) -> Result<(), VMError> {
+        let size = self.args_to_vec().len();
+        self.registers.set(dst, Value::Int(size as i64))
+    }
+
+    /// Ensures execution memory spans `[base, base + len)`.
+    ///
+    /// Memory grows in word-sized chunks and charges gas proportional to the
+    /// number of bytes expanded.
     fn expand_memory(&mut self, base: usize, len: usize) -> Result<(), VMError> {
         let max = base.saturating_add(len);
         if self.heap.len() < max {
-            let expanded = max.saturating_sub(self.heap.len()).div_ceil(WORD_SIZE) * WORD_SIZE;
+            let expanded = max.saturating_sub(self.heap.len()) * WORD_SIZE;
             self.charge_gas_categorized(expanded as u64 * 5, GasCategory::Memory)?;
             self.heap
                 .resize(self.heap.len().saturating_add(expanded), 0);
@@ -2214,8 +2258,30 @@ impl VM {
         Ok(())
     }
 
-    fn op_memload(&mut self, _instr: &'static str, rd: u8, addr: u32) -> Result<(), VMError> {
-        let addr = addr as usize;
+    /// Resolves an address operand to a concrete u32 value.
+    ///
+    /// For immediate addresses, returns the value directly. For register addresses,
+    /// reads the integer value from the register and truncates to u32.
+    fn addr_operand_to_u32(&self, instr: &'static str, addr: AddrOperand) -> Result<u32, VMError> {
+        Ok(match addr {
+            AddrOperand::U32(u) => u,
+            AddrOperand::Reg(r) => self.registers.get_int(r, instr)? as u32,
+        })
+    }
+
+    /// Loads `COUNT` bytes from memory into a register with sign/zero extension.
+    ///
+    /// Reads `COUNT` bytes from the heap at the given address and extends to 64-bit.
+    /// If `unsigned` is true, zero-extends; otherwise sign-extends based on the
+    /// most significant bit of the loaded value.
+    fn memload<const COUNT: usize>(
+        &mut self,
+        instr: &'static str,
+        rd: u8,
+        addr: AddrOperand,
+        unsigned: bool,
+    ) -> Result<(), VMError> {
+        let addr = self.addr_operand_to_u32(instr, addr)? as usize;
         if addr + WORD_SIZE > self.heap.len() {
             return Err(VMError::MemoryOOBRead {
                 got: addr + WORD_SIZE,
@@ -2223,17 +2289,38 @@ impl VM {
             });
         }
 
-        let data: [u8; WORD_SIZE] = self.heap[addr..addr + WORD_SIZE].try_into().unwrap();
-        self.registers.set(rd, Value::Int(i64::from_le_bytes(data)))
+        // Load the requested number of bytes
+        let mut result: [u8; WORD_SIZE] = [0u8; WORD_SIZE];
+        result[..COUNT].copy_from_slice(&self.heap[addr..addr + COUNT]);
+        // Sign or Zero extend the bytes
+        let extension: u8 = if !unsigned && (result[COUNT - 1] >> 7) != 0 {
+            0xFF
+        } else {
+            0
+        };
+        result[COUNT..].fill(extension);
+
+        self.registers
+            .set(rd, Value::Int(i64::from_le_bytes(result)))
+    }
+
+    fn op_memload(
+        &mut self,
+        instr: &'static str,
+        rd: u8,
+        addr: AddrOperand,
+    ) -> Result<(), VMError> {
+        self.memload::<WORD_SIZE>(instr, rd, addr, true)
     }
 
     fn op_memstore(
         &mut self,
         instr: &'static str,
-        addr: u32,
+        addr: AddrOperand,
         rs: SrcOperand,
     ) -> Result<(), VMError> {
-        let addr = addr as usize;
+        let addr = self.addr_operand_to_u32(instr, addr)? as usize;
+        error!("{} {} {}", addr, self.heap.len(), self.ip);
         self.expand_memory(addr, WORD_SIZE)?;
 
         let value = self.int_from_operand(rs, instr, 2)?;
@@ -2245,18 +2332,18 @@ impl VM {
 
     fn op_memcpy(
         &mut self,
-        _instr: &'static str,
-        dst: u32,
-        src: u32,
-        len: u32,
+        instr: &'static str,
+        dst: AddrOperand,
+        src: AddrOperand,
+        len: AddrOperand,
     ) -> Result<(), VMError> {
+        let len = self.addr_operand_to_u32(instr, len)? as usize;
         if len == 0 {
             return Ok(());
         }
 
-        let dst = dst as usize;
-        let len = len as usize;
-        let src = src as usize;
+        let dst = self.addr_operand_to_u32(instr, dst)? as usize;
+        let src = self.addr_operand_to_u32(instr, src)? as usize;
         self.expand_memory(dst, len)?;
 
         if self.heap.len() < src.saturating_add(len) {
@@ -2274,17 +2361,17 @@ impl VM {
 
     fn op_memset(
         &mut self,
-        _instr: &'static str,
-        dst: u32,
-        len: u32,
+        instr: &'static str,
+        dst: AddrOperand,
+        len: AddrOperand,
         val: u8,
     ) -> Result<(), VMError> {
+        let len = self.addr_operand_to_u32(instr, len)? as usize;
         if len == 0 {
             return Ok(());
         }
 
-        let dst = dst as usize;
-        let len = len as usize;
+        let dst = self.addr_operand_to_u32(instr, dst)? as usize;
         self.expand_memory(dst, len)?;
         self.charge_gas_categorized(len as u64 * 3, GasCategory::Memory)?;
         self.heap[dst..dst + len].fill(val);
@@ -2336,6 +2423,60 @@ impl VM {
         // Jump to the target function
         self.op_jump(instr, offset)
     }
+
+    fn op_memload_8u(
+        &mut self,
+        instr: &'static str,
+        rd: u8,
+        addr: AddrOperand,
+    ) -> Result<(), VMError> {
+        self.memload::<BYTE_SIZE>(instr, rd, addr, true)
+    }
+
+    fn op_memload_8s(
+        &mut self,
+        instr: &'static str,
+        rd: u8,
+        addr: AddrOperand,
+    ) -> Result<(), VMError> {
+        self.memload::<BYTE_SIZE>(instr, rd, addr, false)
+    }
+
+    fn op_memload_16u(
+        &mut self,
+        instr: &'static str,
+        rd: u8,
+        addr: AddrOperand,
+    ) -> Result<(), VMError> {
+        self.memload::<QUARTER_WORD_SIZE>(instr, rd, addr, true)
+    }
+
+    fn op_memload_16s(
+        &mut self,
+        instr: &'static str,
+        rd: u8,
+        addr: AddrOperand,
+    ) -> Result<(), VMError> {
+        self.memload::<QUARTER_WORD_SIZE>(instr, rd, addr, false)
+    }
+
+    fn op_memload_32u(
+        &mut self,
+        instr: &'static str,
+        rd: u8,
+        addr: AddrOperand,
+    ) -> Result<(), VMError> {
+        self.memload::<HALF_WORD_SIZE>(instr, rd, addr, true)
+    }
+
+    fn op_memload_32s(
+        &mut self,
+        instr: &'static str,
+        rd: u8,
+        addr: AddrOperand,
+    ) -> Result<(), VMError> {
+        self.memload::<HALF_WORD_SIZE>(instr, rd, addr, false)
+    }
 }
 
 #[cfg(test)]
@@ -2368,7 +2509,6 @@ mod tests {
                 max_gas,
                 gas_profile: GasProfile::new(),
                 args: vec![],
-                heap_arg_base: 0,
             };
 
             vm.charge_gas_categorized(init_cost, GasCategory::Deploy)?;
@@ -2378,6 +2518,20 @@ mod tests {
         /// Returns a slice of the execution memory.
         fn exec_memory(&self) -> &[u8] {
             self.heap.exec_memory()
+        }
+    }
+
+    impl Heap {
+        /// Retrieves a hash by its reference index.
+        fn get_hash(&self, id: u32) -> Result<Hash, VMError> {
+            let bytes = self.get_raw_ref(id)?;
+            match Hash::from_slice(&bytes[WORD_SIZE..]) {
+                None => Err(VMError::InvalidHash {
+                    expected_len: HASH_LEN,
+                    actual_len: bytes.len(),
+                }),
+                Some(hash) => Ok(hash),
+            }
         }
     }
 
@@ -2455,6 +2609,12 @@ mod tests {
         let ref_id = vm.registers.get_ref(0, "").unwrap();
         let expected = Hash::from_slice(b"00000000000000000000000000000000").unwrap();
         assert_eq!(vm.heap.get_hash(ref_id).unwrap(), expected);
+    }
+
+    #[test]
+    fn noop_does_not_modify_registers() {
+        let vm = run_vm("MOVE r0, 7\nNOOP");
+        assert_eq!(vm.registers.get_int(0, "").unwrap(), 7);
     }
 
     // ==================== Moves / Casts ====================
@@ -2949,8 +3109,8 @@ MOVE r0, 1
     fn src_operand_store_immediate_key() {
         // Store with immediate string key
         let vm = run_vm(
-            r#"STORE_I64 "mykey", 123
-LOAD_I64_STATE r0, "mykey""#,
+            r#"STORE "mykey", 123
+LOAD_I64 r0, "mykey""#,
         );
         assert_eq!(vm.registers.get_int(0, "").unwrap(), 123);
     }
@@ -2960,8 +3120,8 @@ LOAD_I64_STATE r0, "mykey""#,
         // Store with immediate value
         let vm = run_vm(
             r#"MOVE r0, "counter"
-STORE_I64 r0, 999
-LOAD_I64_STATE r1, r0"#,
+STORE r0, 999
+LOAD_I64 r1, r0"#,
         );
         assert_eq!(vm.registers.get_int(1, "").unwrap(), 999);
     }
@@ -2970,8 +3130,8 @@ LOAD_I64_STATE r1, r0"#,
     fn src_operand_store_both_immediate() {
         // Both key and value immediate
         let vm = run_vm(
-            r#"STORE_BOOL "flag", true
-LOAD_BOOL_STATE r0, "flag""#,
+            r#"STORE "flag", true
+LOAD_BOOL r0, "flag""#,
         );
         assert!(vm.registers.get_bool(0, "").unwrap());
     }
@@ -3314,7 +3474,7 @@ NE r2, r0, r1"#,
         let state = run_vm_with_state(
             r#"MOVE r0, "counter"
 MOVE r1, 42
-STORE_I64 r0, r1"#,
+STORE r0, r1"#,
         );
         let key = make_test_key(b"counter").unwrap();
         let value = state.get(key).expect("key not found");
@@ -3324,8 +3484,8 @@ STORE_I64 r0, r1"#,
     #[test]
     fn store_i64_inline_key() {
         let vm = run_vm(
-            r#"STORE_I64 "counter", 42
-LOAD_I64_STATE r0, "counter""#,
+            r#"STORE "counter", 42
+LOAD_I64 r0, "counter""#,
         );
         assert_eq!(vm.registers.get_int(0, "").unwrap(), 42);
     }
@@ -3335,7 +3495,7 @@ LOAD_I64_STATE r0, "counter""#,
         let state = run_vm_with_state(
             r#"MOVE r0, "name"
 MOVE r1, "alice"
-STORE_STR r0, r1"#,
+STORE r0, r1"#,
         );
         let key = make_test_key(b"name").unwrap();
         let value = state.get(key).expect("key not found");
@@ -3347,7 +3507,7 @@ STORE_STR r0, r1"#,
         let state = run_vm_with_state(
             r#"MOVE r0, "hash_key"
 MOVE r1, "00000000000000000000000000000000"
-STORE_HASH r0, r1"#,
+STORE r0, r1"#,
         );
         let key = make_test_key(b"hash_key").unwrap();
         let value = state.get(key).expect("key not found");
@@ -3356,17 +3516,11 @@ STORE_HASH r0, r1"#,
     }
 
     #[test]
-    fn store_hash_invalid_literal() {
-        let err = run_expect_err(r#"STORE_HASH "hash_key", "short""#);
-        assert!(matches!(err, VMError::InvalidHash { .. }));
-    }
-
-    #[test]
     fn store_bool() {
         let state = run_vm_with_state(
             r#"MOVE r0, "flag"
 MOVE r1, true
-STORE_BOOL r0, r1"#,
+STORE r0, r1"#,
         );
         let key = make_test_key(b"flag").unwrap();
         let value = state.get(key).expect("key not found");
@@ -3378,13 +3532,25 @@ STORE_BOOL r0, r1"#,
         let state = run_vm_with_state(
             r#"MOVE r0, "x"
 MOVE r1, 100
-STORE_I64 r0, r1
+STORE r0, r1
 MOVE r2, 200
-STORE_I64 r0, r2"#,
+STORE r0, r2"#,
         );
         let key = make_test_key(b"x").unwrap();
         let value = state.get(key).expect("key not found");
         assert_eq!(i64::from_le_bytes(value.try_into().unwrap()), 200);
+    }
+
+    #[test]
+    fn store_then_load_bytes() {
+        let vm = run_vm(
+            r#"MOVE r0, "blob"
+MOVE r1, "hello"
+STORE r0, r1
+LOAD r2, r0"#,
+        );
+        let ref_id = vm.registers.get_ref(2, "").unwrap();
+        assert_eq!(vm.heap.get_data(ref_id).unwrap(), b"hello");
     }
 
     // ==================== State Loads ====================
@@ -3402,7 +3568,7 @@ STORE_I64 r0, r2"#,
         let mut state = TestState::with_data(vec![(key, 42i64.to_le_bytes().to_vec())]);
         let vm = run_vm_on_state(
             r#"MOVE r0, "counter"
-LOAD_I64_STATE r1, r0"#,
+LOAD_I64 r1, r0"#,
             &mut state,
         );
         assert_eq!(vm.registers.get_int(1, "").unwrap(), 42);
@@ -3414,7 +3580,7 @@ LOAD_I64_STATE r1, r0"#,
         let mut state = TestState::with_data(vec![(key, (-999i64).to_le_bytes().to_vec())]);
         let vm = run_vm_on_state(
             r#"MOVE r0, "neg"
-LOAD_I64_STATE r1, r0"#,
+LOAD_I64 r1, r0"#,
             &mut state,
         );
         assert_eq!(vm.registers.get_int(1, "").unwrap(), -999);
@@ -3424,7 +3590,7 @@ LOAD_I64_STATE r1, r0"#,
     fn load_i64_state_key_not_found() {
         let program = assemble_source(
             r#"MOVE r0, "missing"
-LOAD_I64_STATE r1, r0"#,
+LOAD_I64 r1, r0"#,
         )
         .expect("assembly failed");
         let mut vm = VM::new_with_init(program, 0, BLOCK_GAS_LIMIT).expect("vm new failed");
@@ -3440,7 +3606,7 @@ LOAD_I64_STATE r1, r0"#,
         let mut state = TestState::with_data(vec![(key, vec![1u8])]);
         let vm = run_vm_on_state(
             r#"MOVE r0, "flag"
-LOAD_BOOL_STATE r1, r0"#,
+LOAD_BOOL r1, r0"#,
             &mut state,
         );
         assert!(vm.registers.get_bool(1, "").unwrap());
@@ -3452,7 +3618,7 @@ LOAD_BOOL_STATE r1, r0"#,
         let mut state = TestState::with_data(vec![(key, vec![0u8])]);
         let vm = run_vm_on_state(
             r#"MOVE r0, "flag"
-LOAD_BOOL_STATE r1, r0"#,
+LOAD_BOOL r1, r0"#,
             &mut state,
         );
         assert!(!vm.registers.get_bool(1, "").unwrap());
@@ -3462,7 +3628,7 @@ LOAD_BOOL_STATE r1, r0"#,
     fn load_bool_state_key_not_found() {
         let program = assemble_source(
             r#"MOVE r0, "missing"
-LOAD_BOOL_STATE r1, r0"#,
+LOAD_BOOL r1, r0"#,
         )
         .expect("assembly failed");
         let mut vm = VM::new_with_init(program, 0, BLOCK_GAS_LIMIT).expect("vm new failed");
@@ -3473,12 +3639,27 @@ LOAD_BOOL_STATE r1, r0"#,
     }
 
     #[test]
+    fn has_state_reports_presence() {
+        let key = make_test_key(b"present").unwrap();
+        let mut state = TestState::with_data(vec![(key, vec![1u8])]);
+        let vm = run_vm_on_state(
+            r#"MOVE r0, "present"
+MOVE r1, "missing"
+HAS_STATE r2, r0
+HAS_STATE r3, r1"#,
+            &mut state,
+        );
+        assert!(vm.registers.get_bool(2, "").unwrap());
+        assert!(!vm.registers.get_bool(3, "").unwrap());
+    }
+
+    #[test]
     fn load_str_state() {
         let key = make_test_key(b"name").unwrap();
         let mut state = TestState::with_data(vec![(key, b"alice".to_vec())]);
         let vm = run_vm_on_state(
             r#"MOVE r0, "name"
-LOAD_STR_STATE r1, r0"#,
+LOAD_STR r1, r0"#,
             &mut state,
         );
         let ref_id = vm.registers.get_ref(1, "").unwrap();
@@ -3491,7 +3672,7 @@ LOAD_STR_STATE r1, r0"#,
         let mut state = TestState::with_data(vec![(key, vec![])]);
         let vm = run_vm_on_state(
             r#"MOVE r0, "empty"
-LOAD_STR_STATE r1, r0"#,
+LOAD_STR r1, r0"#,
             &mut state,
         );
         let ref_id = vm.registers.get_ref(1, "").unwrap();
@@ -3505,7 +3686,7 @@ LOAD_STR_STATE r1, r0"#,
         let mut state = TestState::with_data(vec![(key, expected.to_vec())]);
         let vm = run_vm_on_state(
             r#"MOVE r0, "hash_key"
-LOAD_HASH_STATE r1, r0"#,
+LOAD_HASH r1, r0"#,
             &mut state,
         );
         let ref_id = vm.registers.get_ref(1, "").unwrap();
@@ -3516,7 +3697,7 @@ LOAD_HASH_STATE r1, r0"#,
     fn load_str_state_key_not_found() {
         let program = assemble_source(
             r#"MOVE r0, "missing"
-LOAD_STR_STATE r1, r0"#,
+LOAD_STR r1, r0"#,
         )
         .expect("assembly failed");
         let mut vm = VM::new_with_init(program, 0, BLOCK_GAS_LIMIT).expect("vm new failed");
@@ -3531,8 +3712,8 @@ LOAD_STR_STATE r1, r0"#,
         let vm = run_vm(
             r#"MOVE r0, "x"
 MOVE r1, 123
-STORE_I64 r0, r1
-LOAD_I64_STATE r2, r0"#,
+STORE r0, r1
+LOAD_I64 r2, r0"#,
         );
         assert_eq!(vm.registers.get_int(2, "").unwrap(), 123);
     }
@@ -3542,8 +3723,8 @@ LOAD_I64_STATE r2, r0"#,
         let vm = run_vm(
             r#"MOVE r0, "b"
 MOVE r1, true
-STORE_BOOL r0, r1
-LOAD_BOOL_STATE r2, r0"#,
+STORE r0, r1
+LOAD_BOOL r2, r0"#,
         );
         assert!(vm.registers.get_bool(2, "").unwrap());
     }
@@ -3553,8 +3734,8 @@ LOAD_BOOL_STATE r2, r0"#,
         let vm = run_vm(
             r#"MOVE r0, "s"
 MOVE r1, "hello"
-STORE_STR r0, r1
-LOAD_STR_STATE r2, r0"#,
+STORE r0, r1
+LOAD_STR r2, r0"#,
         );
         let ref_id = vm.registers.get_ref(2, "").unwrap();
         assert_eq!(vm.heap.get_string(ref_id).unwrap(), "hello");
@@ -3565,8 +3746,8 @@ LOAD_STR_STATE r2, r0"#,
         let vm = run_vm(
             r#"MOVE r0, "hash_key"
 MOVE r1, "22222222222222222222222222222222"
-STORE_HASH r0, r1
-LOAD_HASH_STATE r2, r0"#,
+STORE r0, r1
+LOAD_HASH r2, r0"#,
         );
         let ref_id = vm.registers.get_ref(2, "").unwrap();
         let expected = Hash::from_slice(b"22222222222222222222222222222222").unwrap();
@@ -3884,8 +4065,8 @@ LOAD_HASH_STATE r2, r0"#,
             MOVE r0, "counter"
             MOVE r1, "steps"
 
-            LOAD_I64_STATE r2, r0     # acc = counter
-            LOAD_I64_STATE r3, r1     # limit = steps
+            LOAD_I64 r2, r0     # acc = counter
+            LOAD_I64 r3, r1     # limit = steps
             MOVE r4, 0            # i = 0
             MOVE r5, 1            # inc = 1
 
@@ -3894,7 +4075,7 @@ LOAD_HASH_STATE r2, r0"#,
             ADD r4, r4, r5            # i++
             BLT r4, r3, loop          # loop while i < limit
 
-        STORE_I64 r0, r2              # update counter
+        STORE r0, r2              # update counter
         "#;
 
         let mut state = TestState::new();
@@ -4230,10 +4411,10 @@ LOAD_HASH_STATE r2, r0"#,
 
         // r0 holds the function selector
         assert_eq!(vm.registers.get_int(0, "").unwrap(), 3);
-        // Args are stored for later CALLDATA_LOAD, not pre-loaded into registers
+        // Args are stored for later CALLDATA_LOAD, not preloaded into registers
         assert_eq!(vm.args, args);
         // heap_arg_base points to start of arg items (no base items)
-        assert_eq!(vm.heap_arg_base, 0);
+        assert_eq!(vm.heap.exec_offset, 0);
         // The arg item was appended to the heap at heap_arg_base
         assert_eq!(vm.heap.get_string(0).unwrap(), "hello");
     }
@@ -4742,7 +4923,6 @@ LOAD_HASH_STATE r2, r0"#,
         data.extend(program.runtime_code);
 
         let mut heap = Heap::new(program.memory);
-        let base = heap.total_len() as u32;
         for item in arg_items {
             heap.append(item);
         }
@@ -4758,12 +4938,28 @@ LOAD_HASH_STATE r2, r0"#,
             max_gas: BLOCK_GAS_LIMIT,
             gas_profile: GasProfile::new(),
             args,
-            heap_arg_base: base,
         };
 
         vm.run(&mut TestState::new(), EXECUTION_CONTEXT)
             .expect("vm run failed");
         vm
+    }
+
+    fn expected_calldata(args: &[Value], arg_items: &[Vec<u8>]) -> Vec<u8> {
+        let mut heap = Heap::new(vec![]);
+        for item in arg_items {
+            heap.append(item.clone());
+        }
+
+        let mut buf = Vec::new();
+        for arg in args {
+            match arg {
+                Value::Bool(b) => b.encode(&mut buf),
+                Value::Int(i) => i.encode(&mut buf),
+                Value::Ref(r) => buf.write(heap.get_raw_ref(*r).unwrap_or(&[])),
+            }
+        }
+        buf
     }
 
     #[test]
@@ -4818,6 +5014,20 @@ LOAD_HASH_STATE r2, r0"#,
         assert_eq!(vm.registers.get_int(251, "").unwrap(), 8);
     }
 
+    #[test]
+    fn calldata_len_and_copy_match_serialized_args() {
+        let args = vec![Value::Int(42), Value::Bool(true), Value::Ref(0)];
+        let arg_items = vec![b"hi".to_vec()];
+        let expected = expected_calldata(&args, &arg_items);
+        let vm = run_vm_with_args("CALLDATA_LEN r0\nCALLDATA_COPY 64", args, arg_items);
+        assert!(!expected.is_empty());
+        assert_eq!(vm.registers.get_int(0, "").unwrap(), expected.len() as i64);
+        assert_eq!(
+            &vm.exec_memory()[64..64 + expected.len()],
+            expected.as_slice()
+        );
+    }
+
     // ==================== host_func_argc ====================
 
     #[test]
@@ -4839,7 +5049,7 @@ LOAD_HASH_STATE r2, r0"#,
     fn expand_mem_test() {
         let mut vm = run_vm("");
         vm.expand_memory(0, 8).unwrap();
-        assert_eq!(vm.exec_memory().len(), 8);
+        assert_eq!(vm.exec_memory().len(), 64);
     }
 
     #[test]
@@ -4849,7 +5059,7 @@ LOAD_HASH_STATE r2, r0"#,
         MEM_STORE 64, 2
         "#;
         let vm = run_vm(code);
-        assert_eq!(vm.exec_memory().len(), 72);
+        assert_eq!(vm.exec_memory().len(), 128);
     }
 
     #[test]
@@ -4859,8 +5069,8 @@ LOAD_HASH_STATE r2, r0"#,
         MEM_LOAD r0, 0
         "#;
         let vm = run_vm(code);
-        assert_eq!(vm.exec_memory().len(), 8);
-        assert_eq!(&vm.exec_memory(), &12i64.to_le_bytes());
+        assert_eq!(vm.exec_memory().len(), 64);
+        assert_eq!(&vm.exec_memory()[..8], &12i64.to_le_bytes());
         assert_eq!(vm.registers.get(0).unwrap(), &Value::Int(12));
     }
 
@@ -4870,8 +5080,8 @@ LOAD_HASH_STATE r2, r0"#,
         MEM_SET 0, 64, 255
         "#;
         let vm = run_vm(code);
-        assert_eq!(vm.exec_memory().len(), 64);
-        assert_eq!(&vm.exec_memory(), &[255u8; 64]);
+        assert_eq!(vm.exec_memory().len(), 512);
+        assert_eq!(&vm.exec_memory()[..64], &[255u8; 64]);
     }
 
     #[test]
@@ -4881,7 +5091,7 @@ LOAD_HASH_STATE r2, r0"#,
         MEM_COPY 128, 0, 64
         "#;
         let vm = run_vm(code);
-        assert_eq!(vm.exec_memory().len(), 192);
+        assert_eq!(vm.exec_memory().len(), 512);
         assert_eq!(&vm.exec_memory()[0..64], &[255u8; 64]);
         assert_eq!(&vm.exec_memory()[64..128], &[0u8; 64]);
         assert_eq!(&vm.exec_memory()[128..192], &[255u8; 64]);
@@ -4941,22 +5151,22 @@ LOAD_HASH_STATE r2, r0"#,
         MEM_COPY 0, 0, 0
         "#;
         let vm = run_vm(code);
-        assert_eq!(&vm.exec_memory(), &[170u8; 8]);
+        assert_eq!(&vm.exec_memory()[..8], &[170u8; 8]);
     }
 
     #[test]
     fn expand_memory_alignment() {
-        // Storing at offset 1 should expand to at least 9 bytes, rounded up to 16
+        // Storing at offset 1 should expand by (9 needed bytes) * WORD_SIZE = 72
         let mut vm = run_vm("");
         vm.expand_memory(1, 8).unwrap();
-        assert_eq!(vm.exec_memory().len(), 16);
+        assert_eq!(vm.exec_memory().len(), 72);
     }
 
     #[test]
     fn memset_hex_addr_and_len() {
         let code = "MEM_SET 0x10, 0x20, 0xAB";
         let vm = run_vm(code);
-        assert_eq!(vm.exec_memory().len(), 0x10 + 0x20);
+        assert_eq!(vm.exec_memory().len(), 384);
         assert_eq!(&vm.exec_memory()[0x10..0x30], &[0xABu8; 0x20]);
     }
 
@@ -4975,7 +5185,7 @@ LOAD_HASH_STATE r2, r0"#,
     fn memstore_hex_addr() {
         let code = "MEM_STORE 0x40, 0x1234";
         let vm = run_vm(code);
-        assert_eq!(vm.exec_memory().len(), 0x48);
+        assert_eq!(vm.exec_memory().len(), 576);
         assert_eq!(&vm.exec_memory()[0x40..0x48], &0x1234i64.to_le_bytes());
     }
 
@@ -4987,5 +5197,291 @@ LOAD_HASH_STATE r2, r0"#,
         "#;
         let vm = run_vm(code);
         assert_eq!(vm.registers.get(0).unwrap(), &Value::Int(0xDEAD));
+    }
+
+    #[test]
+    fn memload_8u_hex_addr() {
+        let code = r#"
+        MEM_STORE 0x08, 0xDEAD
+        MEM_LOAD_8U r0, 0x08
+        "#;
+        let vm = run_vm(code);
+        assert_eq!(vm.registers.get(0).unwrap(), &Value::Int(0xAD));
+    }
+
+    #[test]
+    fn memload_8s_hex_addr() {
+        let code = r#"
+        MEM_STORE 0x08, 0xDEAD
+        MEM_LOAD_8S r0, 0x08
+        "#;
+        let vm = run_vm(code);
+
+        assert_eq!(
+            vm.registers.get(0).unwrap(),
+            &Value::Int(0xFFFFFFFFFFFFFFADu64 as i64)
+        );
+    }
+
+    #[test]
+    fn memload_8s_hex_addr2() {
+        let code = r#"
+        MEM_STORE 0x08, 0xDE7D
+        MEM_LOAD_8S r0, 0x08
+        "#;
+        let vm = run_vm(code);
+
+        assert_eq!(vm.registers.get(0).unwrap(), &Value::Int(0x7Du64 as i64));
+    }
+
+    // ==================== 16-bit memory loads ====================
+
+    #[test]
+    fn memload_16u_zero_extends() {
+        let code = r#"
+        MEM_STORE 0x00, 0xFFFF
+        MEM_LOAD_16U r0, 0x00
+        "#;
+        let vm = run_vm(code);
+        assert_eq!(vm.registers.get(0).unwrap(), &Value::Int(0xFFFF));
+    }
+
+    #[test]
+    fn memload_16s_sign_extends_negative() {
+        let code = r#"
+        MEM_STORE 0x00, 0x8000
+        MEM_LOAD_16S r0, 0x00
+        "#;
+        let vm = run_vm(code);
+        assert_eq!(
+            vm.registers.get(0).unwrap(),
+            &Value::Int(0xFFFFFFFFFFFF8000u64 as i64)
+        );
+    }
+
+    #[test]
+    fn memload_16s_no_extend_positive() {
+        let code = r#"
+        MEM_STORE 0x00, 0x7FFF
+        MEM_LOAD_16S r0, 0x00
+        "#;
+        let vm = run_vm(code);
+        assert_eq!(vm.registers.get(0).unwrap(), &Value::Int(0x7FFF));
+    }
+
+    // ==================== 32-bit memory loads ====================
+
+    #[test]
+    fn memload_32u_zero_extends() {
+        let code = r#"
+        MEM_STORE 0x00, 0xFFFFFFFF
+        MEM_LOAD_32U r0, 0x00
+        "#;
+        let vm = run_vm(code);
+        assert_eq!(vm.registers.get(0).unwrap(), &Value::Int(0xFFFFFFFF));
+    }
+
+    #[test]
+    fn memload_32s_sign_extends_negative() {
+        let code = r#"
+        MEM_STORE 0x00, 0x80000000
+        MEM_LOAD_32S r0, 0x00
+        "#;
+        let vm = run_vm(code);
+        assert_eq!(
+            vm.registers.get(0).unwrap(),
+            &Value::Int(0xFFFFFFFF80000000u64 as i64)
+        );
+    }
+
+    #[test]
+    fn memload_32s_no_extend_positive() {
+        let code = r#"
+        MEM_STORE 0x00, 0x7FFFFFFF
+        MEM_LOAD_32S r0, 0x00
+        "#;
+        let vm = run_vm(code);
+        assert_eq!(vm.registers.get(0).unwrap(), &Value::Int(0x7FFFFFFF));
+    }
+
+    // ==================== Register-based addressing ====================
+
+    #[test]
+    fn memstore_register_addr() {
+        let code = r#"
+        MOVE r1, 0x10
+        MEM_STORE r1, 0xABCD
+        MEM_LOAD r0, 0x10
+        "#;
+        let vm = run_vm(code);
+        assert_eq!(vm.registers.get(0).unwrap(), &Value::Int(0xABCD));
+    }
+
+    #[test]
+    fn memload_register_addr() {
+        let code = r#"
+        MEM_STORE 0x20, 0x1234
+        MOVE r1, 0x20
+        MEM_LOAD r0, r1
+        "#;
+        let vm = run_vm(code);
+        assert_eq!(vm.registers.get(0).unwrap(), &Value::Int(0x1234));
+    }
+
+    #[test]
+    fn memcpy_register_addrs() {
+        let code = r#"
+        MEM_SET 0x00, 8, 0xAA
+        MOVE r1, 0x10
+        MOVE r2, 0x00
+        MOVE r3, 8
+        MEM_COPY r1, r2, r3
+        MEM_LOAD r0, 0x10
+        "#;
+        let vm = run_vm(code);
+        assert_eq!(
+            vm.registers.get(0).unwrap(),
+            &Value::Int(i64::from_le_bytes([0xAA; 8]))
+        );
+    }
+
+    #[test]
+    fn memset_register_addrs() {
+        let code = r#"
+        MOVE r1, 0x08
+        MOVE r2, 8
+        MEM_SET r1, r2, 0xFF
+        MEM_LOAD r0, 0x08
+        "#;
+        let vm = run_vm(code);
+        assert_eq!(
+            vm.registers.get(0).unwrap(),
+            &Value::Int(i64::from_le_bytes([0xFF; 8]))
+        );
+    }
+
+    #[test]
+    fn memload_8u_register_addr() {
+        let code = r#"
+        MEM_STORE 0x00, 0xABCD
+        MOVE r1, 0x00
+        MEM_LOAD_8U r0, r1
+        "#;
+        let vm = run_vm(code);
+        assert_eq!(vm.registers.get(0).unwrap(), &Value::Int(0xCD));
+    }
+
+    #[test]
+    fn memload_16s_register_addr() {
+        let code = r#"
+        MEM_STORE 0x00, 0x8001
+        MOVE r1, 0x00
+        MEM_LOAD_16S r0, r1
+        "#;
+        let vm = run_vm(code);
+        assert_eq!(
+            vm.registers.get(0).unwrap(),
+            &Value::Int(0xFFFFFFFFFFFF8001u64 as i64)
+        );
+    }
+
+    // ==================== CMOVE instruction ====================
+
+    #[test]
+    fn cmove_true_condition() {
+        let code = r#"
+        MOVE r1, 100
+        MOVE r2, 200
+        CMOVE r0, true, r1, r2
+        "#;
+        let vm = run_vm(code);
+        assert_eq!(vm.registers.get(0).unwrap(), &Value::Int(100));
+    }
+
+    #[test]
+    fn cmove_false_condition() {
+        let code = r#"
+        MOVE r1, 100
+        MOVE r2, 200
+        CMOVE r0, false, r1, r2
+        "#;
+        let vm = run_vm(code);
+        assert_eq!(vm.registers.get(0).unwrap(), &Value::Int(200));
+    }
+
+    #[test]
+    fn cmove_nonzero_int_is_true() {
+        let code = r#"
+        MOVE r1, 100
+        MOVE r2, 200
+        CMOVE r0, 1, r1, r2
+        "#;
+        let vm = run_vm(code);
+        assert_eq!(vm.registers.get(0).unwrap(), &Value::Int(100));
+    }
+
+    #[test]
+    fn cmove_zero_int_is_false() {
+        let code = r#"
+        MOVE r1, 100
+        MOVE r2, 200
+        CMOVE r0, 0, r1, r2
+        "#;
+        let vm = run_vm(code);
+        assert_eq!(vm.registers.get(0).unwrap(), &Value::Int(200));
+    }
+
+    #[test]
+    fn cmove_negative_int_is_true() {
+        let code = r#"
+        MOVE r1, 100
+        MOVE r2, 200
+        CMOVE r0, -1, r1, r2
+        "#;
+        let vm = run_vm(code);
+        assert_eq!(vm.registers.get(0).unwrap(), &Value::Int(100));
+    }
+
+    #[test]
+    fn cmove_register_condition_true() {
+        let code = r#"
+        MOVE r3, 5
+        MOVE r1, 100
+        MOVE r2, 200
+        CMOVE r0, r3, r1, r2
+        "#;
+        let vm = run_vm(code);
+        assert_eq!(vm.registers.get(0).unwrap(), &Value::Int(100));
+    }
+
+    #[test]
+    fn cmove_register_condition_false() {
+        let code = r#"
+        MOVE r3, 0
+        MOVE r1, 100
+        MOVE r2, 200
+        CMOVE r0, r3, r1, r2
+        "#;
+        let vm = run_vm(code);
+        assert_eq!(vm.registers.get(0).unwrap(), &Value::Int(200));
+    }
+
+    #[test]
+    fn cmove_bool_register_condition() {
+        let code = r#"
+        MOVE r3, true
+        MOVE r1, 100
+        MOVE r2, 200
+        CMOVE r0, r3, r1, r2
+        "#;
+        let vm = run_vm(code);
+        assert_eq!(vm.registers.get(0).unwrap(), &Value::Int(100));
+    }
+
+    #[test]
+    fn cmove_immediate_operands() {
+        let code = "CMOVE r0, true, 42, 99";
+        let vm = run_vm(code);
+        assert_eq!(vm.registers.get(0).unwrap(), &Value::Int(42));
     }
 }

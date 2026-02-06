@@ -32,43 +32,45 @@ macro_rules! for_each_instruction {
     ($callback:ident) => {
         $callback! {
             // =========================
+            // Move, Casts and Misc
+            // =========================
+            /// NOOP ;
+            Noop = 0x00, "NOOP" => [], 1,
+            /// MOVE rd, rs ; rd = rs
+            Move = 0x01, "MOVE" => [rd: Reg, rs: Src], 1,
+            /// CMOVE rd, cond, r1, r2 ; rd = (cond != 0) ? r1 : r2
+            CMove = 0x02, "CMOVE" => [rd: Reg, cond: Src, r1: Src, r2: Src], 5,
+            /// I64_TO_BOOL rd, rs ; rd = (rs != 0)
+            I64ToBool = 0x03, "I64_TO_BOOL" => [rd: Reg, rs: Src], 1,
+            /// BOOL_TO_I64 rd, rs ; rd = rs as i64 (false=0, true=1)
+            BoolToI64 = 0x04, "BOOL_TO_I64" => [rd: Reg, rs: Src], 1,
+            /// STR_TO_I64 rd, rs ; rd = parse_i64(rs)
+            StrToI64 = 0x05, "STR_TO_I64" => [rd: Reg, rs: Src], 30,
+            /// I64_TO_STR rd, rs ; rd = rs formatted as string
+            I64ToStr = 0x06, "I64_TO_STR" => [rd: Reg, rs: Src], 30,
+            /// STR_TO_BOOL rd, rs ; rd = parse_bool(rs)
+            StrToBool = 0x07, "STR_TO_BOOL" => [rd: Reg, rs: Src], 20,
+            /// BOOL_TO_STR rd, rs ; rd = rs formatted as string
+            BoolToStr = 0x08, "BOOL_TO_STR" => [rd: Reg, rs: Src], 20,
+            // =========================
             // Store and Load
             // =========================
-            /// MOVE rd, rs ; rd = rs
-            Move = 0x00, "MOVE" => [rd: Reg, rs: Src], 1,
             /// DELETE_STATE key ; deletes the value at key in storage
-            DeleteState = 0x01, "DELETE_STATE" => [key: Src], 2000,
-            /// STORE_I64 key, value ; store i64 value at key in storage
-            StoreI64 = 0x02, "STORE_I64" => [key: Src, value: Src], 2000,
-            /// LOAD_I64_STATE dst, key ; loads the i64 stored as key from storage
-            LoadI64State = 0x03, "LOAD_I64_STATE" => [rd: Reg, key: Src], 50,
-            /// STORE_BOOL key, value ; store bool value at key in storage
-            StoreBool = 0x04, "STORE_BOOL" => [key: Src, value: Src], 2000,
-            /// LOAD_BOOL_STATE dst, key ; loads the boolean stored as key from storage
-            LoadBoolState = 0x05, "LOAD_BOOL_STATE" => [rd: Reg, key: Src], 50,
-            /// STORE_STR key, value ; store string value at key in storage
-            StoreStr = 0x06, "STORE_STR" => [key: Src, value: Src], 2000,
-            /// LOAD_STR_STATE dst, key ; loads the string stored as key from storage
-            LoadStrState = 0x07, "LOAD_STR_STATE" => [rd: Reg, key: Src], 50,
-            /// STORE_HASH key, value ; store string value at key in storage
-            StoreHash = 0x08, "STORE_HASH" => [key: Src, value: Src], 2000,
-            /// LOAD_HASH_STATE dst, key ; loads the string stored as key from storage
-            LoadHashState = 0x09, "LOAD_HASH_STATE" => [rd: Reg, key: Src], 50,
-            // =========================
-            // Casts
-            // =========================
-            /// I64_TO_BOOL rd, rs ; rd = (rs != 0)
-            I64ToBool = 0x10, "I64_TO_BOOL" => [rd: Reg, rs: Src], 1,
-            /// BOOL_TO_I64 rd, rs ; rd = rs as i64 (false=0, true=1)
-            BoolToI64 = 0x11, "BOOL_TO_I64" => [rd: Reg, rs: Src], 1,
-            /// STR_TO_I64 rd, rs ; rd = parse_i64(rs)
-            StrToI64 = 0x12, "STR_TO_I64" => [rd: Reg, rs: Src], 30,
-            /// I64_TO_STR rd, rs ; rd = rs formatted as string
-            I64ToStr = 0x13, "I64_TO_STR" => [rd: Reg, rs: Src], 30,
-            /// STR_TO_BOOL rd, rs ; rd = parse_bool(rs)
-            StrToBool = 0x14, "STR_TO_BOOL" => [rd: Reg, rs: Src], 20,
-            /// BOOL_TO_STR rd, rs ; rd = rs formatted as string
-            BoolToStr = 0x15, "BOOL_TO_STR" => [rd: Reg, rs: Src], 20,
+            DeleteState = 0x10, "DELETE_STATE" => [key: Src], 2000,
+            /// HAS_STATE rd, key ; sets rd to true if the state has the key src, to false if not
+            HasState = 0x11, "HAS_STATE" => [rd: Reg, key: Src], 50,
+            /// STORE key, value ; store the bytes in rs at key in storage
+            StoreBytes = 0x12, "STORE" => [key: Src, rs: Src], 2000,
+            /// LOAD dst, key ; loads the bytes stored at key from storage
+            LoadBytes = 0x13, "LOAD" => [rd: Reg, key: Src], 50,
+            /// LOAD_I64 dst, key ; loads the i64 stored at key from storage
+            LoadI64 = 0x14, "LOAD_I64" => [rd: Reg, key: Src], 50,
+            /// LOAD_BOOL dst, key ; loads the boolean stored at key from storage
+            LoadBool = 0x15, "LOAD_BOOL" => [rd: Reg, key: Src], 50,
+            /// LOAD_STR dst, key ; loads the string stored at key from storage
+            LoadStr = 0x16, "LOAD_STR" => [rd: Reg, key: Src], 50,
+            /// LOAD_HASH dst, key ; loads the string stored at key from storage
+            LoadHash = 0x17, "LOAD_HASH" => [rd: Reg, key: Src], 50,
             // =========================
             // Integer arithmetic
             // =========================
@@ -159,21 +161,34 @@ macro_rules! for_each_instruction {
             /// HALT ; stop execution immediately
             Halt = 0x50, "HALT" => [], 1,
             // =========================
-            // Data access
+            // Data and Memory access
             // =========================
-            /// CALLDATA_LOAD rd ; load call arguments into registers starting at rd, remapping heap refs
+            /// CALLDATA_LOAD rd ; load call arguments into registers starting at rd
             CallDataLoad = 0x51, "CALLDATA_LOAD" => [rd: Reg], 3,
-            // =========================
-            // Memory access
-            // =========================
+            /// CALLDATA_COPY dst ; copy serialized call arguments to memory at dst
+            CallDataCopy = 0x52, "CALLDATA_COPY" => [dst: Addr], 5,
+            /// CALLDATA_LEN rd ; rd = size in bytes of raw calldata
+            CallDataLen = 0x53, "CALLDATA_LEN" => [rd: Reg], 1,
             /// MEM_LOAD rd, addr ; rd = memory[addr .. addr + 8]
-            MemLoad = 0x60, "MEM_LOAD" => [rd: Reg, addr: AddrU32], 2,
+            MemLoad = 0x54, "MEM_LOAD" => [rd: Reg, addr: Addr], 5,
             /// MEM_STORE addr, rs ; memory[addr .. addr + WORD_SIZE] = rs
-            MemStore = 0x61, "MEM_STORE" => [addr: AddrU32, rs: Src], 3,
+            MemStore = 0x55, "MEM_STORE" => [addr: Addr, rs: Src], 5,
             /// MEM_COPY dst, src, len ; memory[dst .. dst+len] = memory[src .. src+len]
-            MemCpy = 0x62, "MEM_COPY" => [dst: AddrU32, src: AddrU32, len: AddrU32], 3,
+            MemCpy = 0x56, "MEM_COPY" => [dst: Addr, src: Addr, len: Addr], 5,
             /// MEM_SET dst, val, len ; for i in 0..len: memory[dst+i] = val
-            MemSet = 0x63, "MEM_SET" => [dst: AddrU32, len: AddrU32, val: ImmU8], 3,
+            MemSet = 0x57, "MEM_SET" => [dst: Addr, len: Addr, val: ImmU8], 5,
+            /// MEM_LOAD_8U rd, addr ; rd = memory[addr .. addr + 1], zero extended
+            MemLoad8U = 0x58, "MEM_LOAD_8U" => [rd: Reg, addr: Addr], 2,
+            /// MEM_LOAD_8S rd, addr ; rd = memory[addr .. addr + 1], sign extended
+            MemLoad8S = 0x59, "MEM_LOAD_8S" => [rd: Reg, addr: Addr], 2,
+            /// MEM_LOAD_16U rd, addr ; rd = memory[addr .. addr + 2], zero extended
+            MemLoad16U = 0x5A, "MEM_LOAD_16U" => [rd: Reg, addr: Addr], 3,
+            /// MEM_LOAD_16S rd, addr ; rd = memory[addr .. addr + 2], sign extended
+            MemLoad16S = 0x5B, "MEM_LOAD_16S" => [rd: Reg, addr: Addr], 3,
+            /// MEM_LOAD_32U rd, addr ; rd = memory[addr .. addr + 4], zero extended
+            MemLoad32U = 0x5C, "MEM_LOAD_32U" => [rd: Reg, addr: Addr], 4,
+            /// MEM_LOAD_32S rd, addr ; rd = memory[addr .. addr + 4], sign extended
+            MemLoad32S = 0x5D, "MEM_LOAD_32S" => [rd: Reg, addr: Addr], 4,
         }
     };
 }
@@ -239,17 +254,31 @@ macro_rules! define_instructions {
     (@ty Reg)    => { u8 };
     (@ty ImmU8)  => { u8 };
     (@ty RefU32) => { u32 };
-    (@ty AddrU32) => { u32 };
     (@ty ImmI32) => { i32 };
+    (@ty ImmU32) => { u32 };
+    (@ty Addr) => { AddrOperand };
     (@ty Src) => { SrcOperand };
 
     // ---------- encoding ----------
     (@emit $out:ident, Reg, $v:ident) => { $out.push(*$v); };
     (@emit $out:ident, ImmU8, $v:ident) => { $out.push(*$v); };
 
-    (@emit $out:ident, ImmI32, $v:ident) => { $out.extend_from_slice(&$v.to_le_bytes()); };
     (@emit $out:ident, RefU32, $v:ident) => { $out.extend_from_slice(&$v.to_le_bytes()); };
-    (@emit $out:ident, AddrU32, $v:ident) => { $out.extend_from_slice(&$v.to_le_bytes()); };
+    (@emit $out:ident, ImmI32, $v:ident) => { $out.extend_from_slice(&$v.to_le_bytes()); };
+    (@emit $out:ident, ImmU32, $v:ident) => { $out.extend_from_slice(&$v.to_le_bytes()); };
+
+    (@emit $out:ident, Addr, $v:ident) => {
+        match $v {
+            AddrOperand::Reg(r) => {
+                $out.push(0); // TAG_REG
+                $out.push(*r)
+            },
+            AddrOperand::U32(u) => {
+                $out.push(1); // TAG_U32
+                $out.extend_from_slice(&u.to_le_bytes());
+            },
+        }
+    };
 
     (@emit $out:ident, Src, $v:ident) => {
       match $v {

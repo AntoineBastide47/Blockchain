@@ -332,7 +332,6 @@ pub mod tests {
         // Two public functions -> single DISPATCH instruction with 2 entries.
         // DISPATCH: opcode(1) + count(1) + 2 * (offset_i32(4) + argr(1)) = 12 bytes
         let source = r#"
-[ runtime code ]
 pub foo:
     HALT
 pub bar:
@@ -356,7 +355,6 @@ pub bar:
     #[test]
     fn dispatcher_skips_when_no_public_labels() {
         let source = r#"
-[ runtime code ]
 foo:
     HALT
 "#;
@@ -373,7 +371,6 @@ foo:
         // Single public function -> DISPATCH with 1 entry.
         // DISPATCH: opcode(1) + count(1) + 1 * (offset_i32(4) + argr(1)) = 7 bytes
         let source = r#"
-[ runtime code ]
 pub only:
     HALT
 "#;
@@ -393,7 +390,6 @@ pub only:
         // Source order is z then a; entries should be sorted alphabetically (a, z).
         // DISPATCH: opcode(1) + count(1) + 2 * (offset_i32(4) + argr(1)) = 12 bytes
         let source = r#"
-[ runtime code ]
 pub zebra:
     HALT
 pub alpha:

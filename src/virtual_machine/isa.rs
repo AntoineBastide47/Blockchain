@@ -137,7 +137,7 @@ macro_rules! for_each_instruction {
             /// CALL0 dst, fn ; call function fn without any arguments ; return -> dst
             Call0 = 0x44, "CALL0" => [dst: Reg, fn_id: ImmI32], 50,
             /// CALL1 dst, fn, arg ; call function fn with a single argument ; return -> dst
-            Call1 = 0x45, "CALL1" => [dst: Reg, fn_id: ImmI32, arg: Reg], 50,
+            Call1 = 0x45, "CALL1" => [dst: Reg, fn_id: ImmI32, arg: Src], 50,
             /// JAL rd, offset ; rd = PC + instr_size; PC += offset (jump and link)
             Jal = 0x46, "JAL" => [rd: Reg, offset: ImmI32], 5,
             /// JALR rd, rs, offset ; rd = PC + instr_size; PC = rs + offset (jump and link register)

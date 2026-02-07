@@ -2425,6 +2425,31 @@ fn call1_basic() {
     assert_eq!(run_and_get_int(source, 1), 100);
 }
 
+#[test]
+fn call1_accepts_immediate_src_arg() {
+    let source = r#"
+            JUMP skip_fn
+            my_func(1, r255):
+                RET r255
+            skip_fn:
+            CALL1 r1, my_func, 42
+        "#;
+    assert_eq!(run_and_get_int(source, 1), 42);
+}
+
+#[test]
+fn call1_immediate_uses_public_function_argr_from_dispatch() {
+    let source = r#"
+            __init__:
+            CALL1 r9, foo, 42
+            HALT
+
+            pub foo(1, r127):
+                RET r127
+        "#;
+    assert_eq!(run_and_get_int(source, 9), 42);
+}
+
 // ==================== CallDataLoad ====================
 
 fn run_vm_with_args(source: &str, args: Vec<Value>, arg_items: Vec<Vec<u8>>) -> VM {

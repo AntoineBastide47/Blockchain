@@ -14,5 +14,5 @@ pub factorial(1, r1):
     __fact_loop:                # prefixed with __ to indicate internal label
         MUL r3, r3, r1          # result *= i
         DEC r1                  # i--
-        BGE r1, 1, __fact_loop  # while n >= 1
+        BGEI r1, 1, __fact_loop # while n >= 1
     RET r3

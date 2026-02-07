@@ -75,27 +75,27 @@ macro_rules! for_each_instruction {
             // Integer arithmetic
             // =========================
             /// ADD rd, rs1, rs2 ; rd = rs1 + rs2
-            Add = 0x20, "ADD" => [rd: Reg, rs1: Src, rs2: Src], 3,
+            Add = 0x20, "ADD" => [rd: Reg, rs1: Reg, rs2: Reg], 3,
             /// SUB rd, rs1, rs2 ; rd = rs1 - rs2
-            Sub = 0x21, "SUB" => [rd: Reg, rs1: Src, rs2: Src], 3,
+            Sub = 0x21, "SUB" => [rd: Reg, rs1: Reg, rs2: Reg], 3,
             /// MUL rd, rs1, rs2 ; rd = rs1 * rs2
-            Mul = 0x22, "MUL" => [rd: Reg, rs1: Src, rs2: Src], 5,
+            Mul = 0x22, "MUL" => [rd: Reg, rs1: Reg, rs2: Reg], 5,
             /// DIV rd, rs1, rs2 ; rd = rs1 / rs2 (trap on division by zero)
-            Div = 0x23, "DIV" => [rd: Reg, rs1: Src, rs2: Src], 10,
+            Div = 0x23, "DIV" => [rd: Reg, rs1: Reg, rs2: Reg], 10,
             /// MOD rd, rs1, rs2 ; rd = rs1 % rs2
-            Mod = 0x24, "MOD" => [rd: Reg, rs1: Src, rs2: Src], 10,
+            Mod = 0x24, "MOD" => [rd: Reg, rs1: Reg, rs2: Reg], 10,
             /// NEG rd, rs ; rd = -rs
-            Neg = 0x25, "NEG" => [rd: Reg, rs: Src], 2,
+            Neg = 0x25, "NEG" => [rd: Reg, rs: Reg], 2,
             /// ABS rd, rs ; rd = |rs|
-            Abs = 0x26, "ABS" => [rd: Reg, rs: Src], 2,
+            Abs = 0x26, "ABS" => [rd: Reg, rs: Reg], 2,
             /// MIN rd, rs1, rs2 ; rd = min(rs1, rs2)
-            Min = 0x27, "MIN" => [rd: Reg, rs1: Src, rs2: Src], 3,
+            Min = 0x27, "MIN" => [rd: Reg, rs1: Reg, rs2: Reg], 3,
             /// MAX rd, rs1, rs2 ; rd = max(rs1, rs2)
-            Max = 0x28, "MAX" => [rd: Reg, rs1: Src, rs2: Src], 3,
+            Max = 0x28, "MAX" => [rd: Reg, rs1: Reg, rs2: Reg], 3,
             /// SHL rd, rs1, rs2 ; rd = rs1 << rs2
-            Shl = 0x29, "SHL" => [rd: Reg, rs1: Src, rs2: Src], 3,
+            Shl = 0x29, "SHL" => [rd: Reg, rs1: Reg, rs2: Reg], 3,
             /// SHR rd, rs1, rs2 ; rd = rs1 >> rs2 (arithmetic shift)
-            Shr = 0x2A, "SHR" => [rd: Reg, rs1: Src, rs2: Src], 3,
+            Shr = 0x2A, "SHR" => [rd: Reg, rs1: Reg, rs2: Reg], 3,
             /// INC rd ; rd = rd++
             Inc = 0x2B, "INC" => [rd: Reg], 1,
             /// Dec rd ; rd = rd--
@@ -104,25 +104,25 @@ macro_rules! for_each_instruction {
             // Boolean / comparison
             // =========================
             /// NOT rd, rs ; rd = !rs (logical negation)
-            Not = 0x30, "NOT" => [rd: Reg, rs: Src], 1,
+            Not = 0x30, "NOT" => [rd: Reg, rs: Reg], 1,
             /// AND rd, rs1, rs2 ; rd = rs1 & rs2 (bitwise and)
-            And = 0x31, "AND" => [rd: Reg, rs1: Src, rs2: Src], 2,
+            And = 0x31, "AND" => [rd: Reg, rs1: Reg, rs2: Reg], 2,
             /// OR rd, rs1, rs2 ; rd = rs1 | rs2 (bitwise or)
-            Or = 0x32, "OR" => [rd: Reg, rs1: Src, rs2: Src], 2,
+            Or = 0x32, "OR" => [rd: Reg, rs1: Reg, rs2: Reg], 2,
             /// XOR rd, rs1, rs2 ; rd = rs1 ^ rs2 (bitwise xor)
-            Xor = 0x33, "XOR" => [rd: Reg, rs1: Src, rs2: Src], 2,
+            Xor = 0x33, "XOR" => [rd: Reg, rs1: Reg, rs2: Reg], 2,
             /// EQ rd, rs1, rs2 ; rd = (rs1 == rs2)
-            Eq = 0x34, "EQ" => [rd: Reg, rs1: Src, rs2: Src], 3,
+            Eq = 0x34, "EQ" => [rd: Reg, rs1: Reg, rs2: Reg], 3,
             /// NE rd, rs1, rs2 ; rd = (rs1 != rs2)
-            Ne = 0x35, "NE" => [rd: Reg, rs1: Src, rs2: Src], 3,
+            Ne = 0x35, "NE" => [rd: Reg, rs1: Reg, rs2: Reg], 3,
             /// LT rd, rs1, rs2 ; rd = (rs1 < rs2)
-            Lt = 0x36, "LT" => [rd: Reg, rs1: Src, rs2: Src], 3,
+            Lt = 0x36, "LT" => [rd: Reg, rs1: Reg, rs2: Reg], 3,
             /// LE rd, rs1, rs2 ; rd = (rs1 <= rs2)
-            Le = 0x37, "LE" => [rd: Reg, rs1: Src, rs2: Src], 3,
+            Le = 0x37, "LE" => [rd: Reg, rs1: Reg, rs2: Reg], 3,
             /// GT rd, rs1, rs2 ; rd = (rs1 > rs2)
-            Gt = 0x38, "GT" => [rd: Reg, rs1: Src, rs2: Src], 3,
+            Gt = 0x38, "GT" => [rd: Reg, rs1: Reg, rs2: Reg], 3,
             /// GE rd, rs1, rs2 ; rd = (rs1 >= rs2)
-            Ge = 0x39, "GE" => [rd: Reg, rs1: Src, rs2: Src], 3,
+            Ge = 0x39, "GE" => [rd: Reg, rs1: Reg, rs2: Reg], 3,
             // =========================
             // Control Flow
             // =========================
@@ -143,17 +143,17 @@ macro_rules! for_each_instruction {
             /// JALR rd, rs, offset ; rd = PC + instr_size; PC = rs + offset (jump and link register)
             Jalr = 0x47, "JALR" => [rd: Reg, rs: Reg, offset: ImmI32], 5,
             /// BEQ rs1, rs2, offset ; if rs1 == rs2 then PC += offset
-            Beq = 0x48, "BEQ" => [rs1: Src, rs2: Src, offset: ImmI32], 5,
+            Beq = 0x48, "BEQ" => [rs1: Reg, rs2: Reg, offset: ImmI32], 5,
             /// BNE rs1, rs2, offset ; if rs1 != rs2 then PC += offset
-            Bne = 0x49, "BNE" => [rs1: Src, rs2: Src, offset: ImmI32], 5,
+            Bne = 0x49, "BNE" => [rs1: Reg, rs2: Reg, offset: ImmI32], 5,
             /// BLT rs1, rs2, offset ; if rs1 < rs2 (signed) then PC += offset
-            Blt = 0x4A, "BLT" => [rs1: Src, rs2: Src, offset: ImmI32], 5,
+            Blt = 0x4A, "BLT" => [rs1: Reg, rs2: Reg, offset: ImmI32], 5,
             /// BGE rs1, rs2, offset ; if rs1 >= rs2 (signed) then PC += offset
-            Bge = 0x4B, "BGE" => [rs1: Src, rs2: Src, offset: ImmI32], 5,
+            Bge = 0x4B, "BGE" => [rs1: Reg, rs2: Reg, offset: ImmI32], 5,
             /// BLTU rs1, rs2, offset ; if rs1 < rs2 (unsigned) then PC += offset
-            Bltu = 0x4C, "BLTU" => [rs1: Src, rs2: Src, offset: ImmI32], 5,
+            Bltu = 0x4C, "BLTU" => [rs1: Reg, rs2: Reg, offset: ImmI32], 5,
             /// BGEU rs1, rs2, offset ; if rs1 >= rs2 (unsigned) then PC += offset
-            Bgeu = 0x4D, "BGEU" => [rs1: Src, rs2: Src, offset: ImmI32], 5,
+            Bgeu = 0x4D, "BGEU" => [rs1: Reg, rs2: Reg, offset: ImmI32], 5,
             /// JUMP offset ; PC += offset (unconditional jump)
             Jump = 0x4E, "JUMP" => [offset: ImmI32], 5,
             /// RET rs ; return from function call with value in rs
@@ -189,6 +189,57 @@ macro_rules! for_each_instruction {
             MemLoad32U = 0x5C, "MEM_LOAD_32U" => [rd: Reg, addr: Addr], 4,
             /// MEM_LOAD_32S rd, addr ; rd = memory[addr .. addr + 4], sign extended
             MemLoad32S = 0x5D, "MEM_LOAD_32S" => [rd: Reg, addr: Addr], 4,
+            // =========================
+            // Immediate arithmetic
+            // =========================
+            /// ADDI rd, rs1, rs2 ; rd = rs1 + rs2
+            AddI = 0x60, "ADDI" => [rd: Reg, rs1: Reg, rs2: ImmI64], 3,
+            /// SUBI rd, rs1, rs2 ; rd = rs1 - rs2
+            SubI = 0x61, "SUBI" => [rd: Reg, rs1: Reg, rs2: ImmI64], 3,
+            /// MULI rd, rs1, rs2 ; rd = rs1 * rs2
+            MulI = 0x62, "MULI" => [rd: Reg, rs1: Reg, rs2: ImmI64], 5,
+            /// DIVI rd, rs1, rs2 ; rd = rs1 / rs2 (trap on division by zero)
+            DivI = 0x63, "DIVI" => [rd: Reg, rs1: Reg, rs2: ImmI64], 10,
+            /// MODI rd, rs1, rs2 ; rd = rs1 % rs2
+            ModI = 0x64, "MODI" => [rd: Reg, rs1: Reg, rs2: ImmI64], 10,
+            /// MINI rd, rs1, rs2 ; rd = min(rs1, rs2)
+            MinI = 0x65, "MINI" => [rd: Reg, rs1: Reg, rs2: ImmI64], 3,
+            /// MAXI rd, rs1, rs2 ; rd = max(rs1, rs2)
+            MaxI = 0x66, "MAXI" => [rd: Reg, rs1: Reg, rs2: ImmI64], 3,
+            /// SHLI rd, rs1, rs2 ; rd = rs1 << rs2
+            ShlI = 0x67, "SHLI" => [rd: Reg, rs1: Reg, rs2: ImmI64], 3,
+            /// SHRI rd, rs1, rs2 ; rd = rs1 >> rs2 (arithmetic shift)
+            ShrI = 0x68, "SHRI" => [rd: Reg, rs1: Reg, rs2: ImmI64], 3,
+            /// ANDI rd, rs1, imm ; rd = rs1 & imm
+            AndI = 0x69, "ANDI" => [rd: Reg, rs1: Reg, rs2: ImmI64], 2,
+            /// ORI rd, rs1, imm ; rd = rs1 | imm
+            OrI = 0x6A, "ORI" => [rd: Reg, rs1: Reg, rs2: ImmI64], 2,
+            /// XORI rd, rs1, imm ; rd = rs1 ^ imm
+            XorI = 0x6B, "XORI" => [rd: Reg, rs1: Reg, rs2: ImmI64], 2,
+            /// EQI rd, rs1, imm ; rd = (rs1 == imm)
+            EqI = 0x6C, "EQI" => [rd: Reg, rs1: Reg, rs2: ImmI64], 3,
+            /// NEI rd, rs1, imm ; rd = (rs1 != imm)
+            NeI = 0x6D, "NEI" => [rd: Reg, rs1: Reg, rs2: ImmI64], 3,
+            /// LTI rd, rs1, imm ; rd = (rs1 < imm)
+            LtI = 0x6E, "LTI" => [rd: Reg, rs1: Reg, rs2: ImmI64], 3,
+            /// LEI rd, rs1, imm ; rd = (rs1 <= imm)
+            LeI = 0x6F, "LEI" => [rd: Reg, rs1: Reg, rs2: ImmI64], 3,
+            /// GTI rd, rs1, imm ; rd = (rs1 > imm)
+            GtI = 0x70, "GTI" => [rd: Reg, rs1: Reg, rs2: ImmI64], 3,
+            /// GEI rd, rs1, imm ; rd = (rs1 >= imm)
+            GeI = 0x71, "GEI" => [rd: Reg, rs1: Reg, rs2: ImmI64], 3,
+            /// BEQI rs1, imm, offset ; if rs1 == imm then PC += offset
+            BeqI = 0x72, "BEQI" => [rs1: Reg, rs2: ImmI64, offset: ImmI32], 5,
+            /// BNEI rs1, imm, offset ; if rs1 != imm then PC += offset
+            BneI = 0x73, "BNEI" => [rs1: Reg, rs2: ImmI64, offset: ImmI32], 5,
+            /// BLTI rs1, imm, offset ; if rs1 < imm (signed) then PC += offset
+            BltI = 0x74, "BLTI" => [rs1: Reg, rs2: ImmI64, offset: ImmI32], 5,
+            /// BGEI rs1, imm, offset ; if rs1 >= imm (signed) then PC += offset
+            BgeI = 0x75, "BGEI" => [rs1: Reg, rs2: ImmI64, offset: ImmI32], 5,
+            /// BLTUI rs1, imm, offset ; if rs1 < imm (unsigned) then PC += offset
+            BltuI = 0x76, "BLTUI" => [rs1: Reg, rs2: ImmI64, offset: ImmI32], 5,
+            /// BGEUI rs1, imm, offset ; if rs1 >= imm (unsigned) then PC += offset
+            BgeuI = 0x77, "BGEUI" => [rs1: Reg, rs2: ImmI64, offset: ImmI32], 5,
         }
     };
 }
@@ -256,6 +307,7 @@ macro_rules! define_instructions {
     (@ty RefU32) => { u32 };
     (@ty ImmI32) => { i32 };
     (@ty ImmU32) => { u32 };
+    (@ty ImmI64) => { i64 };
     (@ty Addr) => { AddrOperand };
     (@ty Src) => { SrcOperand };
 
@@ -266,6 +318,7 @@ macro_rules! define_instructions {
     (@emit $out:ident, RefU32, $v:ident) => { $out.extend_from_slice(&$v.to_le_bytes()); };
     (@emit $out:ident, ImmI32, $v:ident) => { $out.extend_from_slice(&$v.to_le_bytes()); };
     (@emit $out:ident, ImmU32, $v:ident) => { $out.extend_from_slice(&$v.to_le_bytes()); };
+    (@emit $out:ident, ImmI64, $v:ident) => { $out.extend_from_slice(&$v.to_le_bytes()); };
 
     (@emit $out:ident, Addr, $v:ident) => {
         match $v {

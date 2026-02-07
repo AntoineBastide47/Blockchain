@@ -4,292 +4,95 @@
 //! remain unchanged across updates. Any modification to the ISA will cause these
 //! tests to fail, providing a safety net against accidental changes.
 
-#[cfg(test)]
-mod tests {
-    use crate::virtual_machine::isa::Instruction;
+use crate::for_each_instruction;
 
-    /// Verifies that all instruction opcodes match their expected values.
-    #[test]
-    fn instruction_opcodes_unchanged() {
-        // Move, Casts and Misc
-        assert_eq!(Instruction::Noop as u8, 0x00);
-        assert_eq!(Instruction::Move as u8, 0x01);
-        assert_eq!(Instruction::CMove as u8, 0x02);
-        assert_eq!(Instruction::I64ToBool as u8, 0x03);
-        assert_eq!(Instruction::BoolToI64 as u8, 0x04);
-        assert_eq!(Instruction::StrToI64 as u8, 0x05);
-        assert_eq!(Instruction::I64ToStr as u8, 0x06);
-        assert_eq!(Instruction::StrToBool as u8, 0x07);
-        assert_eq!(Instruction::BoolToStr as u8, 0x08);
+macro_rules! define_static_checks {
+    (
+        $(
+            $(#[$doc:meta])*
+            $name:ident = $opcode:expr, $mnemonic:literal => [
+                $( $field:ident : $kind:ident ),* $(,)?
+            ], $gas:expr
+        ),* $(,)?
+    ) => {
+        #[cfg(test)]
+        mod tests {
+            use crate::virtual_machine::isa::Instruction;
 
-        // Store and Load
-        assert_eq!(Instruction::DeleteState as u8, 0x10);
-        assert_eq!(Instruction::HasState as u8, 0x11);
-        assert_eq!(Instruction::StoreBytes as u8, 0x12);
-        assert_eq!(Instruction::LoadBytes as u8, 0x13);
-        assert_eq!(Instruction::LoadI64 as u8, 0x14);
-        assert_eq!(Instruction::LoadBool as u8, 0x15);
-        assert_eq!(Instruction::LoadStr as u8, 0x16);
-        assert_eq!(Instruction::LoadHash as u8, 0x17);
+            const INSTRUCTIONS: &[(Instruction, u8, &str, u64)] = &[
+                $( (Instruction::$name, $opcode, $mnemonic, $gas), )*
+            ];
+            /*
+            To update this hash after intentional ISA changes, run:
+            `python3 - <<'PY'
+            import re
+            from pathlib import Path
+            text = Path("src/virtual_machine/isa.rs").read_text()
+            pattern = re.compile(r'^\\s*([A-Za-z0-9_]+)\\s*=\\s*(0x[0-9A-Fa-f]+),\\s*\"([^\"]+)\"\\s*=>\\s*\\[[^\\]]*\\],\\s*([0-9]+)\\s*,?\\s*$', re.MULTILINE)
+            entries = pattern.findall(text)
+            FNV_OFFSET = 14695981039346656037
+            FNV_PRIME = 1099511628211
+            h = FNV_OFFSET
+            def fnv_update(h, b):
+                return (h ^ b) * FNV_PRIME & 0xFFFFFFFFFFFFFFFF
+            for name, op_hex, mnemonic, gas in entries:
+                opcode = int(op_hex, 16)
+                h = fnv_update(h, opcode & 0xFF)
+                for b in mnemonic.encode("utf-8"):
+                    h = fnv_update(h, b)
+                h = fnv_update(h, 0)
+                gas_val = int(gas)
+                for b in gas_val.to_bytes(8, "little"):
+                    h = fnv_update(h, b)
+            h = fnv_update(h, 0xFF)
+            for b in b"DISPATCH":
+                h = fnv_update(h, b)
+            h = fnv_update(h, 0)
+            for b in (10).to_bytes(8, "little"):
+                h = fnv_update(h, b)
+            print(h)
+            PY`
+            */
+            const EXPECTED_ISA_HASH: u64 = 6_222_320_695_447_808_144;
 
-        // Integer arithmetic
-        assert_eq!(Instruction::Add as u8, 0x20);
-        assert_eq!(Instruction::Sub as u8, 0x21);
-        assert_eq!(Instruction::Mul as u8, 0x22);
-        assert_eq!(Instruction::Div as u8, 0x23);
-        assert_eq!(Instruction::Mod as u8, 0x24);
-        assert_eq!(Instruction::Neg as u8, 0x25);
-        assert_eq!(Instruction::Abs as u8, 0x26);
-        assert_eq!(Instruction::Min as u8, 0x27);
-        assert_eq!(Instruction::Max as u8, 0x28);
-        assert_eq!(Instruction::Shl as u8, 0x29);
-        assert_eq!(Instruction::Shr as u8, 0x2A);
-        assert_eq!(Instruction::Inc as u8, 0x2B);
-        assert_eq!(Instruction::Dec as u8, 0x2C);
+            fn fnv1a_hash(bytes: &[u8], mut hash: u64) -> u64 {
+                const FNV_PRIME: u64 = 1_099_511_628_211;
+                for b in bytes {
+                    hash ^= *b as u64;
+                    hash = hash.wrapping_mul(FNV_PRIME);
+                }
+                hash
+            }
 
-        // Boolean / comparison
-        assert_eq!(Instruction::Not as u8, 0x30);
-        assert_eq!(Instruction::And as u8, 0x31);
-        assert_eq!(Instruction::Or as u8, 0x32);
-        assert_eq!(Instruction::Xor as u8, 0x33);
-        assert_eq!(Instruction::Eq as u8, 0x34);
-        assert_eq!(Instruction::Ne as u8, 0x35);
-        assert_eq!(Instruction::Lt as u8, 0x36);
-        assert_eq!(Instruction::Le as u8, 0x37);
-        assert_eq!(Instruction::Gt as u8, 0x38);
-        assert_eq!(Instruction::Ge as u8, 0x39);
+            fn isa_hash() -> u64 {
+                const FNV_OFFSET: u64 = 14_695_981_039_346_656_037;
+                let mut hash = FNV_OFFSET;
+                for (_instr, opcode, mnemonic, gas) in INSTRUCTIONS {
+                    hash = fnv1a_hash(&[*opcode], hash);
+                    hash = fnv1a_hash(mnemonic.as_bytes(), hash);
+                    hash = fnv1a_hash(&[0], hash);
+                    hash = fnv1a_hash(&gas.to_le_bytes(), hash);
+                }
 
-        // Control Flow
-        assert_eq!(Instruction::CallHost as u8, 0x40);
-        assert_eq!(Instruction::CallHost0 as u8, 0x41);
-        assert_eq!(Instruction::CallHost1 as u8, 0x42);
-        assert_eq!(Instruction::Call as u8, 0x43);
-        assert_eq!(Instruction::Call0 as u8, 0x44);
-        assert_eq!(Instruction::Call1 as u8, 0x45);
-        assert_eq!(Instruction::Jal as u8, 0x46);
-        assert_eq!(Instruction::Jalr as u8, 0x47);
-        assert_eq!(Instruction::Beq as u8, 0x48);
-        assert_eq!(Instruction::Bne as u8, 0x49);
-        assert_eq!(Instruction::Blt as u8, 0x4A);
-        assert_eq!(Instruction::Bge as u8, 0x4B);
-        assert_eq!(Instruction::Bltu as u8, 0x4C);
-        assert_eq!(Instruction::Bgeu as u8, 0x4D);
-        assert_eq!(Instruction::Jump as u8, 0x4E);
-        assert_eq!(Instruction::Ret as u8, 0x4F);
-        assert_eq!(Instruction::Halt as u8, 0x50);
+                // Include the special Dispatch instruction.
+                hash = fnv1a_hash(&[0xFF], hash);
+                hash = fnv1a_hash(b"DISPATCH", hash);
+                hash = fnv1a_hash(&[0], hash);
+                hash = fnv1a_hash(&10_u64.to_le_bytes(), hash);
+                hash
+            }
 
-        // Data and Memory access
-        assert_eq!(Instruction::CallDataLoad as u8, 0x51);
-        assert_eq!(Instruction::CallDataCopy as u8, 0x52);
-        assert_eq!(Instruction::CallDataLen as u8, 0x53);
-        assert_eq!(Instruction::MemLoad as u8, 0x54);
-        assert_eq!(Instruction::MemStore as u8, 0x55);
-        assert_eq!(Instruction::MemCpy as u8, 0x56);
-        assert_eq!(Instruction::MemSet as u8, 0x57);
-        assert_eq!(Instruction::MemLoad8U as u8, 0x58);
-        assert_eq!(Instruction::MemLoad8S as u8, 0x59);
-        assert_eq!(Instruction::MemLoad16U as u8, 0x5A);
-        assert_eq!(Instruction::MemLoad16S as u8, 0x5B);
-        assert_eq!(Instruction::MemLoad32U as u8, 0x5C);
-        assert_eq!(Instruction::MemLoad32S as u8, 0x5D);
-
-        // Special Dispatch instruction
-        assert_eq!(Instruction::Dispatch as u8, 0xFF);
-    }
-
-    /// Verifies that all instruction mnemonics match their expected values.
-    #[test]
-    fn instruction_mnemonics_unchanged() {
-        // Move, Casts and Misc
-        assert_eq!(Instruction::Noop.mnemonic(), "NOOP");
-        assert_eq!(Instruction::Move.mnemonic(), "MOVE");
-        assert_eq!(Instruction::CMove.mnemonic(), "CMOVE");
-        assert_eq!(Instruction::I64ToBool.mnemonic(), "I64_TO_BOOL");
-        assert_eq!(Instruction::BoolToI64.mnemonic(), "BOOL_TO_I64");
-        assert_eq!(Instruction::StrToI64.mnemonic(), "STR_TO_I64");
-        assert_eq!(Instruction::I64ToStr.mnemonic(), "I64_TO_STR");
-        assert_eq!(Instruction::StrToBool.mnemonic(), "STR_TO_BOOL");
-        assert_eq!(Instruction::BoolToStr.mnemonic(), "BOOL_TO_STR");
-
-        // Store and Load
-        assert_eq!(Instruction::DeleteState.mnemonic(), "DELETE_STATE");
-        assert_eq!(Instruction::HasState.mnemonic(), "HAS_STATE");
-        assert_eq!(Instruction::StoreBytes.mnemonic(), "STORE");
-        assert_eq!(Instruction::LoadBytes.mnemonic(), "LOAD");
-        assert_eq!(Instruction::LoadI64.mnemonic(), "LOAD_I64");
-        assert_eq!(Instruction::LoadBool.mnemonic(), "LOAD_BOOL");
-        assert_eq!(Instruction::LoadStr.mnemonic(), "LOAD_STR");
-        assert_eq!(Instruction::LoadHash.mnemonic(), "LOAD_HASH");
-
-        // Integer arithmetic
-        assert_eq!(Instruction::Add.mnemonic(), "ADD");
-        assert_eq!(Instruction::Sub.mnemonic(), "SUB");
-        assert_eq!(Instruction::Mul.mnemonic(), "MUL");
-        assert_eq!(Instruction::Div.mnemonic(), "DIV");
-        assert_eq!(Instruction::Mod.mnemonic(), "MOD");
-        assert_eq!(Instruction::Neg.mnemonic(), "NEG");
-        assert_eq!(Instruction::Abs.mnemonic(), "ABS");
-        assert_eq!(Instruction::Min.mnemonic(), "MIN");
-        assert_eq!(Instruction::Max.mnemonic(), "MAX");
-        assert_eq!(Instruction::Shl.mnemonic(), "SHL");
-        assert_eq!(Instruction::Shr.mnemonic(), "SHR");
-        assert_eq!(Instruction::Inc.mnemonic(), "INC");
-        assert_eq!(Instruction::Dec.mnemonic(), "DEC");
-
-        // Boolean / comparison
-        assert_eq!(Instruction::Not.mnemonic(), "NOT");
-        assert_eq!(Instruction::And.mnemonic(), "AND");
-        assert_eq!(Instruction::Or.mnemonic(), "OR");
-        assert_eq!(Instruction::Xor.mnemonic(), "XOR");
-        assert_eq!(Instruction::Eq.mnemonic(), "EQ");
-        assert_eq!(Instruction::Ne.mnemonic(), "NE");
-        assert_eq!(Instruction::Lt.mnemonic(), "LT");
-        assert_eq!(Instruction::Le.mnemonic(), "LE");
-        assert_eq!(Instruction::Gt.mnemonic(), "GT");
-        assert_eq!(Instruction::Ge.mnemonic(), "GE");
-
-        // Control Flow
-        assert_eq!(Instruction::CallHost.mnemonic(), "CALL_HOST");
-        assert_eq!(Instruction::CallHost0.mnemonic(), "CALL_HOST0");
-        assert_eq!(Instruction::CallHost1.mnemonic(), "CALL_HOST1");
-        assert_eq!(Instruction::Call.mnemonic(), "CALL");
-        assert_eq!(Instruction::Call0.mnemonic(), "CALL0");
-        assert_eq!(Instruction::Call1.mnemonic(), "CALL1");
-        assert_eq!(Instruction::Jal.mnemonic(), "JAL");
-        assert_eq!(Instruction::Jalr.mnemonic(), "JALR");
-        assert_eq!(Instruction::Beq.mnemonic(), "BEQ");
-        assert_eq!(Instruction::Bne.mnemonic(), "BNE");
-        assert_eq!(Instruction::Blt.mnemonic(), "BLT");
-        assert_eq!(Instruction::Bge.mnemonic(), "BGE");
-        assert_eq!(Instruction::Bltu.mnemonic(), "BLTU");
-        assert_eq!(Instruction::Bgeu.mnemonic(), "BGEU");
-        assert_eq!(Instruction::Jump.mnemonic(), "JUMP");
-        assert_eq!(Instruction::Ret.mnemonic(), "RET");
-        assert_eq!(Instruction::Halt.mnemonic(), "HALT");
-
-        // Data and Memory access
-        assert_eq!(Instruction::CallDataLoad.mnemonic(), "CALLDATA_LOAD");
-        assert_eq!(Instruction::CallDataCopy.mnemonic(), "CALLDATA_COPY");
-        assert_eq!(Instruction::CallDataLen.mnemonic(), "CALLDATA_LEN");
-        assert_eq!(Instruction::MemLoad.mnemonic(), "MEM_LOAD");
-        assert_eq!(Instruction::MemStore.mnemonic(), "MEM_STORE");
-        assert_eq!(Instruction::MemCpy.mnemonic(), "MEM_COPY");
-        assert_eq!(Instruction::MemSet.mnemonic(), "MEM_SET");
-        assert_eq!(Instruction::MemLoad8U.mnemonic(), "MEM_LOAD_8U");
-        assert_eq!(Instruction::MemLoad8S.mnemonic(), "MEM_LOAD_8S");
-        assert_eq!(Instruction::MemLoad16U.mnemonic(), "MEM_LOAD_16U");
-        assert_eq!(Instruction::MemLoad16S.mnemonic(), "MEM_LOAD_16S");
-        assert_eq!(Instruction::MemLoad32U.mnemonic(), "MEM_LOAD_32U");
-        assert_eq!(Instruction::MemLoad32S.mnemonic(), "MEM_LOAD_32S");
-
-        // Special Dispatch instruction
-        assert_eq!(Instruction::Dispatch.mnemonic(), "DISPATCH");
-    }
-
-    /// Verifies that all instruction base gas costs match their expected values.
-    #[test]
-    fn instruction_gas_costs_unchanged() {
-        // Move, Casts and Misc
-        assert_eq!(Instruction::Noop.base_gas(), 1);
-        assert_eq!(Instruction::Move.base_gas(), 1);
-        assert_eq!(Instruction::CMove.base_gas(), 5);
-        assert_eq!(Instruction::I64ToBool.base_gas(), 1);
-        assert_eq!(Instruction::BoolToI64.base_gas(), 1);
-        assert_eq!(Instruction::StrToI64.base_gas(), 30);
-        assert_eq!(Instruction::I64ToStr.base_gas(), 30);
-        assert_eq!(Instruction::StrToBool.base_gas(), 20);
-        assert_eq!(Instruction::BoolToStr.base_gas(), 20);
-
-        // Store and Load
-        assert_eq!(Instruction::DeleteState.base_gas(), 2000);
-        assert_eq!(Instruction::HasState.base_gas(), 50);
-        assert_eq!(Instruction::StoreBytes.base_gas(), 2000);
-        assert_eq!(Instruction::LoadBytes.base_gas(), 50);
-        assert_eq!(Instruction::LoadI64.base_gas(), 50);
-        assert_eq!(Instruction::LoadBool.base_gas(), 50);
-        assert_eq!(Instruction::LoadStr.base_gas(), 50);
-        assert_eq!(Instruction::LoadHash.base_gas(), 50);
-
-        // Integer arithmetic
-        assert_eq!(Instruction::Add.base_gas(), 3);
-        assert_eq!(Instruction::Sub.base_gas(), 3);
-        assert_eq!(Instruction::Mul.base_gas(), 5);
-        assert_eq!(Instruction::Div.base_gas(), 10);
-        assert_eq!(Instruction::Mod.base_gas(), 10);
-        assert_eq!(Instruction::Neg.base_gas(), 2);
-        assert_eq!(Instruction::Abs.base_gas(), 2);
-        assert_eq!(Instruction::Min.base_gas(), 3);
-        assert_eq!(Instruction::Max.base_gas(), 3);
-        assert_eq!(Instruction::Shl.base_gas(), 3);
-        assert_eq!(Instruction::Shr.base_gas(), 3);
-        assert_eq!(Instruction::Inc.base_gas(), 1);
-        assert_eq!(Instruction::Dec.base_gas(), 1);
-
-        // Boolean / comparison
-        assert_eq!(Instruction::Not.base_gas(), 1);
-        assert_eq!(Instruction::And.base_gas(), 2);
-        assert_eq!(Instruction::Or.base_gas(), 2);
-        assert_eq!(Instruction::Xor.base_gas(), 2);
-        assert_eq!(Instruction::Eq.base_gas(), 3);
-        assert_eq!(Instruction::Ne.base_gas(), 3);
-        assert_eq!(Instruction::Lt.base_gas(), 3);
-        assert_eq!(Instruction::Le.base_gas(), 3);
-        assert_eq!(Instruction::Gt.base_gas(), 3);
-        assert_eq!(Instruction::Ge.base_gas(), 3);
-
-        // Control Flow
-        assert_eq!(Instruction::CallHost.base_gas(), 100);
-        assert_eq!(Instruction::CallHost0.base_gas(), 100);
-        assert_eq!(Instruction::CallHost1.base_gas(), 100);
-        assert_eq!(Instruction::Call.base_gas(), 50);
-        assert_eq!(Instruction::Call0.base_gas(), 50);
-        assert_eq!(Instruction::Call1.base_gas(), 50);
-        assert_eq!(Instruction::Jal.base_gas(), 5);
-        assert_eq!(Instruction::Jalr.base_gas(), 5);
-        assert_eq!(Instruction::Beq.base_gas(), 5);
-        assert_eq!(Instruction::Bne.base_gas(), 5);
-        assert_eq!(Instruction::Blt.base_gas(), 5);
-        assert_eq!(Instruction::Bge.base_gas(), 5);
-        assert_eq!(Instruction::Bltu.base_gas(), 5);
-        assert_eq!(Instruction::Bgeu.base_gas(), 5);
-        assert_eq!(Instruction::Jump.base_gas(), 5);
-        assert_eq!(Instruction::Ret.base_gas(), 5);
-        assert_eq!(Instruction::Halt.base_gas(), 1);
-
-        // Data and Memory access
-        assert_eq!(Instruction::CallDataLoad.base_gas(), 3);
-        assert_eq!(Instruction::CallDataCopy.base_gas(), 5);
-        assert_eq!(Instruction::CallDataLen.base_gas(), 1);
-        assert_eq!(Instruction::MemLoad.base_gas(), 5);
-        assert_eq!(Instruction::MemStore.base_gas(), 5);
-        assert_eq!(Instruction::MemCpy.base_gas(), 5);
-        assert_eq!(Instruction::MemSet.base_gas(), 5);
-        assert_eq!(Instruction::MemLoad8U.base_gas(), 2);
-        assert_eq!(Instruction::MemLoad8S.base_gas(), 2);
-        assert_eq!(Instruction::MemLoad16U.base_gas(), 3);
-        assert_eq!(Instruction::MemLoad16S.base_gas(), 3);
-        assert_eq!(Instruction::MemLoad32U.base_gas(), 4);
-        assert_eq!(Instruction::MemLoad32S.base_gas(), 4);
-
-        // Special Dispatch instruction
-        assert_eq!(Instruction::Dispatch.base_gas(), 10);
-    }
-
-    /// Verifies the total instruction count has not changed.
-    #[test]
-    fn instruction_count_unchanged() {
-        const EXPECTED_COUNT: usize = 71;
-
-        // Count by verifying TryFrom succeeds for expected opcodes
-        let mut count = 0;
-        for byte in 0..=0xFF_u8 {
-            count += Instruction::try_from(byte).is_ok() as usize;
+            /// Verifies the ISA definition hash has not changed.
+            #[test]
+            fn instruction_definition_hash_unchanged() {
+                assert_eq!(
+                    isa_hash(),
+                    EXPECTED_ISA_HASH,
+                    "ISA definition changed; update EXPECTED_ISA_HASH if intentional"
+                );
+            }
         }
-
-        assert_eq!(
-            count, EXPECTED_COUNT,
-            "instruction count changed: expected {}, found {}",
-            EXPECTED_COUNT, count
-        );
-    }
+    };
 }
+
+for_each_instruction!(define_static_checks);

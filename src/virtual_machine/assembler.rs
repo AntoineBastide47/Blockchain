@@ -964,6 +964,7 @@ macro_rules! define_parse_instruction {
     (@token_size RefU32, $iter:ident) => { { $iter.next(); 4usize } };
     (@token_size ImmI32, $iter:ident) => { { $iter.next(); 4usize } };
     (@token_size ImmU32, $iter:ident) => { { $iter.next(); 4usize } };
+    (@token_size ImmI64, $iter:ident) => { { $iter.next(); 8usize } };
 
     (@token_size Addr, $iter:ident) => { addr_size_from_token($iter.next().unwrap().text) };
     (@token_size Src, $iter:ident) => { src_size_from_token($iter.next().unwrap().text) };
@@ -987,6 +988,7 @@ macro_rules! define_parse_instruction {
 
     (@parse_operand ImmI32, $tok:expr, $ctx:expr, $line:ident, $offset:expr) => { parse_i32_or_label(&$tok.text, $ctx, $line, $offset) };
     (@parse_operand ImmU32, $tok:expr, $ctx:expr, $line:ident, $offset:expr) => { parse_u32_or_hex(&$tok.text, $line, $offset) };
+    (@parse_operand ImmI64, $tok:expr, $ctx:expr, $line:ident, $offset:expr) => { parse_i64_or_hex(&$tok.text, $line, $offset) };
     (@parse_operand RefU32, $tok:expr, $ctx:expr, $line:ident, $offset:expr) => {{
         let tok = &$tok.text;
         if let Some(s) = tok.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
@@ -1644,8 +1646,8 @@ mod tests {
         match instr {
             AsmInstr::Add { rd, rs1, rs2 } => {
                 assert_eq!(rd, 0);
-                assert_eq!(rs1, SrcOperand::Reg(1));
-                assert_eq!(rs2, SrcOperand::Reg(2));
+                assert_eq!(rs1, 1);
+                assert_eq!(rs2, 2);
             }
             _ => panic!("wrong instruction type"),
         }
@@ -1667,28 +1669,21 @@ mod tests {
     fn asm_instr_assemble_three_reg() {
         let instr = AsmInstr::Sub {
             rd: 10,
-            rs1: SrcOperand::I64(20),
-            rs2: SrcOperand::I64(30),
+            rs1: 20,
+            rs2: 30,
         };
         let mut out = Vec::new();
         instr.assemble(&mut out);
-        let mut expected = vec![Instruction::Sub as u8, 10, 2];
-        expected.extend_from_slice(&20i64.to_le_bytes());
-        expected.push(2);
-        expected.extend_from_slice(&30i64.to_le_bytes());
+        let expected = vec![Instruction::Sub as u8, 10, 20, 30];
         assert_eq!(out, expected);
     }
 
     #[test]
     fn asm_instr_assemble_two_reg() {
-        let instr = AsmInstr::Neg {
-            rd: 1,
-            rs: SrcOperand::I64(2),
-        };
+        let instr = AsmInstr::Neg { rd: 1, rs: 2 };
         let mut out = Vec::new();
         instr.assemble(&mut out);
-        let mut expected = vec![Instruction::Neg as u8, 1, 2];
-        expected.extend_from_slice(&2i64.to_le_bytes());
+        let expected = vec![Instruction::Neg as u8, 1, 2];
         assert_eq!(out, expected);
     }
 

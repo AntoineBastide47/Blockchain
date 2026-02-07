@@ -48,6 +48,7 @@ use std::fs;
 use std::path::Path;
 use std::process;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 struct EmptyStorage;
 
@@ -159,6 +160,7 @@ fn main() {
 
     SHOW_TIMESTAMP.store(false, Ordering::Relaxed);
 
+    let assemble_start = Instant::now();
     let program = match assemble_file(input_path) {
         Ok(p) => p,
         Err(e) => {
@@ -166,6 +168,7 @@ fn main() {
             process::exit(1);
         }
     };
+    let assemble_elapsed = assemble_start.elapsed();
 
     let program_bytes = program.to_bytes();
 
@@ -178,14 +181,20 @@ fn main() {
 
     match output_path {
         None => {
-            info!("Compiled {} ({} bytes)", input_path, program_bytes.len());
+            info!(
+                "Assembled {} ({} bytes) in {:?}",
+                input_path,
+                program_bytes.len(),
+                assemble_elapsed
+            );
         }
         Some(ref path) => {
             info!(
-                "Compiled {} -> {} ({} bytes)",
+                "Assembled {} -> {} ({} bytes) in {:?}",
                 input_path,
                 path,
-                program_bytes.len()
+                program_bytes.len(),
+                assemble_elapsed
             );
         }
     }
@@ -277,6 +286,7 @@ fn main() {
                     continue;
                 }
 
+                let exec_start = Instant::now();
                 let mut vm = VM::new_execute(
                     exec_program,
                     program.clone(),
@@ -292,6 +302,7 @@ fn main() {
                     warn!("Function '{}': execution failed: {}", fn_name, e);
                     continue;
                 }
+                let exec_elapsed = exec_start.elapsed();
 
                 let mut exec_profile = vm.gas_profile();
                 exec_profile.add(GasCategory::Intrinsic, exec_intrinsic);
@@ -308,7 +319,10 @@ fn main() {
                 };
                 print_gas_profile(
                     &exec_profile,
-                    &format!("Execution Gas Profile: {}({})", fn_name, args_str),
+                    &format!(
+                        "Estimted {}({}) in {:?}, Gas Profile",
+                        fn_name, args_str, exec_elapsed
+                    ),
                     gas_price,
                 );
             }
@@ -431,17 +445,17 @@ fn print_gas_profile(
 }
 
 const USAGE: &str = "\
-Assembly Compiler
+Bytecode Assembler
 
 USAGE:
     {program} <input.asm> [OPTIONS]
 
 ARGS:
-    <input.asm>    Assembly source file to compile
+    <input.asm>    Assembly source file to bytecode
 
 OPTIONS:
     -o, --output <file>                   Optional output file path
-    -p, --predict [price] [func(args)...] Estimate gas costs
+    -p, --predict [price] [func(args...)...] Estimate gas costs
     -h, --help                            Print this help message
 
 DESCRIPTION:

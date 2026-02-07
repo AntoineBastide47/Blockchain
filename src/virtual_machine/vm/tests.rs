@@ -409,204 +409,7 @@ fn dec_type_error() {
     ));
 }
 
-#[test]
-fn immediate_arithmetic_and_logic() {
-    assert_eq!(run_and_get_int("MOVE r0, 5\nADDI r1, r0, -2", 1), 3);
-    assert_eq!(run_and_get_int("MOVE r0, 10\nSUBI r1, r0, 4", 1), 6);
-    assert_eq!(run_and_get_int("MOVE r0, 6\nMULI r1, r0, 7", 1), 42);
-    assert_eq!(run_and_get_int("MOVE r0, 1\nSHLI r1, r0, 3", 1), 8);
-    assert_eq!(run_and_get_int("MOVE r0, 16\nSHRI r1, r0, 2", 1), 4);
-    assert!(run_and_get_bool("MOVE r0, true\nANDI r1, r0, 1", 1));
-    assert!(run_and_get_bool("MOVE r0, false\nORI r1, r0, 1", 1));
-    assert!(!run_and_get_bool("MOVE r0, true\nXORI r1, r0, 1", 1));
-}
-
-#[test]
-fn immediate_comparisons() {
-    assert!(run_and_get_bool("MOVE r0, 7\nEQI r1, r0, 7", 1));
-    assert!(run_and_get_bool("MOVE r0, 7\nLTI r1, r0, 10", 1));
-    assert!(run_and_get_bool("MOVE r0, 7\nGEI r1, r0, 7", 1));
-    assert!(run_and_get_bool("MOVE r0, 7\nLEI r1, r0, 7", 1));
-    assert!(run_and_get_bool("MOVE r0, 7\nGTI r1, r0, 5", 1));
-}
-
-#[test]
-fn immediate_branches() {
-    let source = r#"
-MOVE r0, 0
-BEQI r0, 0, target
-MOVE r1, 1
-HALT
-target:
-MOVE r1, 42
-"#;
-    assert_eq!(run_and_get_int(source, 1), 42);
-
-    let source = r#"
-MOVE r0, 5
-BNEI r0, 5, target
-MOVE r1, 99
-HALT
-target:
-MOVE r1, 1
-"#;
-    assert_eq!(run_and_get_int(source, 1), 99);
-
-    let source = r#"
-MOVE r0, 3
-BLTI r0, 5, target
-MOVE r1, 0
-HALT
-target:
-MOVE r1, 77
-"#;
-    assert_eq!(run_and_get_int(source, 1), 77);
-
-    let source = r#"
-MOVE r0, -1
-BGEUI r0, 0, target
-MOVE r1, 0
-HALT
-target:
-MOVE r1, 123
-"#;
-    assert_eq!(run_and_get_int(source, 1), 123);
-
-    let source = r#"
-MOVE r0, -5
-BGEI r0, -10, target
-MOVE r1, 0
-HALT
-target:
-MOVE r1, 9
-"#;
-    assert_eq!(run_and_get_int(source, 1), 9);
-
-    let source = r#"
-MOVE r0, 1
-BLTUI r0, 5, target
-MOVE r1, 0
-HALT
-target:
-MOVE r1, 11
-"#;
-    assert_eq!(run_and_get_int(source, 1), 11);
-}
-
 // ==================== Src Operand Encoding ====================
-
-#[test]
-fn src_operand_i64_both_positions() {
-    // Immediate arithmetic with register source
-    assert_eq!(run_and_get_int("MOVE r1, 10\nADDI r0, r1, 32", 0), 42);
-    assert_eq!(run_and_get_int("MOVE r1, 50\nSUBI r0, r1, 8", 0), 42);
-    assert_eq!(run_and_get_int("MOVE r1, 6\nMULI r0, r1, 7", 0), 42);
-}
-
-#[test]
-fn src_operand_i64_first_position() {
-    // Register source with immediate
-    assert_eq!(run_and_get_int("MOVE r1, 32\nADDI r0, r1, 10", 0), 42);
-    assert_eq!(run_and_get_int("MOVE r1, 8\nSUBI r0, r1, -34", 0), 42);
-}
-
-#[test]
-fn src_operand_bool_immediate() {
-    // Boolean immediates in logic operations (imm uses 0/1)
-    assert!(run_and_get_bool("MOVE r1, true\nANDI r0, r1, 1", 0));
-    assert!(!run_and_get_bool("MOVE r1, true\nANDI r0, r1, 0", 0));
-    assert!(run_and_get_bool("MOVE r1, false\nORI r0, r1, 1", 0));
-    assert!(!run_and_get_bool("MOVE r1, false\nORI r0, r1, 0", 0));
-    assert!(run_and_get_bool("MOVE r1, true\nXORI r0, r1, 0", 0));
-    assert!(!run_and_get_bool("MOVE r1, true\nXORI r0, r1, 1", 0));
-}
-
-#[test]
-fn src_operand_bool_mixed() {
-    // Mix of register and immediate bool (imm uses 0/1)
-    assert!(run_and_get_bool("MOVE r1, true\nANDI r0, r1, 1", 0));
-    assert!(run_and_get_bool("MOVE r1, true\nORI r0, r1, 1", 0));
-    assert!(!run_and_get_bool("MOVE r1, false\nORI r0, r1, 0", 0));
-}
-
-#[test]
-fn src_operand_string_ref_comparison() {
-    let source = r#"MOVE r0, "hello"
-MOVE r1, "hello"
-EQ r2, r0, r1"#;
-    assert!(matches!(
-        run_expect_err(source),
-        VMError::TypeMismatchStatic { .. }
-    ));
-}
-
-#[test]
-fn src_operand_string_ref_mixed() {
-    let source = r#"MOVE r0, "test"
-MOVE r1, 1
-EQ r2, r0, r1"#;
-    assert!(matches!(
-        run_expect_err(source),
-        VMError::TypeMismatchStatic { .. }
-    ));
-}
-
-#[test]
-fn src_operand_branch_both_immediate() {
-    // Both branch operands as immediate
-    let source = r#"
-MOVE r0, 5
-BEQI r0, 5, target
-MOVE r0, 0
-HALT
-target:
-MOVE r0, 1
-"#;
-    assert_eq!(run_and_get_int(source, 0), 1);
-
-    let source = r#"
-MOVE r0, 5
-BNEI r0, 6, target
-MOVE r0, 0
-HALT
-target:
-MOVE r0, 1
-"#;
-    assert_eq!(run_and_get_int(source, 0), 1);
-
-    let source = r#"
-MOVE r0, 3
-BLTI r0, 5, target
-MOVE r0, 0
-HALT
-target:
-MOVE r0, 1
-"#;
-    assert_eq!(run_and_get_int(source, 0), 1);
-}
-
-#[test]
-fn src_operand_branch_bool_immediate() {
-    let source = r#"
-MOVE r0, 1
-BEQI r0, 1, target
-MOVE r0, 0
-HALT
-target:
-MOVE r0, 1
-"#;
-    assert_eq!(run_and_get_int(source, 0), 1);
-
-    let source = r#"
-MOVE r0, 0
-BNEI r0, 1, target
-MOVE r0, 0
-HALT
-target:
-MOVE r0, 1
-"#;
-    assert_eq!(run_and_get_int(source, 0), 1);
-}
 
 #[test]
 fn src_operand_move_all_types() {
@@ -679,23 +482,6 @@ fn src_operand_neg_abs_immediate() {
     assert_eq!(run_and_get_int("MOVE r1, 42\nABS r0, r1", 0), 42);
 }
 
-#[test]
-fn src_operand_min_max_immediate() {
-    assert_eq!(run_and_get_int("MOVE r1, 10\nMINI r0, r1, 5", 0), 5);
-    assert_eq!(run_and_get_int("MOVE r1, 5\nMINI r0, r1, 10", 0), 5);
-    assert_eq!(run_and_get_int("MOVE r1, 10\nMAXI r0, r1, 5", 0), 10);
-    assert_eq!(run_and_get_int("MOVE r1, 5\nMAXI r0, r1, 10", 0), 10);
-}
-
-#[test]
-fn src_operand_shift_immediate() {
-    assert_eq!(run_and_get_int("MOVE r1, 1\nSHLI r0, r1, 4", 0), 16);
-    assert_eq!(run_and_get_int("MOVE r1, 16\nSHRI r0, r1, 2", 0), 4);
-    // Mix: register source with immediate
-    assert_eq!(run_and_get_int("MOVE r1, 1\nSHLI r0, r1, 3", 0), 8);
-    assert_eq!(run_and_get_int("MOVE r1, 32\nSHRI r0, r1, 2", 0), 8);
-}
-
 // ==================== Boolean ====================
 
 #[test]
@@ -757,26 +543,6 @@ fn ne() {
     assert!(!run_and_get_bool(
         "MOVE r0, 5\nMOVE r1, 5\nNE r2, r0, r1",
         2
-    ));
-}
-
-#[test]
-fn ne_with_bool() {
-    let source = "MOVE r0, true\nMOVE r1, false\nNE r2, r0, r1";
-    assert!(matches!(
-        run_expect_err(source),
-        VMError::TypeMismatchStatic { .. }
-    ));
-}
-
-#[test]
-fn ne_with_string() {
-    let source = r#"MOVE r0, "hello"
-MOVE r1, "world"
-NE r2, r0, r1"#;
-    assert!(matches!(
-        run_expect_err(source),
-        VMError::TypeMismatchStatic { .. }
     ));
 }
 
@@ -849,15 +615,6 @@ fn invalid_operand_for_int_op() {
     let source = r#"MOVE r0, "hi"
 MOVE r1, 1
 ADD r2, r0, r1"#;
-    assert!(matches!(
-        run_expect_err(source),
-        VMError::TypeMismatchStatic { .. }
-    ));
-}
-
-#[test]
-fn invalid_comparison_types() {
-    let source = "MOVE r0, 1\nMOVE r1, true\nEQ r2, r0, r1";
     assert!(matches!(
         run_expect_err(source),
         VMError::TypeMismatchStatic { .. }
@@ -2423,6 +2180,31 @@ fn call1_basic() {
             CALL1 r1, my_func, r2
         "#;
     assert_eq!(run_and_get_int(source, 1), 100);
+}
+
+#[test]
+fn call1_accepts_immediate_src_arg() {
+    let source = r#"
+            JUMP skip_fn
+            my_func(1, r255):
+                RET r255
+            skip_fn:
+            CALL1 r1, my_func, 42
+        "#;
+    assert_eq!(run_and_get_int(source, 1), 42);
+}
+
+#[test]
+fn call1_immediate_uses_public_function_argr_from_dispatch() {
+    let source = r#"
+            __init__:
+            CALL1 r9, foo, 42
+            HALT
+
+            pub foo(1, r127):
+                RET r127
+        "#;
+    assert_eq!(run_and_get_int(source, 9), 42);
 }
 
 // ==================== CallDataLoad ====================

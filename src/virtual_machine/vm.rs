@@ -45,6 +45,7 @@ macro_rules! host_functions {
   }
 
 host_functions! {
+    LOG     = "log"     => 1,
     LEN     = "len"     => 1,
     HASH    = "hash"    => 1,
     SLICE   = "slice"   => 3,
@@ -216,6 +217,8 @@ crate::for_each_instruction!(define_instruction_decoder);
 
 /// Maximum depth of the call stack to prevent unbounded recursion.
 const MAX_CALL_STACK_LEN: usize = 1024;
+/// Temporary register used to materialize immediate `CALL1` arguments.
+const CALL1_ARG_TMP_REG: u8 = u8::MAX;
 /// Gas cost per byte when writing to state storage.
 const STORE_BYTE_COST: u64 = 10;
 /// Gas cost per byte when reading from state storage.
@@ -925,7 +928,7 @@ impl VM {
                 CallHost1 => op_call_host1(dst: Reg, fn_id: RefU32, arg: Src),
                 Call => op_call(dst: Reg, offset: ImmI32, argc: ImmU8, argv: Reg),
                 Call0 => op_call0(dst: Reg, fn_id: ImmI32),
-                Call1 => op_call1(dst: Reg, fn_id: ImmI32, arg: Reg),
+                Call1 => op_call1(dst: Reg, fn_id: ImmI32, arg: Src),
                 Jal => op_jal(rd: Reg, offset: ImmI32),
                 Jalr => op_jalr(rd: Reg, rs: Reg, offset: ImmI32),
                 Beq => op_beq(rs1: Src, rs2: Src, offset: ImmI32),
@@ -1651,6 +1654,10 @@ impl VM {
                 self.charge_gas_categorized(len as u64, GasCategory::HostFunction)?;
                 self.registers.set(dst, Value::Int(len as i64))
             }
+            LOG => {
+                error!("{:?}", self.value_from_operand(arg)?);
+                Ok(())
+            }
             HASH => {
                 let value = self.value_from_operand(arg)?;
                 let len = match value {
@@ -1706,9 +1713,57 @@ impl VM {
         instr: &'static str,
         dst: u8,
         fn_id: i32,
-        arg: u8,
+        arg: SrcOperand,
     ) -> Result<(), VMError> {
-        self.op_call(instr, dst, fn_id, 1, arg)
+        let argv = match arg {
+            SrcOperand::Reg(reg) => reg,
+            _ => {
+                let target_ip = self.ip as i32 + fn_id;
+                let argr = self
+                    .resolve_public_call_argr(target_ip)
+                    .unwrap_or(CALL1_ARG_TMP_REG);
+                let value = self.value_from_operand(arg)?;
+                self.registers.set(argr, value)?;
+                argr
+            }
+        };
+        self.op_call(instr, dst, fn_id, 1, argv)
+    }
+
+    /// Attempts to resolve the argument register (`argr`) for a call target by
+    /// scanning generated DISPATCH tables and matching absolute target offsets.
+    fn resolve_public_call_argr(&self, target_ip: i32) -> Option<u8> {
+        let dispatch_opcode = Instruction::Dispatch as u8;
+
+        for i in 0..self.data.len().saturating_sub(2) {
+            if self.data[i] != dispatch_opcode {
+                continue;
+            }
+
+            let count = *self.data.get(i + 1)? as usize;
+            let entries_start = i + 2;
+            let entries_len = count.checked_mul(5)?;
+            let entries_end = entries_start.checked_add(entries_len)?;
+            if entries_end > self.data.len() {
+                continue;
+            }
+
+            let entry_base = entries_end as i32;
+            let mut cursor = entries_start;
+            for _ in 0..count {
+                let offset_bytes: [u8; 4] = self.data.get(cursor..cursor + 4)?.try_into().ok()?;
+                let offset = i32::from_le_bytes(offset_bytes);
+                cursor += 4;
+                let argr = *self.data.get(cursor)?;
+                cursor += 1;
+
+                if entry_base + offset == target_ip {
+                    return Some(argr);
+                }
+            }
+        }
+
+        None
     }
 
     fn op_jal(&mut self, instr: &'static str, rd: u8, offset: i32) -> Result<(), VMError> {

@@ -35,9 +35,7 @@ use std::sync::atomic::Ordering;
 
 const COMMENT_CHAR: char = '#';
 const LABEL_SUFFIX: char = ':';
-const SECTION_INIT: &str = "[ init code ]";
-const SECTION_RUNTIME: &str = "[ runtime code ]";
-const SECTION_DISPATCHER: &str = "[ dispatcher code ]";
+const INIT_LABEL: &str = "__init__";
 
 /// Tracks line offset introduced by dispatcher code insertion.
 #[derive(Debug, Clone, Copy)]
@@ -189,14 +187,10 @@ fn log_assembly_error_adjusted(
 /// Represents which section of the assembly we're currently parsing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
-    /// Before any section marker - code goes to runtime by default.
-    None,
-    /// Inside `[ init code ]` section.
+    /// Initialization code section (`__init__` label and its internal labels).
     Init,
-    /// Inside `[ runtime code ]` section.
+    /// Runtime code section (default).
     Runtime,
-    /// Inside `[ dispatcher code ]` section.
-    Dispatcher,
 }
 
 /// Assembly context for heap items interning and label tracking during compilation.
@@ -754,18 +748,117 @@ fn addr_size_from_token(tok: &str) -> usize {
     }
 }
 
-/// Checks if a line is a section marker and returns the section type if so.
-fn parse_section_marker(line: &str) -> Option<Section> {
-    let trimmed = line.trim();
-    if trimmed.eq_ignore_ascii_case(SECTION_INIT) {
-        Some(Section::Init)
-    } else if trimmed.eq_ignore_ascii_case(SECTION_RUNTIME) {
-        Some(Section::Runtime)
-    } else if trimmed.eq_ignore_ascii_case(SECTION_DISPATCHER) {
-        Some(Section::Dispatcher)
+/// Returns line content without inline comments and surrounding spaces.
+fn strip_comment_and_trim(line: &str) -> &str {
+    line.split(COMMENT_CHAR).next().unwrap_or("").trim()
+}
+
+/// Returns true if the line contains code or a label definition.
+fn is_code_line(line: &str) -> bool {
+    !strip_comment_and_trim(line).is_empty()
+}
+
+/// Updates the current section based on a parsed label.
+///
+/// `__init__` switches to init section. Any non-internal label switches to runtime.
+/// Internal labels (`__*`) inherit the current section.
+fn advance_section_for_label(current: Section, label_name: &str) -> Section {
+    if label_name == INIT_LABEL {
+        Section::Init
+    } else if label_name.starts_with("__") {
+        current
     } else {
-        None
+        Section::Runtime
     }
+}
+
+/// Step 0: normalizes source by moving all `__init__` section lines to the top.
+///
+/// Also validates that the final instruction in `__init__` is `HALT`.
+fn assemble_source_step_0(source: &str, errors: &mut Vec<VMError>) -> Option<String> {
+    let mut in_init = false;
+    let mut has_init = false;
+    let mut line_is_init = Vec::new();
+    let mut last_init_instr: Option<(usize, usize, String)> = None; // (line, offset, mnemonic)
+
+    for (line_no, line) in source.lines().enumerate() {
+        let mut is_init_line = in_init;
+        let mut instr_start = 0usize;
+
+        if is_code_line(line) && is_label_def(line) {
+            let label = match tokenize_label(line_no + 1, line) {
+                Ok(l) => l,
+                Err(e) => {
+                    errors.push(e);
+                    return None;
+                }
+            };
+            if label.name == INIT_LABEL {
+                has_init = true;
+                in_init = true;
+                is_init_line = true;
+            }
+            instr_start = line.find(':').unwrap_or(0).saturating_add(1);
+        }
+
+        if is_init_line && is_code_line(line) {
+            let tokens = match tokenize(line_no + 1, &line[instr_start..]) {
+                Ok(t) => t,
+                Err(e) => {
+                    errors.push(e);
+                    return None;
+                }
+            };
+            if let Some(tok) = tokens.first() {
+                last_init_instr = Some((line_no + 1, tok.offset, tok.text.to_string()));
+                if tok.text == Instruction::Halt.mnemonic() {
+                    in_init = false;
+                }
+            }
+        }
+
+        line_is_init.push(is_init_line);
+    }
+
+    if has_init {
+        match last_init_instr {
+            Some((_, _, mnemonic)) if mnemonic == Instruction::Halt.mnemonic() => {}
+            Some((line, offset, mnemonic)) => {
+                errors.push(VMError::AssemblyError {
+                    line,
+                    offset,
+                    length: mnemonic.len().max(1),
+                    source: "label '__init__' must end with HALT".to_string(),
+                });
+                return None;
+            }
+            None => {
+                errors.push(VMError::AssemblyError {
+                    line: 1,
+                    offset: 1,
+                    length: INIT_LABEL.len(),
+                    source: "label '__init__' must end with HALT".to_string(),
+                });
+                return None;
+            }
+        }
+    }
+
+    let lines: Vec<&str> = source.lines().collect();
+    let mut out = String::with_capacity(source.len());
+    for (idx, line) in lines.iter().enumerate() {
+        if line_is_init[idx] {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    for (idx, line) in lines.iter().enumerate() {
+        if !line_is_init[idx] {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    Some(out)
 }
 
 macro_rules! define_parse_instruction {
@@ -1008,28 +1101,32 @@ for_each_instruction!(define_parse_instruction);
 /// - A set of public label names (those prefixed with `pub`)
 /// - A vector of all parsed [`Label`] structs
 ///
-/// Also updates `insert_point` to the line number of the `[ runtime code ]`
-/// section marker, which is used for dispatcher insertion.
+/// Also updates `insert_point` to the line number where runtime code starts,
+/// used for dispatcher insertion.
 pub fn extract_label_data<'a>(
     source: &'a str,
     insert_point: &mut usize,
 ) -> Result<(HashSet<&'a str>, Vec<Label<'a>>), VMError> {
     let mut public_labels: HashSet<&str> = HashSet::new();
     let mut label_data: Vec<Label> = Vec::new();
+    let mut current_section = Section::Runtime;
+    let mut runtime_insert: Option<usize> = None;
 
-    // First pass: scan source to find public labels and the runtime section marker
+    // First pass: scan source to find public labels and runtime start.
     for (line_no, line) in source.lines().enumerate() {
-        // Check for section markers first
-        if let Some(section) = parse_section_marker(line) {
-            if section == Section::Runtime {
-                *insert_point = line_no;
-            }
+        if !is_code_line(line) {
             continue;
         }
 
         if is_label_def(line) {
-            // Skip compiler generated internal labels
             let label = tokenize_label(line_no + 1, line)?;
+            current_section = advance_section_for_label(current_section, label.name);
+
+            if current_section == Section::Runtime && runtime_insert.is_none() {
+                runtime_insert = Some(line_no);
+            }
+
+            // Skip compiler generated internal labels from dispatcher metadata.
             if label.name.starts_with("__") {
                 continue;
             }
@@ -1039,9 +1136,12 @@ pub fn extract_label_data<'a>(
                 public_labels.insert(label.name);
             }
             label_data.push(label);
+        } else if current_section == Section::Runtime && runtime_insert.is_none() {
+            runtime_insert = Some(line_no);
         }
     }
 
+    *insert_point = runtime_insert.unwrap_or(0);
     Ok((public_labels, label_data))
 }
 
@@ -1049,8 +1149,7 @@ pub fn extract_label_data<'a>(
 ///
 /// Scans the source for labels prefixed with `pub` and generates a jump table
 /// (`__resolver_jump_table`) that dispatches to public functions based on a
-/// selector in `r0`. The generated dispatcher is inserted at the start of the
-/// `[ runtime code ]` section.
+/// selector in `r0`. The generated dispatcher is inserted at runtime start.
 ///
 /// Collects tokenization errors into the provided vector and continues processing.
 /// Returns the processed source and optional dispatcher info for line adjustment.
@@ -1062,7 +1161,7 @@ fn assemble_source_step_1<'a>(
     Option<DispatcherInfo>,
     Option<Vec<Label<'a>>>,
 ) {
-    // Track where to insert the dispatcher (line number of `[ runtime code ]`)
+    // Track where to insert the dispatcher (line number where runtime starts).
     let mut insert_point = 0usize;
     // Collect all public label names (including trailing ':')
     let (public_labels, label_data) = match extract_label_data(source, &mut insert_point) {
@@ -1101,18 +1200,21 @@ fn assemble_source_step_1<'a>(
     // Count lines added by dispatcher (+1 for the extra newline after base)
     let lines_added = base.lines().count() + 1;
 
-    // Reassemble source with dispatcher inserted at the runtime section marker
+    // Reassemble source with dispatcher inserted at runtime start.
     let mut out = String::with_capacity(source.len() + base.len());
     for (i, line) in source.lines().enumerate() {
-        // Insert dispatcher just before the `[ runtime code ]` line
+        // Insert dispatcher just before the first runtime line.
         if i == insert_point {
-            out.push_str(SECTION_DISPATCHER);
-            out.push('\n');
             out.push_str(&base);
             out.push('\n');
         }
         out.push_str(line.split(COMMENT_CHAR).next().unwrap_or(""));
         out.push('\n');
+    }
+
+    // If source had no lines, still prepend dispatcher.
+    if source.lines().next().is_none() {
+        out.push_str(&base);
     }
 
     let dispatcher_info = DispatcherInfo {
@@ -1201,7 +1303,7 @@ fn extract_argc(
 
 /// Performs two-pass assembly on preprocessed source.
 ///
-/// Pass 1: Tokenizes all lines, detects `[ init code ]` / `[ runtime code ]` sections,
+/// Pass 1: Tokenizes all lines, classifies lines into init/runtime using `__init__`,
 /// computes instruction sizes, and records label positions as global offsets in the
 /// concatenated address space (init || runtime).
 ///
@@ -1218,7 +1320,8 @@ fn assemble_source_step_2(
     // First pass: tokenize all lines, detect sections, compute global offsets
     // We track (line_no, tokens, section) for each instruction line
     let mut parsed_lines: Vec<(usize, Vec<Token>, Section)> = Vec::new();
-    let mut current_section = Section::None;
+    let mut current_section = Section::Runtime;
+    let mut saw_runtime_code = false;
 
     // Track sizes separately for init and runtime sections
     let mut init_size = 0usize;
@@ -1229,26 +1332,10 @@ fn assemble_source_step_2(
     let mut pending_labels: Vec<(String, Section, usize, usize, usize, usize)> = Vec::new();
 
     for (line_no, line) in source.lines().enumerate() {
-        // Check for section markers first
-        if let Some(section) = parse_section_marker(line) {
-            current_section = match section {
-                Section::Dispatcher => Section::Runtime,
-                _ => section,
-            };
+        if !is_code_line(line) {
             continue;
         }
-
-        // Determine which section this code belongs to
-        let effective_section = match current_section {
-            Section::None | Section::Runtime | Section::Dispatcher => Section::Runtime,
-            Section::Init => Section::Init,
-        };
-
-        // Get the offset pointer for the current section
-        let local_offset = match effective_section {
-            Section::Init => &mut init_size,
-            Section::Runtime | Section::None | Section::Dispatcher => &mut runtime_size,
-        };
+        let mut effective_section = current_section;
 
         // Check if first token is a label definition
         let mut instr_start = 0;
@@ -1259,6 +1346,25 @@ fn assemble_source_step_2(
                     errors.push(e);
                     continue;
                 }
+            };
+
+            let next_section = advance_section_for_label(current_section, label.name);
+            if label.name == INIT_LABEL && saw_runtime_code {
+                errors.push(VMError::AssemblyError {
+                    line: line_no + 1,
+                    offset: if label.public { 5 } else { 1 },
+                    length: INIT_LABEL.len(),
+                    source: "label '__init__' must appear before runtime code".to_string(),
+                });
+                continue;
+            }
+            effective_section = next_section;
+            current_section = next_section;
+
+            // Get the offset pointer for the current section
+            let local_offset = match effective_section {
+                Section::Init => &mut init_size,
+                Section::Runtime => &mut runtime_size,
             };
 
             pending_labels.push((
@@ -1273,7 +1379,6 @@ fn assemble_source_step_2(
             // If there are more tokens after the label, treat them as an instruction
             instr_start = line.find(':').unwrap() + 1;
         }
-
         let tokens = match tokenize(line_no + 1, &line[instr_start..]) {
             Ok(t) => t,
             Err(e) => {
@@ -1283,6 +1388,24 @@ fn assemble_source_step_2(
         };
         if tokens.is_empty() {
             continue;
+        }
+
+        // Dispatcher is always runtime code; force section when injected before
+        // the first runtime label after an `__init__` block.
+        if effective_section == Section::Init && tokens[0].text == Instruction::Dispatch.mnemonic()
+        {
+            effective_section = Section::Runtime;
+            current_section = Section::Runtime;
+        }
+
+        // Get the offset pointer for the current section.
+        let local_offset = match effective_section {
+            Section::Init => &mut init_size,
+            Section::Runtime => &mut runtime_size,
+        };
+
+        if effective_section == Section::Runtime {
+            saw_runtime_code = true;
         }
 
         // Validate CALL and CALL_HOST argc
@@ -1358,7 +1481,7 @@ fn assemble_source_step_2(
     for (name, section, local_offset, line_no, tok_offset, tok_len) in pending_labels {
         let global_offset = match section {
             Section::Init => local_offset,
-            Section::Runtime | Section::None | Section::Dispatcher => init_size + local_offset,
+            Section::Runtime => init_size + local_offset,
         };
         if let Err(e) = asm_context.define_label(name, global_offset) {
             errors.push(VMError::AssemblyError {
@@ -1377,13 +1500,13 @@ fn assemble_source_step_2(
     for (line_no, tokens, section) in parsed_lines {
         let bytecode = match section {
             Section::Init => &mut init_bytecode,
-            Section::Runtime | Section::None | Section::Dispatcher => &mut runtime_bytecode,
+            Section::Runtime => &mut runtime_bytecode,
         };
 
         // Compute global offset for label resolution
         let global_offset = match section {
             Section::Init => bytecode.len(),
-            Section::Runtime | Section::None | Section::Dispatcher => init_size + bytecode.len(),
+            Section::Runtime => init_size + bytecode.len(),
         };
 
         match parse_instruction(&mut asm_context, &tokens, line_no + 1, global_offset) {
@@ -1425,13 +1548,11 @@ fn assemble_source_step_2(
 /// Assemble a full source string into bytecode.
 ///
 /// Uses two-pass assembly:
-/// 1. First pass: tokenize lines, record label positions, detect sections
+/// 1. First pass: tokenize lines, record label positions, classify init/runtime
 /// 2. Second pass: parse instructions with label resolution, emit bytecode
 ///
-/// Section markers `[ init code ]` and `[ runtime code ]` split the source:
-/// - Code between `[ init code ]` and `[ runtime code ]` goes to `init_code`
-/// - Code after `[ runtime code ]` goes to `runtime_code`
-/// - Code before any section marker goes to `runtime_code` by default
+/// The reserved label `__init__:` marks initialization code. Runtime code is the
+/// default section and starts at the first non-init label/instruction.
 ///
 /// Labels are computed for a concatenated view (init_code + runtime_code) so that
 /// init_code can call into runtime_code. The VM should run the concatenated bytecode,
@@ -1446,24 +1567,29 @@ pub fn assemble_source(source: impl Into<String>) -> Result<DeployProgram, VMErr
 /// on failure, including source location information for all errors found.
 fn assemble_source_with_name(source: String, source_name: &str) -> Result<DeployProgram, VMError> {
     let mut errors = Vec::new();
+    let normalized = assemble_source_step_0(&source, &mut errors);
+    if normalized.is_none() && !errors.is_empty() {
+        log_assembly_errors(source_name, &source, &errors, None);
+        return Err(errors.into_iter().next().unwrap());
+    }
+    let normalized_source = normalized.unwrap_or_else(|| source.clone());
 
-    let (processed, dispatcher_info, label_data) = assemble_source_step_1(&source, &mut errors);
+    let (processed, dispatcher_info, label_data) =
+        assemble_source_step_1(&normalized_source, &mut errors);
     if processed.is_none() && !errors.is_empty() {
-        // Use original source for error display, with line adjustment for dispatcher
-        log_assembly_errors(source_name, &source, &errors, dispatcher_info);
+        log_assembly_errors(source_name, &normalized_source, &errors, dispatcher_info);
         // Return the first error with adjusted line number
         let first_err = errors.into_iter().next().unwrap();
         return Err(adjust_error_line(first_err, dispatcher_info));
     }
 
     let result = assemble_source_step_2(
-        processed.unwrap_or_else(|| source.clone()),
+        processed.unwrap_or_else(|| normalized_source.clone()),
         label_data.unwrap_or_default(),
         &mut errors,
     );
     if !errors.is_empty() {
-        // Use original source for error display, with line adjustment for dispatcher
-        log_assembly_errors(source_name, &source, &errors, dispatcher_info);
+        log_assembly_errors(source_name, &normalized_source, &errors, dispatcher_info);
         // Return the first error with adjusted line number
         let first_err = errors.into_iter().next().unwrap();
         return Err(adjust_error_line(first_err, dispatcher_info));
@@ -1805,77 +1931,53 @@ mod tests {
     // ==================== Sections ====================
 
     #[test]
-    fn parse_section_marker_valid() {
-        assert_eq!(parse_section_marker("[ init code ]"), Some(Section::Init));
-        assert_eq!(
-            parse_section_marker("[ runtime code ]"),
-            Some(Section::Runtime)
-        );
-        assert_eq!(
-            parse_section_marker("  [ init code ]  "),
-            Some(Section::Init)
-        );
-        assert_eq!(parse_section_marker("[ INIT CODE ]"), Some(Section::Init));
-        assert_eq!(
-            parse_section_marker("[ dispatcher code ]"),
-            Some(Section::Dispatcher)
-        );
-    }
-
-    #[test]
-    fn parse_section_marker_invalid() {
-        assert_eq!(parse_section_marker("init code"), None);
-        assert_eq!(parse_section_marker("[init code]"), None);
-        assert_eq!(parse_section_marker("[ unknown ]"), None);
-        assert_eq!(parse_section_marker("MOVE r0, 1"), None);
-    }
-
-    #[test]
-    fn assemble_no_sections_defaults_to_runtime() {
+    fn assemble_defaults_to_runtime_when_no_init_label() {
         let program = assemble_source("MOVE r0, 1").unwrap();
         assert!(program.init_code.is_empty());
         assert!(!program.runtime_code.is_empty());
     }
 
     #[test]
-    fn assemble_init_section_only() {
-        let source = "[ init code ]\nMOVE r0, 42";
+    fn assemble_init_label_only() {
+        let source = "__init__:\nMOVE r0, 42\nHALT";
         let program = assemble_source(source).unwrap();
-        assert_eq!(program.init_code.len(), 11);
+        assert_eq!(program.init_code.len(), 12);
         assert!(program.runtime_code.is_empty());
     }
 
     #[test]
-    fn assemble_runtime_section_only() {
-        let source = "[ runtime code ]\nMOVE r0, 42";
+    fn assemble_runtime_only_label() {
+        let source = "main:\nMOVE r0, 42";
         let program = assemble_source(source).unwrap();
         assert!(program.init_code.is_empty());
         assert_eq!(program.runtime_code.len(), 11);
     }
 
     #[test]
-    fn assemble_both_sections() {
+    fn assemble_init_then_runtime_by_label() {
         let source = r#"
-[ init code ]
+__init__:
 MOVE r0, 1
 MOVE r1, 2
+HALT
 
-[ runtime code ]
+main:
 MOVE r2, 3
 "#;
         let program = assemble_source(source).unwrap();
-        assert_eq!(program.init_code.len(), 22); // 2 MOVE instructions
+        assert_eq!(program.init_code.len(), 23); // 2 MOVE + HALT instructions
         assert_eq!(program.runtime_code.len(), 11); // 1 MOVE instruction
     }
 
     #[test]
-    fn assemble_labels_within_sections() {
+    fn assemble_internal_labels_inherit_current_section() {
         let source = r#"
-[ init code ]
-start: MOVE r0, 1
+__init__:
+__init_loop: MOVE r0, 1
+HALT
 
-[ runtime code ]
-func: MOVE r1, 2
+main:
+__rt_loop: MOVE r1, 2
 "#;
         let program = assemble_source(source).unwrap();
         assert!(!program.init_code.is_empty());
@@ -1883,26 +1985,60 @@ func: MOVE r1, 2
     }
 
     #[test]
-    fn assemble_empty_init_section() {
-        let source = "[ init code ]\n[ runtime code ]\nMOVE r0, 1";
-        let program = assemble_source(source).unwrap();
-        assert!(program.init_code.is_empty());
-        assert_eq!(program.runtime_code.len(), 11);
-    }
-
-    #[test]
-    fn assemble_strings_across_sections() {
+    fn assemble_strings_across_init_and_runtime() {
         let source = r#"
-[ init code ]
+__init__:
 MOVE r0, "init"
+HALT
 
-[ runtime code ]
+main:
 MOVE r1, "runtime"
 "#;
         let program = assemble_source(source).unwrap();
         assert_eq!(program.memory.len(), 8 + 4 + 8 + 7);
         assert_eq!(&program.memory[8..12], b"init");
         assert_eq!(&program.memory[20..27], b"runtime");
+    }
+
+    #[test]
+    fn init_label_after_runtime_is_hoisted() {
+        let source = "main:\nMOVE r0, 1\n__init__:\nMOVE r1, 2\nHALT";
+        let program = assemble_source(source).unwrap();
+        assert_eq!(program.init_code.len(), 12);
+        assert!(program.runtime_code.len() >= 11);
+    }
+
+    #[test]
+    fn init_must_end_with_halt() {
+        let source = "__init__:\nMOVE r0, 1\nRET r0\nmain:\nMOVE r1, 2";
+        let err = assemble_source(source).unwrap_err();
+        assert!(matches!(
+            err,
+            VMError::AssemblyError { ref source, .. } if source.contains("__init__") && source.contains("HALT")
+        ));
+    }
+
+    #[test]
+    fn init_end_with_halt_is_valid() {
+        let source = "__init__:\nMOVE r0, 1\nHALT\nmain:\nMOVE r1, 2";
+        let program = assemble_source(source).unwrap();
+        assert!(!program.init_code.is_empty());
+        assert!(!program.runtime_code.is_empty());
+    }
+
+    #[test]
+    fn dispatcher_is_emitted_in_runtime_when_init_exists() {
+        let source = r#"
+__init__:
+MOVE r0, 1
+HALT
+
+pub factorial(1, r1):
+RET r1
+"#;
+        let program = assemble_source(source).unwrap();
+        assert_eq!(program.init_code[0], Instruction::Move as u8);
+        assert_eq!(program.runtime_code[0], Instruction::Dispatch as u8);
     }
 
     // ==================== Label Tokenization ====================

@@ -1405,10 +1405,11 @@ mod tests {
         let bc = with_validator_and_storage(TEST_CHAIN_ID, AcceptAllValidator, storage);
 
         let source = r#"
-[ init code ]
+__init__:
 MOVE r0, 1
+HALT
 
-[ runtime code ]
+main:
 MOVE r1, 2
 "#;
         let program = assemble_source(source).expect("assemble failed");

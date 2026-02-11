@@ -6,95 +6,120 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::virtual_machine::isa::Instruction;
+    use crate::virtual_machine::isa::{Instruction, OPCODE_BASE_MASK, OPCODE_METADATA_FLAG};
 
     /// Verifies that all instruction opcodes match their expected values.
     #[test]
     fn instruction_opcodes_unchanged() {
         // Move, Casts and Misc
-        assert_eq!(Instruction::Noop as u8, 0x00);
-        assert_eq!(Instruction::Move as u8, 0x01);
-        assert_eq!(Instruction::CMove as u8, 0x02);
-        assert_eq!(Instruction::I64ToBool as u8, 0x03);
-        assert_eq!(Instruction::BoolToI64 as u8, 0x04);
-        assert_eq!(Instruction::StrToI64 as u8, 0x05);
-        assert_eq!(Instruction::I64ToStr as u8, 0x06);
-        assert_eq!(Instruction::StrToBool as u8, 0x07);
-        assert_eq!(Instruction::BoolToStr as u8, 0x08);
+        assert_eq!((Instruction::Noop as u8) & OPCODE_BASE_MASK, 0x00);
+        assert_eq!((Instruction::Move as u8) & OPCODE_BASE_MASK, 0x01);
+        assert_eq!((Instruction::CMove as u8) & OPCODE_BASE_MASK, 0x02);
+        assert_eq!((Instruction::I64ToBool as u8) & OPCODE_BASE_MASK, 0x03);
+        assert_eq!((Instruction::BoolToI64 as u8) & OPCODE_BASE_MASK, 0x04);
+        assert_eq!((Instruction::StrToI64 as u8) & OPCODE_BASE_MASK, 0x05);
+        assert_eq!((Instruction::I64ToStr as u8) & OPCODE_BASE_MASK, 0x06);
+        assert_eq!((Instruction::StrToBool as u8) & OPCODE_BASE_MASK, 0x07);
+        assert_eq!((Instruction::BoolToStr as u8) & OPCODE_BASE_MASK, 0x08);
 
         // Store and Load
-        assert_eq!(Instruction::DeleteState as u8, 0x10);
-        assert_eq!(Instruction::HasState as u8, 0x11);
-        assert_eq!(Instruction::StoreBytes as u8, 0x12);
-        assert_eq!(Instruction::LoadBytes as u8, 0x13);
-        assert_eq!(Instruction::LoadI64 as u8, 0x14);
-        assert_eq!(Instruction::LoadBool as u8, 0x15);
-        assert_eq!(Instruction::LoadStr as u8, 0x16);
-        assert_eq!(Instruction::LoadHash as u8, 0x17);
+        assert_eq!((Instruction::DeleteState as u8) & OPCODE_BASE_MASK, 0x10);
+        assert_eq!((Instruction::HasState as u8) & OPCODE_BASE_MASK, 0x11);
+        assert_eq!((Instruction::StoreBytes as u8) & OPCODE_BASE_MASK, 0x12);
+        assert_eq!((Instruction::LoadBytes as u8) & OPCODE_BASE_MASK, 0x13);
+        assert_eq!((Instruction::LoadI64 as u8) & OPCODE_BASE_MASK, 0x14);
+        assert_eq!((Instruction::LoadBool as u8) & OPCODE_BASE_MASK, 0x15);
+        assert_eq!((Instruction::LoadStr as u8) & OPCODE_BASE_MASK, 0x16);
+        assert_eq!((Instruction::LoadHash as u8) & OPCODE_BASE_MASK, 0x17);
+        assert_eq!((Instruction::Sha3 as u8) & OPCODE_BASE_MASK, 0x18);
 
         // Integer arithmetic
-        assert_eq!(Instruction::Add as u8, 0x20);
-        assert_eq!(Instruction::Sub as u8, 0x21);
-        assert_eq!(Instruction::Mul as u8, 0x22);
-        assert_eq!(Instruction::Div as u8, 0x23);
-        assert_eq!(Instruction::Mod as u8, 0x24);
-        assert_eq!(Instruction::Neg as u8, 0x25);
-        assert_eq!(Instruction::Abs as u8, 0x26);
-        assert_eq!(Instruction::Min as u8, 0x27);
-        assert_eq!(Instruction::Max as u8, 0x28);
-        assert_eq!(Instruction::Shl as u8, 0x29);
-        assert_eq!(Instruction::Shr as u8, 0x2A);
-        assert_eq!(Instruction::Inc as u8, 0x2B);
-        assert_eq!(Instruction::Dec as u8, 0x2C);
+        assert_eq!((Instruction::Add as u8) & OPCODE_BASE_MASK, 0x20);
+        assert_eq!((Instruction::Sub as u8) & OPCODE_BASE_MASK, 0x21);
+        assert_eq!((Instruction::Mul as u8) & OPCODE_BASE_MASK, 0x22);
+        assert_eq!((Instruction::Div as u8) & OPCODE_BASE_MASK, 0x23);
+        assert_eq!((Instruction::Mod as u8) & OPCODE_BASE_MASK, 0x24);
+        assert_eq!((Instruction::Neg as u8) & OPCODE_BASE_MASK, 0x25);
+        assert_eq!((Instruction::Abs as u8) & OPCODE_BASE_MASK, 0x26);
+        assert_eq!((Instruction::Min as u8) & OPCODE_BASE_MASK, 0x27);
+        assert_eq!((Instruction::Max as u8) & OPCODE_BASE_MASK, 0x28);
+        assert_eq!((Instruction::Shl as u8) & OPCODE_BASE_MASK, 0x29);
+        assert_eq!((Instruction::Shr as u8) & OPCODE_BASE_MASK, 0x2A);
+        assert_eq!((Instruction::Inc as u8) & OPCODE_BASE_MASK, 0x2B);
+        assert_eq!((Instruction::Dec as u8) & OPCODE_BASE_MASK, 0x2C);
 
         // Boolean / comparison
-        assert_eq!(Instruction::Not as u8, 0x30);
-        assert_eq!(Instruction::And as u8, 0x31);
-        assert_eq!(Instruction::Or as u8, 0x32);
-        assert_eq!(Instruction::Xor as u8, 0x33);
-        assert_eq!(Instruction::Eq as u8, 0x34);
-        assert_eq!(Instruction::Ne as u8, 0x35);
-        assert_eq!(Instruction::Lt as u8, 0x36);
-        assert_eq!(Instruction::Le as u8, 0x37);
-        assert_eq!(Instruction::Gt as u8, 0x38);
-        assert_eq!(Instruction::Ge as u8, 0x39);
+        assert_eq!((Instruction::Not as u8) & OPCODE_BASE_MASK, 0x30);
+        assert_eq!((Instruction::And as u8) & OPCODE_BASE_MASK, 0x31);
+        assert_eq!((Instruction::Or as u8) & OPCODE_BASE_MASK, 0x32);
+        assert_eq!((Instruction::Xor as u8) & OPCODE_BASE_MASK, 0x33);
+        assert_eq!((Instruction::Eq as u8) & OPCODE_BASE_MASK, 0x34);
+        assert_eq!((Instruction::Ne as u8) & OPCODE_BASE_MASK, 0x35);
+        assert_eq!((Instruction::Lt as u8) & OPCODE_BASE_MASK, 0x36);
+        assert_eq!((Instruction::Le as u8) & OPCODE_BASE_MASK, 0x37);
+        assert_eq!((Instruction::Gt as u8) & OPCODE_BASE_MASK, 0x38);
+        assert_eq!((Instruction::Ge as u8) & OPCODE_BASE_MASK, 0x39);
 
         // Control Flow
-        assert_eq!(Instruction::CallHost as u8, 0x40);
-        assert_eq!(Instruction::CallHost0 as u8, 0x41);
-        assert_eq!(Instruction::CallHost1 as u8, 0x42);
-        assert_eq!(Instruction::Call as u8, 0x43);
-        assert_eq!(Instruction::Call0 as u8, 0x44);
-        assert_eq!(Instruction::Call1 as u8, 0x45);
-        assert_eq!(Instruction::Jal as u8, 0x46);
-        assert_eq!(Instruction::Jalr as u8, 0x47);
-        assert_eq!(Instruction::Beq as u8, 0x48);
-        assert_eq!(Instruction::Bne as u8, 0x49);
-        assert_eq!(Instruction::Blt as u8, 0x4A);
-        assert_eq!(Instruction::Bge as u8, 0x4B);
-        assert_eq!(Instruction::Bltu as u8, 0x4C);
-        assert_eq!(Instruction::Bgeu as u8, 0x4D);
-        assert_eq!(Instruction::Jump as u8, 0x4E);
-        assert_eq!(Instruction::Ret as u8, 0x4F);
-        assert_eq!(Instruction::Halt as u8, 0x50);
+        assert_eq!((Instruction::CallHost as u8) & OPCODE_BASE_MASK, 0x40);
+        assert_eq!((Instruction::Call as u8) & OPCODE_BASE_MASK, 0x43);
+        assert_eq!((Instruction::Jal as u8) & OPCODE_BASE_MASK, 0x46);
+        assert_eq!((Instruction::Jalr as u8) & OPCODE_BASE_MASK, 0x47);
+        assert_eq!((Instruction::Beq as u8) & OPCODE_BASE_MASK, 0x48);
+        assert_eq!((Instruction::Bne as u8) & OPCODE_BASE_MASK, 0x49);
+        assert_eq!((Instruction::Blt as u8) & OPCODE_BASE_MASK, 0x4A);
+        assert_eq!((Instruction::Bge as u8) & OPCODE_BASE_MASK, 0x4B);
+        assert_eq!((Instruction::Bltu as u8) & OPCODE_BASE_MASK, 0x4C);
+        assert_eq!((Instruction::Bgeu as u8) & OPCODE_BASE_MASK, 0x4D);
+        assert_eq!((Instruction::Jump as u8) & OPCODE_BASE_MASK, 0x4E);
+        assert_eq!((Instruction::Ret as u8) & OPCODE_BASE_MASK, 0x4F);
+        assert_eq!((Instruction::Halt as u8) & OPCODE_BASE_MASK, 0x50);
 
         // Data and Memory access
-        assert_eq!(Instruction::CallDataLoad as u8, 0x51);
-        assert_eq!(Instruction::CallDataCopy as u8, 0x52);
-        assert_eq!(Instruction::CallDataLen as u8, 0x53);
-        assert_eq!(Instruction::MemLoad as u8, 0x54);
-        assert_eq!(Instruction::MemStore as u8, 0x55);
-        assert_eq!(Instruction::MemCpy as u8, 0x56);
-        assert_eq!(Instruction::MemSet as u8, 0x57);
-        assert_eq!(Instruction::MemLoad8U as u8, 0x58);
-        assert_eq!(Instruction::MemLoad8S as u8, 0x59);
-        assert_eq!(Instruction::MemLoad16U as u8, 0x5A);
-        assert_eq!(Instruction::MemLoad16S as u8, 0x5B);
-        assert_eq!(Instruction::MemLoad32U as u8, 0x5C);
-        assert_eq!(Instruction::MemLoad32S as u8, 0x5D);
+        assert_eq!((Instruction::CallDataLoad as u8) & OPCODE_BASE_MASK, 0x51);
+        assert_eq!((Instruction::CallDataCopy as u8) & OPCODE_BASE_MASK, 0x52);
+        assert_eq!((Instruction::CallDataLen as u8) & OPCODE_BASE_MASK, 0x53);
+        assert_eq!((Instruction::MemLoad as u8) & OPCODE_BASE_MASK, 0x54);
+        assert_eq!((Instruction::MemStore as u8) & OPCODE_BASE_MASK, 0x55);
+        assert_eq!((Instruction::MemCpy as u8) & OPCODE_BASE_MASK, 0x56);
+        assert_eq!((Instruction::MemSet as u8) & OPCODE_BASE_MASK, 0x57);
+        assert_eq!((Instruction::MemLoad8U as u8) & OPCODE_BASE_MASK, 0x58);
+        assert_eq!((Instruction::MemLoad8S as u8) & OPCODE_BASE_MASK, 0x59);
+        assert_eq!((Instruction::MemLoad16U as u8) & OPCODE_BASE_MASK, 0x5A);
+        assert_eq!((Instruction::MemLoad16S as u8) & OPCODE_BASE_MASK, 0x5B);
+        assert_eq!((Instruction::MemLoad32U as u8) & OPCODE_BASE_MASK, 0x5C);
+        assert_eq!((Instruction::MemLoad32S as u8) & OPCODE_BASE_MASK, 0x5D);
 
         // Special Dispatch instruction
-        assert_eq!(Instruction::Dispatch as u8, 0xFF);
+        assert_eq!((Instruction::Dispatch as u8) & OPCODE_BASE_MASK, 0x7F);
+    }
+
+    /// Verifies metadata-flag (opcode Z bit) assignment for representative opcodes.
+    #[test]
+    fn instruction_metadata_flags_unchanged() {
+        // No dynamic Src/Addr/ImmI32/RefU32 operands => no metadata flag.
+        assert_eq!((Instruction::Noop as u8) & OPCODE_METADATA_FLAG, 0);
+        assert_eq!((Instruction::Halt as u8) & OPCODE_METADATA_FLAG, 0);
+        assert_eq!((Instruction::CallDataLoad as u8) & OPCODE_METADATA_FLAG, 0);
+        assert_eq!((Instruction::CallDataLen as u8) & OPCODE_METADATA_FLAG, 0);
+        assert_eq!((Instruction::Dispatch as u8) & OPCODE_METADATA_FLAG, 0);
+
+        // Any Src/Addr/ImmI32/RefU32 operand in ISA => metadata flag present in opcode.
+        assert_ne!((Instruction::Move as u8) & OPCODE_METADATA_FLAG, 0);
+        assert_ne!((Instruction::DeleteState as u8) & OPCODE_METADATA_FLAG, 0);
+        assert_ne!((Instruction::Add as u8) & OPCODE_METADATA_FLAG, 0);
+        assert_ne!((Instruction::CallHost as u8) & OPCODE_METADATA_FLAG, 0);
+        assert_ne!((Instruction::Call as u8) & OPCODE_METADATA_FLAG, 0);
+        assert_ne!((Instruction::Jal as u8) & OPCODE_METADATA_FLAG, 0);
+        assert_ne!((Instruction::Jalr as u8) & OPCODE_METADATA_FLAG, 0);
+        assert_ne!((Instruction::Beq as u8) & OPCODE_METADATA_FLAG, 0);
+        assert_ne!((Instruction::Jump as u8) & OPCODE_METADATA_FLAG, 0);
+        assert_ne!((Instruction::LoadBytes as u8) & OPCODE_METADATA_FLAG, 0);
+        assert_ne!((Instruction::CallDataCopy as u8) & OPCODE_METADATA_FLAG, 0);
+        assert_ne!((Instruction::MemLoad as u8) & OPCODE_METADATA_FLAG, 0);
+        assert_ne!((Instruction::MemStore as u8) & OPCODE_METADATA_FLAG, 0);
+        assert_ne!((Instruction::MemCpy as u8) & OPCODE_METADATA_FLAG, 0);
+        assert_eq!((Instruction::Sha3 as u8) & OPCODE_METADATA_FLAG, 0);
     }
 
     /// Verifies that all instruction mnemonics match their expected values.
@@ -120,6 +145,7 @@ mod tests {
         assert_eq!(Instruction::LoadBool.mnemonic(), "LOAD_BOOL");
         assert_eq!(Instruction::LoadStr.mnemonic(), "LOAD_STR");
         assert_eq!(Instruction::LoadHash.mnemonic(), "LOAD_HASH");
+        assert_eq!(Instruction::Sha3.mnemonic(), "SHA3");
 
         // Integer arithmetic
         assert_eq!(Instruction::Add.mnemonic(), "ADD");
@@ -150,11 +176,7 @@ mod tests {
 
         // Control Flow
         assert_eq!(Instruction::CallHost.mnemonic(), "CALL_HOST");
-        assert_eq!(Instruction::CallHost0.mnemonic(), "CALL_HOST0");
-        assert_eq!(Instruction::CallHost1.mnemonic(), "CALL_HOST1");
         assert_eq!(Instruction::Call.mnemonic(), "CALL");
-        assert_eq!(Instruction::Call0.mnemonic(), "CALL0");
-        assert_eq!(Instruction::Call1.mnemonic(), "CALL1");
         assert_eq!(Instruction::Jal.mnemonic(), "JAL");
         assert_eq!(Instruction::Jalr.mnemonic(), "JALR");
         assert_eq!(Instruction::Beq.mnemonic(), "BEQ");
@@ -209,6 +231,7 @@ mod tests {
         assert_eq!(Instruction::LoadBool.base_gas(), 50);
         assert_eq!(Instruction::LoadStr.base_gas(), 50);
         assert_eq!(Instruction::LoadHash.base_gas(), 50);
+        assert_eq!(Instruction::Sha3.base_gas(), 100);
 
         // Integer arithmetic
         assert_eq!(Instruction::Add.base_gas(), 3);
@@ -239,11 +262,7 @@ mod tests {
 
         // Control Flow
         assert_eq!(Instruction::CallHost.base_gas(), 100);
-        assert_eq!(Instruction::CallHost0.base_gas(), 100);
-        assert_eq!(Instruction::CallHost1.base_gas(), 100);
         assert_eq!(Instruction::Call.base_gas(), 50);
-        assert_eq!(Instruction::Call0.base_gas(), 50);
-        assert_eq!(Instruction::Call1.base_gas(), 50);
         assert_eq!(Instruction::Jal.base_gas(), 5);
         assert_eq!(Instruction::Jalr.base_gas(), 5);
         assert_eq!(Instruction::Beq.base_gas(), 5);
@@ -278,7 +297,7 @@ mod tests {
     /// Verifies the total instruction count has not changed.
     #[test]
     fn instruction_count_unchanged() {
-        const EXPECTED_COUNT: usize = 71;
+        const EXPECTED_COUNT: usize = 68;
 
         // Count by verifying TryFrom succeeds for expected opcodes
         let mut count = 0;

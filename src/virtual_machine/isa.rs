@@ -23,6 +23,11 @@
 
 use crate::virtual_machine::errors::VMError;
 
+/// High bit in opcode byte indicating that one metadata byte follows.
+pub const OPCODE_METADATA_FLAG: u8 = 0b1000_0000;
+/// Mask extracting the 7-bit base opcode from `0xZ[ooooooo]`.
+pub const OPCODE_BASE_MASK: u8 = 0b0111_1111;
+
 /// Invokes a callback macro with the complete instruction definition list.
 ///
 /// This macro enables code generation for instructions in multiple modules
@@ -39,7 +44,7 @@ macro_rules! for_each_instruction {
             /// MOVE rd, rs ; rd = rs
             Move = 0x01, "MOVE" => [rd: Reg, rs: Src], 1,
             /// CMOVE rd, cond, r1, r2 ; rd = (cond != 0) ? r1 : r2
-            CMove = 0x02, "CMOVE" => [rd: Reg, cond: Src, r1: Src, r2: Src], 5,
+            CMove = 0x02, "CMOVE" => [rd: Reg, cond: Reg, r1: Src, r2: Src], 5,
             /// I64_TO_BOOL rd, rs ; rd = (rs != 0)
             I64ToBool = 0x03, "I64_TO_BOOL" => [rd: Reg, rs: Src], 1,
             /// BOOL_TO_I64 rd, rs ; rd = rs as i64 (false=0, true=1)
@@ -71,6 +76,8 @@ macro_rules! for_each_instruction {
             LoadStr = 0x16, "LOAD_STR" => [rd: Reg, key: Src], 50,
             /// LOAD_HASH dst, key ; loads the string stored at key from storage
             LoadHash = 0x17, "LOAD_HASH" => [rd: Reg, key: Src], 50,
+            /// SHA3 dst, argc, argv ; dst = sha3(concat(regs[argv..argv+argc]))
+            Sha3 = 0x18, "SHA3" => [dst: Reg, argc: ImmU8, argv: Reg], 100,
             // =========================
             // Integer arithmetic
             // =========================
@@ -126,18 +133,10 @@ macro_rules! for_each_instruction {
             // =========================
             // Control Flow
             // =========================
-            /// CALL_HOST dst, fn, argc, argv ; call host function fn with argc args from regs[argv...] ; return -> dst
-            CallHost = 0x40, "CALL_HOST" => [dst: Reg, fn_id: RefU32, argc: ImmU8, argv: Reg], 100,
-            /// CALL_HOST0 dst, fn ; call host function fn without any arguments ; return -> dst
-            CallHost0 = 0x41, "CALL_HOST0" => [dst: Reg, fn_id: RefU32], 100,
-            /// CALL_HOST1 dst, fn, arg ; call host function fn with a single argument ; return -> dst
-            CallHost1 = 0x42, "CALL_HOST1" => [dst: Reg, fn_id: RefU32, arg: Src], 100,
-            /// CALL dst, fn, argc, argv ; call function fn with argc args from regs[argv...] ; return -> dst
-            Call = 0x43, "CALL" => [dst: Reg, fn_id: ImmI32, argc: ImmU8, argv: Reg], 50,
-            /// CALL0 dst, fn ; call function fn without any arguments ; return -> dst
-            Call0 = 0x44, "CALL0" => [dst: Reg, fn_id: ImmI32], 50,
-            /// CALL1 dst, fn, arg ; call function fn with a single argument ; return -> dst
-            Call1 = 0x45, "CALL1" => [dst: Reg, fn_id: ImmI32, arg: Src], 50,
+            /// CALL_HOST dst, fn, argv ; call host function fn with args from regs[argv...] ; return -> dst
+            CallHost = 0x40, "CALL_HOST" => [dst: Reg, fn_id: RefU32, argv: Reg], 100,
+            /// CALL dst, fn, argv ; call function fn with args from regs[argv...] ; return -> dst
+            Call = 0x43, "CALL" => [dst: Reg, fn_id: ImmI32, argv: Reg], 50,
             /// JAL rd, offset ; rd = PC + instr_size; PC += offset (jump and link)
             Jal = 0x46, "JAL" => [rd: Reg, offset: ImmI32], 5,
             /// JALR rd, rs, offset ; rd = PC + instr_size; PC = rs + offset (jump and link register)
@@ -206,14 +205,15 @@ macro_rules! define_instructions {
         // =========================
         // VM instruction enum
         // =========================
+        #[repr(u8)]
         #[derive(Copy, Clone, Debug, Eq, PartialEq)]
         pub enum Instruction {
             $(
                 $(#[$doc])*
-                $name = $opcode,
+                $name = define_instructions!(@opcode_value $opcode; $( $kind ),*),
             )*
             /// DISPATCH count, (offset, argr)... ; dispatch to public function by selector index
-            Dispatch = 0xFF,
+            Dispatch = 0x7F,
         }
 
         impl TryFrom<u8> for Instruction {
@@ -221,8 +221,8 @@ macro_rules! define_instructions {
 
             fn try_from(value: u8) -> Result<Self, Self::Error> {
                 match value {
-                    $( $opcode => Ok(Instruction::$name), )*
-                    0xFF => Ok(Instruction::Dispatch),
+                    $( v if v == define_instructions!(@opcode_value $opcode; $( $kind ),*) => Ok(Instruction::$name), )*
+                    0x7F => Ok(Instruction::Dispatch),
                     _ => Err(VMError::InvalidInstruction {
                         opcode: value,
                         offset: 0,
@@ -247,7 +247,94 @@ macro_rules! define_instructions {
                     Instruction::Dispatch => 10,
                 }
             }
+
+            /// Returns true when this instruction accepts compact concat form
+            /// (`rd, rs2` with metadata A=1 representing `rd, rd, rs2`).
+            pub const fn supports_concat_compact(self) -> bool {
+                matches!(
+                    self,
+                    Instruction::Add
+                        | Instruction::Sub
+                        | Instruction::Mul
+                        | Instruction::Div
+                        | Instruction::Mod
+                        | Instruction::Min
+                        | Instruction::Max
+                        | Instruction::Shl
+                        | Instruction::Shr
+                        | Instruction::And
+                        | Instruction::Or
+                        | Instruction::Xor
+                        | Instruction::Eq
+                        | Instruction::Ne
+                        | Instruction::Lt
+                        | Instruction::Le
+                        | Instruction::Gt
+                        | Instruction::Ge
+                )
+            }
+
+            /// Returns true when this instruction may carry one operand metadata byte.
+            pub const fn supports_operand_metadata(self) -> bool {
+                match self {
+                    $( Instruction::$name => define_instructions!(@has_dynamic $( $kind ),*), )*
+                    Instruction::Dispatch => false,
+                }
+            }
+
+            /// Encodes this instruction opcode with an optional metadata flag.
+            ///
+            /// The resulting byte uses `0xZ[ooooooo]` where:
+            /// - `ooooooo` is the 7-bit opcode value
+            /// - `Z=1` means one metadata byte follows the opcode
+            pub const fn encode_opcode(self, has_metadata: bool) -> u8 {
+                let base = (self as u8) & OPCODE_BASE_MASK;
+                if has_metadata {
+                    base | OPCODE_METADATA_FLAG
+                } else {
+                    base
+                }
+            }
+
+            /// Decodes an opcode byte into `(instruction, has_metadata)`.
+            ///
+            /// This strips the metadata flag bit and decodes the base opcode.
+            pub fn decode_opcode(opcode: u8) -> Result<(Self, bool), VMError> {
+                let has_metadata = (opcode & OPCODE_METADATA_FLAG) != 0;
+                let instruction = match opcode & OPCODE_BASE_MASK {
+                    $( v if v == (($opcode as u8) & OPCODE_BASE_MASK) => Instruction::$name, )*
+                    0x7F => Instruction::Dispatch,
+                    _ => {
+                        return Err(VMError::InvalidInstruction { opcode, offset: 0 });
+                    }
+                };
+                if has_metadata && !instruction.supports_operand_metadata() {
+                    return Err(VMError::InvalidInstruction { opcode, offset: 0 });
+                }
+                Ok((instruction, has_metadata))
+            }
         }
+    };
+
+    // ---------- opcode helpers ----------
+    (@opcode_value $opcode:expr; $( $kind:ident ),* ) => {
+        (($opcode as u8) & OPCODE_BASE_MASK) | define_instructions!(@opcode_metadata_flag $( $kind ),*)
+    };
+    (@opcode_metadata_flag) => { 0u8 };
+    (@opcode_metadata_flag Src $(, $rest:ident )* ) => { OPCODE_METADATA_FLAG };
+    (@opcode_metadata_flag Addr $(, $rest:ident )* ) => { OPCODE_METADATA_FLAG };
+    (@opcode_metadata_flag ImmI32 $(, $rest:ident )* ) => { OPCODE_METADATA_FLAG };
+    (@opcode_metadata_flag RefU32 $(, $rest:ident )* ) => { OPCODE_METADATA_FLAG };
+    (@opcode_metadata_flag $other:ident $(, $rest:ident )* ) => {
+        define_instructions!(@opcode_metadata_flag $( $rest ),*)
+    };
+    (@has_dynamic) => { false };
+    (@has_dynamic Src $(, $rest:ident )* ) => { true };
+    (@has_dynamic Addr $(, $rest:ident )* ) => { true };
+    (@has_dynamic ImmI32 $(, $rest:ident )* ) => { true };
+    (@has_dynamic RefU32 $(, $rest:ident )* ) => { true };
+    (@has_dynamic $other:ident $(, $rest:ident )* ) => {
+        define_instructions!(@has_dynamic $( $rest ),*)
     };
 
     // ---------- types ----------
@@ -303,16 +390,3 @@ macro_rules! define_instructions {
 }
 
 for_each_instruction!(define_instructions);
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn instruction_try_from_invalid() {
-        assert!(matches!(
-            Instruction::try_from(0xFE),
-            Err(VMError::InvalidInstruction { opcode: 0xFE, .. })
-        ));
-    }
-}

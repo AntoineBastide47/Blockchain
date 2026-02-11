@@ -17,13 +17,43 @@
 //! - Booleans are `true` or `false`
 //! - Comments start with `#`
 //! - Commas between operands are optional
+//!
+//! # Opcode/Metadata Encoding (Src/Addr v2)
+//!
+//! This assembler targets an opcode format where the high bit indicates whether
+//! an instruction carries one metadata byte immediately after the opcode:
+//!
+//! ```text
+//! opcode: 0xZ[ooooooo]
+//!           ^ Z = 1 => one metadata byte follows
+//! ```
+//!
+//! Metadata now uses mixed-radix state encoding:
+//!
+//! ```text
+//! Src states (radix 8): Reg, Ref_1, Ref_2, Ref_4, I64_1, I64_2, I64_4, I64_8
+//! Addr states (radix 2): Reg, U32
+//! Len states (radix 3): 1B, 2B, 4B (used by ImmI32 and RefU32)
+//! ```
+//!
+//! - `3-dyn Src`: `meta = s0 + 8*s1 + 64*s2` (fits in one byte)
+//! - `2-dyn arithmetic`: `meta = (concat << 7) | (s0 + 8*s1)`
+//! - `3-dyn Addr` (e.g. `MEM_COPY`): `meta = a0 + 2*a1 + 4*a2`
+//!
+//! Booleans are not a dedicated dynamic Src state; immediates are encoded via
+//! compact i64 states.
 
 use crate::for_each_instruction;
 use crate::types::encoding::Encode;
 use crate::utils::log::SHOW_TYPE;
 use crate::virtual_machine::errors::VMError;
 use crate::virtual_machine::isa::Instruction;
-use crate::virtual_machine::operand::{AddrOperand, SrcOperand};
+use crate::virtual_machine::operand::{
+    AddrMetadataState, AddrOperand, ImmI32MetadataState, MetadataSlotEncoding, SrcMetadataState,
+    SrcOperand, encode_i32_compact, encode_i64_compact, encode_metadata_byte, encode_u32_compact,
+    metadata_consume_addr_state, metadata_consume_imm_i32_state, metadata_consume_src_state,
+    metadata_i64_len_and_code, metadata_payload_value,
+};
 use crate::virtual_machine::program::DeployProgram;
 use crate::virtual_machine::vm::HOST_FUNCTIONS;
 use crate::{define_instructions, error};
@@ -36,6 +66,7 @@ use std::sync::atomic::Ordering;
 const COMMENT_CHAR: char = '#';
 const LABEL_SUFFIX: char = ':';
 const INIT_LABEL: &str = "__init__";
+const DISPATCH_WIDTHS_PER_BYTE: usize = 4;
 
 /// Tracks line offset introduced by dispatcher code insertion.
 #[derive(Debug, Clone, Copy)]
@@ -394,7 +425,7 @@ fn tokenize_label(line_no: usize, line: &str) -> Result<Label<'_>, VMError> {
     while j < ab.len() && ab[j].is_ascii_digit() {
         j += 1;
     }
-    let argc = parse_u8_or_hex(&arg_data[n_start..j], line_no, arg_start + n_start + 1)?;
+    let argc = parse_u8(&arg_data[n_start..j], line_no, arg_start + n_start + 1)?;
 
     while j < ab.len() && ab[j] == b' ' {
         j += 1;
@@ -424,7 +455,7 @@ fn tokenize_label(line_no: usize, line: &str) -> Result<Label<'_>, VMError> {
     while j < ab.len() && ab[j].is_ascii_digit() {
         j += 1;
     }
-    let argr = parse_u8_or_hex(&arg_data[r_start..j], line_no, arg_start + r_start + 1)?;
+    let argr = parse_u8(&arg_data[r_start..j], line_no, arg_start + r_start + 1)?;
 
     while j < ab.len() {
         if ab[j] != b' ' {
@@ -545,7 +576,7 @@ fn parse_ref_u32(tok: &str) -> Result<u32, VMError> {
         })
 }
 
-macro_rules! define_parse_int_or_hex {
+macro_rules! define_parse_int {
     (
         $(
              $vis:vis $name:ident : $ty:ty
@@ -559,6 +590,8 @@ macro_rules! define_parse_int_or_hex {
             ) -> Result<$ty, VMError> {
                 let (s, radix) = if let Some(hex) = tok.strip_prefix("0x") {
                     (hex, 16)
+                } else if let Some(bin) = tok.strip_prefix("0b") {
+                    (bin, 2)
                 } else {
                     (tok, 10)
                 };
@@ -578,11 +611,11 @@ macro_rules! define_parse_int_or_hex {
     };
 }
 
-define_parse_int_or_hex! {
-    parse_u8_or_hex: u8,
-    parse_u32_or_hex: u32,
-    parse_i32_or_hex: i32,
-    pub(crate) parse_i64_or_hex: i64,
+define_parse_int! {
+    parse_u8: u8,
+    parse_u32: u32,
+    parse_i32: i32,
+    pub(crate) parse_i64: i64,
 }
 
 /// Parses an i32 immediate or a label reference.
@@ -596,7 +629,7 @@ fn parse_i32_or_label(
     line: usize,
     current_global_offset: usize,
 ) -> Result<i32, VMError> {
-    if let Ok(v) = parse_i32_or_hex(tok, line, current_global_offset) {
+    if let Ok(v) = parse_i32(tok, line, current_global_offset) {
         return Ok(v);
     }
     let target = ctx.resolve_label(tok)?;
@@ -614,11 +647,119 @@ fn parse_i64_or_label(
     line: usize,
     current_global_offset: usize,
 ) -> Result<i64, VMError> {
-    if let Ok(v) = parse_i64_or_hex(tok, line, current_global_offset) {
+    if let Ok(v) = parse_i64(tok, line, current_global_offset) {
         return Ok(v);
     }
     let target = ctx.resolve_label(tok)?;
     Ok(target as i64 - current_global_offset as i64)
+}
+
+/// Returns the number of packed width bytes needed for `entry_count` dispatch entries.
+fn dispatch_width_table_len(entry_count: usize) -> usize {
+    entry_count.div_ceil(DISPATCH_WIDTHS_PER_BYTE)
+}
+
+/// Returns the bit shift for the 2-bit width code at `entry_index`.
+fn dispatch_width_shift(entry_index: usize) -> u8 {
+    6 - ((entry_index % DISPATCH_WIDTHS_PER_BYTE) as u8 * 2)
+}
+
+/// Stores one 2-bit width code into the packed dispatch width table.
+fn dispatch_pack_width_code(width_table: &mut [u8], entry_index: usize, code: u8) {
+    let packed_index = entry_index / DISPATCH_WIDTHS_PER_BYTE;
+    let shift = dispatch_width_shift(entry_index);
+    width_table[packed_index] |= (code & 0b11) << shift;
+}
+
+/// Parses and validates dispatch arity, returning entry count.
+fn dispatch_count_from_tokens(tokens: &[Token]) -> Result<u8, VMError> {
+    if tokens.len() < 2 {
+        return Err(VMError::ArityMismatch {
+            instruction: tokens[0].text.to_string(),
+            expected: 2,
+            actual: tokens.len() as u8 - 1,
+        });
+    }
+    let count = tokens[1]
+        .text
+        .parse::<u8>()
+        .map_err(|_| VMError::InvalidInstructionName {
+            name: tokens[1].text.to_string(),
+        })?;
+    let expected = 2 + count as usize * 2;
+    if tokens.len() != expected {
+        return Err(VMError::ArityMismatch {
+            instruction: tokens[0].text.to_string(),
+            expected: expected as u8 - 1,
+            actual: tokens.len() as u8 - 1,
+        });
+    }
+    Ok(count)
+}
+
+/// Validates dispatch argument registers (`argr`) for each entry.
+fn validate_dispatch_entry_registers(tokens: &[Token], count: u8) -> Result<(), VMError> {
+    for i in 0..count as usize {
+        parse_reg(tokens[3 + i * 2].text)?;
+    }
+    Ok(())
+}
+
+/// Parses a dispatch offset token as numeric i64 or a label-relative i64.
+fn dispatch_offset_from_token_with_end(
+    tok: &str,
+    ctx: &AsmContext,
+    instruction_end: usize,
+) -> Result<i64, VMError> {
+    if let Ok(v) = parse_i64(tok, 0, instruction_end) {
+        return Ok(v);
+    }
+    let target = ctx.resolve_label(tok)?;
+    Ok(target as i64 - instruction_end as i64)
+}
+
+/// Returns encoded byte length for one dispatch offset using compact i64 encoding.
+fn dispatch_offset_size_from_token_with_end(
+    tok: &str,
+    ctx: &AsmContext,
+    instruction_end: usize,
+) -> Result<usize, VMError> {
+    let offset = dispatch_offset_from_token_with_end(tok, ctx, instruction_end)?;
+    Ok(metadata_i64_len_and_code(offset).0 as usize)
+}
+
+/// Computes relaxed DISPATCH size using packed offset width codes plus compact offsets.
+fn dispatch_size_from_tokens_relaxed(
+    ctx: &mut AsmContext,
+    tokens: &[Token],
+    current_global_offset: usize,
+) -> Result<usize, VMError> {
+    let count = dispatch_count_from_tokens(tokens)?;
+    validate_dispatch_entry_registers(tokens, count)?;
+
+    let width_table_len = dispatch_width_table_len(count as usize);
+    // Initial guess: legacy 4-byte offsets.
+    let mut size = 2usize + width_table_len + count as usize * (4 + 1);
+
+    for _ in 0..8 {
+        let instruction_end = current_global_offset + size;
+        let mut payload_size = 0usize;
+        for i in 0..count as usize {
+            let len = dispatch_offset_size_from_token_with_end(
+                tokens[2 + i * 2].text,
+                ctx,
+                instruction_end,
+            )?;
+            payload_size += len + 1; // offset payload + argr
+        }
+        let new_size = 2usize + width_table_len + payload_size;
+        if new_size == size {
+            break;
+        }
+        size = new_size;
+    }
+
+    Ok(size)
 }
 
 fn parse_src(
@@ -661,11 +802,7 @@ fn parse_addr(tok: &str, line: usize, current_offset: usize) -> Result<AddrOpera
         return Ok(AddrOperand::Reg(reg));
     }
     // number or hex
-    Ok(AddrOperand::U32(parse_u32_or_hex(
-        tok,
-        line,
-        current_offset,
-    )?))
+    Ok(AddrOperand::U32(parse_u32(tok, line, current_offset)?))
 }
 
 /// Extracts the token text that caused an error, if available.
@@ -716,36 +853,231 @@ fn is_label_def(line: &str) -> bool {
     bytes[i] == LABEL_SUFFIX as u8 || bytes[i] == b'('
 }
 
-/// Computes the encoded size of a Src operand from its token text.
-///
-/// Determines the operand type by inspecting the token:
-/// - Register (r0, r1, ...): tag(1) + reg(1) = 2 bytes
-/// - Bool (true/false): tag(1) + bool(1) = 2 bytes
-/// - String literal ("..."): tag(1) + ref(4) = 5 bytes
-/// - Number or label: tag(1) + i64(8) = 9 bytes
-fn src_size_from_token(tok: &str) -> usize {
-    if tok.starts_with('r') && tok.len() > 1 && tok[1..].chars().all(|c| c.is_ascii_digit())
-        || tok == "true"
-        || tok == "false"
-    {
-        2 // tag + (register or bool)
-    } else if tok.starts_with('"') {
-        5 // tag + u32 ref
+/// Returns `true` when `tok` matches the register pattern `r<digits>`.
+fn is_register_token(tok: &str) -> bool {
+    tok.starts_with('r') && tok.len() > 1 && tok[1..].chars().all(|c| c.is_ascii_digit())
+}
+
+/// Emits the payload bytes for a [`SrcOperand`] using metadata-based encoding.
+fn emit_src_payload_from_metadata(
+    out: &mut Vec<u8>,
+    operand: &SrcOperand,
+    metadata_cursor: &mut u16,
+) {
+    let state =
+        metadata_consume_src_state(metadata_cursor).expect("invalid Src metadata state cursor");
+
+    if let Some(len) = state.i64_len() {
+        let value = match operand {
+            SrcOperand::I64(value) => *value,
+            SrcOperand::Bool(value) => i64::from(*value),
+            _ => panic!("metadata state {state:?} expects i64 Src payload"),
+        };
+        let bytes = encode_i64_compact(value, len)
+            .expect("metadata i64 length must be valid for Src payload");
+        out.extend_from_slice(&bytes);
+    } else if let Some(len) = state.ref_len() {
+        let value = match operand {
+            SrcOperand::Ref(value) => *value,
+            _ => panic!("metadata state {state:?} expects Ref Src payload"),
+        };
+        let bytes = encode_u32_compact(value, len)
+            .expect("metadata ref length must be valid for Src payload");
+        out.extend_from_slice(&bytes);
     } else {
-        9 // tag + i64 (numbers and labels)
+        match (state, operand) {
+            (SrcMetadataState::Reg, SrcOperand::Reg(reg)) => out.push(*reg),
+            _ => panic!("metadata state {state:?} does not match Src operand {operand:?}"),
+        }
     }
 }
 
-/// Computes the encoded size of an Addr operand from its token text.
-///
-/// - Register (r0, r1, ...): tag(1) + reg(1) = 2 bytes
-/// - Immediate u32: tag(1) + u32(4) = 5 bytes
-fn addr_size_from_token(tok: &str) -> usize {
-    if tok.starts_with('r') && tok.len() > 1 && tok[1..].chars().all(|c| c.is_ascii_digit()) {
-        2 // tag + register
-    } else {
-        5 // tag + u32
+/// Emits the payload bytes for an [`AddrOperand`] using metadata-based encoding.
+fn emit_addr_payload_from_metadata(
+    out: &mut Vec<u8>,
+    operand: &AddrOperand,
+    metadata_cursor: &mut u16,
+) {
+    let state =
+        metadata_consume_addr_state(metadata_cursor).expect("invalid Addr metadata state cursor");
+    match (state, operand) {
+        (AddrMetadataState::Reg, AddrOperand::Reg(reg)) => out.push(*reg),
+        (AddrMetadataState::U32, AddrOperand::U32(value)) => {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        _ => panic!("metadata state {state:?} does not match Addr operand {operand:?}"),
     }
+}
+
+/// Returns compact Ref metadata state for a u32 value.
+fn src_ref_metadata_state_from_value(value: u32) -> SrcMetadataState {
+    if value <= u8::MAX as u32 {
+        SrcMetadataState::RefLen1
+    } else if value <= u16::MAX as u32 {
+        SrcMetadataState::RefLen2
+    } else {
+        SrcMetadataState::RefLen4
+    }
+}
+
+/// Returns Src metadata state for a token.
+fn src_metadata_state_from_token(tok: &str, ctx: &mut AsmContext) -> SrcMetadataState {
+    if is_register_token(tok) {
+        return SrcMetadataState::Reg;
+    }
+    if tok == "true" || tok == "false" {
+        return SrcMetadataState::I64Len1;
+    }
+    if let Some(s) = tok.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
+        let reference = ctx.intern_string(s.to_string());
+        return src_ref_metadata_state_from_value(reference);
+    }
+
+    if let Ok(value) = parse_i64(tok, 0, 0) {
+        // Reserve 1-byte i64 payload value space for bool literals.
+        if value == 0 || value == 1 {
+            return SrcMetadataState::I64Len2;
+        }
+        let (_, len_code) = metadata_i64_len_and_code(value);
+        return SrcMetadataState::from_i64_len_code(len_code);
+    }
+
+    // Label-derived i64 immediates are fixed to 8 bytes.
+    SrcMetadataState::I64Len8
+}
+
+/// Returns metadata slot encoding for a Src token.
+fn src_metadata_slot_from_token(tok: &str, ctx: &mut AsmContext) -> MetadataSlotEncoding {
+    MetadataSlotEncoding::src(src_metadata_state_from_token(tok, ctx))
+}
+
+/// Returns metadata slot encoding for an Addr token.
+fn addr_metadata_slot_from_token(tok: &str) -> MetadataSlotEncoding {
+    if is_register_token(tok) {
+        MetadataSlotEncoding::addr(AddrMetadataState::Reg)
+    } else {
+        MetadataSlotEncoding::addr(AddrMetadataState::U32)
+    }
+}
+
+/// Computes Src payload size under metadata encoding (no per-operand tag bytes).
+fn src_size_from_token_metadata(tok: &str, ctx: &mut AsmContext) -> usize {
+    src_metadata_state_from_token(tok, ctx).payload_len()
+}
+
+/// Computes Addr payload size under metadata encoding (no per-operand tag bytes).
+fn addr_size_from_token_metadata(tok: &str) -> usize {
+    if is_register_token(tok) { 1 } else { 4 }
+}
+
+/// Returns ImmI32 metadata state for a token.
+fn imm_i32_metadata_state_from_token(tok: &str) -> ImmI32MetadataState {
+    if let Ok(value) = parse_i32(tok, 0, 0) {
+        ImmI32MetadataState::from_value(value)
+    } else {
+        // Label-derived offsets use fixed i32 payload width.
+        ImmI32MetadataState::Len4
+    }
+}
+
+/// Returns ImmI32 metadata state for a token using a resolved instruction end offset.
+///
+/// This enables label-based branch/call relaxation (`target - instruction_end`)
+/// to choose compact ImmI32 payload sizes when possible.
+fn imm_i32_metadata_state_from_token_with_end(
+    tok: &str,
+    ctx: &AsmContext,
+    instruction_end: usize,
+) -> ImmI32MetadataState {
+    if let Ok(value) = parse_i32(tok, 0, 0) {
+        return ImmI32MetadataState::from_value(value);
+    }
+    if let Ok(target) = ctx.resolve_label(tok)
+        && let Ok(relative) = i32::try_from(target as i64 - instruction_end as i64)
+    {
+        return ImmI32MetadataState::from_value(relative);
+    }
+    ImmI32MetadataState::Len4
+}
+
+/// Returns metadata slot encoding for an ImmI32 token using relaxed label offsets.
+fn imm_i32_metadata_slot_from_token_with_end(
+    tok: &str,
+    ctx: &AsmContext,
+    instruction_end: usize,
+) -> MetadataSlotEncoding {
+    MetadataSlotEncoding::imm_i32(imm_i32_metadata_state_from_token_with_end(
+        tok,
+        ctx,
+        instruction_end,
+    ))
+}
+
+/// Computes ImmI32 payload size under metadata encoding.
+fn imm_i32_size_from_token_metadata(tok: &str) -> usize {
+    imm_i32_metadata_state_from_token(tok).payload_len()
+}
+
+/// Computes ImmI32 payload size under metadata encoding with relaxed label offsets.
+fn imm_i32_size_from_token_metadata_with_end(
+    tok: &str,
+    ctx: &AsmContext,
+    instruction_end: usize,
+) -> usize {
+    imm_i32_metadata_state_from_token_with_end(tok, ctx, instruction_end).payload_len()
+}
+
+/// Returns compact len state for a RefU32 value.
+fn ref_u32_metadata_state_from_value(value: u32) -> ImmI32MetadataState {
+    if value <= u8::MAX as u32 {
+        ImmI32MetadataState::Len1
+    } else if value <= u16::MAX as u32 {
+        ImmI32MetadataState::Len2
+    } else {
+        ImmI32MetadataState::Len4
+    }
+}
+
+/// Returns RefU32 compact len state for a token and syncs string interning.
+fn ref_u32_metadata_state_from_token(tok: &str, ctx: &mut AsmContext) -> ImmI32MetadataState {
+    if let Some(s) = tok.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
+        return ref_u32_metadata_state_from_value(ctx.intern_string(s.to_string()));
+    }
+    if let Ok(value) = parse_ref_u32(tok) {
+        return ref_u32_metadata_state_from_value(value);
+    }
+    // Parse errors are surfaced by operand parsing; keep sizing deterministic here.
+    ImmI32MetadataState::Len4
+}
+
+/// Returns metadata slot encoding for a RefU32 token.
+fn ref_u32_metadata_slot_from_token(tok: &str, ctx: &mut AsmContext) -> MetadataSlotEncoding {
+    MetadataSlotEncoding::imm_i32(ref_u32_metadata_state_from_token(tok, ctx))
+}
+
+/// Computes RefU32 payload size under metadata encoding.
+fn ref_u32_size_from_token_metadata(tok: &str, ctx: &mut AsmContext) -> usize {
+    ref_u32_metadata_state_from_token(tok, ctx).payload_len()
+}
+
+/// Emits compact u32 payload bytes using metadata state from the current slot.
+fn emit_ref_u32_payload_from_metadata(out: &mut Vec<u8>, value: &u32, metadata_cursor: &mut u16) {
+    let state = metadata_consume_imm_i32_state(metadata_cursor)
+        .expect("invalid RefU32 metadata state cursor");
+    let len = state.payload_len() as u8;
+    let bytes =
+        encode_u32_compact(*value, len).expect("metadata u32 length must be valid for payload");
+    out.extend_from_slice(&bytes);
+}
+
+/// Emits compact i32 payload bytes using metadata state from the current slot.
+fn emit_imm_i32_payload_from_metadata(out: &mut Vec<u8>, value: &i32, metadata_cursor: &mut u16) {
+    let state = metadata_consume_imm_i32_state(metadata_cursor)
+        .expect("invalid ImmI32 metadata state cursor");
+    let len = state.payload_len() as u8;
+    let bytes =
+        encode_i32_compact(*value, len).expect("metadata i32 length must be valid for payload");
+    out.extend_from_slice(&bytes);
 }
 
 /// Returns line content without inline comments and surrounding spaces.
@@ -878,6 +1210,8 @@ macro_rules! define_parse_instruction {
         enum AsmInstr {
             $(
                 $name {
+                    concat: bool,
+                    metadata: Option<u8>,
                     $( $field: define_instructions!(@ty $kind) ),*
                 },
             )*
@@ -892,18 +1226,47 @@ macro_rules! define_parse_instruction {
             fn assemble(&self, out: &mut Vec<u8>) {
                 match self {
                     $(
-                        AsmInstr::$name { $( $field ),* } => {
-                            out.push($opcode);
-                            $(
-                                define_instructions!(@emit out, $kind, $field);
-                            )*
+                        AsmInstr::$name {
+                            concat,
+                            metadata,
+                            $( $field ),*
+                        } => {
+                            // Z bit is driven by metadata presence at encode time.
+                            out.push(Instruction::$name.encode_opcode(metadata.is_some()));
+                            if let Some(metadata) = metadata {
+                                out.push(*metadata);
+                            }
+
+                            let concat = *concat;
+                            let concat_capable =
+                                define_parse_instruction!(@concat_capable $name $( $kind ),*);
+                            let mut metadata_cursor = metadata.map_or(0u16, |m| {
+                                metadata_payload_value(m, concat_capable)
+                            });
+                            let _ = &mut metadata_cursor;
+                            define_parse_instruction!(
+                                @emit_fields_with_concat out, metadata_cursor, concat;
+                                $( $field : $kind ),*
+                            );
                         }
                     ),*
                     AsmInstr::Dispatch { entries } => {
                         out.push(Instruction::Dispatch as u8);
                         out.push(entries.len() as u8);
-                        for (offset, argr) in entries {
-                            out.extend_from_slice(&(*offset as i32).to_le_bytes());
+                        let width_table_len = dispatch_width_table_len(entries.len());
+                        let width_table_start = out.len();
+                        out.resize(width_table_start + width_table_len, 0u8);
+
+                        for (entry_index, (offset, argr)) in entries.iter().enumerate() {
+                            let (len, code) = metadata_i64_len_and_code(*offset);
+                            dispatch_pack_width_code(
+                                &mut out[width_table_start..width_table_start + width_table_len],
+                                entry_index,
+                                code,
+                            );
+                            let bytes = encode_i64_compact(*offset, len)
+                                .expect("dispatch offset compact length must be valid");
+                            out.extend_from_slice(&bytes);
                             out.push(*argr);
                         }
                     }
@@ -925,7 +1288,10 @@ macro_rules! define_parse_instruction {
         ///
         /// Tokens should include the instruction mnemonic followed by operands.
         /// Size depends on operand types, which are determined by inspecting tokens.
-        fn instruction_size_from_tokens(tokens: &[Token]) -> Result<usize, VMError> {
+        fn instruction_size_from_tokens(
+            mut ctx: &mut AsmContext,
+            tokens: &[Token],
+        ) -> Result<usize, VMError> {
             if tokens.is_empty() {
                 return Err(VMError::ArityMismatch {
                     instruction: "<missing opcode>".to_string(),
@@ -939,40 +1305,220 @@ macro_rules! define_parse_instruction {
             Ok(match instr {
                 $(
                     Instruction::$name => {
-                        const EXPECTED: usize = 1 + define_parse_instruction!(@count $( $field ),*);
-                        if tokens.len() != EXPECTED {
-                            return Err(VMError::ArityMismatch {
-                                instruction: tokens[0].text.to_string(),
-                                expected: EXPECTED as u8 - 1,
-                                actual: tokens.len() as u8 - 1,
-                            });
+                        let concat = define_parse_instruction!(
+                            @check_arity tokens, $name; $( $field ),* ; $( $kind ),*
+                        );
+                        if concat {
+                            parse_reg(tokens[1].text)?;
+                            let rs2_size = src_size_from_token_metadata(tokens[2].text, ctx);
+                            1usize + 1 + 1 + rs2_size
+                        } else {
+                            let payload_size =
+                                0usize $( + define_parse_instruction!(@token_size $kind, tok_iter, ctx) )*;
+                            let metadata_slots: Vec<MetadataSlotEncoding> = {
+                                let mut slots = Vec::new();
+                                let _ = &mut slots;
+                                define_parse_instruction!(
+                                    @collect_metadata_slots_from_tokens tokens, slots, ctx, 0usize;
+                                    $( $kind ),*
+                                );
+                                slots
+                            };
+                            let metadata_size = if metadata_slots.is_empty() {
+                                0usize
+                            } else {
+                                usize::from(encode_metadata_byte(false, &metadata_slots)? != 0)
+                            };
+                            1usize + metadata_size + payload_size
                         }
-                        1usize $( + define_parse_instruction!(@token_size $kind, tok_iter) )*
                     }
                 ),*
                 Instruction::Dispatch => {
-                    // DISPATCH count, label0, reg0, label1, reg1, ...
-                    // Token layout: ["DISPATCH", count, (label, reg)*]
-                    if tokens.len() < 2 {
-                        return Err(VMError::ArityMismatch {
-                            instruction: tokens[0].text.to_string(),
-                            expected: 2,
-                            actual: tokens.len() as u8 - 1,
-                        });
+                    let count = dispatch_count_from_tokens(tokens)?;
+                    validate_dispatch_entry_registers(tokens, count)?;
+                    let width_table_len = dispatch_width_table_len(count as usize);
+                    // Labels may not resolve in pass 1; use len4 fallback for non-numeric offsets.
+                    let mut payload_size = 0usize;
+                    for i in 0..count as usize {
+                        let off_len = if let Ok(value) = parse_i64(tokens[2 + i * 2].text, 0, 0) {
+                            metadata_i64_len_and_code(value).0 as usize
+                        } else {
+                            4usize
+                        };
+                        payload_size += off_len + 1; // offset + argr
                     }
-                    let count = tokens[1].text.parse::<u8>().map_err(|_| {
-                        VMError::InvalidInstructionName { name: tokens[1].text.to_string() }
-                    })?;
-                    let expected = 2 + count as usize * 2;
-                    if tokens.len() != expected {
-                        return Err(VMError::ArityMismatch {
-                            instruction: tokens[0].text.to_string(),
-                            expected: expected as u8 - 1,
-                            actual: tokens.len() as u8 - 1,
-                        });
+                    2 + width_table_len + payload_size
+                }
+            })
+        }
+
+        /// Returns instruction size using current label offsets for ImmI32 relaxation.
+        ///
+        /// This pass computes compact ImmI32 widths for label-based operands by
+        /// iterating on the instruction end offset until size reaches a fixed point.
+        fn instruction_size_from_tokens_relaxed(
+            mut ctx: &mut AsmContext,
+            tokens: &[Token],
+            current_global_offset: usize,
+        ) -> Result<usize, VMError> {
+            if tokens.is_empty() {
+                return Err(VMError::ArityMismatch {
+                    instruction: "<missing opcode>".to_string(),
+                    expected: 1,
+                    actual: 0,
+                });
+            }
+
+            let instr = instruction_from_str(tokens[0].text)?;
+            Ok(match instr {
+                $(
+                    Instruction::$name => {
+                        let concat = define_parse_instruction!(
+                            @check_arity tokens, $name; $( $field ),* ; $( $kind ),*
+                        );
+                        if concat {
+                            parse_reg(tokens[1].text)?;
+                            let rs2_size = src_size_from_token_metadata(tokens[2].text, ctx);
+                            1usize + 1 + 1 + rs2_size
+                        } else {
+                            let mut size = {
+                                let mut tok_iter = tokens.iter().skip(1);
+                                let _ = &mut tok_iter;
+                                let payload_size =
+                                    0usize $( + define_parse_instruction!(@token_size $kind, tok_iter, ctx) )*;
+                                let metadata_slots: Vec<MetadataSlotEncoding> = {
+                                    let mut slots = Vec::new();
+                                    let _ = &mut slots;
+                                    define_parse_instruction!(
+                                        @collect_metadata_slots_from_tokens
+                                        tokens, slots, ctx, current_global_offset;
+                                        $( $kind ),*
+                                    );
+                                    slots
+                                };
+                                let metadata_size = if metadata_slots.is_empty() {
+                                    0usize
+                                } else {
+                                    usize::from(encode_metadata_byte(false, &metadata_slots)? != 0)
+                                };
+                                1usize + metadata_size + payload_size
+                            };
+
+                            for _ in 0..4 {
+                                let instruction_end = current_global_offset + size;
+                                let _ = instruction_end;
+                                let mut tok_iter = tokens.iter().skip(1);
+                                let _ = &mut tok_iter;
+                                let payload_size = 0usize $(
+                                    + define_parse_instruction!(
+                                        @token_size_relaxed $kind,
+                                        tok_iter,
+                                        ctx,
+                                        current_global_offset,
+                                        size
+                                    )
+                                )*;
+                                let metadata_slots: Vec<MetadataSlotEncoding> = {
+                                    let mut slots = Vec::new();
+                                    let _ = &mut slots;
+                                    define_parse_instruction!(
+                                        @collect_metadata_slots_from_tokens
+                                        tokens, slots, ctx, instruction_end;
+                                        $( $kind ),*
+                                    );
+                                    slots
+                                };
+                                let metadata_size = if metadata_slots.is_empty() {
+                                    0usize
+                                } else {
+                                    usize::from(encode_metadata_byte(false, &metadata_slots)? != 0)
+                                };
+                                let new_size = 1usize + metadata_size + payload_size;
+                                if new_size == size {
+                                    break;
+                                }
+                                size = new_size;
+                            }
+
+                            size
+                        }
                     }
-                    // opcode(1) + count(1) + count * (i32(4) + reg(1))
-                    2 + count as usize * 5
+                ),*
+                Instruction::Dispatch => {
+                    dispatch_size_from_tokens_relaxed(ctx, tokens, current_global_offset)?
+                }
+            })
+        }
+
+        /// Returns encoded payload sizes grouped per instruction operand.
+        ///
+        /// Group sizes are aligned with emitted operand payloads (not raw bytes),
+        /// so audit output can separate arguments with commas.
+        fn instruction_operand_group_sizes_from_tokens(
+            mut ctx: &mut AsmContext,
+            tokens: &[Token],
+            current_global_offset: usize,
+        ) -> Result<Vec<usize>, VMError> {
+            if tokens.is_empty() {
+                return Err(VMError::ArityMismatch {
+                    instruction: "<missing opcode>".to_string(),
+                    expected: 1,
+                    actual: 0,
+                });
+            }
+
+            let instr = instruction_from_str(tokens[0].text)?;
+            Ok(match instr {
+                $(
+                    Instruction::$name => {
+                        let concat = define_parse_instruction!(
+                            @check_arity tokens, $name; $( $field ),* ; $( $kind ),*
+                        );
+                        if concat {
+                            parse_reg(tokens[1].text)?;
+                            vec![1usize, src_size_from_token_metadata(tokens[2].text, ctx)]
+                        } else {
+                            let instruction_end = current_global_offset
+                                + instruction_size_from_tokens_relaxed(
+                                    ctx,
+                                    tokens,
+                                    current_global_offset,
+                                )?;
+                            let _ = instruction_end;
+                            let mut groups = Vec::new();
+                            let _ = &mut groups;
+                            define_parse_instruction!(
+                                @collect_operand_group_sizes_from_tokens
+                                tokens, groups, ctx, instruction_end;
+                                $( $kind ),*
+                            );
+                            groups
+                        }
+                    }
+                ),*
+                Instruction::Dispatch => {
+                    let count = dispatch_count_from_tokens(tokens)?;
+                    validate_dispatch_entry_registers(tokens, count)?;
+                    let total_size =
+                        dispatch_size_from_tokens_relaxed(ctx, tokens, current_global_offset)?;
+                    let instruction_end = current_global_offset + total_size;
+
+                    let width_table_len = dispatch_width_table_len(count as usize);
+                    let mut groups = Vec::with_capacity(2 + count as usize * 2);
+                    groups.push(1); // count
+                    if width_table_len > 0 {
+                        groups.push(width_table_len); // packed width codes
+                    }
+                    for i in 0..count as usize {
+                        let off_len = dispatch_offset_size_from_token_with_end(
+                            tokens[2 + i * 2].text,
+                            ctx,
+                            instruction_end,
+                        )?;
+                        groups.push(off_len); // compact offset payload
+                        groups.push(1); // argr
+                    }
+                    groups
                 }
             })
         }
@@ -982,7 +1528,7 @@ macro_rules! define_parse_instruction {
         /// `current_global_offset` is the global bytecode offset (in init || runtime space)
         /// where this instruction starts, used for resolving label references to relative offsets.
         fn parse_instruction(
-            ctx: &mut AsmContext,
+            mut ctx: &mut AsmContext,
             tokens: &[Token],
             line: usize,
             current_global_offset: usize,
@@ -996,42 +1542,40 @@ macro_rules! define_parse_instruction {
             }
 
             let instr = instruction_from_str(&tokens[0].text)?;
-            let offset = current_global_offset + instruction_size_from_tokens(tokens)?;
+            let offset =
+                current_global_offset + instruction_size_from_tokens_relaxed(ctx, tokens, current_global_offset)?;
 
             match instr {
                 $(
                     Instruction::$name => {
-                        const EXPECTED: usize = 1 + define_parse_instruction!(@count $( $field ),*);
-                        if tokens.len() != EXPECTED {
-                            return Err(VMError::ArityMismatch {
-                                instruction: tokens[0].text.to_string(),
-                                expected: EXPECTED as u8 - 1,
-                                actual: tokens.len() as u8 - 1,
-                            });
+                        let concat = define_parse_instruction!(
+                            @check_arity tokens, $name; $( $field ),* ; $( $kind ),*
+                        );
+                        let mut metadata_slots: Vec<MetadataSlotEncoding> = Vec::new();
+                        if concat {
+                            metadata_slots.push(MetadataSlotEncoding::src(SrcMetadataState::Reg));
+                            metadata_slots.push(src_metadata_slot_from_token(tokens[2].text, ctx));
+                        } else {
+                            define_parse_instruction!(
+                                @collect_metadata_slots_from_tokens tokens, metadata_slots, ctx, offset;
+                                $( $kind ),*
+                            );
                         }
+                        let metadata = if metadata_slots.is_empty() {
+                            None
+                        } else {
+                            let encoded = encode_metadata_byte(concat, &metadata_slots)?;
+                            (encoded != 0).then_some(encoded)
+                        };
 
                         define_parse_instruction!(
-                            @construct ctx line offset tokens; $name $( $field : $kind ),*
+                            @construct_with_concat ctx line offset tokens, concat, metadata;
+                            $name $( $field : $kind ),*
                         )
                     }
                 ),*
                 Instruction::Dispatch => {
-                    if tokens.len() < 2 {
-                        return Err(VMError::ArityMismatch {
-                            instruction: tokens[0].text.to_string(),
-                            expected: 2,
-                            actual: tokens.len() as u8 - 1,
-                        });
-                    }
-                    let count = parse_u8_or_hex(&tokens[1].text, line, offset)?;
-                    let expected = 2 + count as usize * 2;
-                    if tokens.len() != expected {
-                        return Err(VMError::ArityMismatch {
-                            instruction: tokens[0].text.to_string(),
-                            expected: expected as u8 - 1,
-                            actual: tokens.len() as u8 - 1,
-                        });
-                    }
+                    let count = dispatch_count_from_tokens(tokens)?;
                     let mut entries = Vec::with_capacity(count as usize);
                     for i in 0..count as usize {
                         let target = parse_i64_or_label(
@@ -1049,24 +1593,245 @@ macro_rules! define_parse_instruction {
     // ---------- counting ----------
     (@count $( $x:ident ),* ) => { <[()]>::len(&[ $( define_parse_instruction!(@unit $x) ),* ]) };
     (@unit $x:ident) => { () };
+    (@dynamic Reg) => { 0usize };
+    (@dynamic ImmU8) => { 0usize };
+    (@dynamic RefU32) => { 1usize };
+    (@dynamic ImmI32) => { 1usize };
+    (@dynamic ImmU32) => { 0usize };
+    (@dynamic Addr) => { 1usize };
+    (@dynamic Src) => { 1usize };
+    (@concat_capable $name:ident Reg, Src, Src) => { Instruction::$name.supports_concat_compact() };
+    (@concat_capable $name:ident $( $kind:ident ),* ) => { false };
+
+    // ---------- arity check ----------
+    (@check_arity $tokens:ident, $name:ident; $( $field:ident ),* ; $( $kind:ident ),* ) => {{
+        const EXPECTED: usize = 1 + define_parse_instruction!(@count $( $field ),*);
+        const COMPACT_EXPECTED: usize = EXPECTED.saturating_sub(1);
+        let concat =
+            define_parse_instruction!(@concat_capable $name $( $kind ),*)
+                && $tokens.len() == COMPACT_EXPECTED;
+        if !concat && $tokens.len() != EXPECTED {
+            return Err(VMError::ArityMismatch {
+                instruction: $tokens[0].text.to_string(),
+                expected: EXPECTED as u8 - 1,
+                actual: $tokens.len() as u8 - 1,
+            });
+        }
+        concat
+    }};
 
     // ---------- operand sizes from tokens ----------
-    (@token_size Reg, $iter:ident) => { { $iter.next(); 1usize } };
-    (@token_size ImmU8, $iter:ident) => { { $iter.next(); 1usize } };
+    (@token_size Reg, $iter:ident, $ctx:ident) => {{ let _ = &mut $ctx; $iter.next(); 1usize }};
+    (@token_size ImmU8, $iter:ident, $ctx:ident) => {{ let _ = &mut $ctx; $iter.next(); 1usize }};
 
-    (@token_size RefU32, $iter:ident) => { { $iter.next(); 4usize } };
-    (@token_size ImmI32, $iter:ident) => { { $iter.next(); 4usize } };
-    (@token_size ImmU32, $iter:ident) => { { $iter.next(); 4usize } };
+    (@token_size RefU32, $iter:ident, $ctx:ident) => {{
+        ref_u32_size_from_token_metadata($iter.next().unwrap().text, $ctx)
+    }};
+    (@token_size ImmI32, $iter:ident, $ctx:ident) => {{
+        let _ = &mut $ctx;
+        imm_i32_size_from_token_metadata($iter.next().unwrap().text)
+    }};
+    (@token_size ImmU32, $iter:ident, $ctx:ident) => {{ let _ = &mut $ctx; $iter.next(); 4usize }};
 
-    (@token_size Addr, $iter:ident) => { addr_size_from_token($iter.next().unwrap().text) };
-    (@token_size Src, $iter:ident) => { src_size_from_token($iter.next().unwrap().text) };
+    (@token_size Addr, $iter:ident, $ctx:ident) => {{
+        let _ = &mut $ctx;
+        addr_size_from_token_metadata($iter.next().unwrap().text)
+    }};
+    (@token_size Src, $iter:ident, $ctx:ident) => {{
+        let tok = $iter.next().unwrap();
+        src_size_from_token_metadata(tok.text, $ctx)
+    }};
+
+    // ---------- relaxed operand sizes ----------
+    (@token_size_relaxed Reg, $iter:ident, $ctx:ident, $base:expr, $size:expr) => {{
+        let _ = (&mut $ctx, $base, $size);
+        $iter.next();
+        1usize
+    }};
+    (@token_size_relaxed ImmU8, $iter:ident, $ctx:ident, $base:expr, $size:expr) => {{
+        let _ = (&mut $ctx, $base, $size);
+        $iter.next();
+        1usize
+    }};
+    (@token_size_relaxed RefU32, $iter:ident, $ctx:ident, $base:expr, $size:expr) => {{
+        let _ = ($base, $size);
+        ref_u32_size_from_token_metadata($iter.next().unwrap().text, $ctx)
+    }};
+    (@token_size_relaxed ImmI32, $iter:ident, $ctx:ident, $base:expr, $size:expr) => {{
+        imm_i32_size_from_token_metadata_with_end(
+            $iter.next().unwrap().text,
+            $ctx,
+            $base + $size,
+        )
+    }};
+    (@token_size_relaxed ImmU32, $iter:ident, $ctx:ident, $base:expr, $size:expr) => {{
+        let _ = (&mut $ctx, $base, $size);
+        $iter.next();
+        4usize
+    }};
+    (@token_size_relaxed Addr, $iter:ident, $ctx:ident, $base:expr, $size:expr) => {{
+        let _ = (&mut $ctx, $base, $size);
+        addr_size_from_token_metadata($iter.next().unwrap().text)
+    }};
+    (@token_size_relaxed Src, $iter:ident, $ctx:ident, $base:expr, $size:expr) => {{
+        let _ = ($base, $size);
+        let tok = $iter.next().unwrap();
+        src_size_from_token_metadata(tok.text, $ctx)
+    }};
+
+    // ---------- metadata collection ----------
+    (@collect_metadata_slot Addr, $iter:ident, $slots:ident, $ctx:ident, $offset_end:expr) => {{
+        let _ = (&mut $ctx, $offset_end);
+        let tok = $iter.next().unwrap();
+        $slots.push(addr_metadata_slot_from_token(tok.text));
+    }};
+    (@collect_metadata_slot Src, $iter:ident, $slots:ident, $ctx:ident, $offset_end:expr) => {{
+        let _ = (&mut $ctx, $offset_end);
+        let tok = $iter.next().unwrap();
+        $slots.push(src_metadata_slot_from_token(tok.text, $ctx));
+    }};
+    (@collect_metadata_slot ImmI32, $iter:ident, $slots:ident, $ctx:ident, $offset_end:expr) => {{
+        let tok = $iter.next().unwrap();
+        $slots.push(imm_i32_metadata_slot_from_token_with_end(
+            tok.text,
+            $ctx,
+            $offset_end,
+        ));
+    }};
+    (@collect_metadata_slot RefU32, $iter:ident, $slots:ident, $ctx:ident, $offset_end:expr) => {{
+        let _ = $offset_end;
+        let tok = $iter.next().unwrap();
+        $slots.push(ref_u32_metadata_slot_from_token(tok.text, $ctx));
+    }};
+    (@collect_metadata_slot $_kind:ident, $iter:ident, $slots:ident, $ctx:ident, $offset_end:expr) => {{
+        let _ = (&mut $ctx, $offset_end);
+        let _ = $iter.next();
+    }};
+    (@collect_metadata_slots_from_tokens $tokens:ident, $slots:ident, $ctx:ident, $offset_end:expr; ) => {};
+    (@collect_metadata_slots_from_tokens $tokens:ident, $slots:ident, $ctx:ident, $offset_end:expr; $( $kind:ident ),+ ) => {{
+        let mut meta_iter = $tokens.iter().skip(1);
+        $(
+            define_parse_instruction!(
+                @collect_metadata_slot $kind, meta_iter, $slots, $ctx, $offset_end
+            );
+        )*
+    }};
+
+    // ---------- operand group sizes ----------
+    (@collect_operand_group_size Reg, $iter:ident, $groups:ident, $ctx:ident, $offset_end:expr) => {{
+        let _ = (&mut $ctx, $offset_end);
+        let _ = $iter.next();
+        $groups.push(1usize);
+    }};
+    (@collect_operand_group_size ImmU8, $iter:ident, $groups:ident, $ctx:ident, $offset_end:expr) => {{
+        let _ = (&mut $ctx, $offset_end);
+        let _ = $iter.next();
+        $groups.push(1usize);
+    }};
+    (@collect_operand_group_size ImmU32, $iter:ident, $groups:ident, $ctx:ident, $offset_end:expr) => {{
+        let _ = (&mut $ctx, $offset_end);
+        let _ = $iter.next();
+        $groups.push(4usize);
+    }};
+    (@collect_operand_group_size Addr, $iter:ident, $groups:ident, $ctx:ident, $offset_end:expr) => {{
+        let _ = $offset_end;
+        let tok = $iter.next().unwrap();
+        $groups.push(addr_size_from_token_metadata(tok.text));
+    }};
+    (@collect_operand_group_size Src, $iter:ident, $groups:ident, $ctx:ident, $offset_end:expr) => {{
+        let _ = $offset_end;
+        let tok = $iter.next().unwrap();
+        $groups.push(src_size_from_token_metadata(tok.text, $ctx));
+    }};
+    (@collect_operand_group_size ImmI32, $iter:ident, $groups:ident, $ctx:ident, $offset_end:expr) => {{
+        let tok = $iter.next().unwrap();
+        $groups.push(imm_i32_size_from_token_metadata_with_end(
+            tok.text,
+            $ctx,
+            $offset_end,
+        ));
+    }};
+    (@collect_operand_group_size RefU32, $iter:ident, $groups:ident, $ctx:ident, $offset_end:expr) => {{
+        let _ = $offset_end;
+        let tok = $iter.next().unwrap();
+        $groups.push(ref_u32_size_from_token_metadata(tok.text, $ctx));
+    }};
+    (@collect_operand_group_sizes_from_tokens $tokens:ident, $groups:ident, $ctx:ident, $offset_end:expr; ) => {};
+    (@collect_operand_group_sizes_from_tokens $tokens:ident, $groups:ident, $ctx:ident, $offset_end:expr; $( $kind:ident ),+ ) => {{
+        let mut group_iter = $tokens.iter().skip(1);
+        $(
+            define_parse_instruction!(
+                @collect_operand_group_size $kind, group_iter, $groups, $ctx, $offset_end
+            );
+        )*
+    }};
+
+    // ---------- emission ----------
+    (@emit_operand $out:ident, $metadata_cursor:ident, Reg, $value:ident) => {{
+        let _ = &mut $metadata_cursor;
+        $out.push(*$value);
+    }};
+    (@emit_operand $out:ident, $metadata_cursor:ident, ImmU8, $value:ident) => {{
+        let _ = &mut $metadata_cursor;
+        $out.push(*$value);
+    }};
+    (@emit_operand $out:ident, $metadata_cursor:ident, RefU32, $value:ident) => {{
+        emit_ref_u32_payload_from_metadata($out, $value, &mut $metadata_cursor);
+    }};
+    (@emit_operand $out:ident, $metadata_cursor:ident, ImmI32, $value:ident) => {{
+        emit_imm_i32_payload_from_metadata($out, $value, &mut $metadata_cursor);
+    }};
+    (@emit_operand $out:ident, $metadata_cursor:ident, ImmU32, $value:ident) => {{
+        let _ = &mut $metadata_cursor;
+        $out.extend_from_slice(&$value.to_le_bytes());
+    }};
+    (@emit_operand $out:ident, $metadata_cursor:ident, Addr, $value:ident) => {{
+        emit_addr_payload_from_metadata($out, $value, &mut $metadata_cursor);
+    }};
+    (@emit_operand $out:ident, $metadata_cursor:ident, Src, $value:ident) => {{
+        emit_src_payload_from_metadata($out, $value, &mut $metadata_cursor);
+    }};
+
+    (@emit_fields $out:ident, $metadata_cursor:ident; ) => {};
+    (@emit_fields $out:ident, $metadata_cursor:ident;
+        $field:ident : $kind:ident $(, $rest_field:ident : $rest_kind:ident )*
+    ) => {{
+        define_parse_instruction!(@emit_operand $out, $metadata_cursor, $kind, $field);
+        define_parse_instruction!(@emit_fields $out, $metadata_cursor; $( $rest_field : $rest_kind ),*);
+    }};
+
+    (@emit_fields_with_concat $out:ident, $metadata_cursor:ident, $concat:expr;
+        $rd:ident : Reg, $rs1:ident : Src, $rs2:ident : Src
+    ) => {{
+        define_parse_instruction!(@emit_operand $out, $metadata_cursor, Reg, $rd);
+        if !$concat {
+            define_parse_instruction!(@emit_operand $out, $metadata_cursor, Src, $rs1);
+        } else {
+            let _ = metadata_consume_src_state(&mut $metadata_cursor)
+                .expect("concat metadata must encode implicit rs1 state");
+        }
+        define_parse_instruction!(@emit_operand $out, $metadata_cursor, Src, $rs2);
+    }};
+    (@emit_fields_with_concat $out:ident, $metadata_cursor:ident, $concat:expr;
+        $( $field:ident : $kind:ident ),*
+    ) => {{
+        let _ = $concat;
+        define_parse_instruction!(@emit_fields $out, $metadata_cursor; $( $field : $kind ),*);
+    }};
 
     // ---------- parsing ----------
-    (@construct $ctx:ident $line:ident $offset:ident $tokens:ident; $name:ident) => { Ok(AsmInstr::$name { }) };
+    (@construct $ctx:ident $line:ident $offset:ident $tokens:ident, $concat:expr, $metadata:expr; $name:ident) => {
+        Ok(AsmInstr::$name {
+            concat: $concat,
+            metadata: $metadata,
+        })
+    };
 
-    (@construct $ctx:ident $line:ident $offset:ident $tokens:ident; $name:ident $( $field:ident : $kind:ident ),+ ) => {{
+    (@construct $ctx:ident $line:ident $offset:ident $tokens:ident, $concat:expr, $metadata:expr; $name:ident $( $field:ident : $kind:ident ),+ ) => {{
         let mut it = $tokens.iter().skip(1);
         Ok(AsmInstr::$name {
+            concat: $concat,
+            metadata: $metadata,
             $(
                 $field: define_parse_instruction!(
                     @parse_operand $kind, it.next().unwrap(), $ctx, $line, $offset
@@ -1075,11 +1840,36 @@ macro_rules! define_parse_instruction {
         })
     }};
 
+    (@construct_with_concat $ctx:ident $line:ident $offset:ident $tokens:ident, $concat:expr, $metadata:expr; $name:ident $rd:ident : Reg, $rs1:ident : Src, $rs2:ident : Src) => {{
+        if $concat {
+            let $rd = parse_reg($tokens[1].text)?;
+            let $rs2 = parse_src($tokens[2].text, $ctx, $line, $offset)?;
+            Ok(AsmInstr::$name {
+                concat: true,
+                metadata: $metadata,
+                $rd,
+                $rs1: SrcOperand::Reg($rd),
+                $rs2,
+            })
+        } else {
+            define_parse_instruction!(
+                @construct $ctx $line $offset $tokens, $concat, $metadata;
+                $name $rd : Reg, $rs1 : Src, $rs2 : Src
+            )
+        }
+    }};
+    (@construct_with_concat $ctx:ident $line:ident $offset:ident $tokens:ident, $concat:expr, $metadata:expr; $name:ident $( $field:ident : $kind:ident ),* ) => {{
+        define_parse_instruction!(
+            @construct $ctx $line $offset $tokens, $concat, $metadata;
+            $name $( $field : $kind ),*
+        )
+    }};
+
     (@parse_operand Reg, $tok:expr, $ctx:expr, $line:ident, $offset:expr) => { parse_reg(&$tok.text) };
-    (@parse_operand ImmU8, $tok:expr, $ctx:expr, $line:ident, $offset:expr) => { parse_u8_or_hex(&$tok.text, $line, $offset) };
+    (@parse_operand ImmU8, $tok:expr, $ctx:expr, $line:ident, $offset:expr) => { parse_u8(&$tok.text, $line, $offset) };
 
     (@parse_operand ImmI32, $tok:expr, $ctx:expr, $line:ident, $offset:expr) => { parse_i32_or_label(&$tok.text, $ctx, $line, $offset) };
-    (@parse_operand ImmU32, $tok:expr, $ctx:expr, $line:ident, $offset:expr) => { parse_u32_or_hex(&$tok.text, $line, $offset) };
+    (@parse_operand ImmU32, $tok:expr, $ctx:expr, $line:ident, $offset:expr) => { parse_u32(&$tok.text, $line, $offset) };
     (@parse_operand RefU32, $tok:expr, $ctx:expr, $line:ident, $offset:expr) => {{
         let tok = &$tok.text;
         if let Some(s) = tok.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
@@ -1208,7 +1998,7 @@ fn assemble_source_step_1<'a>(
             out.push_str(&base);
             out.push('\n');
         }
-        out.push_str(line.split(COMMENT_CHAR).next().unwrap_or(""));
+        out.push_str(line);
         out.push('\n');
     }
 
@@ -1225,8 +2015,8 @@ fn assemble_source_step_1<'a>(
     (Some(out), Some(dispatcher_info), Some(label_data))
 }
 
-/// Validates that a `CALL` instruction's argument count matches the target label's declared argc.
-fn check_call_argc(
+/// Validates that a `CALL` source argument count matches the target label's declared argc.
+fn validate_call_argc_against_label(
     tokens: &[Token],
     label_data: &[Label],
     line_no: usize,
@@ -1256,80 +2046,185 @@ fn check_call_argc(
     Ok(())
 }
 
-/// Validates that a `CALL_HOST` instruction's argument count matches the host function's expected argc.
-fn check_call_host_argc(tokens: &[Token], line_no: usize, argc: u8) -> Result<(), VMError> {
-    let func_name = &tokens[2].text[1..tokens[2].text.len() - 1];
-    for (name, func_argc) in HOST_FUNCTIONS {
-        if *name == func_name && *func_argc != argc {
-            return Err(VMError::ParseErrorString {
-                line: line_no + 1,
-                offset: tokens[0].offset,
-                length: tokens[0].text.len(),
-                message: if argc == 1 {
-                    format!(
-                        "host function '{}' expects {} argument, but 1 was provided",
-                        *name, *func_argc
-                    )
-                } else {
-                    format!(
-                        "host function '{}' expects {} argument, but {} were provided",
-                        *name, *func_argc, argc
-                    )
-                },
-            });
-        }
+/// Validates that a `CALL_HOST` source argument count matches host function arity.
+fn validate_call_host_argc(tokens: &[Token], line_no: usize, argc: u8) -> Result<(), VMError> {
+    let Some(tok) = tokens.get(2) else {
+        return Ok(());
+    };
+    let Some(func_name) = tok
+        .text
+        .strip_prefix('"')
+        .and_then(|name| name.strip_suffix('"'))
+    else {
+        // Raw refs like @12 cannot be validated at assembly time.
+        return Ok(());
+    };
+
+    let Some((_, expected)) = HOST_FUNCTIONS.iter().find(|(name, _)| *name == func_name) else {
+        return Err(VMError::ParseErrorString {
+            line: line_no + 1,
+            offset: tok.offset,
+            length: tok.text.len(),
+            message: format!("unknown host function '{func_name}'"),
+        });
+    };
+    if *expected != argc {
+        return Err(VMError::ParseErrorString {
+            line: line_no + 1,
+            offset: tokens[0].offset,
+            length: tokens[0].text.len(),
+            message: if argc == 1 {
+                format!(
+                    "host function '{}' expects {} argument, but 1 was provided",
+                    func_name, *expected
+                )
+            } else {
+                format!(
+                    "host function '{}' expects {} argument, but {} were provided",
+                    func_name, *expected, argc
+                )
+            },
+        });
     }
     Ok(())
 }
 
-/// Extracts the argument count from a call instruction token by matching against the
-/// zero-arg, one-arg, and n-arg instruction variants.
-fn extract_argc(
-    tokens: &[Token],
+/// Normalizes `CALL` and `CALL_HOST` source forms:
+/// - Source must include `argc` for validation.
+/// - Bytecode form omits `argc`, so this strips it before instruction parsing.
+fn normalize_call_tokens<'a>(
+    tokens: &[Token<'a>],
+    label_data: &[Label<'a>],
     line_no: usize,
-    instr_0: Instruction,
-    instr_1: Instruction,
-    instr_n: Instruction,
-) -> Result<u8, VMError> {
-    Ok(match tokens[0] {
-        Token { text, .. } if text == instr_0.mnemonic() => 0,
-        Token { text, .. } if text == instr_1.mnemonic() => 1,
-        Token { text, .. } if text == instr_n.mnemonic() => {
-            parse_u8_or_hex(tokens[3].text, line_no + 1, tokens[3].offset)?
+) -> Result<Vec<Token<'a>>, VMError> {
+    if tokens.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let opcode = tokens[0].text;
+    if opcode == "CALL0" || opcode == "CALL1" || opcode == "CALL_HOST0" || opcode == "CALL_HOST1" {
+        return Err(VMError::ParseErrorString {
+            line: line_no + 1,
+            offset: tokens[0].offset,
+            length: tokens[0].text.len(),
+            message: format!(
+                "'{}' was removed; use '{}' with explicit argc",
+                opcode,
+                if opcode.starts_with("CALL_HOST") {
+                    "CALL_HOST dst, fn, argc, argv"
+                } else {
+                    "CALL dst, fn, argc, argv"
+                }
+            ),
+        });
+    }
+
+    if opcode == Instruction::Call.mnemonic() {
+        if tokens.len() != 5 {
+            return Err(VMError::ArityMismatch {
+                instruction: tokens[0].text.to_string(),
+                expected: 4,
+                actual: tokens.len() as u8 - 1,
+            });
         }
-        _ => 0,
-    })
+        let argc = parse_u8(tokens[3].text, line_no + 1, tokens[3].offset)?;
+        validate_call_argc_against_label(tokens, label_data, line_no, argc)?;
+        return Ok(vec![
+            tokens[0].clone(),
+            tokens[1].clone(),
+            tokens[2].clone(),
+            tokens[4].clone(),
+        ]);
+    }
+
+    if opcode == Instruction::CallHost.mnemonic() {
+        if tokens.len() != 5 {
+            return Err(VMError::ArityMismatch {
+                instruction: tokens[0].text.to_string(),
+                expected: 4,
+                actual: tokens.len() as u8 - 1,
+            });
+        }
+        let argc = parse_u8(tokens[3].text, line_no + 1, tokens[3].offset)?;
+        validate_call_host_argc(tokens, line_no, argc)?;
+        return Ok(vec![
+            tokens[0].clone(),
+            tokens[1].clone(),
+            tokens[2].clone(),
+            tokens[4].clone(),
+        ]);
+    }
+
+    Ok(tokens.to_vec())
 }
 
-/// Performs two-pass assembly on preprocessed source.
+/// Intermediate result from pass 1, consumed by pass 2 (step 3).
+struct Pass1Result<'a> {
+    /// Tokenized instruction lines with line numbers and section classification.
+    parsed_lines: Vec<ParsedLine<'a>>,
+    /// Assembly context with labels defined and ready for resolution.
+    asm_context: AsmContext,
+    /// Total init section bytecode size, used to compute global offsets for runtime.
+    init_size: usize,
+    /// Number of instructions in init section.
+    init_instr_count: usize,
+    /// Number of instructions in runtime section.
+    runtime_instr_count: usize,
+    /// Label anchors used by relaxation to recompute offsets.
+    label_anchors: Vec<LabelAnchor>,
+}
+
+/// One tokenized instruction line tracked through sizing/relaxation/emission.
+struct ParsedLine<'a> {
+    /// Zero-based source line number.
+    line_no: usize,
+    /// Tokenized instruction + operands.
+    tokens: Vec<Token<'a>>,
+    /// Section where this instruction belongs.
+    section: Section,
+    /// Instruction index within its section.
+    section_index: usize,
+}
+
+/// Label anchor at a section-local instruction boundary.
+struct LabelAnchor {
+    /// Label identifier.
+    name: String,
+    /// Section where the label is defined.
+    section: Section,
+    /// Instruction boundary index within that section.
+    section_index: usize,
+}
+
+/// Pass 1: tokenizes source, classifies sections, computes sizes, and registers labels.
 ///
-/// Pass 1: Tokenizes all lines, classifies lines into init/runtime using `__init__`,
+/// Tokenizes all lines, classifies lines into init/runtime using `__init__`,
 /// computes instruction sizes, and records label positions as global offsets in the
 /// concatenated address space (init || runtime).
 ///
-/// Pass 2: Parses instructions with label resolution and emits bytecode.
-///
-/// Collects all errors into the provided vector and continues processing where possible.
-fn assemble_source_step_2(
-    source: String,
-    label_data: Vec<Label>,
+/// Collects errors into the provided vector and continues processing where possible.
+fn assemble_source_step_2<'a>(
+    source: &'a str,
+    label_data: Vec<Label<'a>>,
     errors: &mut Vec<VMError>,
-) -> Option<DeployProgram> {
+) -> Pass1Result<'a> {
     let mut asm_context = AsmContext::new();
 
     // First pass: tokenize all lines, detect sections, compute global offsets
     // We track (line_no, tokens, section) for each instruction line
-    let mut parsed_lines: Vec<(usize, Vec<Token>, Section)> = Vec::new();
+    let mut parsed_lines: Vec<ParsedLine> = Vec::new();
     let mut current_section = Section::Runtime;
     let mut saw_runtime_code = false;
+    let mut init_instr_count = 0usize;
+    let mut runtime_instr_count = 0usize;
 
     // Track sizes separately for init and runtime sections
     let mut init_size = 0usize;
     let mut runtime_size = 0usize;
 
     // Temporary label storage: (name, global_offset, line_no, tok_offset)
-    // (name, section, local_offset, line_no, tok_offset, tok_len)
-    let mut pending_labels: Vec<(String, Section, usize, usize, usize, usize)> = Vec::new();
+    // (name, section, local_offset, section_index, line_no, tok_offset, tok_len)
+    let mut pending_labels: Vec<(String, Section, usize, usize, usize, usize, usize)> = Vec::new();
 
     for (line_no, line) in source.lines().enumerate() {
         if !is_code_line(line) {
@@ -1371,6 +2266,10 @@ fn assemble_source_step_2(
                 label.name.to_string(),
                 effective_section,
                 *local_offset,
+                match effective_section {
+                    Section::Init => init_instr_count,
+                    Section::Runtime => runtime_instr_count,
+                },
                 line_no + 1,
                 if label.public { 4 } else { 0 },
                 label.name.len(),
@@ -1379,16 +2278,23 @@ fn assemble_source_step_2(
             // If there are more tokens after the label, treat them as an instruction
             instr_start = line.find(':').unwrap() + 1;
         }
-        let tokens = match tokenize(line_no + 1, &line[instr_start..]) {
+        let raw_tokens = match tokenize(line_no + 1, &line[instr_start..]) {
             Ok(t) => t,
             Err(e) => {
                 errors.push(e);
                 continue;
             }
         };
-        if tokens.is_empty() {
+        if raw_tokens.is_empty() {
             continue;
         }
+        let tokens = match normalize_call_tokens(&raw_tokens, &label_data, line_no) {
+            Ok(t) => t,
+            Err(e) => {
+                errors.push(e);
+                continue;
+            }
+        };
 
         // Dispatcher is always runtime code; force section when injected before
         // the first runtime label after an `__init__` block.
@@ -1408,63 +2314,27 @@ fn assemble_source_step_2(
             saw_runtime_code = true;
         }
 
-        // Validate CALL and CALL_HOST argc
-        match tokens[0] {
-            Token { text, .. }
-                if text == Instruction::Call0.mnemonic()
-                    || text == Instruction::Call1.mnemonic()
-                    || text == Instruction::Call.mnemonic() =>
-            {
-                let argc = match extract_argc(
-                    &tokens,
-                    line_no,
-                    Instruction::Call0,
-                    Instruction::Call1,
-                    Instruction::Call,
-                ) {
-                    Ok(n) => n,
-                    Err(e) => {
-                        errors.push(e);
-                        continue;
-                    }
-                };
-
-                if let Err(e) = check_call_argc(&tokens, &label_data, line_no, argc) {
-                    errors.push(e);
-                    continue;
-                }
-            }
-            Token { text, .. }
-                if text == Instruction::CallHost0.mnemonic()
-                    || text == Instruction::CallHost1.mnemonic()
-                    || text == Instruction::CallHost.mnemonic() =>
-            {
-                let argc = match extract_argc(
-                    &tokens,
-                    line_no,
-                    Instruction::CallHost0,
-                    Instruction::CallHost1,
-                    Instruction::CallHost,
-                ) {
-                    Ok(n) => n,
-                    Err(e) => {
-                        errors.push(e);
-                        continue;
-                    }
-                };
-
-                if let Err(e) = check_call_host_argc(&tokens, line_no, argc) {
-                    errors.push(e);
-                    continue;
-                }
-            }
-            _ => {}
-        }
-
-        match instruction_size_from_tokens(&tokens) {
+        match instruction_size_from_tokens(&mut asm_context, &tokens) {
             Ok(size) => {
                 *local_offset += size;
-                parsed_lines.push((line_no, tokens, effective_section));
+                let section_index = match effective_section {
+                    Section::Init => {
+                        let idx = init_instr_count;
+                        init_instr_count += 1;
+                        idx
+                    }
+                    Section::Runtime => {
+                        let idx = runtime_instr_count;
+                        runtime_instr_count += 1;
+                        idx
+                    }
+                };
+                parsed_lines.push(ParsedLine {
+                    line_no,
+                    tokens,
+                    section: effective_section,
+                    section_index,
+                });
             }
             Err(e) => {
                 errors.push(VMError::AssemblyError {
@@ -1478,11 +2348,18 @@ fn assemble_source_step_2(
     }
 
     // Register labels with global offsets (init || runtime address space).
-    for (name, section, local_offset, line_no, tok_offset, tok_len) in pending_labels {
+    let mut label_anchors = Vec::with_capacity(pending_labels.len());
+    for (name, section, local_offset, section_index, line_no, tok_offset, tok_len) in pending_labels
+    {
         let global_offset = match section {
             Section::Init => local_offset,
             Section::Runtime => init_size + local_offset,
         };
+        label_anchors.push(LabelAnchor {
+            name: name.clone(),
+            section,
+            section_index,
+        });
         if let Err(e) = asm_context.define_label(name, global_offset) {
             errors.push(VMError::AssemblyError {
                 line: line_no,
@@ -1493,11 +2370,193 @@ fn assemble_source_step_2(
         }
     }
 
-    // Second pass: parse instructions and emit bytecode to separate vectors
+    Pass1Result {
+        parsed_lines,
+        asm_context,
+        init_size,
+        init_instr_count,
+        runtime_instr_count,
+        label_anchors,
+    }
+}
+
+/// Computes section instruction sizes under the provided label map.
+fn relaxed_instruction_sizes(
+    pass1: &mut Pass1Result<'_>,
+    labels: &HashMap<String, usize>,
+) -> Result<(Vec<usize>, Vec<usize>, usize), VMError> {
+    pass1.asm_context.labels = labels.clone();
+
+    let mut init_sizes = vec![0usize; pass1.init_instr_count];
+    let mut runtime_sizes = vec![0usize; pass1.runtime_instr_count];
+
+    let mut init_local_offset = 0usize;
+    for parsed in pass1
+        .parsed_lines
+        .iter()
+        .filter(|line| line.section == Section::Init)
+    {
+        let size = instruction_size_from_tokens_relaxed(
+            &mut pass1.asm_context,
+            &parsed.tokens,
+            init_local_offset,
+        )?;
+        init_sizes[parsed.section_index] = size;
+        init_local_offset += size;
+    }
+    let init_total = init_local_offset;
+
+    let mut runtime_local_offset = 0usize;
+    for parsed in pass1
+        .parsed_lines
+        .iter()
+        .filter(|line| line.section == Section::Runtime)
+    {
+        let size = instruction_size_from_tokens_relaxed(
+            &mut pass1.asm_context,
+            &parsed.tokens,
+            init_total + runtime_local_offset,
+        )?;
+        runtime_sizes[parsed.section_index] = size;
+        runtime_local_offset += size;
+    }
+
+    Ok((init_sizes, runtime_sizes, init_total))
+}
+
+/// Builds label offsets from section-local instruction sizes and recorded anchors.
+fn relaxed_label_offsets(
+    pass1: &Pass1Result<'_>,
+    init_sizes: &[usize],
+    runtime_sizes: &[usize],
+    init_total: usize,
+) -> HashMap<String, usize> {
+    let mut init_prefix = Vec::with_capacity(init_sizes.len() + 1);
+    init_prefix.push(0usize);
+    for size in init_sizes {
+        init_prefix.push(init_prefix.last().copied().unwrap() + *size);
+    }
+
+    let mut runtime_prefix = Vec::with_capacity(runtime_sizes.len() + 1);
+    runtime_prefix.push(0usize);
+    for size in runtime_sizes {
+        runtime_prefix.push(runtime_prefix.last().copied().unwrap() + *size);
+    }
+
+    let mut labels = HashMap::with_capacity(pass1.label_anchors.len());
+    for anchor in &pass1.label_anchors {
+        let global_offset = match anchor.section {
+            Section::Init => init_prefix[anchor.section_index],
+            Section::Runtime => init_total + runtime_prefix[anchor.section_index],
+        };
+        labels.insert(anchor.name.clone(), global_offset);
+    }
+    labels
+}
+
+/// Compacts eligible `rd, rs1, rs2` instructions into `rd, rs2` form.
+///
+/// This enables concat metadata (`A=1`) without requiring source-level compact syntax.
+/// Only instructions that explicitly support concat compaction are rewritten.
+fn apply_concat_compaction(pass1: &mut Pass1Result<'_>) {
+    for parsed in &mut pass1.parsed_lines {
+        // Full form only: opcode + rd + rs1 + rs2.
+        if parsed.tokens.len() != 4 {
+            continue;
+        }
+
+        let Ok(instr) = instruction_from_str(parsed.tokens[0].text) else {
+            continue;
+        };
+        if !instr.supports_concat_compact() {
+            continue;
+        }
+
+        let Ok(rd) = parse_reg(parsed.tokens[1].text) else {
+            continue;
+        };
+        let Ok(rs1) = parse_reg(parsed.tokens[2].text) else {
+            continue;
+        };
+
+        if rd == rs1 {
+            // Keep opcode, rd, rs2
+            parsed.tokens.remove(2);
+        }
+    }
+}
+
+/// Step 2.5: relaxes label-based ImmI32 widths to compact encodings.
+///
+/// Runs a fixed-point layout loop: recompute instruction sizes using current
+/// label offsets, rebuild label offsets from new sizes, repeat until stable.
+fn assemble_source_step_2_5_relax(pass1: &mut Pass1Result<'_>, errors: &mut Vec<VMError>) {
+    const MAX_RELAX_PASSES: usize = 16;
+
+    // Apply concat compaction before layout relaxation.
+    apply_concat_compaction(pass1);
+
+    let mut labels = pass1.asm_context.labels.clone();
+    let mut last_init_total = pass1.init_size;
+
+    for _ in 0..MAX_RELAX_PASSES {
+        let (init_sizes, runtime_sizes, init_total) =
+            match relaxed_instruction_sizes(pass1, &labels) {
+                Ok(layout) => layout,
+                Err(err) => {
+                    errors.push(VMError::AssemblyError {
+                        line: 1,
+                        offset: 1,
+                        length: 1,
+                        source: err.to_string(),
+                    });
+                    return;
+                }
+            };
+
+        let new_labels = relaxed_label_offsets(pass1, &init_sizes, &runtime_sizes, init_total);
+        last_init_total = init_total;
+
+        if new_labels == labels {
+            labels = new_labels;
+            break;
+        }
+        labels = new_labels;
+    }
+
+    pass1.init_size = last_init_total;
+    pass1.asm_context.labels = labels;
+}
+
+/// Pass 2: parses instructions with label resolution and emits bytecode.
+///
+/// Consumes the result of pass 1 (step 2), resolves label references to
+/// PC-relative offsets, and emits bytecode into separate init and runtime vectors.
+///
+/// Collects errors into the provided vector and continues processing where possible.
+fn assemble_source_step_3(
+    pass1: Pass1Result<'_>,
+    errors: &mut Vec<VMError>,
+) -> Option<DeployProgram> {
+    let Pass1Result {
+        parsed_lines,
+        mut asm_context,
+        init_size,
+        init_instr_count: _,
+        runtime_instr_count: _,
+        label_anchors: _,
+    } = pass1;
+
     let mut init_bytecode = Vec::new();
     let mut runtime_bytecode = Vec::new();
 
-    for (line_no, tokens, section) in parsed_lines {
+    for ParsedLine {
+        line_no,
+        tokens,
+        section,
+        section_index: _,
+    } in parsed_lines
+    {
         let bytecode = match section {
             Section::Init => &mut init_bytecode,
             Section::Runtime => &mut runtime_bytecode,
@@ -1561,39 +2620,312 @@ pub fn assemble_source(source: impl Into<String>) -> Result<DeployProgram, VMErr
     assemble_source_with_name(source.into(), "<source>")
 }
 
-/// Assembles source with an associated filename for error diagnostics.
+/// Formats instruction bytes as hex with metadata highlighted in brackets.
 ///
-/// Runs both assembly passes and logs compiler-style diagnostics to stderr
-/// on failure, including source location information for all errors found.
-fn assemble_source_with_name(source: String, source_name: &str) -> Result<DeployProgram, VMError> {
+/// Groups payload bytes by operand and separates groups with commas.
+/// Example: `C9 [0001_0010] 04, 00 00, 66`
+fn format_audit_bytes(bytes: &[u8], operand_groups: &[usize]) -> String {
+    if bytes.is_empty() {
+        return String::new();
+    }
+    let has_metadata = Instruction::decode_opcode(bytes[0])
+        .map(|(_, has_meta)| has_meta)
+        .unwrap_or(false);
+
+    let mut out = format!("{:02X}", bytes[0]);
+    let payload_start = if has_metadata && bytes.len() > 1 {
+        out.push(' ');
+        out.push_str(&format!("[{:04b}_{:04b}]", bytes[1] >> 4, bytes[1] & 0x0F));
+        2usize
+    } else {
+        1usize
+    };
+
+    let payload = if payload_start <= bytes.len() {
+        &bytes[payload_start..]
+    } else {
+        &[]
+    };
+    if payload.is_empty() {
+        return out;
+    }
+
+    let mut groups = Vec::new();
+    let mut cursor = 0usize;
+    for &len in operand_groups {
+        if len == 0 || cursor + len > payload.len() {
+            break;
+        }
+        let mut segment = String::new();
+        for (idx, byte) in payload[cursor..cursor + len].iter().enumerate() {
+            if idx > 0 {
+                segment.push(' ');
+            }
+            segment.push_str(&format!("{:02X}", byte));
+        }
+        groups.push(segment);
+        cursor += len;
+    }
+    if cursor < payload.len() {
+        let mut segment = String::new();
+        for (idx, byte) in payload[cursor..].iter().enumerate() {
+            if idx > 0 {
+                segment.push(' ');
+            }
+            segment.push_str(&format!("{:02X}", byte));
+        }
+        groups.push(segment);
+    }
+    if !groups.is_empty() {
+        out.push(' ');
+        out.push_str(&groups.join(", "));
+    }
+
+    out
+}
+
+/// Returns byte index where inline comment starts, ignoring `#` inside strings.
+fn comment_start_index(line: &str) -> usize {
+    let bytes = line.as_bytes();
+    let mut in_str = false;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => in_str = !in_str,
+            b'#' if !in_str => return i,
+            _ => {}
+        }
+        i += 1;
+    }
+    line.len()
+}
+
+/// Replaces only the instruction segment of a source line with encoded bytes.
+///
+/// Keeps labels, indentation, and inline comments intact.
+fn render_audit_line_in_place(line: &str, encoded: &str) -> String {
+    let comment_idx = comment_start_index(line);
+    let (code_part, comment_part) = line.split_at(comment_idx);
+
+    let mut instr_start = 0usize;
+    if is_code_line(code_part)
+        && is_label_def(code_part)
+        && let Some(colon) = code_part.find(':')
+    {
+        instr_start = colon + 1;
+    }
+
+    let instr_segment = &code_part[instr_start..];
+    let instr_bytes = instr_segment.as_bytes();
+    let mut leading = 0usize;
+    while leading < instr_bytes.len()
+        && (instr_bytes[leading] == b' ' || instr_bytes[leading] == b'\t')
+    {
+        leading += 1;
+    }
+    let mut trailing = instr_bytes.len();
+    while trailing > leading
+        && (instr_bytes[trailing - 1] == b' ' || instr_bytes[trailing - 1] == b'\t')
+    {
+        trailing -= 1;
+    }
+
+    let mut out = String::with_capacity(line.len() + encoded.len());
+    out.push_str(&code_part[..instr_start]);
+    out.push_str(&instr_segment[..leading]);
+    out.push_str(encoded);
+    out.push_str(&instr_segment[trailing..]);
+    out.push_str(comment_part);
+    out
+}
+
+/// Rebuilds source text with instruction lines replaced by encoded byte strings.
+fn render_audit_source_in_place(source: &str, line_bytes: &[Option<String>]) -> String {
+    let mut out = String::with_capacity(source.len());
+    for (line_no, line) in source.lines().enumerate() {
+        if line_no > 0 {
+            out.push('\n');
+        }
+        if let Some(encoded) = line_bytes.get(line_no).and_then(|v| v.as_ref()) {
+            out.push_str(&render_audit_line_in_place(line, encoded));
+        } else {
+            out.push_str(line);
+        }
+    }
+    if source.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// Assembles source and renders an audit view with bytecode in place of instructions.
+///
+/// Each instruction is rendered using the post-optimization instruction stream
+/// (after step 2.5 relaxation/compaction), so output matches emitted bytecode.
+pub fn assemble_source_audit(source: impl Into<String>) -> Result<String, VMError> {
+    let source = source.into();
     let mut errors = Vec::new();
+
     let normalized = assemble_source_step_0(&source, &mut errors);
-    if normalized.is_none() && !errors.is_empty() {
-        log_assembly_errors(source_name, &source, &errors, None);
-        return Err(errors.into_iter().next().unwrap());
+    if normalized.is_none() {
+        return Err(errors.into_iter().next().unwrap_or(VMError::AssemblyError {
+            line: 0,
+            offset: 0,
+            length: 1,
+            source: "assembly failed".to_string(),
+        }));
     }
     let normalized_source = normalized.unwrap_or_else(|| source.clone());
 
     let (processed, dispatcher_info, label_data) =
         assemble_source_step_1(&normalized_source, &mut errors);
     if processed.is_none() && !errors.is_empty() {
-        log_assembly_errors(source_name, &normalized_source, &errors, dispatcher_info);
-        // Return the first error with adjusted line number
-        let first_err = errors.into_iter().next().unwrap();
-        return Err(adjust_error_line(first_err, dispatcher_info));
+        let err = errors.into_iter().next().unwrap_or(VMError::AssemblyError {
+            line: 0,
+            offset: 0,
+            length: 1,
+            source: "assembly failed".to_string(),
+        });
+        return Err(adjust_error_line(err, dispatcher_info));
     }
 
-    let result = assemble_source_step_2(
-        processed.unwrap_or_else(|| normalized_source.clone()),
-        label_data.unwrap_or_default(),
-        &mut errors,
-    );
+    let final_source = processed.unwrap_or_else(|| normalized_source.clone());
+    let mut pass1 =
+        assemble_source_step_2(&final_source, label_data.unwrap_or_default(), &mut errors);
     if !errors.is_empty() {
-        log_assembly_errors(source_name, &normalized_source, &errors, dispatcher_info);
-        // Return the first error with adjusted line number
-        let first_err = errors.into_iter().next().unwrap();
-        return Err(adjust_error_line(first_err, dispatcher_info));
+        let err = errors.remove(0);
+        return Err(adjust_error_line(err, dispatcher_info));
     }
+
+    assemble_source_step_2_5_relax(&mut pass1, &mut errors);
+    if !errors.is_empty() {
+        let err = errors.remove(0);
+        return Err(adjust_error_line(err, dispatcher_info));
+    }
+
+    let Pass1Result {
+        parsed_lines,
+        mut asm_context,
+        init_size,
+        init_instr_count: _,
+        runtime_instr_count: _,
+        label_anchors: _,
+    } = pass1;
+
+    let mut init_byte_len = 0usize;
+    let mut runtime_byte_len = 0usize;
+    let mut line_bytes = vec![None; final_source.lines().count()];
+
+    for ParsedLine {
+        line_no,
+        tokens,
+        section,
+        section_index: _,
+    } in parsed_lines
+    {
+        let global_offset = match section {
+            Section::Init => init_byte_len,
+            Section::Runtime => init_size + runtime_byte_len,
+        };
+
+        let instr = parse_instruction(&mut asm_context, &tokens, line_no + 1, global_offset)
+            .map_err(|e| VMError::AssemblyError {
+                line: line_no + 1,
+                offset: tokens.first().map(|t| t.offset).unwrap_or(1),
+                length: tokens.first().map(|t| t.text.len()).unwrap_or(1),
+                source: e.to_string(),
+            })?;
+        let operand_groups =
+            instruction_operand_group_sizes_from_tokens(&mut asm_context, &tokens, global_offset)
+                .map_err(|e| VMError::AssemblyError {
+                line: line_no + 1,
+                offset: tokens.first().map(|t| t.offset).unwrap_or(1),
+                length: tokens.first().map(|t| t.text.len()).unwrap_or(1),
+                source: e.to_string(),
+            })?;
+
+        let mut bytes = Vec::new();
+        instr.assemble(&mut bytes);
+        if let Some(slot) = line_bytes.get_mut(line_no) {
+            *slot = Some(format_audit_bytes(&bytes, &operand_groups));
+        }
+
+        match section {
+            Section::Init => init_byte_len += bytes.len(),
+            Section::Runtime => runtime_byte_len += bytes.len(),
+        }
+    }
+
+    Ok(render_audit_source_in_place(&final_source, &line_bytes))
+}
+
+/// Logs accumulated assembly errors and returns the first one (line-adjusted).
+///
+/// Returns `Ok(())` when `errors` is empty, allowing callers to use `?` for
+/// early exit on failure.
+fn flush_assembly_errors(
+    errors: &mut Vec<VMError>,
+    source_name: &str,
+    source: &str,
+    dispatcher: Option<DispatcherInfo>,
+) -> Result<(), VMError> {
+    if errors.is_empty() {
+        return Ok(());
+    }
+    log_assembly_errors(source_name, source, errors, dispatcher);
+    let first_err = errors.drain(..).next().unwrap();
+    Err(adjust_error_line(first_err, dispatcher))
+}
+
+/// Assembles source with an associated filename for error diagnostics.
+///
+/// Runs both assembly passes and logs compiler-style diagnostics to stderr
+/// on failure, including source location information for all errors found.
+fn assemble_source_with_name(source: String, source_name: &str) -> Result<DeployProgram, VMError> {
+    let mut errors = Vec::new();
+
+    let normalized = assemble_source_step_0(&source, &mut errors);
+    if normalized.is_none() {
+        flush_assembly_errors(&mut errors, source_name, &source, None)?;
+    }
+    let normalized_source = normalized.unwrap_or_else(|| source.clone());
+
+    let (processed, dispatcher_info, label_data) =
+        assemble_source_step_1(&normalized_source, &mut errors);
+    if processed.is_none() {
+        flush_assembly_errors(
+            &mut errors,
+            source_name,
+            &normalized_source,
+            dispatcher_info,
+        )?;
+    }
+
+    let final_source = processed.unwrap_or_else(|| normalized_source.clone());
+    let mut pass1 =
+        assemble_source_step_2(&final_source, label_data.unwrap_or_default(), &mut errors);
+    flush_assembly_errors(
+        &mut errors,
+        source_name,
+        &normalized_source,
+        dispatcher_info,
+    )?;
+
+    assemble_source_step_2_5_relax(&mut pass1, &mut errors);
+    flush_assembly_errors(
+        &mut errors,
+        source_name,
+        &normalized_source,
+        dispatcher_info,
+    )?;
+
+    let result = assemble_source_step_3(pass1, &mut errors);
+    flush_assembly_errors(
+        &mut errors,
+        source_name,
+        &normalized_source,
+        dispatcher_info,
+    )?;
 
     result.ok_or_else(|| VMError::AssemblyError {
         line: 0,
@@ -1611,6 +2943,16 @@ pub fn assemble_file<P: AsRef<Path>>(path: P) -> Result<DeployProgram, VMError> 
         source: e.to_string(),
     })?;
     assemble_source_with_name(source, &path_ref.display().to_string())
+}
+
+/// Convenience: render in-place audit view from a file.
+pub fn assemble_file_audit<P: AsRef<Path>>(path: P) -> Result<String, VMError> {
+    let path_ref = path.as_ref();
+    let source = fs::read_to_string(path_ref).map_err(|e| VMError::IoError {
+        path: path_ref.display().to_string(),
+        source: e.to_string(),
+    })?;
+    assemble_source_audit(source)
 }
 
 #[cfg(test)]
@@ -1673,7 +3015,39 @@ mod tests {
     fn assemble_inline_comment() {
         let source = format!("MOVE r0, 42 {COMMENT_CHAR} load value");
         let program = assemble_source(source).unwrap();
-        assert_eq!(program.runtime_code.len(), 11); // opcode(1) + reg(1) + tag(1) + i64(8)
+        assert_eq!(program.runtime_code.len(), 4); // opcode(1) + metadata(1) + reg(1) + i64(1)
+    }
+
+    #[test]
+    fn assemble_audit_keeps_labels_and_comments() {
+        let source = r#"
+start: ADD r1, r1, r2 # add
+# keep this comment
+MOVE r3, 42
+"#;
+        let audit = assemble_source_audit(source).unwrap();
+        let lines: Vec<&str> = audit.lines().collect();
+        assert!(lines[1].starts_with("start: "));
+        assert!(lines[1].contains("# add"));
+        assert!(!lines[1].contains("ADD r1"));
+        assert_eq!(lines[2], "# keep this comment");
+        assert!(!lines[3].contains("MOVE r3, 42"));
+    }
+
+    #[test]
+    fn assemble_audit_ignores_hash_inside_strings() {
+        let source = r#"MOVE r0, "a#b" # trailing comment"#;
+        let audit = assemble_source_audit(source).unwrap();
+        assert!(audit.contains("# trailing comment"));
+        assert!(!audit.contains("#b\" # trailing comment"));
+    }
+
+    #[test]
+    fn format_audit_bytes_groups_by_operand() {
+        assert_eq!(
+            format_audit_bytes(&[0xC9, 0x12, 0x04, 0x00, 0x00, 0x66], &[1, 2, 1]),
+            "C9 [0001_0010] 04, 00 00, 66"
+        );
     }
 
     #[test]
@@ -1687,7 +3061,7 @@ mod tests {
 
     #[test]
     fn assemble_wrong_arity() {
-        let err = assemble_source("ADD r0, r1").unwrap_err();
+        let err = assemble_source("BEQ r0, r1").unwrap_err();
         assert!(matches!(
             err,
             VMError::AssemblyError { line: 1, offset: _, ref source,.. } if source.contains("operand count mismatch")
@@ -1768,13 +3142,207 @@ mod tests {
         ];
         let instr = parse_instruction(&mut AsmContext::new(), &tokens, 0, 0).unwrap();
         match instr {
-            AsmInstr::Add { rd, rs1, rs2 } => {
+            AsmInstr::Add {
+                concat,
+                metadata,
+                rd,
+                rs1,
+                rs2,
+            } => {
+                assert!(!concat);
+                assert_eq!(metadata, None);
                 assert_eq!(rd, 0);
                 assert_eq!(rs1, SrcOperand::Reg(1));
                 assert_eq!(rs2, SrcOperand::Reg(2));
             }
             _ => panic!("wrong instruction type"),
         }
+    }
+
+    #[test]
+    fn instruction_parse_compact_concat() {
+        let tokens = vec![
+            Token {
+                text: "ADD",
+                offset: 1,
+            },
+            Token {
+                text: "r7",
+                offset: 5,
+            },
+            Token {
+                text: "r2",
+                offset: 9,
+            },
+        ];
+        let instr = parse_instruction(&mut AsmContext::new(), &tokens, 0, 0).unwrap();
+        match instr {
+            AsmInstr::Add {
+                concat,
+                metadata,
+                rd,
+                rs1,
+                rs2,
+            } => {
+                assert!(concat);
+                assert_eq!(metadata, Some(0b1000_0000));
+                assert_eq!(rd, 7);
+                assert_eq!(rs1, SrcOperand::Reg(7));
+                assert_eq!(rs2, SrcOperand::Reg(2));
+            }
+            _ => panic!("wrong instruction type"),
+        }
+    }
+
+    #[test]
+    fn compact_concat_reduces_size_by_one_byte() {
+        let full = vec![
+            Token {
+                text: "ADD",
+                offset: 1,
+            },
+            Token {
+                text: "r1",
+                offset: 5,
+            },
+            Token {
+                text: "r1",
+                offset: 9,
+            },
+            Token {
+                text: "r0",
+                offset: 13,
+            },
+        ];
+        let compact = vec![
+            Token {
+                text: "ADD",
+                offset: 1,
+            },
+            Token {
+                text: "r1",
+                offset: 5,
+            },
+            Token {
+                text: "r0",
+                offset: 9,
+            },
+        ];
+        let mut ctx = AsmContext::new();
+        let full_size = instruction_size_from_tokens(&mut ctx, &full).unwrap();
+        let compact_size = instruction_size_from_tokens(&mut ctx, &compact).unwrap();
+        // Full form defaults to no metadata; compact form uses concat metadata.
+        assert_eq!(full_size, compact_size);
+    }
+
+    #[test]
+    fn compact_immi32_reduces_size_for_small_values() {
+        let small = vec![
+            Token {
+                text: "JUMP",
+                offset: 1,
+            },
+            Token {
+                text: "1",
+                offset: 6,
+            },
+        ];
+        let large = vec![
+            Token {
+                text: "JUMP",
+                offset: 1,
+            },
+            Token {
+                text: "70000",
+                offset: 6,
+            },
+        ];
+        let label = vec![
+            Token {
+                text: "JUMP",
+                offset: 1,
+            },
+            Token {
+                text: "loop",
+                offset: 6,
+            },
+        ];
+
+        let mut ctx = AsmContext::new();
+        let small_size = instruction_size_from_tokens(&mut ctx, &small).unwrap();
+        let large_size = instruction_size_from_tokens(&mut ctx, &large).unwrap();
+        let label_size = instruction_size_from_tokens(&mut ctx, &label).unwrap();
+
+        assert_eq!(small_size, 2); // opcode + i32_1 payload (default Len1, no metadata)
+        assert_eq!(large_size, 6); // opcode + metadata + i32_4 payload
+        assert_eq!(label_size, 6); // unresolved labels keep i32_4 payload
+    }
+
+    #[test]
+    fn compact_ref_u32_reduces_size_for_small_values() {
+        let small = vec![
+            Token {
+                text: "CALL_HOST",
+                offset: 1,
+            },
+            Token {
+                text: "r0",
+                offset: 12,
+            },
+            Token {
+                text: "@1",
+                offset: 16,
+            },
+            Token {
+                text: "r1",
+                offset: 20,
+            },
+        ];
+        let medium = vec![
+            Token {
+                text: "CALL_HOST",
+                offset: 1,
+            },
+            Token {
+                text: "r0",
+                offset: 12,
+            },
+            Token {
+                text: "@300",
+                offset: 16,
+            },
+            Token {
+                text: "r1",
+                offset: 20,
+            },
+        ];
+        let large = vec![
+            Token {
+                text: "CALL_HOST",
+                offset: 1,
+            },
+            Token {
+                text: "r0",
+                offset: 12,
+            },
+            Token {
+                text: "@70000",
+                offset: 16,
+            },
+            Token {
+                text: "r1",
+                offset: 20,
+            },
+        ];
+
+        let mut ctx = AsmContext::new();
+        let small_size = instruction_size_from_tokens(&mut ctx, &small).unwrap();
+        let medium_size = instruction_size_from_tokens(&mut ctx, &medium).unwrap();
+        let large_size = instruction_size_from_tokens(&mut ctx, &large).unwrap();
+
+        assert_eq!(small_size, 4); // opcode + dst + u32_1 + argv (default Len1, no metadata)
+        assert_eq!(medium_size, 6); // opcode + metadata + dst + u32_2 + argv
+        assert_eq!(large_size, 8); // opcode + metadata + dst + u32_4 + argv
     }
 
     #[test]
@@ -1792,29 +3360,29 @@ mod tests {
     #[test]
     fn asm_instr_assemble_three_reg() {
         let instr = AsmInstr::Sub {
+            concat: false,
+            metadata: Some(0b0010_0100),
             rd: 10,
             rs1: SrcOperand::I64(20),
             rs2: SrcOperand::I64(30),
         };
         let mut out = Vec::new();
         instr.assemble(&mut out);
-        let mut expected = vec![Instruction::Sub as u8, 10, 2];
-        expected.extend_from_slice(&20i64.to_le_bytes());
-        expected.push(2);
-        expected.extend_from_slice(&30i64.to_le_bytes());
+        let expected = vec![Instruction::Sub as u8, 0b0010_0100, 10, 20, 30];
         assert_eq!(out, expected);
     }
 
     #[test]
     fn asm_instr_assemble_two_reg() {
         let instr = AsmInstr::Neg {
+            concat: false,
+            metadata: Some(0b0000_0100),
             rd: 1,
             rs: SrcOperand::I64(2),
         };
         let mut out = Vec::new();
         instr.assemble(&mut out);
-        let mut expected = vec![Instruction::Neg as u8, 1, 2];
-        expected.extend_from_slice(&2i64.to_le_bytes());
+        let expected = vec![Instruction::Neg as u8, 0b0000_0100, 1, 2];
         assert_eq!(out, expected);
     }
 
@@ -1880,51 +3448,74 @@ mod tests {
 
     #[test]
     fn parse_u8_valid() {
-        assert_eq!(parse_u8_or_hex("0", 0, 0).unwrap(), 0);
-        assert_eq!(parse_u8_or_hex("255", 0, 0).unwrap(), 255);
-        assert_eq!(parse_u8_or_hex("42", 0, 0).unwrap(), 42);
+        assert_eq!(parse_u8("0", 0, 0).unwrap(), 0);
+        assert_eq!(parse_u8("255", 0, 0).unwrap(), 255);
+        assert_eq!(parse_u8("42", 0, 0).unwrap(), 42);
     }
 
     #[test]
     fn parse_u8_invalid() {
-        assert!(parse_u8_or_hex("256", 0, 0).is_err());
-        assert!(parse_u8_or_hex("-1", 0, 0).is_err());
-        assert!(parse_u8_or_hex("abc", 0, 0).is_err());
-        assert!(parse_u8_or_hex("", 0, 0).is_err());
+        assert!(parse_u8("256", 0, 0).is_err());
+        assert!(parse_u8("-1", 0, 0).is_err());
+        assert!(parse_u8("abc", 0, 0).is_err());
+        assert!(parse_u8("", 0, 0).is_err());
     }
 
     #[test]
     fn assemble_call_host_argc_u8() {
-        // CALL_HOST: opcode(1) + dst(1) + fn_id(4) + argc(1) + argv(1) = 8 bytes
-        let program = assemble_source(r#"CALL_HOST r0, "test_fn", 3, r1"#).unwrap();
-        assert_eq!(program.runtime_code[0], Instruction::CallHost as u8);
+        // CALL_HOST source keeps argc for validation, bytecode omits it.
+        // With RefU32 Len1 default, metadata is omitted.
+        let program = assemble_source(r#"CALL_HOST r0, "len", 1, r1"#).unwrap();
+        let (instr, has_metadata) = Instruction::decode_opcode(program.runtime_code[0]).unwrap();
+        assert_eq!(instr, Instruction::CallHost);
+        assert!(!has_metadata);
         assert_eq!(program.runtime_code[1], 0); // dst = r0
-        assert_eq!(program.runtime_code[6], 3); // argc = 3 (single byte)
-        assert_eq!(program.runtime_code[7], 1); // argv = r1
-        assert_eq!(program.runtime_code.len(), 8);
+        assert_eq!(program.runtime_code[2], 0); // fn_id = @0
+        assert_eq!(program.runtime_code[3], 1); // argv = r1
+        assert_eq!(program.runtime_code.len(), 4);
     }
 
     #[test]
     fn assemble_call_argc_u8() {
-        // CALL: opcode(1) + dst(1) + fn_id(4) + argc(1) + argv(1) = 8 bytes
+        // CALL source keeps argc for validation, bytecode omits it.
+        // Label-based fn_id is relaxed after step 2.5 and may use 1/2/4 bytes.
         let program = assemble_source("my_func(5, r2):\nCALL r0, my_func, 5, r2").unwrap();
-        assert_eq!(program.runtime_code[0], Instruction::Call as u8);
-        assert_eq!(program.runtime_code[1], 0); // dst = r0
-        assert_eq!(program.runtime_code[6], 5); // argc = 5 (single byte)
-        assert_eq!(program.runtime_code[7], 2); // argv = r2
-        assert_eq!(program.runtime_code.len(), 8);
+        let (instr, has_metadata) = Instruction::decode_opcode(program.runtime_code[0]).unwrap();
+        assert_eq!(instr, Instruction::Call);
+        let dst_index = if has_metadata {
+            assert!(matches!(
+                program.runtime_code[1],
+                x if x == ImmI32MetadataState::Len2 as u8 || x == ImmI32MetadataState::Len4 as u8
+            ));
+            2usize
+        } else {
+            // Len1 is default, so metadata byte is omitted.
+            1usize
+        };
+        assert_eq!(program.runtime_code[dst_index], 0); // dst = r0
+        assert_eq!(*program.runtime_code.last().unwrap(), 2); // argv = r2
+        assert!((4..=8).contains(&program.runtime_code.len()));
+    }
+
+    #[test]
+    fn assemble_eq_reg_reg_reg_omits_zero_metadata() {
+        let program = assemble_source("EQ r3, r1, r2").unwrap();
+        assert_eq!(
+            program.runtime_code,
+            vec![Instruction::Eq.encode_opcode(false), 3, 1, 2]
+        );
     }
 
     #[test]
     fn assemble_call_argc_max_u8() {
-        let program = assemble_source(r#"CALL_HOST r0, "fn", 255, r0"#).unwrap();
-        assert_eq!(program.runtime_code[6], 255); // max u8 value
+        let source = "f(255, r0):\nRET r0\nCALL r0, f, 255, r0";
+        assert!(assemble_source(source).is_ok());
     }
 
     #[test]
     fn assemble_call_argc_overflow() {
         // 256 exceeds u8 range
-        let err = assemble_source(r#"CALL_HOST r0, "fn", 256, r0"#).unwrap_err();
+        let err = assemble_source("f(1, r0):\nRET r0\nCALL r0, f, 256, r0").unwrap_err();
         assert!(matches!(err, VMError::ParseErrorString { .. }));
     }
 
@@ -1941,7 +3532,7 @@ mod tests {
     fn assemble_init_label_only() {
         let source = "__init__:\nMOVE r0, 42\nHALT";
         let program = assemble_source(source).unwrap();
-        assert_eq!(program.init_code.len(), 12);
+        assert_eq!(program.init_code.len(), 5);
         assert!(program.runtime_code.is_empty());
     }
 
@@ -1950,7 +3541,7 @@ mod tests {
         let source = "main:\nMOVE r0, 42";
         let program = assemble_source(source).unwrap();
         assert!(program.init_code.is_empty());
-        assert_eq!(program.runtime_code.len(), 11);
+        assert_eq!(program.runtime_code.len(), 4);
     }
 
     #[test]
@@ -1961,12 +3552,12 @@ MOVE r0, 1
 MOVE r1, 2
 HALT
 
-main:
+        main:
 MOVE r2, 3
 "#;
         let program = assemble_source(source).unwrap();
-        assert_eq!(program.init_code.len(), 23); // 2 MOVE + HALT instructions
-        assert_eq!(program.runtime_code.len(), 11); // 1 MOVE instruction
+        assert_eq!(program.init_code.len(), 10); // 2 MOVE + HALT instructions
+        assert_eq!(program.runtime_code.len(), 4); // 1 MOVE instruction
     }
 
     #[test]
@@ -2004,8 +3595,8 @@ MOVE r1, "runtime"
     fn init_label_after_runtime_is_hoisted() {
         let source = "main:\nMOVE r0, 1\n__init__:\nMOVE r1, 2\nHALT";
         let program = assemble_source(source).unwrap();
-        assert_eq!(program.init_code.len(), 12);
-        assert!(program.runtime_code.len() >= 11);
+        assert_eq!(program.init_code.len(), 5);
+        assert!(program.runtime_code.len() >= 4);
     }
 
     #[test]
@@ -2212,14 +3803,14 @@ RET r1
     // ==================== Call argc validation ====================
 
     #[test]
-    fn call0_argc_mismatch() {
+    fn call0_removed() {
         let source = "add(2, r0):\nRET r0\nCALL0 r1, add";
         let err = assemble_source(source).unwrap_err();
         assert!(matches!(err, VMError::ParseErrorString { .. }));
     }
 
     #[test]
-    fn call1_argc_mismatch() {
+    fn call1_removed() {
         let source = "add(2, r0):\nRET r0\nCALL1 r1, add, r2";
         let err = assemble_source(source).unwrap_err();
         assert!(matches!(err, VMError::ParseErrorString { .. }));
@@ -2239,14 +3830,14 @@ RET r1
     }
 
     #[test]
-    fn call_host0_argc_mismatch() {
+    fn call_host0_removed() {
         let source = r#"CALL_HOST0 r0, "len""#;
         let err = assemble_source(source).unwrap_err();
         assert!(matches!(err, VMError::ParseErrorString { .. }));
     }
 
     #[test]
-    fn call_host1_argc_mismatch() {
+    fn call_host1_removed() {
         let source = r#"CALL_HOST1 r0, "slice", r1"#;
         let err = assemble_source(source).unwrap_err();
         assert!(matches!(err, VMError::ParseErrorString { .. }));
@@ -2262,7 +3853,7 @@ RET r1
     #[test]
     fn call_host_argc_correct() {
         let source = r#"MOVE r1, "hello"
-CALL_HOST1 r0, "len", r1"#;
+CALL_HOST r0, "len", 1, r1"#;
         assert!(assemble_source(source).is_ok());
     }
 }

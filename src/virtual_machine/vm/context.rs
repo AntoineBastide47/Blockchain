@@ -9,6 +9,8 @@ pub struct ExecContext {
     pub chain_id: u64,
     /// Contract identifier for storage key derivation.
     pub contract_id: Hash,
+    /// Address of the account that initiated the current transaction.
+    pub caller: Hash,
 }
 
 /// Call stack frame storing return address and destination register.

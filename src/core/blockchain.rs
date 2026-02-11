@@ -289,6 +289,7 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
                 let ctx = ExecContext {
                     chain_id: self.id,
                     contract_id,
+                    caller: transaction.from.address(),
                 };
 
                 // Run init_code (may call into runtime_code for setup)
@@ -306,12 +307,6 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
                         tx_overlay.push(code_hash, program.to_vec());
 
                         // Create contract account with code_hash reference
-                        //error!("Creating contract account with bytecode len={}", Account::from(
-                        //    0,
-                        //    transaction.amount,
-                        //    code_hash,
-                        //    Account::EMPTY_STORAGE_ROOT,
-                        //).to_vec().len());
                         tx_overlay.push(
                             contract_id,
                             Account::from(
@@ -358,6 +353,7 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
                 let ctx = ExecContext {
                     chain_id: self.id,
                     contract_id,
+                    caller: transaction.from.address(),
                 };
 
                 // Run runtime_code

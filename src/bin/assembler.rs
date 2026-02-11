@@ -12,6 +12,7 @@
 //!
 //! # Options
 //! - `-o, --output <file>`: Optional output file path
+//! - `-a, --audit [file]`: Print in-place audit view (or write to file)
 //! - `-p, --predict [price] [func(args)...]`: Estimate gas costs (price defaults to 1)
 //!
 //! # Gas Prediction
@@ -38,7 +39,9 @@ use blockchain::storage::state_store::{StateStore, VmStorage};
 use blockchain::storage::state_view::{StateView, StateViewProvider};
 use blockchain::types::hash::Hash;
 use blockchain::utils::log::SHOW_TIMESTAMP;
-use blockchain::virtual_machine::assembler::{assemble_file, extract_label_data};
+use blockchain::virtual_machine::assembler::{
+    assemble_file, assemble_file_audit, extract_label_data,
+};
 use blockchain::virtual_machine::program::ExecuteProgram;
 use blockchain::virtual_machine::state::OverlayState;
 use blockchain::virtual_machine::vm::{BLOCK_GAS_LIMIT, ExecContext, GasCategory, VM, Value};
@@ -89,6 +92,8 @@ fn main() {
 
     let input_path = &args[1];
     let mut output_path: Option<String> = None;
+    let mut audit_output_path: Option<String> = None;
+    let mut audit = false;
     let mut predict = false;
     let mut gas_price = 0u64;
     let mut predict_calls: Vec<(String, Vec<i64>)> = Vec::new();
@@ -104,6 +109,15 @@ fn main() {
                 }
                 output_path = Some(args[i].clone());
                 i += 1;
+            }
+            "--audit" | "-a" => {
+                audit = true;
+                i += 1;
+                // Optional output audit file path.
+                if i < args.len() && !args[i].starts_with('-') && !args[i].contains('(') {
+                    audit_output_path = Some(args[i].clone());
+                    i += 1;
+                }
             }
             "--predict" | "-p" => {
                 predict = true;
@@ -149,6 +163,11 @@ fn main() {
         process::exit(1);
     }
 
+    if audit && output_path.is_some() {
+        error!("--audit/-a cannot be combined with --output/-o");
+        process::exit(1);
+    }
+
     if let Some(ref path) = output_path
         && let Some(parent) = Path::new(&path).parent()
         && !parent.as_os_str().is_empty()
@@ -158,7 +177,42 @@ fn main() {
         process::exit(1);
     }
 
+    if let Some(ref path) = audit_output_path
+        && let Some(parent) = Path::new(&path).parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.exists()
+    {
+        error!(
+            "Audit output directory does not exist: {}",
+            parent.display()
+        );
+        process::exit(1);
+    }
+
     SHOW_TIMESTAMP.store(false, Ordering::Relaxed);
+
+    if audit {
+        let audit_listing = match assemble_file_audit(input_path) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("Assembly audit failed: {}", e);
+                process::exit(1);
+            }
+        };
+
+        if let Some(path) = audit_output_path {
+            if let Err(e) = fs::write(&path, audit_listing.as_bytes()) {
+                error!("Failed to write audit file: {}", e);
+                process::exit(1);
+            }
+            info!("Wrote audit listing to {}", path);
+        } else {
+            println!("{audit_listing}");
+        }
+        if !predict {
+            return;
+        }
+    }
 
     let assemble_start = Instant::now();
     let program = match assemble_file(input_path) {
@@ -205,6 +259,7 @@ fn main() {
         let ctx = ExecContext {
             chain_id: 0,
             contract_id: Hash::zero(),
+            caller: Hash::zero(),
         };
 
         // === Deployment cost prediction ===
@@ -455,6 +510,7 @@ ARGS:
 
 OPTIONS:
     -o, --output <file>                   Optional output file path
+    -a, --audit [file]                    Print in-place audit view
     -p, --predict [price] [func(args...)...] Estimate gas costs
     -h, --help                            Print this help message
 
@@ -472,6 +528,12 @@ EXAMPLES:
 
     # Compile and save the output
     {program} program.asm -o output.bin
+
+    # Print audit listing to stdout
+    {program} program.asm -a
+
+    # Write audit listing to file
+    {program} program.asm --audit audit.txt
 
     # Predict deployment only (price = 1)
     {program} program.asm -p

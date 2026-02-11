@@ -1,16 +1,22 @@
 //! Core virtual machine implementation.
 //!
-//! The VM executes bytecode using a register-based architecture with 256 general-purpose
-//! registers. All arithmetic uses wrapping semantics to prevent overflow panics.
+//! The VM executes bytecode using a register-based architecture with 256 registers.
+//! Register `r0` is hardwired to integer zero (writes are ignored).
+//! All arithmetic uses wrapping semantics to prevent overflow panics.
 
 use crate::error;
 use crate::types::encoding::{Encode, EncodeSink};
 use crate::types::hash::{HASH_LEN, Hash};
 use crate::utils::log::SHOW_TYPE;
-use crate::virtual_machine::assembler::parse_i64_or_hex;
+use crate::virtual_machine::assembler::parse_i64;
 use crate::virtual_machine::errors::VMError;
 use crate::virtual_machine::isa::Instruction;
-use crate::virtual_machine::operand::{AddrOperand, SrcOperand};
+use crate::virtual_machine::operand::{
+    AddrMetadataState, AddrOperand, SrcMetadataState, SrcOperand, decode_i32_compact,
+    decode_i64_compact, decode_u32_compact, metadata_concat_flag, metadata_consume_addr_state,
+    metadata_consume_imm_i32_state, metadata_consume_src_state, metadata_len_from_code,
+    metadata_payload_value,
+};
 use crate::virtual_machine::program::{DeployProgram, ExecuteProgram};
 use crate::virtual_machine::state::State;
 use std::sync::atomic::Ordering;
@@ -35,6 +41,8 @@ const HALF_WORD_SIZE: usize = WORD_SIZE / 2;
 const QUARTER_WORD_SIZE: usize = WORD_SIZE / 4;
 /// Single byte size for 8-bit memory loads.
 const BYTE_SIZE: usize = WORD_SIZE / 8;
+/// Number of dispatch entry width codes packed in one byte.
+const DISPATCH_WIDTHS_PER_BYTE: usize = 4;
 
 /// Defines host function name constants and a lookup table of `(name, argc)` pairs.
 macro_rules! host_functions {
@@ -45,12 +53,11 @@ macro_rules! host_functions {
   }
 
 host_functions! {
-    LOG     = "log"     => 1,
+    CALLER  = "caller"  => 0,
     LEN     = "len"     => 1,
-    HASH    = "hash"    => 1,
-    SLICE   = "slice"   => 3,
     CONCAT  = "concat"  => 2,
     COMPARE = "compare" => 2,
+    SLICE   = "slice"   => 3,
 }
 
 /// Returns the expected argument count for a host function by name.
@@ -95,6 +102,107 @@ fn read_u8(data: &[u8], cursor: &mut usize, ip: usize) -> Result<u8, VMError> {
     Ok(*read_bytes(data, cursor, 1, ip)?.first().unwrap())
 }
 
+/// Returns the number of packed width bytes for a DISPATCH table.
+fn dispatch_width_table_len(entry_count: usize) -> usize {
+    entry_count.div_ceil(DISPATCH_WIDTHS_PER_BYTE)
+}
+
+/// Returns one 2-bit width code from packed DISPATCH width bytes.
+fn dispatch_width_code_at(width_table: &[u8], entry_index: usize) -> Result<u8, VMError> {
+    let packed_index = entry_index / DISPATCH_WIDTHS_PER_BYTE;
+    let packed = *width_table
+        .get(packed_index)
+        .ok_or_else(|| VMError::DecodeError {
+            reason: format!("dispatch width table missing entry {}", entry_index),
+        })?;
+    let shift = 6 - ((entry_index % DISPATCH_WIDTHS_PER_BYTE) as u8 * 2);
+    Ok((packed >> shift) & 0b11)
+}
+
+/// Returns true when the instruction uses compact concat form.
+fn metadata_concat_for_instruction(metadata: Option<u8>, instr: Instruction) -> bool {
+    instr.supports_concat_compact() && metadata.is_some_and(metadata_concat_flag)
+}
+
+/// Decodes a [`SrcOperand`] from the bytecode stream using metadata encoding.
+fn decode_src_operand_from_stream(
+    data: &[u8],
+    cursor: &mut usize,
+    instr_offset: usize,
+    metadata_cursor: &mut u16,
+) -> Result<SrcOperand, VMError> {
+    let state = metadata_consume_src_state(metadata_cursor)?;
+    match state {
+        SrcMetadataState::Reg => Ok(SrcOperand::Reg(read_u8(data, cursor, instr_offset)?)),
+        SrcMetadataState::I64Len1
+        | SrcMetadataState::I64Len2
+        | SrcMetadataState::I64Len4
+        | SrcMetadataState::I64Len8 => {
+            let len = state.i64_len().unwrap() as usize;
+            let payload = read_bytes(data, cursor, len, instr_offset)?;
+            let value = decode_i64_compact(payload, len as u8)?;
+            if matches!(state, SrcMetadataState::I64Len1) && (value == 0 || value == 1) {
+                Ok(SrcOperand::Bool(value != 0))
+            } else {
+                Ok(SrcOperand::I64(value))
+            }
+        }
+        _ => {
+            let len = state
+                .ref_len()
+                .expect("Src ref metadata state must include len");
+            let payload = read_bytes(data, cursor, len as usize, instr_offset)?;
+            let value = decode_u32_compact(payload, len)?;
+            Ok(SrcOperand::Ref(value))
+        }
+    }
+}
+
+/// Decodes an [`AddrOperand`] from the bytecode stream using metadata encoding.
+fn decode_addr_operand_from_stream(
+    data: &[u8],
+    cursor: &mut usize,
+    instr_offset: usize,
+    metadata_cursor: &mut u16,
+) -> Result<AddrOperand, VMError> {
+    let state = metadata_consume_addr_state(metadata_cursor)?;
+    match state {
+        AddrMetadataState::Reg => Ok(AddrOperand::Reg(read_u8(data, cursor, instr_offset)?)),
+        AddrMetadataState::U32 => {
+            let bytes = read_bytes(data, cursor, 4, instr_offset)?;
+            Ok(AddrOperand::U32(u32::from_le_bytes(
+                bytes.try_into().unwrap(),
+            )))
+        }
+    }
+}
+
+/// Decodes a compact [`i32`] immediate from the bytecode stream using metadata encoding.
+fn decode_i32_operand_from_stream(
+    data: &[u8],
+    cursor: &mut usize,
+    instr_offset: usize,
+    metadata_cursor: &mut u16,
+) -> Result<i32, VMError> {
+    let state = metadata_consume_imm_i32_state(metadata_cursor)?;
+    let len = state.payload_len();
+    let payload = read_bytes(data, cursor, len, instr_offset)?;
+    decode_i32_compact(payload, len as u8)
+}
+
+/// Decodes a compact [`u32`] reference from the bytecode stream using metadata encoding.
+fn decode_ref_u32_operand_from_stream(
+    data: &[u8],
+    cursor: &mut usize,
+    instr_offset: usize,
+    metadata_cursor: &mut u16,
+) -> Result<u32, VMError> {
+    let state = metadata_consume_imm_i32_state(metadata_cursor)?;
+    let len = state.payload_len();
+    let payload = read_bytes(data, cursor, len, instr_offset)?;
+    decode_u32_compact(payload, len as u8)
+}
+
 macro_rules! define_instruction_decoder {
     (
         $(
@@ -114,24 +222,38 @@ macro_rules! define_instruction_decoder {
             }
 
             let opcode = data[start];
-            let instr = Instruction::try_from(opcode)?;
+            let (instr, has_metadata) = Instruction::decode_opcode(opcode)?;
             let mut cursor = start + 1;
+            let metadata = if has_metadata {
+                Some(read_u8(data, &mut cursor, start)?)
+            } else {
+                None
+            };
+            let concat = metadata_concat_for_instruction(metadata, instr);
+            let mut metadata_cursor = metadata.map_or(0u16, |value| {
+                metadata_payload_value(value, instr.supports_concat_compact())
+            });
 
             let text = match instr {
                 $(
                     Instruction::$name => {
                         define_instruction_decoder!(
-                            @decode data cursor start $mnemonic; $( $kind ),*
+                            @decode data, cursor, start, metadata_cursor, concat, $mnemonic;
+                            $( $kind ),*
                         )?
                     }
                 ),*
                 Instruction::Dispatch => {
                     let count = read_u8(data, &mut cursor, start)?;
+                    let width_table_len = dispatch_width_table_len(count as usize);
+                    let width_table = read_bytes(data, &mut cursor, width_table_len, start)?;
                     let mut parts = Vec::new();
                     parts.push(count.to_string());
-                    for _ in 0..count {
-                        let bytes = read_bytes(data, &mut cursor, 4, start)?;
-                        let offset = i32::from_le_bytes(bytes.try_into().unwrap());
+                    for entry_index in 0..count as usize {
+                        let width_code = dispatch_width_code_at(width_table, entry_index)?;
+                        let offset_len = metadata_len_from_code(width_code) as usize;
+                        let bytes = read_bytes(data, &mut cursor, offset_len, start)?;
+                        let offset = decode_i64_compact(bytes, offset_len as u8)?;
                         let argr = read_u8(data, &mut cursor, start)?;
                         parts.push(offset.to_string());
                         parts.push(format!("r{}", argr));
@@ -144,81 +266,108 @@ macro_rules! define_instruction_decoder {
         }
     };
 
-    (@decode $data:ident $cursor:ident $start:ident $mnemonic:expr; ) => {
+    (@decode $data:ident, $cursor:ident, $start:ident, $metadata_cursor:ident, $concat:expr, $mnemonic:expr; ) => {
         Ok::<_, VMError>($mnemonic.to_string())
     };
 
-    (@decode $data:ident $cursor:ident $start:ident $mnemonic:expr; $( $kind:ident ),+ ) => {{
+    (@decode $data:ident, $cursor:ident, $start:ident, $metadata_cursor:ident, $concat:expr, $mnemonic:expr; Reg, Src, Src ) => {{
         let mut parts = Vec::new();
-        $(
-            let val = define_instruction_decoder!(@read $data $cursor $start $kind)?;
-            parts.push(val);
-        )*
+        let rd = define_instruction_decoder!(@read $data, $cursor, $start, $metadata_cursor, Reg)?;
+        parts.push(rd);
+        if !$concat {
+            let rs1 = define_instruction_decoder!(@read $data, $cursor, $start, $metadata_cursor, Src)?;
+            parts.push(rs1);
+        } else {
+            let _ = metadata_consume_src_state(&mut $metadata_cursor)?;
+        }
+        let rs2 = define_instruction_decoder!(@read $data, $cursor, $start, $metadata_cursor, Src)?;
+        parts.push(rs2);
         Ok::<_, VMError>(format!("{} {}", $mnemonic, parts.join(", ")))
     }};
 
-    (@read $data:ident $cursor:ident $start:ident Reg) => {{
+    (@decode $data:ident, $cursor:ident, $start:ident, $metadata_cursor:ident, $concat:expr, $mnemonic:expr; $( $kind:ident ),+ ) => {{
+        let mut parts = Vec::new();
+        $(
+            let val = define_instruction_decoder!(@read $data, $cursor, $start, $metadata_cursor, $kind)?;
+            parts.push(val);
+        )*
+        let _ = $concat;
+        Ok::<_, VMError>(format!("{} {}", $mnemonic, parts.join(", ")))
+    }};
+
+    (@read $data:ident, $cursor:ident, $start:ident, $metadata_cursor:ident, Reg) => {{
+        let _ = &mut $metadata_cursor;
         let v = read_u8($data, &mut $cursor, $start)?;
         Ok::<String, VMError>(format!("r{}", v))
     }};
 
-    (@read $data:ident $cursor:ident $start:ident ImmU8) => {{
+    (@read $data:ident, $cursor:ident, $start:ident, $metadata_cursor:ident, ImmU8) => {{
+        let _ = &mut $metadata_cursor;
         let v = read_u8($data, &mut $cursor, $start)?;
         Ok::<String, VMError>(v.to_string())
     }};
 
-    (@read $data:ident $cursor:ident $start:ident RefU32) => {{
-        let bytes = read_bytes($data, &mut $cursor, 4, $start)?;
-        Ok::<String, VMError>(format!("@{}", u32::from_le_bytes(bytes.try_into().unwrap())))
+    (@read $data:ident, $cursor:ident, $start:ident, $metadata_cursor:ident, RefU32) => {{
+        let value = decode_ref_u32_operand_from_stream(
+            $data,
+            &mut $cursor,
+            $start,
+            &mut $metadata_cursor,
+        )?;
+        Ok::<String, VMError>(format!("@{}", value))
     }};
 
-    (@read $data:ident $cursor:ident $start:ident ImmI32) => {{
-        let bytes = read_bytes($data, &mut $cursor, 4, $start)?;
-        Ok::<String, VMError>(i32::from_le_bytes(bytes.try_into().unwrap()).to_string())
+    (@read $data:ident, $cursor:ident, $start:ident, $metadata_cursor:ident, ImmI32) => {{
+        let value =
+            decode_i32_operand_from_stream($data, &mut $cursor, $start, &mut $metadata_cursor)?;
+        Ok::<String, VMError>(value.to_string())
     }};
 
-    (@read $data:ident $cursor:ident $start:ident ImmU32) => {{
+    (@read $data:ident, $cursor:ident, $start:ident, $metadata_cursor:ident, ImmU32) => {{
+        let _ = &mut $metadata_cursor;
         let bytes = read_bytes($data, &mut $cursor, 4, $start)?;
         Ok::<String, VMError>(u32::from_le_bytes(bytes.try_into().unwrap()).to_string())
     }};
 
-    (@read $data:ident $cursor:ident $start:ident ImmI64) => {{
+    (@read $data:ident, $cursor:ident, $start:ident, $metadata_cursor:ident, ImmI64) => {{
+        let _ = &mut $metadata_cursor;
         let bytes = read_bytes($data, &mut $cursor, 8, $start)?;
         Ok::<String, VMError>(i64::from_le_bytes(bytes.try_into().unwrap()).to_string())
     }};
 
-    (@read $data:ident $cursor:ident $start:ident Addr) => {{let tag = read_u8($data, &mut $cursor, $start)?;
-      match tag {
-          0 => define_instruction_decoder!(@read $data $cursor $start Reg),
-          1 => {
-              let b = read_bytes($data, &mut $cursor, 4, $start)?;
-              Ok::<String, VMError>(u32::from_le_bytes(b.try_into().unwrap()).to_string())
-          }
-          _ => Err(VMError::InvalidOperandTag { tag, offset: $start })
-      }
+    (@read $data:ident, $cursor:ident, $start:ident, $metadata_cursor:ident, Addr) => {{
+      let operand = decode_addr_operand_from_stream(
+          $data,
+          &mut $cursor,
+          $start,
+          &mut $metadata_cursor,
+      )?;
+      Ok::<String, VMError>(match operand {
+          AddrOperand::Reg(r) => format!("r{}", r),
+          AddrOperand::U32(v) => v.to_string(),
+      })
     }};
 
-    (@read $data:ident $cursor:ident $start:ident Src) => {{
-      let tag = read_u8($data, &mut $cursor, $start)?;
-      match tag {
-          0 => define_instruction_decoder!(@read $data $cursor $start Reg),
-          1 => {
-              let b = read_u8($data, &mut $cursor, $start)?;
-              Ok::<String, VMError>(if b == 0 { "false" } else { "true" }.to_string())
-          }
-          2 => define_instruction_decoder!(@read $data $cursor $start ImmI64),
-          3 => define_instruction_decoder!(@read $data $cursor $start RefU32),
-          _ => Err(VMError::InvalidOperandTag { tag, offset: $start })
-      }
-  }};
+    (@read $data:ident, $cursor:ident, $start:ident, $metadata_cursor:ident, Src) => {{
+      let operand = decode_src_operand_from_stream(
+          $data,
+          &mut $cursor,
+          $start,
+          &mut $metadata_cursor,
+      )?;
+      Ok::<String, VMError>(match operand {
+          SrcOperand::Reg(r) => format!("r{}", r),
+          SrcOperand::I64(i) => i.to_string(),
+          SrcOperand::Ref(r) => format!("@{}", r),
+          SrcOperand::Bool(b) => if b { "true".to_string() } else { "false".to_string() },
+      })
+    }};
 }
 
 crate::for_each_instruction!(define_instruction_decoder);
 
 /// Maximum depth of the call stack to prevent unbounded recursion.
 const MAX_CALL_STACK_LEN: usize = 1024;
-/// Temporary register used to materialize immediate `CALL1` arguments.
-const CALL1_ARG_TMP_REG: u8 = u8::MAX;
 /// Gas cost per byte when writing to state storage.
 const STORE_BYTE_COST: u64 = 10;
 /// Gas cost per byte when reading from state storage.
@@ -251,6 +400,21 @@ macro_rules! exec_vm {
         $vm.$handler($instr_name, $state, $ctx, $( $field ),*)
     }};
 
+    // Compact concat form: when metadata A=1, rs1 is omitted and equals rd.
+    (@call $vm:ident, $state:ident, $ctx:ident, $instr_name:expr, $handler:ident,
+        (rd: Reg, rs1: Src, rs2: Src $(,)? )
+    ) => {{
+        let rd = exec_vm!(@read $vm, Reg)?;
+        let rs1 = if $vm.operand_concat_flag() {
+            $vm.consume_concat_src_slot()?;
+            SrcOperand::Reg(rd)
+        } else {
+            exec_vm!(@read $vm, Src)?
+        };
+        let rs2 = exec_vm!(@read $vm, Src)?;
+        $vm.$handler($instr_name, rd, rs1, rs2)
+    }};
+
     // Handler without storage (no semicolon)
     (@call $vm:ident, $state:ident, $ctx:ident, $instr_name:expr, $handler:ident,
         ( $( $field:ident : $kind:ident ),* $(,)? )
@@ -269,10 +433,9 @@ macro_rules! exec_vm {
         Ok::<u8, VMError>($vm.read_exact(1)?[0])
     }};
 
-    // Decode an i32 immediate (little-endian, 4 bytes)
+    // Decode an i32 immediate (compact width from metadata)
     (@read $vm:ident, ImmI32) => {{
-        let bytes = $vm.read_exact(4)?;
-        Ok::<i32, VMError>(i32::from_le_bytes(bytes.try_into().unwrap()))
+        $vm.read_imm_i32()
     }};
 
     // Decode an u32 immediate (little-endian, 4 bytes)
@@ -287,32 +450,19 @@ macro_rules! exec_vm {
         Ok::<i64, VMError>(i64::from_le_bytes(bytes.try_into().unwrap()))
     }};
 
-    // Decode a u32 reference (little-endian, 4 bytes)
+    // Decode a compact u32 reference (metadata-selected width).
     (@read $vm:ident, RefU32) => {{
-        let bytes = $vm.read_exact(4)?;
-        Ok::<u32, VMError>(u32::from_le_bytes(bytes.try_into().unwrap()))
+        $vm.read_ref_u32()
     }};
 
     // Decode a u32 (little-endian, 4 bytes)
     (@read $vm:ident, Addr) => {{
-        let tag = $vm.read_exact(1)?[0];
-        match tag {
-            0 => Ok::<AddrOperand, VMError>(AddrOperand::Reg(exec_vm!(@read $vm, Reg)?)),
-            1 => Ok::<AddrOperand, VMError>(AddrOperand::U32(exec_vm!(@read $vm, RefU32)?)),
-            _ => Err(VMError::InvalidOperandTag { tag, offset: $vm.ip })
-        }
+        $vm.read_addr_operand()
     }};
 
     // Decode a bool (1 byte, 0 = false, nonzero = true)
     (@read $vm:ident, Src) => {{
-        let tag = $vm.read_exact(1)?[0];
-        match tag {
-            0 => Ok::<SrcOperand, VMError>(SrcOperand::Reg(exec_vm!(@read $vm, Reg)?)),
-            1 => Ok::<SrcOperand, VMError>(SrcOperand::Bool(exec_vm!(@read $vm, Reg)? == 1)),
-            2 => Ok::<SrcOperand, VMError>(SrcOperand::I64(exec_vm!(@read $vm, ImmI64)?)),
-            3 => Ok::<SrcOperand, VMError>(SrcOperand::Ref(exec_vm!(@read $vm, RefU32)?)),
-            _ => Err(VMError::InvalidOperandTag { tag, offset: $vm.ip })
-        }
+        $vm.read_src_operand()
     }};
 }
 
@@ -339,6 +489,10 @@ pub struct VM {
     ip: usize,
     /// Start offset of the currently executing instruction (for error reporting).
     instr_offset: usize,
+    /// Per-instruction metadata byte read when opcode Z flag is set.
+    operand_metadata: Option<u8>,
+    /// Mixed-radix metadata cursor for dynamic Src/Addr decoding.
+    operand_metadata_cursor: u16,
     /// Register file (256 registers).
     registers: Registers,
     /// Heap for const and execution memory.
@@ -353,6 +507,8 @@ pub struct VM {
     gas_profile: GasProfile,
     /// Arguments passed to the program, loaded into registers by `CALLDATA_LOAD`.
     args: Vec<Value>,
+    /// Root dispatcher selector for runtime entry.
+    dispatch_selector: i64,
 }
 
 /// impl block for basic VM functions
@@ -375,6 +531,8 @@ impl VM {
             data,
             ip: 0,
             instr_offset: 0,
+            operand_metadata: None,
+            operand_metadata_cursor: 0,
             registers: Registers::new(),
             heap: Heap::new(program.memory),
             call_stack: Vec::new(),
@@ -382,6 +540,7 @@ impl VM {
             max_gas,
             gas_profile: GasProfile::new(),
             args: vec![],
+            dispatch_selector: 0,
         };
 
         vm.charge_gas_categorized(20_000 + total_bytes as u64 * 200, GasCategory::Deploy)?;
@@ -390,9 +549,9 @@ impl VM {
 
     /// Creates a VM for executing a function call on a deployed contract.
     ///
-    /// Seeds `r0` with the function selector and subsequent registers with the
-    /// provided arguments. Heap items from the stored contract and any argument
-    /// refs are merged so `Value::Ref` indices resolve correctly.
+    /// Stores the function selector for `DISPATCH` and prepares call arguments.
+    /// Heap items from the stored contract and any argument refs are merged so
+    /// `Value::Ref` indices resolve correctly.
     pub fn new_execute(
         execute: ExecuteProgram,
         deploy: DeployProgram,
@@ -417,10 +576,12 @@ impl VM {
             })
             .collect();
 
-        let mut vm = Self {
+        let vm = Self {
             data: deploy.runtime_code,
             ip: 0,
             instr_offset: 0,
+            operand_metadata: None,
+            operand_metadata_cursor: 0,
             registers: Registers::new(),
             heap,
             call_stack: Vec::new(),
@@ -428,9 +589,8 @@ impl VM {
             max_gas,
             gas_profile: GasProfile::new(),
             args,
+            dispatch_selector: execute.function_id,
         };
-
-        vm.registers.set(0, Value::Int(execute.function_id))?;
         Ok(vm)
     }
 
@@ -638,15 +798,9 @@ impl VM {
     /// Charges gas for a function call based on argument count and call stack depth.
     ///
     /// Cost formula: `argc * arg_gas_cost + call_depth * depth_gas_cost`
-    fn charge_call(
-        &mut self,
-        argc: u8,
-        arg_gas_cost: u64,
-        call_depth: usize,
-        depth_gas_cost: u64,
-    ) -> Result<(), VMError> {
+    fn charge_call(&mut self, call_depth: usize, depth_gas_cost: u64) -> Result<(), VMError> {
         self.charge_gas_categorized(
-            argc as u64 * arg_gas_cost + call_depth as u64 * depth_gas_cost,
+            call_depth as u64 * depth_gas_cost,
             GasCategory::CallOverhead,
         )
     }
@@ -656,6 +810,7 @@ impl VM {
 mod tests;
 
 impl VM {
+    /// Extracts a boolean from a [`SrcOperand`], reading from the register file if needed.
     fn bool_from_operand(
         &self,
         src_operand: SrcOperand,
@@ -676,6 +831,7 @@ impl VM {
         })
     }
 
+    /// Extracts a heap reference from a [`SrcOperand`], reading from the register file if needed.
     fn ref_from_operand(
         &self,
         src_operand: SrcOperand,
@@ -696,6 +852,7 @@ impl VM {
         })
     }
 
+    /// Extracts an i64 from a [`SrcOperand`], reading from the register file if needed.
     fn int_from_operand(
         &self,
         src_operand: SrcOperand,
@@ -716,6 +873,7 @@ impl VM {
         })
     }
 
+    /// Converts a [`SrcOperand`] to a [`Value`], reading from the register file if needed.
     fn value_from_operand(&self, src_operand: SrcOperand) -> Result<Value, VMError> {
         Ok(match src_operand {
             SrcOperand::Reg(idx) => *self.registers.get(idx)?,
@@ -725,6 +883,7 @@ impl VM {
         })
     }
 
+    /// Serializes a [`SrcOperand`] to its raw byte representation for storage keys.
     fn bytes_from_operand(&mut self, src_operand: SrcOperand) -> Result<Vec<u8>, VMError> {
         Ok(match src_operand {
             SrcOperand::Reg(idx) => match self.registers.get(idx)? {
@@ -749,6 +908,7 @@ impl VM {
         Ok(self.heap.append(item))
     }
 
+    /// Retrieves raw bytes from the heap by reference index with gas charging.
     fn heap_get_data(&mut self, id: u32) -> Result<&[u8], VMError> {
         let data = self.heap.get_data(id)?;
         self.charge_gas_categorized(data.len() as u64, GasCategory::HeapAllocation)?;
@@ -823,11 +983,18 @@ impl VM {
                 let opcode = self.data[self.instr_offset];
                 self.ip += 1;
 
-                let instr =
-                    Instruction::try_from(opcode).map_err(|_| VMError::InvalidInstruction {
+                let (instr, has_metadata) = Instruction::decode_opcode(opcode).map_err(|_| {
+                    VMError::InvalidInstruction {
                         opcode,
                         offset: self.instr_offset,
-                    })?;
+                    }
+                })?;
+                let metadata = if has_metadata {
+                    Some(self.read_exact(1)?[0])
+                } else {
+                    None
+                };
+                self.set_operand_metadata(metadata, instr);
                 self.charge_base(instr)?;
                 self.exec(instr, state, ctx)?;
             }
@@ -865,6 +1032,65 @@ impl VM {
         Ok(slice)
     }
 
+    /// Stores per-instruction metadata and resets the mixed-radix decode cursor.
+    fn set_operand_metadata(&mut self, metadata: Option<u8>, instr: Instruction) {
+        self.operand_metadata = metadata;
+        self.operand_metadata_cursor = metadata.map_or(0u16, |value| {
+            metadata_payload_value(value, instr.supports_concat_compact())
+        });
+    }
+
+    /// Returns `true` when the current instruction's metadata has the concat flag set.
+    fn operand_concat_flag(&self) -> bool {
+        self.operand_metadata.is_some_and(metadata_concat_flag)
+    }
+
+    /// Consumes the implicit `rs1` Src metadata slot used by compact concat form.
+    fn consume_concat_src_slot(&mut self) -> Result<(), VMError> {
+        let _ = metadata_consume_src_state(&mut self.operand_metadata_cursor)?;
+        Ok(())
+    }
+
+    /// Reads the next [`SrcOperand`] from the bytecode at the current instruction pointer.
+    fn read_src_operand(&mut self) -> Result<SrcOperand, VMError> {
+        decode_src_operand_from_stream(
+            &self.data,
+            &mut self.ip,
+            self.instr_offset,
+            &mut self.operand_metadata_cursor,
+        )
+    }
+
+    /// Reads the next [`AddrOperand`] from the bytecode at the current instruction pointer.
+    fn read_addr_operand(&mut self) -> Result<AddrOperand, VMError> {
+        decode_addr_operand_from_stream(
+            &self.data,
+            &mut self.ip,
+            self.instr_offset,
+            &mut self.operand_metadata_cursor,
+        )
+    }
+
+    /// Reads the next compact i32 immediate from bytecode at current IP.
+    fn read_imm_i32(&mut self) -> Result<i32, VMError> {
+        decode_i32_operand_from_stream(
+            &self.data,
+            &mut self.ip,
+            self.instr_offset,
+            &mut self.operand_metadata_cursor,
+        )
+    }
+
+    /// Reads the next compact u32 reference from bytecode at current IP.
+    fn read_ref_u32(&mut self) -> Result<u32, VMError> {
+        decode_ref_u32_operand_from_stream(
+            &self.data,
+            &mut self.ip,
+            self.instr_offset,
+            &mut self.operand_metadata_cursor,
+        )
+    }
+
     /// Executes a single instruction.
     fn exec<S: State>(
         &mut self,
@@ -881,7 +1107,7 @@ impl VM {
                 // Move, Casts and Misc
                 Noop => op_noop(),
                 Move => op_move(rd: Reg, rs: Src),
-                CMove => op_cmove(rd: Reg, cond: Src, r1: Src, r2: Src),
+                CMove => op_cmove(rd: Reg, cond: Reg, r1: Src, r2: Src),
                 I64ToBool => op_i64_to_bool(rd: Reg, rs: Src),
                 BoolToI64 => op_bool_to_i64(rd: Reg, rs: Src),
                 StrToI64 => op_str_to_i64(rd: Reg, rs: Src),
@@ -897,6 +1123,7 @@ impl VM {
                 LoadBool => op_load_bool(state, ctx; rd: Reg, key: Src),
                 LoadStr => op_load_str(state, ctx; rd: Reg, key: Src),
                 LoadHash => op_load_hash(state, ctx; rd: Reg, key: Src),
+                Sha3 => op_sha3(dst: Reg, argc: ImmU8, argv: Reg),
                 // Integer arithmetic
                 Add => op_add(rd: Reg, rs1: Src, rs2: Src),
                 Sub => op_sub(rd: Reg, rs1: Src, rs2: Src),
@@ -923,12 +1150,8 @@ impl VM {
                 Gt => op_gt(rd: Reg, rs1: Src, rs2: Src),
                 Ge => op_ge(rd: Reg, rs1: Src, rs2: Src),
                 // Control Flow
-                CallHost => op_call_host(dst: Reg, fn_id: RefU32, argc: ImmU8, argv: Reg),
-                CallHost0 => op_call_host0(dst: Reg, fn_id: RefU32),
-                CallHost1 => op_call_host1(dst: Reg, fn_id: RefU32, arg: Src),
-                Call => op_call(dst: Reg, offset: ImmI32, argc: ImmU8, argv: Reg),
-                Call0 => op_call0(dst: Reg, fn_id: ImmI32),
-                Call1 => op_call1(dst: Reg, fn_id: ImmI32, arg: Src),
+                CallHost => op_call_host(state, ctx; dst: Reg, fn_id: RefU32, argv: Reg),
+                Call => op_call(dst: Reg, offset: ImmI32, argv: Reg),
                 Jal => op_jal(rd: Reg, offset: ImmI32),
                 Jalr => op_jalr(rd: Reg, rs: Reg, offset: ImmI32),
                 Beq => op_beq(rs1: Src, rs2: Src, offset: ImmI32),
@@ -982,26 +1205,13 @@ impl VM {
         &mut self,
         instr: &'static str,
         dst: u8,
-        cond: SrcOperand,
+        cond: u8,
         r1: SrcOperand,
         r2: SrcOperand,
     ) -> Result<(), VMError> {
-        let v: bool = match cond {
-            SrcOperand::Reg(idx) => match *self.registers.get(idx)? {
-                Value::Bool(b) => b,
-                Value::Ref(_) => {
-                    return Err(VMError::TypeMismatchStatic {
-                        instruction: instr,
-                        arg_index: 2,
-                        expected: "Boolean or Integer",
-                        actual: "Reference",
-                    });
-                }
-                Value::Int(i) => i != 0,
-            },
-            SrcOperand::Bool(b) => b,
-            SrcOperand::I64(i) => i != 0,
-            SrcOperand::Ref(_) => {
+        let v: bool = match *self.registers.get(cond)? {
+            Value::Bool(b) => b,
+            Value::Ref(_) => {
                 return Err(VMError::TypeMismatchStatic {
                     instruction: instr,
                     arg_index: 2,
@@ -1009,6 +1219,7 @@ impl VM {
                     actual: "Reference",
                 });
             }
+            Value::Int(i) => i != 0,
         };
 
         let value = if v { r1 } else { r2 };
@@ -1043,8 +1254,7 @@ impl VM {
     ) -> Result<(), VMError> {
         let reg = self.ref_from_operand(src, instr, 1)?;
         let str = self.heap_get_string(reg)?;
-        self.registers
-            .set(dst, Value::Int(parse_i64_or_hex(&str, 0, 0)?))
+        self.registers.set(dst, Value::Int(parse_i64(&str, 0, 0)?))
     }
 
     /// Returns the number of characters in the decimal string representation of `n`.
@@ -1273,6 +1483,43 @@ impl VM {
     ) -> Result<(), VMError> {
         let (_, value) = self.load_state_bytes(state, ctx, key)?;
         let hash_ref = self.heap_index(value)?;
+        self.registers.set(dst, Value::Ref(hash_ref))
+    }
+
+    fn op_sha3(
+        &mut self,
+        _instr: &'static str,
+        dst: u8,
+        argc: u8,
+        argv: u8,
+    ) -> Result<(), VMError> {
+        let mut hasher = Hash::sha3();
+        let mut hashed_bytes = 0usize;
+
+        for i in 0..argc {
+            let idx = argv.wrapping_add(i);
+            match *self.registers.get(idx)? {
+                Value::Bool(b) => {
+                    hasher.update(&[b as u8]);
+                    hashed_bytes += 1;
+                }
+                Value::Int(v) => {
+                    let bytes = v.to_le_bytes();
+                    hasher.update(&bytes);
+                    hashed_bytes += bytes.len();
+                }
+                Value::Ref(r) => {
+                    let bytes = self.heap.get_data(r)?;
+                    hasher.update(bytes);
+                    hashed_bytes += bytes.len();
+                }
+            }
+        }
+
+        self.charge_gas_categorized(hashed_bytes as u64, GasCategory::HostFunction)?;
+
+        let hash = hasher.finalize();
+        let hash_ref = self.heap_index(hash.to_vec())?;
         self.registers.set(dst, Value::Ref(hash_ref))
     }
 
@@ -1526,31 +1773,27 @@ impl VM {
         self.registers.set(dst, Value::Bool(va >= vb))
     }
 
-    fn op_call_host(
+    #[allow(clippy::too_many_arguments)]
+    fn op_call_host<S: State>(
         &mut self,
-        _instr: &'static str,
+        _: &'static str,
+        _: &mut S,
+        ctx: &ExecContext,
         dst: u8,
         fn_id: u32,
-        argc: u8,
         argv: u8,
     ) -> Result<(), VMError> {
-        self.charge_call(argc, 5, self.call_stack.len(), 10)?;
+        self.charge_call(self.call_stack.len(), 10)?;
         let fn_name = self.heap_get_string(fn_id)?;
+        let argc = HOST_FUNCTIONS
+            .iter()
+            .find_map(|(name, argc)| (*name == fn_name).then_some(*argc))
+            .ok_or(VMError::InvalidCallHostFunction {
+                name: fn_name.clone(),
+            })?;
         let args: Vec<Value> = (0..argc)
             .map(|i| self.registers.get(argv.wrapping_add(i)).copied())
             .collect::<Result<_, _>>()?;
-
-        /// Returns an error if actual != expected
-        fn arg_len_check(expected: u8, actual: u8, name: &str) -> Result<(), VMError> {
-            if actual != expected {
-                return Err(VMError::ArityMismatch {
-                    instruction: format!("CALL_HOST reg, \"{name}\""),
-                    expected,
-                    actual,
-                });
-            }
-            Ok(())
-        }
 
         /// Converts the given value to an u32 (ref), returns an error if it isn't a Value::Ref
         fn get_ref(val: Value) -> Result<u32, VMError> {
@@ -1579,8 +1822,13 @@ impl VM {
         }
 
         match fn_name.as_str() {
+            LEN => {
+                let str_ref = get_ref(args[0])?;
+                let len = self.heap.get_data(str_ref)?.len();
+                self.charge_gas_categorized(len as u64, GasCategory::HostFunction)?;
+                self.registers.set(dst, Value::Int(len as i64))
+            }
             SLICE => {
-                arg_len_check(host_func_argc(SLICE), args.len() as u8, SLICE)?;
                 let str_ref = get_ref(args[0])?;
                 let start = get_i64(args[1])? as usize;
                 let end = get_i64(args[2])? as usize;
@@ -1597,7 +1845,6 @@ impl VM {
                 self.registers.set(dst, Value::Ref(new_ref))
             }
             CONCAT => {
-                arg_len_check(host_func_argc(CONCAT), args.len() as u8, CONCAT)?;
                 let ref1 = get_ref(args[0])?;
                 let ref2 = get_ref(args[1])?;
 
@@ -1612,7 +1859,6 @@ impl VM {
                 self.registers.set(dst, Value::Ref(new_ref))
             }
             COMPARE => {
-                arg_len_check(host_func_argc(COMPARE), args.len() as u8, COMPARE)?;
                 let ref1 = get_ref(args[0])?;
                 let ref2 = get_ref(args[1])?;
 
@@ -1629,51 +1875,9 @@ impl VM {
                 };
                 self.registers.set(dst, Value::Int(cmp))
             }
-            _ => Err(VMError::InvalidCallHostFunction { name: fn_name }),
-        }
-    }
-
-    fn op_call_host0(&mut self, instr: &'static str, dst: u8, fn_id: u32) -> Result<(), VMError> {
-        self.op_call_host(instr, dst, fn_id, 0, 0)
-    }
-
-    fn op_call_host1(
-        &mut self,
-        instr: &'static str,
-        dst: u8,
-        fn_id: u32,
-        arg: SrcOperand,
-    ) -> Result<(), VMError> {
-        self.charge_call(1, 5, self.call_stack.len(), 10)?;
-        let fn_name = self.heap_get_string(fn_id)?;
-
-        match fn_name.as_str() {
-            LEN => {
-                let str_ref = self.ref_from_operand(arg, instr, 1)?;
-                let len = self.heap.get_data(str_ref)?.len();
-                self.charge_gas_categorized(len as u64, GasCategory::HostFunction)?;
-                self.registers.set(dst, Value::Int(len as i64))
-            }
-            LOG => {
-                error!("{:?}", self.value_from_operand(arg)?);
-                Ok(())
-            }
-            HASH => {
-                let value = self.value_from_operand(arg)?;
-                let len = match value {
-                    Value::Bool(_) => 1,
-                    Value::Int(_) => 8,
-                    Value::Ref(r) => self.heap.get_data(r)?.len(),
-                };
-                self.charge_gas_categorized(len as u64, GasCategory::HostFunction)?;
-
-                let hash = match value {
-                    Value::Bool(b) => Hash::sha3().chain(&[b as u8]).finalize(),
-                    Value::Ref(r) => Hash::sha3().chain(self.heap.get_data(r)?).finalize(),
-                    Value::Int(i) => Hash::sha3().chain(&i.to_le_bytes()).finalize(),
-                };
-                let new_ref = self.heap_index(hash.to_vec())?;
-                self.registers.set(dst, Value::Ref(new_ref))
+            CALLER => {
+                let reference = self.heap_index(ctx.caller.to_vec())?;
+                self.registers.set(dst, Value::Ref(reference))
             }
             _ => Err(VMError::InvalidCallHostFunction { name: fn_name }),
         }
@@ -1684,10 +1888,9 @@ impl VM {
         instr: &'static str,
         dst: u8,
         offset: i32,
-        argc: u8,
         _argv: u8,
     ) -> Result<(), VMError> {
-        self.charge_call(argc, 5, self.call_stack.len(), 10)?;
+        self.charge_call(self.call_stack.len(), 10)?;
 
         if self.call_stack.len() >= MAX_CALL_STACK_LEN {
             return Err(VMError::CallStackOverflow {
@@ -1702,68 +1905,6 @@ impl VM {
         });
 
         self.op_jump(instr, offset)
-    }
-
-    fn op_call0(&mut self, instr: &'static str, dst: u8, fn_id: i32) -> Result<(), VMError> {
-        self.op_call(instr, dst, fn_id, 0, 0)
-    }
-
-    fn op_call1(
-        &mut self,
-        instr: &'static str,
-        dst: u8,
-        fn_id: i32,
-        arg: SrcOperand,
-    ) -> Result<(), VMError> {
-        let argv = match arg {
-            SrcOperand::Reg(reg) => reg,
-            _ => {
-                let target_ip = self.ip as i32 + fn_id;
-                let argr = self
-                    .resolve_public_call_argr(target_ip)
-                    .unwrap_or(CALL1_ARG_TMP_REG);
-                let value = self.value_from_operand(arg)?;
-                self.registers.set(argr, value)?;
-                argr
-            }
-        };
-        self.op_call(instr, dst, fn_id, 1, argv)
-    }
-
-    /// Attempts to resolve the argument register (`argr`) for a call target by
-    /// scanning generated DISPATCH tables and matching absolute target offsets.
-    fn resolve_public_call_argr(&self, target_ip: i32) -> Option<u8> {
-        let dispatch_opcode = Instruction::Dispatch as u8;
-
-        for i in 0..self.data.len().saturating_sub(2) {
-            if self.data[i] != dispatch_opcode {
-                continue;
-            }
-
-            let count = *self.data.get(i + 1)? as usize;
-            let entries_start = i + 2;
-            let entries_len = count.checked_mul(5)?;
-            let entries_end = entries_start.checked_add(entries_len)?;
-            if entries_end > self.data.len() {
-                continue;
-            }
-
-            let entry_base = entries_end as i32;
-            let mut cursor = entries_start;
-            for _ in 0..count {
-                let offset_bytes: [u8; 4] = self.data.get(cursor..cursor + 4)?.try_into().ok()?;
-                let offset = i32::from_le_bytes(offset_bytes);
-                cursor += 4;
-                let argr = *self.data.get(cursor)?;
-                cursor += 1;
-
-                if entry_base + offset == target_ip {
-                    return Some(argr);
-                }
-            }
-        }
-
-        None
     }
 
     fn op_jal(&mut self, instr: &'static str, rd: u8, offset: i32) -> Result<(), VMError> {
@@ -2059,38 +2200,37 @@ impl VM {
 
     /// Dispatches to a public function by selector index.
     ///
-    /// Reads an inline table of `(offset_i32, argr)` entries from bytecode.
-    /// Uses `r0` as the selector index, loads call arguments via `CALLDATA_LOAD`
-    /// semantics into the entry's `argr`, calls the target function, and halts.
+    /// Reads an inline table of `(offset, argr)` entries from bytecode.
+    /// Offset widths are compact and selected per-entry via packed
+    /// `AABB_CCDD` width-code bytes after the entry count.
+    /// Uses the execute-program selector, loads call arguments via
+    /// `CALLDATA_LOAD` semantics into the entry's `argr`, calls the target
+    /// function, and halts.
     fn op_dispatch(&mut self, instr: &'static str) -> Result<(), VMError> {
         let count = self.read_exact(1)?[0] as usize;
-        let selector = match self.registers.get(0)? {
-            Value::Int(i) => *i as usize,
-            other => {
-                return Err(VMError::TypeMismatch {
-                    instruction: instr,
-                    arg_index: 0,
-                    expected: "Integer",
-                    actual: other.type_name().to_string(),
-                });
-            }
-        };
+        let selector = self.dispatch_selector as usize;
         if selector >= count {
             return Err(VMError::DispatchOutOfBounds { selector, count });
         }
-        // Skip entries before the selected one (each entry = 4 + 1 = 5 bytes)
-        if selector > 0 {
-            self.read_exact(selector * 5)?;
+        let width_table_len = dispatch_width_table_len(count);
+        let width_table = self.read_exact(width_table_len)?.to_vec();
+
+        let mut selected: Option<(i32, u8)> = None;
+        for entry_index in 0..count {
+            let width_code = dispatch_width_code_at(&width_table, entry_index)?;
+            let offset_len = metadata_len_from_code(width_code) as usize;
+            let offset_bytes = self.read_exact(offset_len)?;
+            let offset_i64 = decode_i64_compact(offset_bytes, offset_len as u8)?;
+            let offset = i32::try_from(offset_i64).map_err(|_| VMError::DecodeError {
+                reason: format!("dispatch offset {offset_i64} is out of i32 range"),
+            })?;
+            let argr = self.read_exact(1)?[0];
+            if entry_index == selector {
+                selected = Some((offset, argr));
+            }
         }
-        // Read the selected entry
-        let entry_bytes = self.read_exact(5)?;
-        let offset = i32::from_le_bytes(entry_bytes[0..4].try_into().unwrap());
-        let argr = entry_bytes[4];
-        // Skip remaining entries
-        let remaining = count - selector - 1;
-        if remaining > 0 {
-            self.read_exact(remaining * 5)?;
-        }
+
+        let (offset, argr) = selected.expect("selector validated against count");
         // Load call arguments into registers starting at argr
         self.op_call_data_load(instr, argr)?;
         // Push a call frame whose return address is past all bytecode,

@@ -22,6 +22,9 @@ impl Value {
         }
     }
 
+    /// Returns `true` when two values of the same type are equal.
+    ///
+    /// Returns [`VMError::InvalidComparison`] if the types differ.
     pub fn equals(va: Value, vb: Value) -> Result<bool, VMError> {
         Ok(match (va, vb) {
             (Value::Bool(b1), Value::Bool(b2)) => b1 == b2,
@@ -39,13 +42,16 @@ impl Value {
 
 /// Register file holding VM storage.
 ///
-/// Provides 256 registers, each capable of storing a single [`Value`].
-/// Registers are lazily initialized (start as `None`).
+/// Provides 256 registers, each capable of storing a single [`Value`], except
+/// `r0` which is hardwired to integer zero.
 pub(super) struct Registers {
     regs: Vec<Value>,
 }
 
 impl Registers {
+    /// Index of the hardwired zero register.
+    const ZERO_REG: u8 = 0;
+
     /// Creates a new register file with `count` registers.
     pub(super) fn new() -> Self {
         Self {
@@ -57,6 +63,9 @@ impl Registers {
     ///
     /// Returns [`VMError::InvalidRegisterIndex`] if `idx` is out of bounds.
     pub(super) fn get(&self, idx: u8) -> Result<&Value, VMError> {
+        if idx == Self::ZERO_REG {
+            return Ok(&self.regs[Self::ZERO_REG as usize]);
+        }
         self.regs
             .get(idx as usize)
             .ok_or(VMError::InvalidRegisterIndex {
@@ -114,6 +123,10 @@ impl Registers {
     ///
     /// Returns [`VMError::InvalidRegisterIndex`] if `idx` is out of bounds.
     pub(super) fn set(&mut self, idx: u8, v: Value) -> Result<(), VMError> {
+        if idx == Self::ZERO_REG {
+            // r0 is hardwired to integer zero; writes are discarded.
+            return Ok(());
+        }
         let available = self.regs.len();
         let slot = self
             .regs

@@ -1,6 +1,7 @@
 __init__:                         # Contract constructor
-    CALL1 r2, factorial, 5        # r2 = 5! = 120
-    CALL_HOST1 r2, "hash", r2     # hash the value
+    MOVE r1, 5
+    CALL r2, factorial, 1, r1     # r2 = 5! = 120
+    SHA3 r2, 1, r2                # hash the value
     STORE "hash", r2              # Store the hashes value at key "hash"
     HALT
 

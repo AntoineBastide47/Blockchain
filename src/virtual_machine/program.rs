@@ -15,7 +15,7 @@ use blockchain_derive::BinaryCodec;
 const MAGIC: &[u8; 5] = b"VM_BC";
 
 /// Current bytecode format version.
-const CURRENT_VERSION: Version = Version::new(0, 4, 0);
+const CURRENT_VERSION: Version = Version::new(0, 5, 0);
 
 /// Semantic version for bytecode format compatibility.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, BinaryCodec)]
@@ -278,6 +278,15 @@ pub mod tests {
     }
 
     #[test]
+    fn from_bytes_previous_version_unsupported() {
+        let mut bytes = Vec::new();
+        MAGIC.encode(&mut bytes);
+        Version::new(0, 4, 0).encode(&mut bytes);
+        let err = DeployProgram::from_bytes(&bytes).unwrap_err();
+        assert!(matches!(err, VMError::DecodeError{ref reason} if reason == "unsupported version"));
+    }
+
+    #[test]
     fn from_bytes_trailing_bytes() {
         let program = DeployProgram::new(vec![], vec![], vec![]);
         let mut bytes = program.to_bytes().to_vec();
@@ -330,7 +339,7 @@ pub mod tests {
     #[test]
     fn dispatcher_uses_dispatch_opcode() {
         // Two public functions -> single DISPATCH instruction with 2 entries.
-        // DISPATCH: opcode(1) + count(1) + 2 * (offset_i32(4) + argr(1)) = 12 bytes
+        // DISPATCH: opcode(1) + count(1) + widths(1) + 2 * (offset_1 + argr(1)) = 7 bytes
         let source = r#"
 pub foo:
     HALT
@@ -345,11 +354,11 @@ pub bar:
         // count = 2
         assert_eq!(bc[1], 2);
 
-        // Function bodies after the DISPATCH instruction (12 bytes)
-        assert_eq!(bc[12], Instruction::Halt as u8); // bar (sorted first)
-        assert_eq!(bc[13], Instruction::Halt as u8); // foo
+        // Function bodies after the DISPATCH instruction (7 bytes).
+        assert_eq!(bc[7], Instruction::Halt as u8);
+        assert_eq!(bc[8], Instruction::Halt as u8);
 
-        assert_eq!(bc.len(), 14);
+        assert_eq!(bc.len(), 9);
     }
 
     #[test]
@@ -369,7 +378,7 @@ foo:
     #[test]
     fn dispatcher_single_entry() {
         // Single public function -> DISPATCH with 1 entry.
-        // DISPATCH: opcode(1) + count(1) + 1 * (offset_i32(4) + argr(1)) = 7 bytes
+        // DISPATCH: opcode(1) + count(1) + widths(1) + 1 * (offset_1 + argr(1)) = 5 bytes
         let source = r#"
 pub only:
     HALT
@@ -380,15 +389,15 @@ pub only:
         assert_eq!(bc[0], Instruction::Dispatch as u8);
         assert_eq!(bc[1], 1); // count
 
-        // Function body after DISPATCH (7 bytes)
-        assert_eq!(bc[7], Instruction::Halt as u8);
-        assert_eq!(bc.len(), 8);
+        // Function body after DISPATCH (5 bytes)
+        assert_eq!(bc[5], Instruction::Halt as u8);
+        assert_eq!(bc.len(), 6);
     }
 
     #[test]
     fn dispatcher_sorts_public_labels_for_entries() {
         // Source order is z then a; entries should be sorted alphabetically (a, z).
-        // DISPATCH: opcode(1) + count(1) + 2 * (offset_i32(4) + argr(1)) = 12 bytes
+        // DISPATCH: opcode(1) + count(1) + widths(1) + 2 * (offset_1 + argr(1)) = 7 bytes
         let source = r#"
 pub zebra:
     HALT
@@ -401,15 +410,15 @@ pub alpha:
         assert_eq!(bc[0], Instruction::Dispatch as u8);
         assert_eq!(bc[1], 2); // count
 
-        // Entry 0 = alpha (sorted first), entry 1 = zebra
-        // Each entry: offset_i32(4) + argr(1) = 5 bytes, starting at byte 2
-        let entry0_offset = i32::from_le_bytes(bc[2..6].try_into().unwrap());
-        let entry1_offset = i32::from_le_bytes(bc[7..11].try_into().unwrap());
+        // Entry 0 = alpha (sorted first), entry 1 = zebra.
+        assert_eq!(bc[2], 0x00); // packed width byte: both offsets use Len1
+        let entry0_offset = bc[3] as i8 as i32;
+        let entry1_offset = bc[5] as i8 as i32;
 
-        // Bodies: alpha at 13 (second HALT, source order: zebra=12, alpha=13)
-        // Offsets are PC-relative from end of DISPATCH (byte 12)
-        assert_eq!(entry0_offset, 1); // alpha body at 13, from ip=12 -> 1
-        assert_eq!(entry1_offset, 0); // zebra body at 12, from ip=12 -> 0
+        // Bodies: zebra at 7 and alpha at 8 (source order preserved).
+        // Offsets are PC-relative from end of DISPATCH (byte 7).
+        assert_eq!(entry0_offset, 1); // alpha body at 8, from ip=7 -> 1
+        assert_eq!(entry1_offset, 0); // zebra body at 7, from ip=7 -> 0
     }
 
     #[test]
@@ -439,6 +448,15 @@ pub alpha:
         let mut bytes = Vec::new();
         MAGIC.encode(&mut bytes);
         Version::new(255, 0, 0).encode(&mut bytes);
+        let err = ExecuteProgram::from_bytes(&bytes).unwrap_err();
+        assert!(matches!(err, VMError::DecodeError{ref reason} if reason == "unsupported version"));
+    }
+
+    #[test]
+    fn execute_from_bytes_previous_version_unsupported() {
+        let mut bytes = Vec::new();
+        MAGIC.encode(&mut bytes);
+        Version::new(0, 4, 0).encode(&mut bytes);
         let err = ExecuteProgram::from_bytes(&bytes).unwrap_err();
         assert!(matches!(err, VMError::DecodeError{ref reason} if reason == "unsupported version"));
     }

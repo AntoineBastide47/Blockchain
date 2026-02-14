@@ -135,59 +135,63 @@ macro_rules! for_each_instruction {
             // =========================
             /// CALL_HOST dst, fn, argv ; call host function fn with args from regs[argv...] ; return -> dst
             CallHost = 0x40, "CALL_HOST" => [dst: Reg, fn_id: RefU32, argv: Reg], 100,
+            /// CALL_HOST0 dst, fn ; call host function fn with no args ; return -> dst
+            CallHost0 = 0x41, "CALL_HOST0" => [dst: Reg, fn_id: RefU32], 100,
             /// CALL dst, fn, argv ; call function fn with args from regs[argv...] ; return -> dst
-            Call = 0x43, "CALL" => [dst: Reg, fn_id: ImmI32, argv: Reg], 50,
+            Call = 0x42, "CALL" => [dst: Reg, fn_id: ImmI32, argv: Reg], 50,
+            /// CALL0 dst, fn ; call function fn with no args ; return -> dst
+            Call0 = 0x43, "CALL0" => [dst: Reg, fn_id: ImmI32], 50,
             /// JAL rd, offset ; rd = PC + instr_size; PC += offset (jump and link)
-            Jal = 0x46, "JAL" => [rd: Reg, offset: ImmI32], 5,
+            Jal = 0x44, "JAL" => [rd: Reg, offset: ImmI32], 5,
             /// JALR rd, rs, offset ; rd = PC + instr_size; PC = rs + offset (jump and link register)
-            Jalr = 0x47, "JALR" => [rd: Reg, rs: Reg, offset: ImmI32], 5,
+            Jalr = 0x45, "JALR" => [rd: Reg, rs: Reg, offset: ImmI32], 5,
             /// BEQ rs1, rs2, offset ; if rs1 == rs2 then PC += offset
-            Beq = 0x48, "BEQ" => [rs1: Src, rs2: Src, offset: ImmI32], 5,
+            Beq = 0x46, "BEQ" => [rs1: Src, rs2: Src, offset: ImmI32], 5,
             /// BNE rs1, rs2, offset ; if rs1 != rs2 then PC += offset
-            Bne = 0x49, "BNE" => [rs1: Src, rs2: Src, offset: ImmI32], 5,
+            Bne = 0x47, "BNE" => [rs1: Src, rs2: Src, offset: ImmI32], 5,
             /// BLT rs1, rs2, offset ; if rs1 < rs2 (signed) then PC += offset
-            Blt = 0x4A, "BLT" => [rs1: Src, rs2: Src, offset: ImmI32], 5,
+            Blt = 0x48, "BLT" => [rs1: Src, rs2: Src, offset: ImmI32], 5,
             /// BGE rs1, rs2, offset ; if rs1 >= rs2 (signed) then PC += offset
-            Bge = 0x4B, "BGE" => [rs1: Src, rs2: Src, offset: ImmI32], 5,
+            Bge = 0x49, "BGE" => [rs1: Src, rs2: Src, offset: ImmI32], 5,
             /// BLTU rs1, rs2, offset ; if rs1 < rs2 (unsigned) then PC += offset
-            Bltu = 0x4C, "BLTU" => [rs1: Src, rs2: Src, offset: ImmI32], 5,
+            Bltu = 0x4A, "BLTU" => [rs1: Src, rs2: Src, offset: ImmI32], 5,
             /// BGEU rs1, rs2, offset ; if rs1 >= rs2 (unsigned) then PC += offset
-            Bgeu = 0x4D, "BGEU" => [rs1: Src, rs2: Src, offset: ImmI32], 5,
+            Bgeu = 0x4B, "BGEU" => [rs1: Src, rs2: Src, offset: ImmI32], 5,
             /// JUMP offset ; PC += offset (unconditional jump)
-            Jump = 0x4E, "JUMP" => [offset: ImmI32], 5,
+            Jump = 0x4C, "JUMP" => [offset: ImmI32], 5,
             /// RET rs ; return from function call with value in rs
-            Ret = 0x4F, "RET" => [rs: Reg], 5,
+            Ret = 0x4D, "RET" => [rs: Reg], 5,
             /// HALT ; stop execution immediately
-            Halt = 0x50, "HALT" => [], 1,
+            Halt = 0x4E, "HALT" => [], 1,
             // =========================
             // Data and Memory access
             // =========================
             /// CALLDATA_LOAD rd ; load call arguments into registers starting at rd
-            CallDataLoad = 0x51, "CALLDATA_LOAD" => [rd: Reg], 3,
+            CallDataLoad = 0x50, "CALLDATA_LOAD" => [rd: Reg], 3,
             /// CALLDATA_COPY dst ; copy serialized call arguments to memory at dst
-            CallDataCopy = 0x52, "CALLDATA_COPY" => [dst: Addr], 5,
+            CallDataCopy = 0x51, "CALLDATA_COPY" => [dst: Addr], 5,
             /// CALLDATA_LEN rd ; rd = size in bytes of raw calldata
-            CallDataLen = 0x53, "CALLDATA_LEN" => [rd: Reg], 1,
+            CallDataLen = 0x52, "CALLDATA_LEN" => [rd: Reg], 1,
             /// MEM_LOAD rd, addr ; rd = memory[addr .. addr + 8]
-            MemLoad = 0x54, "MEM_LOAD" => [rd: Reg, addr: Addr], 5,
+            MemLoad = 0x53, "MEM_LOAD" => [rd: Reg, addr: Addr], 5,
             /// MEM_STORE addr, rs ; memory[addr .. addr + WORD_SIZE] = rs
-            MemStore = 0x55, "MEM_STORE" => [addr: Addr, rs: Src], 5,
+            MemStore = 0x54, "MEM_STORE" => [addr: Addr, rs: Src], 5,
             /// MEM_COPY dst, src, len ; memory[dst .. dst+len] = memory[src .. src+len]
-            MemCpy = 0x56, "MEM_COPY" => [dst: Addr, src: Addr, len: Addr], 5,
+            MemCpy = 0x55, "MEM_COPY" => [dst: Addr, src: Addr, len: Addr], 5,
             /// MEM_SET dst, val, len ; for i in 0..len: memory[dst+i] = val
-            MemSet = 0x57, "MEM_SET" => [dst: Addr, len: Addr, val: ImmU8], 5,
+            MemSet = 0x56, "MEM_SET" => [dst: Addr, len: Addr, val: ImmU8], 5,
             /// MEM_LOAD_8U rd, addr ; rd = memory[addr .. addr + 1], zero extended
-            MemLoad8U = 0x58, "MEM_LOAD_8U" => [rd: Reg, addr: Addr], 2,
+            MemLoad8U = 0x57, "MEM_LOAD_8U" => [rd: Reg, addr: Addr], 2,
             /// MEM_LOAD_8S rd, addr ; rd = memory[addr .. addr + 1], sign extended
-            MemLoad8S = 0x59, "MEM_LOAD_8S" => [rd: Reg, addr: Addr], 2,
+            MemLoad8S = 0x58, "MEM_LOAD_8S" => [rd: Reg, addr: Addr], 2,
             /// MEM_LOAD_16U rd, addr ; rd = memory[addr .. addr + 2], zero extended
-            MemLoad16U = 0x5A, "MEM_LOAD_16U" => [rd: Reg, addr: Addr], 3,
+            MemLoad16U = 0x59, "MEM_LOAD_16U" => [rd: Reg, addr: Addr], 3,
             /// MEM_LOAD_16S rd, addr ; rd = memory[addr .. addr + 2], sign extended
-            MemLoad16S = 0x5B, "MEM_LOAD_16S" => [rd: Reg, addr: Addr], 3,
+            MemLoad16S = 0x5A, "MEM_LOAD_16S" => [rd: Reg, addr: Addr], 3,
             /// MEM_LOAD_32U rd, addr ; rd = memory[addr .. addr + 4], zero extended
-            MemLoad32U = 0x5C, "MEM_LOAD_32U" => [rd: Reg, addr: Addr], 4,
+            MemLoad32U = 0x5B, "MEM_LOAD_32U" => [rd: Reg, addr: Addr], 4,
             /// MEM_LOAD_32S rd, addr ; rd = memory[addr .. addr + 4], sign extended
-            MemLoad32S = 0x5D, "MEM_LOAD_32S" => [rd: Reg, addr: Addr], 4,
+            MemLoad32S = 0x5C, "MEM_LOAD_32S" => [rd: Reg, addr: Addr], 4,
         }
     };
 }

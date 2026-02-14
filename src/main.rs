@@ -239,7 +239,7 @@ async fn main() {
             let sender_addr = validator_key_clone.public_key().address();
 
             // Deploy contract first
-            let deploy_data = assemble_file("../example_contracts/main.asm")
+            let deploy_data = assemble_file("../example_contracts/factorial.asm")
                 .expect("assembly failed")
                 .to_bytes();
 

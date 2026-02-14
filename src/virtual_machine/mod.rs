@@ -19,6 +19,7 @@
 pub mod assembler;
 pub mod errors;
 pub mod isa;
+#[cfg(test)]
 mod isa_static_check;
 pub mod operand;
 pub mod program;

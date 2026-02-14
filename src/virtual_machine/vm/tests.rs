@@ -2178,8 +2178,8 @@ fn call_basic_with_explicit_argc_and_argv() {
                 MOVE r10, 100
                 RET r10
             skip_fn:
-            MOVE r2, 99
-            CALL r1, my_func, 1, r2
+            MOVE r10, 99
+            CALL r1, my_func, 1, r10
         "#;
     assert_eq!(run_and_get_int(source, 1), 100);
 }

@@ -1129,6 +1129,9 @@ fn assemble_source_step_0(source: &str, errors: &mut Vec<VMError>) -> Option<Str
                 has_init = true;
                 in_init = true;
                 is_init_line = true;
+            } else if in_init && !label.name.starts_with("__") {
+                in_init = false;
+                is_init_line = false;
             }
             instr_start = line.find(':').unwrap_or(0).saturating_add(1);
         }
@@ -1142,6 +1145,16 @@ fn assemble_source_step_0(source: &str, errors: &mut Vec<VMError>) -> Option<Str
                 }
             };
             if let Some(tok) = tokens.first() {
+                if tok.text == Instruction::Ret.mnemonic() {
+                    errors.push(VMError::AssemblyError {
+                        line: line_no + 1,
+                        offset: tok.offset,
+                        length: tok.text.len(),
+                        source: "RET is not allowed inside '__init__'; use HALT to end init code"
+                            .to_string(),
+                    });
+                    return None;
+                }
                 last_init_instr = Some((line_no + 1, tok.offset, tok.text.to_string()));
                 if tok.text == Instruction::Halt.mnemonic() {
                     in_init = false;
@@ -1885,6 +1898,12 @@ macro_rules! define_parse_instruction {
 
 for_each_instruction!(define_parse_instruction);
 
+pub struct LabelData<'a> {
+    pub names: Vec<&'a str>,
+    pub data: Vec<Label<'a>>,
+    pub init_label: Option<Label<'a>>,
+}
+
 /// Extracts all labels from assembly source, identifying public entry points.
 ///
 /// Scans the source for label definitions and returns:
@@ -1896,9 +1915,10 @@ for_each_instruction!(define_parse_instruction);
 pub fn extract_label_data<'a>(
     source: &'a str,
     insert_point: &mut usize,
-) -> Result<(HashSet<&'a str>, Vec<Label<'a>>), VMError> {
+) -> Result<LabelData<'a>, VMError> {
     let mut public_labels: HashSet<&str> = HashSet::new();
     let mut label_data: Vec<Label> = Vec::new();
+    let mut init_label: Option<Label> = None;
     let mut current_section = Section::Runtime;
     let mut runtime_insert: Option<usize> = None;
 
@@ -1918,6 +1938,9 @@ pub fn extract_label_data<'a>(
 
             // Skip compiler generated internal labels from dispatcher metadata.
             if label.name.starts_with("__") {
+                if label.name == INIT_LABEL {
+                    init_label = Some(label);
+                }
                 continue;
             }
 
@@ -1931,8 +1954,14 @@ pub fn extract_label_data<'a>(
         }
     }
 
+    let mut label_names: Vec<&str> = public_labels.iter().copied().collect();
+    label_names.sort();
     *insert_point = runtime_insert.unwrap_or(0);
-    Ok((public_labels, label_data))
+    Ok(LabelData {
+        names: label_names,
+        data: label_data,
+        init_label,
+    })
 }
 
 /// Preprocesses assembly source to generate a dispatcher for public entry points.
@@ -1954,7 +1983,7 @@ fn assemble_source_step_1<'a>(
     // Track where to insert the dispatcher (line number where runtime starts).
     let mut insert_point = 0usize;
     // Collect all public label names (including trailing ':')
-    let (public_labels, label_data) = match extract_label_data(source, &mut insert_point) {
+    let lll = match extract_label_data(source, &mut insert_point) {
         Ok(p) => p,
         Err(e) => {
             errors.push(e);
@@ -1962,17 +1991,14 @@ fn assemble_source_step_1<'a>(
         }
     };
 
-    if public_labels.is_empty() {
-        return (None, None, Some(label_data));
+    if lll.names.is_empty() && lll.init_label.as_ref().is_none_or(|l| l.argc == 0) {
+        return (None, None, Some(lll.data));
     }
 
     let mut base = String::new();
-    let mut label_names: Vec<&str> = public_labels.iter().copied().collect();
-    label_names.sort();
-
-    let mut labels = Vec::<Label>::with_capacity(label_names.len());
-    for name in label_names {
-        for label in &label_data {
+    let mut labels = Vec::<Label>::with_capacity(lll.names.len());
+    for name in lll.names {
+        for label in &lll.data {
             if label.name == name {
                 labels.push(label.clone())
             }
@@ -1987,10 +2013,21 @@ fn assemble_source_step_1<'a>(
     }
     base.push('\n');
 
-    // Count lines added by dispatcher (+1 for the extra newline after base)
-    let lines_added = base.lines().count() + 1;
+    // Build CALLDATA_LOAD to inject after __init__ label if it declares arguments.
+    let init_calldata = lll
+        .init_label
+        .as_ref()
+        .filter(|l| l.argc > 0)
+        .map(|l| format!("    CALLDATA_LOAD r{}\n", l.argr));
 
-    // Reassemble source with dispatcher inserted at runtime start.
+    // Count lines added by dispatcher (+1 for the extra newline after base)
+    let mut lines_added = base.lines().count() + 1;
+    if init_calldata.is_some() {
+        lines_added += 1;
+    }
+
+    // Reassemble source with dispatcher inserted at runtime start
+    // and CALLDATA_LOAD injected after the __init__ label line.
     let mut out = String::with_capacity(source.len() + base.len());
     for (i, line) in source.lines().enumerate() {
         // Insert dispatcher just before the first runtime line.
@@ -2000,6 +2037,15 @@ fn assemble_source_step_1<'a>(
         }
         out.push_str(line);
         out.push('\n');
+        // Insert CALLDATA_LOAD right after the __init__ label line.
+        if let Some(ref calldata) = init_calldata
+            && is_code_line(line)
+            && is_label_def(line)
+            && let Ok(label) = tokenize_label(i + 1, line)
+            && label.name == INIT_LABEL
+        {
+            out.push_str(calldata);
+        }
     }
 
     // If source had no lines, still prepend dispatcher.
@@ -2012,7 +2058,7 @@ fn assemble_source_step_1<'a>(
         lines_added,
     };
 
-    (Some(out), Some(dispatcher_info), Some(label_data))
+    (Some(out), Some(dispatcher_info), Some(lll.data))
 }
 
 /// Validates that a `CALL` source argument count matches the target label's declared argc.
@@ -2040,6 +2086,37 @@ fn validate_call_argc_against_label(
                         label.name, label.argc, argc
                     )
                 },
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Validates that a `CALL` source argv register matches the target label's declared `argr`.
+///
+/// This check is applied only when `argc > 0`, because argv is irrelevant for zero-arg calls.
+fn validate_call_argv_against_label(
+    tokens: &[Token],
+    label_data: &[Label],
+    line_no: usize,
+    argc: u8,
+) -> Result<(), VMError> {
+    if argc == 0 {
+        return Ok(());
+    }
+
+    let func_name = tokens[2].text;
+    let argv = parse_reg(tokens[4].text)?;
+    for label in label_data {
+        if label.name == func_name && label.argr != argv {
+            return Err(VMError::ParseErrorString {
+                line: line_no + 1,
+                offset: tokens[4].offset,
+                length: tokens[4].text.len(),
+                message: format!(
+                    "function '{}' expects argv register r{}, but r{} was provided",
+                    label.name, label.argr, argv
+                ),
             });
         }
     }
@@ -2102,20 +2179,19 @@ fn normalize_call_tokens<'a>(
     }
 
     let opcode = tokens[0].text;
-    if opcode == "CALL0" || opcode == "CALL1" || opcode == "CALL_HOST0" || opcode == "CALL_HOST1" {
+
+    if matches!(opcode, "CALL0" | "CALL1" | "CALL_HOST0" | "CALL_HOST1") {
         return Err(VMError::ParseErrorString {
             line: line_no + 1,
             offset: tokens[0].offset,
             length: tokens[0].text.len(),
-            message: format!(
-                "'{}' was removed; use '{}' with explicit argc",
-                opcode,
-                if opcode.starts_with("CALL_HOST") {
-                    "CALL_HOST dst, fn, argc, argv"
-                } else {
-                    "CALL dst, fn, argc, argv"
+            message: match opcode {
+                "CALL_HOST0" | "CALL_HOST1" => {
+                    "CALL_HOST0/CALL_HOST1 were removed; use CALL_HOST dst, fn, argc, argv"
+                        .to_string()
                 }
-            ),
+                _ => "CALL0/CALL1 were removed; use CALL dst, fn, argc, argv".to_string(),
+            },
         });
     }
 
@@ -2129,6 +2205,7 @@ fn normalize_call_tokens<'a>(
         }
         let argc = parse_u8(tokens[3].text, line_no + 1, tokens[3].offset)?;
         validate_call_argc_against_label(tokens, label_data, line_no, argc)?;
+        validate_call_argv_against_label(tokens, label_data, line_no, argc)?;
         return Ok(vec![
             tokens[0].clone(),
             tokens[1].clone(),
@@ -3601,11 +3678,21 @@ MOVE r1, "runtime"
 
     #[test]
     fn init_must_end_with_halt() {
-        let source = "__init__:\nMOVE r0, 1\nRET r0\nmain:\nMOVE r1, 2";
+        let source = "__init__:\nMOVE r0, 1\nMOVE r1, 2\nmain:\nMOVE r2, 3";
         let err = assemble_source(source).unwrap_err();
         assert!(matches!(
             err,
             VMError::AssemblyError { ref source, .. } if source.contains("__init__") && source.contains("HALT")
+        ));
+    }
+
+    #[test]
+    fn init_rejects_ret() {
+        let source = "__init__:\nMOVE r0, 1\nRET r0\nmain:\nMOVE r1, 2";
+        let err = assemble_source(source).unwrap_err();
+        assert!(matches!(
+            err,
+            VMError::AssemblyError { ref source, .. } if source.contains("RET") && source.contains("__init__")
         ));
     }
 
@@ -3825,7 +3912,20 @@ RET r1
 
     #[test]
     fn call_argc_correct() {
-        let source = "add(2, r0):\nADD r0, r0, r1\nRET r0\nCALL r1, add, 2, r2";
+        let source = "add(2, r0):\nADD r0, r0, r1\nRET r0\nCALL r1, add, 2, r0";
+        assert!(assemble_source(source).is_ok());
+    }
+
+    #[test]
+    fn call_argv_mismatch() {
+        let source = "add(2, r5):\nADD r5, r5, r6\nRET r5\nCALL r1, add, 2, r2";
+        let err = assemble_source(source).unwrap_err();
+        assert!(matches!(err, VMError::ParseErrorString { .. }));
+    }
+
+    #[test]
+    fn call_argv_ignored_when_argc_zero() {
+        let source = "noop:\nRET r0\nCALL r1, noop, 0, r255";
         assert!(assemble_source(source).is_ok());
     }
 

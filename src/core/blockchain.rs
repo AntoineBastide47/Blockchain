@@ -284,7 +284,7 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
                             limit: transaction.gas_limit,
                         })?;
 
-                let mut vm = VM::new_deploy(program.clone(), max_gas)?;
+                let mut vm = VM::new_deploy(program.clone(), max_gas, vec![], vec![])?;
                 let contract_id = Self::contract_id(transaction);
                 let ctx = ExecContext {
                     chain_id: self.id,

@@ -4,31 +4,24 @@
 //!
 //! # Usage
 //! ```text
-//! assembler <input.asm> [OPTIONS]
+//! assembler [COMMAND] <input.asm> [OPTIONS]
 //! ```
 //!
-//! # Arguments
-//! - `input.asm`: Assembly source file to compile
-//!
-//! # Options
-//! - `-o, --output <file>`: Optional output file path
-//! - `-a, --audit [file]`: Print in-place audit view (or write to file)
-//! - `-p, --predict [price] [func(args)...]`: Estimate gas costs (price defaults to 1)
-//!
-//! # Gas Prediction
-//! The `-p` flag enables gas cost estimation for:
-//! - **Deployment**: Always predicted when `-p` is used
-//! - **Execution**: Predicted only for explicitly specified function calls
-//!
-//! Function call syntax: `func(arg1,arg2,...)` where args are integers.
-//! Public functions are ordered alphabetically for the dispatcher.
+//! # Commands
+//! - `build`: Compile and print summary (default, no file output)
+//! - `output [file]`: Compile and write bytecode (defaults to `<input>.bin`)
+//! - `audit [file]`: Generate audit listing (defaults to `<input>.audit.txt`)
+//! - `predict [price] [func(args)...]`: Estimate gas costs
 //!
 //! # Examples
 //! ```text
 //! assembler program.asm
-//! assembler program.asm -o output.bin
-//! assembler program.asm -p
-//! assembler program.asm -p 100 factorial(5)
+//! assembler build program.asm
+//! assembler output program.asm
+//! assembler output program.asm out.bin
+//! assembler audit program.asm
+//! assembler audit program.asm out.txt
+//! assembler predict program.asm 100 'transfer("addr",100)'
 //! ```
 
 use blockchain::core::blockchain::Blockchain;
@@ -37,6 +30,7 @@ use blockchain::core::validator::BlockValidator;
 use blockchain::storage::rocksdb_storage::RocksDbStorage;
 use blockchain::storage::state_store::{StateStore, VmStorage};
 use blockchain::storage::state_view::{StateView, StateViewProvider};
+use blockchain::types::bytes::Bytes;
 use blockchain::types::hash::Hash;
 use blockchain::utils::log::SHOW_TIMESTAMP;
 use blockchain::virtual_machine::assembler::{
@@ -82,138 +76,166 @@ impl StateViewProvider for EmptyStorage {
     }
 }
 
-fn main() {
-    let args: Vec<String> = env::args().collect();
+/// Parsed function call arguments for gas prediction.
+struct CallArgs {
+    values: Vec<Value>,
+    items: Vec<Vec<u8>>,
+}
 
-    if args.len() < 2 || args[1] == "--help" || args[1] == "-h" {
+/// Parsed CLI command.
+enum Command {
+    /// Compile and print info, no file output.
+    Build,
+    /// Compile and write bytecode to file.
+    Output { path: Option<String> },
+    /// Generate and write audit listing to file.
+    Audit { path: Option<String> },
+    /// Estimate gas costs.
+    Predict {
+        gas_price: u64,
+        calls: Vec<(String, CallArgs)>,
+    },
+}
+
+/// Parses CLI arguments into input path and command.
+///
+/// Format: `assembler [COMMAND] <input.asm> [OPTIONS]`
+/// Defaults to `build` if the first argument is not a known command.
+fn parse_args(args: &[String]) -> (&str, Command) {
+    if args.len() < 2 {
         print_usage(&args[0]);
-        process::exit(if args.len() < 2 { 1 } else { 0 });
+        process::exit(1);
     }
 
-    let input_path = &args[1];
-    let mut output_path: Option<String> = None;
-    let mut audit_output_path: Option<String> = None;
-    let mut audit = false;
-    let mut predict = false;
-    let mut gas_price = 0u64;
-    let mut predict_calls: Vec<(String, Vec<i64>)> = Vec::new();
-
-    let mut i = 2;
-    while i < args.len() {
-        match args[i].as_str() {
-            k @ ("--output" | "-o") => {
-                i += 1;
-                if i >= args.len() {
-                    error!("{k} requires an argument");
-                    process::exit(1);
-                }
-                output_path = Some(args[i].clone());
-                i += 1;
-            }
-            "--audit" | "-a" => {
-                audit = true;
-                i += 1;
-                // Optional output audit file path.
-                if i < args.len() && !args[i].starts_with('-') && !args[i].contains('(') {
-                    audit_output_path = Some(args[i].clone());
-                    i += 1;
-                }
-            }
-            "--predict" | "-p" => {
-                predict = true;
-                i += 1;
-                // Check if next arg exists and is a valid number (gas price)
-                if i < args.len() && !args[i].starts_with('-') && !args[i].contains('(') {
-                    gas_price = args[i].parse::<u64>().unwrap_or_else(|_| {
-                        error!("Invalid gas price: '{}' is not a valid number", args[i]);
-                        process::exit(1);
-                    });
-                    if gas_price == 0 {
-                        error!("Gas price must be greater than 0");
-                        process::exit(1);
-                    }
-                    i += 1;
-                } else {
-                    gas_price = 1;
-                }
-                // Collect function calls: func(arg1,arg2,...)
-                while i < args.len() && !args[i].starts_with('-') {
-                    if let Some((name, args_str)) = parse_function_call(&args[i]) {
-                        predict_calls.push((name, args_str));
-                    } else {
-                        error!(
-                            "Invalid function call syntax: '{}'. Expected: func(arg1,arg2,...)",
-                            args[i]
-                        );
-                        process::exit(1);
-                    }
-                    i += 1;
-                }
-            }
-            other => {
-                error!("Unexpected argument: {}\n", other);
-                print_usage(&args[0]);
+    let (command_str, input_path, rest) = match args[1].as_str() {
+        "help" => {
+            print_usage(&args[0]);
+            process::exit(0);
+        }
+        cmd @ ("build" | "output" | "audit" | "predict") => {
+            if args.len() < 3 {
+                error!("'{}' requires an input file", cmd);
                 process::exit(1);
             }
+            (cmd, &args[2], &args[3..])
         }
-    }
+        _ => ("build", &args[1], &args[2..]),
+    };
 
-    if !Path::new(input_path).exists() {
+    if !Path::new(input_path.as_str()).exists() {
         error!("Input file does not exist: {}", input_path);
         process::exit(1);
     }
 
-    if audit && output_path.is_some() {
-        error!("--audit/-a cannot be combined with --output/-o");
+    match command_str {
+        "build" => {
+            if !rest.is_empty() {
+                error!("'build' takes no arguments");
+                process::exit(1);
+            }
+            (input_path, Command::Build)
+        }
+        "output" => {
+            let path = parse_optional_path(rest);
+            (input_path, Command::Output { path })
+        }
+        "audit" => {
+            let path = parse_optional_path(rest);
+            (input_path, Command::Audit { path })
+        }
+        "predict" => {
+            let (gas_price, calls) = parse_predict_args(rest);
+            (input_path, Command::Predict { gas_price, calls })
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// Parses an optional file path from remaining args. Exits on unexpected extra args.
+fn parse_optional_path(args: &[String]) -> Option<String> {
+    if args.is_empty() {
+        return None;
+    }
+    if args.len() > 1 {
+        error!("Unexpected argument: {}", args[1]);
         process::exit(1);
     }
-
-    if let Some(ref path) = output_path
-        && let Some(parent) = Path::new(&path).parent()
+    let path = &args[0];
+    if let Some(parent) = Path::new(path.as_str()).parent()
         && !parent.as_os_str().is_empty()
         && !parent.exists()
     {
         error!("Output directory does not exist: {}", parent.display());
         process::exit(1);
     }
+    Some(path.clone())
+}
 
-    if let Some(ref path) = audit_output_path
-        && let Some(parent) = Path::new(&path).parent()
-        && !parent.as_os_str().is_empty()
-        && !parent.exists()
-    {
-        error!(
-            "Audit output directory does not exist: {}",
-            parent.display()
-        );
-        process::exit(1);
+/// Parses predict subcommand args: `[price] [func(args)...]`.
+fn parse_predict_args(args: &[String]) -> (u64, Vec<(String, CallArgs)>) {
+    let mut i = 0;
+
+    let gas_price = if i < args.len() && !args[i].contains('(') {
+        let price = args[i].parse::<u64>().unwrap_or_else(|_| {
+            error!("Invalid gas price: '{}' is not a valid number", args[i]);
+            process::exit(1);
+        });
+        if price == 0 {
+            error!("Gas price must be greater than 0");
+            process::exit(1);
+        }
+        i += 1;
+        price
+    } else {
+        1
+    };
+
+    let mut calls = Vec::new();
+    while i < args.len() {
+        if let Some(call) = parse_function_call(&args[i]) {
+            calls.push(call);
+        } else {
+            error!(
+                "Invalid function call syntax: '{}'. Expected: func(arg1,arg2,...)",
+                args[i]
+            );
+            process::exit(1);
+        }
+        i += 1;
     }
 
+    (gas_price, calls)
+}
+
+fn main() {
     SHOW_TIMESTAMP.store(false, Ordering::Relaxed);
 
-    if audit {
-        let audit_listing = match assemble_file_audit(input_path) {
-            Ok(v) => v,
-            Err(e) => {
-                error!("Assembly audit failed: {}", e);
-                process::exit(1);
-            }
-        };
+    let args: Vec<String> = env::args().collect();
+    let (input_path, command) = parse_args(&args);
 
-        if let Some(path) = audit_output_path {
-            if let Err(e) = fs::write(&path, audit_listing.as_bytes()) {
-                error!("Failed to write audit file: {}", e);
-                process::exit(1);
-            }
-            info!("Wrote audit listing to {}", path);
-        } else {
-            println!("{audit_listing}");
-        }
-        if !predict {
-            return;
-        }
+    match command {
+        Command::Build => cmd_build(input_path),
+        Command::Output { path } => cmd_output(input_path, path),
+        Command::Audit { path } => cmd_audit(input_path, path),
+        Command::Predict { gas_price, calls } => cmd_predict(input_path, gas_price, calls),
     }
+}
 
+/// Derives output path by replacing the file extension.
+fn output_path_for(input: &str, new_ext: &str) -> String {
+    let p = Path::new(input);
+    p.with_extension(new_ext).display().to_string()
+}
+
+/// Result of assembling a source file.
+struct AssembleResult {
+    program: blockchain::virtual_machine::program::DeployProgram,
+    program_bytes: Vec<u8>,
+    public_functions: Vec<String>,
+}
+
+/// Assembles a source file, logs build info, and returns the result.
+fn assemble(input_path: &str) -> AssembleResult {
     let assemble_start = Instant::now();
     let program = match assemble_file(input_path) {
         Ok(p) => p,
@@ -222,175 +244,228 @@ fn main() {
             process::exit(1);
         }
     };
-    let assemble_elapsed = assemble_start.elapsed();
+    let elapsed = assemble_start.elapsed();
 
     let program_bytes = program.to_bytes();
 
-    if let Some(ref path) = output_path
-        && let Err(e) = fs::write(path, program_bytes.as_slice())
-    {
-        error!("Failed to write output file: {}", e);
+    let source = fs::read_to_string(input_path).unwrap_or_else(|e| {
+        error!("Failed to read source file: {}", e);
         process::exit(1);
-    }
+    });
+    let mut insert_point = 0usize;
+    let public_functions: Vec<String> = extract_label_data(&source, &mut insert_point)
+        .unwrap()
+        .names
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect();
 
-    match output_path {
-        None => {
-            info!(
-                "Assembled {} ({} bytes) in {:?}",
-                input_path,
-                program_bytes.len(),
-                assemble_elapsed
-            );
-        }
-        Some(ref path) => {
-            info!(
-                "Assembled {} -> {} ({} bytes) in {:?}",
-                input_path,
-                path,
-                program_bytes.len(),
-                assemble_elapsed
-            );
-        }
-    }
+    info!(
+        "Assembled {} ({} bytes) in {:?}",
+        input_path,
+        program_bytes.len(),
+        elapsed
+    );
 
-    if predict {
-        let ms = EmptyStorage {};
-        let base = ms.state_view();
-        let ctx = ExecContext {
-            chain_id: 0,
-            contract_id: Hash::zero(),
-            caller: Hash::zero(),
-        };
-
-        // === Deployment cost prediction ===
-        let deploy_intrinsic = Blockchain::<BlockValidator, RocksDbStorage>::intrinsic_gas_units(
-            TransactionType::DeployContract,
-            &program_bytes,
-        );
-
-        if deploy_intrinsic > BLOCK_GAS_LIMIT {
-            error!(
-                "Intrinsic gas ({}) exceeds transaction limit ({})",
-                deploy_intrinsic, BLOCK_GAS_LIMIT
-            );
-            process::exit(1);
-        }
-
-        let mut vm = VM::new_deploy(program.clone(), BLOCK_GAS_LIMIT - deploy_intrinsic)
-            .unwrap_or_else(|e| {
-                error!("{e}");
-                process::exit(1)
-            });
-
-        let mut overlay = OverlayState::new(&base);
-        vm.run(&mut overlay, &ctx)
-            .unwrap_or_else(|_| process::exit(1));
-
-        let mut deploy_profile = vm.gas_profile();
-        deploy_profile.add(GasCategory::Intrinsic, deploy_intrinsic);
-        print_gas_profile(&deploy_profile, "Deployment Gas Profile", gas_price);
-
-        // === Execution cost prediction for specified functions ===
-        if !predict_calls.is_empty() {
-            // Read source to extract public function names for index resolution
-            let source = fs::read_to_string(input_path).unwrap_or_else(|e| {
-                error!("Failed to read source file: {}", e);
-                process::exit(1);
-            });
-            let mut insert_point = 0usize;
-            let public_functions: Vec<&str> = extract_label_data(&source, &mut insert_point)
-                .unwrap()
-                .0
-                .iter()
-                .copied()
-                .collect();
-
-            // Validate and build list of (fn_name, fn_index, args) to predict
-            let mut calls_to_predict: Vec<(String, usize, Vec<i64>)> = Vec::new();
-            for (name, args) in &predict_calls {
-                if let Some(idx) = public_functions.iter().position(|f| f == name) {
-                    calls_to_predict.push((name.clone(), idx, args.clone()));
-                } else {
-                    error!(
-                        "Function '{}' not found. Available: {}",
-                        name,
-                        public_functions.join(", ")
-                    );
-                    process::exit(1);
-                }
-            }
-
-            for (fn_name, fn_idx, user_args) in calls_to_predict {
-                // Build arguments from user-provided values only
-                let args: Vec<Value> = user_args.iter().map(|&v| Value::Int(v)).collect();
-
-                let exec_program = ExecuteProgram::new(Hash::zero(), fn_idx as i64, args, vec![]);
-                let exec_data = exec_program.to_bytes();
-
-                let exec_intrinsic =
-                    Blockchain::<BlockValidator, RocksDbStorage>::intrinsic_gas_units(
-                        TransactionType::InvokeContract,
-                        &exec_data,
-                    );
-
-                if exec_intrinsic > BLOCK_GAS_LIMIT {
-                    warn!(
-                        "Function '{}': intrinsic gas ({}) exceeds limit, skipping",
-                        fn_name, exec_intrinsic
-                    );
-                    continue;
-                }
-
-                let exec_start = Instant::now();
-                let mut vm = VM::new_execute(
-                    exec_program,
-                    program.clone(),
-                    BLOCK_GAS_LIMIT - exec_intrinsic,
-                )
-                .unwrap_or_else(|e| {
-                    warn!("Function '{}': failed to create VM: {}", fn_name, e);
-                    process::exit(1)
-                });
-
-                let mut overlay = OverlayState::new(&base);
-                if let Err(e) = vm.run(&mut overlay, &ctx) {
-                    warn!("Function '{}': execution failed: {}", fn_name, e);
-                    continue;
-                }
-                let exec_elapsed = exec_start.elapsed();
-
-                let mut exec_profile = vm.gas_profile();
-                exec_profile.add(GasCategory::Intrinsic, exec_intrinsic);
-
-                // Format title with arguments if provided
-                let args_str = if user_args.is_empty() {
-                    String::new()
-                } else {
-                    user_args
-                        .iter()
-                        .map(|v| v.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                };
-                print_gas_profile(
-                    &exec_profile,
-                    &format!(
-                        "Estimted {}({}) in {:?}, Gas Profile",
-                        fn_name, args_str, exec_elapsed
-                    ),
-                    gas_price,
-                );
-            }
-        }
-
-        warn!("Actual costs will depend on chain state and function arguments.");
+    AssembleResult {
+        program,
+        program_bytes: program_bytes.to_vec(),
+        public_functions,
     }
 }
 
-/// Parses a function call specification like "func(1,2,3)" or "func()".
+/// Compiles assembly and prints summary. No file output.
+fn cmd_build(input_path: &str) {
+    let result = assemble(input_path);
+    log_pub_fn_mapping(&result.public_functions);
+}
+
+/// Compiles assembly and writes bytecode to file.
 ///
-/// Returns the function name and a vector of i64 arguments.
-fn parse_function_call(s: &str) -> Option<(String, Vec<i64>)> {
+/// Defaults to `<input>.bin` if no path is given.
+fn cmd_output(input_path: &str, path: Option<String>) {
+    let result = assemble(input_path);
+    let output = path.unwrap_or_else(|| output_path_for(input_path, "bin"));
+
+    if let Err(e) = fs::write(&output, result.program_bytes.as_slice()) {
+        error!("Failed to write output file: {}", e);
+        process::exit(1);
+    }
+    info!("Wrote bytecode to {}", output);
+}
+
+/// Generates audit listing and writes it to file.
+///
+/// Defaults to `<input>.audit.txt` if no path is given.
+fn cmd_audit(input_path: &str, path: Option<String>) {
+    let _ = assemble(input_path);
+
+    let audit_listing = match assemble_file_audit(input_path) {
+        Ok(v) => v,
+        Err(e) => {
+            error!("Assembly audit failed: {}", e);
+            process::exit(1);
+        }
+    };
+
+    let output = path.unwrap_or_else(|| output_path_for(input_path, "audit.txt"));
+    if let Err(e) = fs::write(&output, audit_listing.as_bytes()) {
+        error!("Failed to write audit file: {}", e);
+        process::exit(1);
+    }
+    info!("Wrote audit listing to {}", output);
+}
+
+/// Predicts gas costs for deployment and specified function calls.
+fn cmd_predict(input_path: &str, gas_price: u64, predict_calls: Vec<(String, CallArgs)>) {
+    let result = assemble(input_path);
+    let public_functions = &result.public_functions;
+
+    // Extract __init__ args if provided
+    let mut runtime_calls = Vec::new();
+    let mut init_args = CallArgs {
+        values: Vec::new(),
+        items: Vec::new(),
+    };
+    for (name, args) in predict_calls {
+        if name == "__init__" {
+            init_args = args;
+        } else {
+            runtime_calls.push((name, args));
+        }
+    }
+
+    let ms = EmptyStorage {};
+    let base = ms.state_view();
+    let ctx = ExecContext {
+        chain_id: 0,
+        contract_id: Hash::zero(),
+        caller: Hash::zero(),
+    };
+
+    let deploy_intrinsic = Blockchain::<BlockValidator, RocksDbStorage>::intrinsic_gas_units(
+        TransactionType::DeployContract,
+        &Bytes::new(result.program_bytes),
+    );
+
+    if deploy_intrinsic > BLOCK_GAS_LIMIT {
+        error!(
+            "Intrinsic gas ({}) exceeds transaction limit ({})",
+            deploy_intrinsic, BLOCK_GAS_LIMIT
+        );
+        process::exit(1);
+    }
+
+    let mut vm = VM::new_deploy(
+        result.program.clone(),
+        BLOCK_GAS_LIMIT - deploy_intrinsic,
+        init_args.values,
+        init_args.items,
+    )
+    .unwrap_or_else(|e| {
+        error!("{e}");
+        process::exit(1)
+    });
+
+    let mut overlay = OverlayState::new(&base);
+    vm.run(&mut overlay, &ctx)
+        .unwrap_or_else(|_| process::exit(1));
+
+    let mut deploy_profile = vm.gas_profile();
+    deploy_profile.add(GasCategory::Intrinsic, deploy_intrinsic);
+    print_gas_profile(&deploy_profile, "Deployment Gas Profile", gas_price);
+
+    if !runtime_calls.is_empty() {
+        let mut calls_to_predict: Vec<(String, usize, CallArgs)> = Vec::new();
+        for (name, call_args) in runtime_calls {
+            if let Some(idx) = public_functions.iter().position(|f| *f == name) {
+                calls_to_predict.push((name, idx, call_args));
+            } else {
+                error!(
+                    "Function '{}' not found. Available: {}",
+                    name,
+                    public_functions.join(", ")
+                );
+                process::exit(1);
+            }
+        }
+
+        for (fn_name, fn_idx, call_args) in calls_to_predict {
+            let args_display = format_call_args(&call_args);
+            let exec_program = ExecuteProgram::new(
+                Hash::zero(),
+                fn_idx as i64,
+                call_args.values,
+                call_args.items,
+            );
+            let exec_data = exec_program.to_bytes();
+
+            let exec_intrinsic = Blockchain::<BlockValidator, RocksDbStorage>::intrinsic_gas_units(
+                TransactionType::InvokeContract,
+                &exec_data,
+            );
+
+            if exec_intrinsic > BLOCK_GAS_LIMIT {
+                warn!(
+                    "Function '{}': intrinsic gas ({}) exceeds limit, skipping",
+                    fn_name, exec_intrinsic
+                );
+                continue;
+            }
+
+            let exec_start = Instant::now();
+            let mut vm = VM::new_execute(
+                exec_program,
+                result.program.clone(),
+                BLOCK_GAS_LIMIT - exec_intrinsic,
+            )
+            .unwrap_or_else(|e| {
+                warn!("Function '{}': failed to create VM: {}", fn_name, e);
+                process::exit(1)
+            });
+
+            if let Err(e) = vm.run(&mut overlay, &ctx) {
+                warn!("Function '{}': execution failed: {}", fn_name, e);
+                continue;
+            }
+            let exec_elapsed = exec_start.elapsed();
+
+            let mut exec_profile = vm.gas_profile();
+            exec_profile.add(GasCategory::Intrinsic, exec_intrinsic);
+
+            print_gas_profile(
+                &exec_profile,
+                &format!(
+                    "Estimated {}({}) in {:?}, Gas Profile",
+                    fn_name, args_display, exec_elapsed
+                ),
+                gas_price,
+            );
+        }
+    }
+
+    warn!("Actual costs will depend on chain state.");
+}
+
+fn log_pub_fn_mapping(functions: &[impl AsRef<str>]) {
+    info!("Public function mapping:");
+    eprintln!("{{");
+    for i in 0..functions.len() {
+        eprint!("  \"{}\": {i}", functions[i].as_ref());
+        if i != functions.len() - 1 {
+            eprintln!(",");
+        } else {
+            eprintln!();
+        }
+    }
+    eprintln!("}}");
+}
+
+/// Parses a function call specification like `func(1,"hello",true)` or `func()`.
+///
+/// Supports integer, boolean, and double-quoted string arguments.
+/// Strings are stored in `CallArgs::items` and referenced via `Value::Ref`.
+fn parse_function_call(s: &str) -> Option<(String, CallArgs)> {
     let open = s.find('(')?;
     let close = s.rfind(')')?;
     if close <= open || close != s.len() - 1 {
@@ -403,21 +478,56 @@ fn parse_function_call(s: &str) -> Option<(String, Vec<i64>)> {
     }
 
     let args_str = s[open + 1..close].trim();
-    let args = if args_str.is_empty() {
-        Vec::new()
-    } else {
-        args_str
-            .split(',')
-            .map(|a| {
-                a.trim()
-                    .parse::<i64>()
-                    .map_err(|_| format!("invalid argument: {}", a))
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .ok()?
-    };
+    if args_str.is_empty() {
+        return Some((
+            name,
+            CallArgs {
+                values: Vec::new(),
+                items: Vec::new(),
+            },
+        ));
+    }
 
-    Some((name, args))
+    let mut values = Vec::new();
+    let mut items: Vec<Vec<u8>> = Vec::new();
+
+    for arg in args_str.split(',') {
+        let arg = arg.trim();
+        if arg == "true" {
+            values.push(Value::Bool(true));
+        } else if arg == "false" {
+            values.push(Value::Bool(false));
+        } else if let Some(s) = arg.strip_prefix('"').and_then(|a| a.strip_suffix('"')) {
+            let idx = items.len() as u32;
+            items.push(s.as_bytes().to_vec());
+            values.push(Value::Ref(idx));
+        } else if let Ok(v) = arg.parse::<i64>() {
+            values.push(Value::Int(v));
+        } else {
+            return None;
+        }
+    }
+
+    Some((name, CallArgs { values, items }))
+}
+
+/// Formats call arguments for display in gas profile titles.
+fn format_call_args(args: &CallArgs) -> String {
+    args.values
+        .iter()
+        .map(|v| match v {
+            Value::Int(n) => n.to_string(),
+            Value::Bool(b) => b.to_string(),
+            Value::Ref(idx) => {
+                if let Some(bytes) = args.items.get(*idx as usize) {
+                    format!("\"{}\"", String::from_utf8_lossy(bytes))
+                } else {
+                    format!("@{idx}")
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn format_with_commas(n: u64) -> String {
@@ -503,49 +613,46 @@ const USAGE: &str = "\
 Bytecode Assembler
 
 USAGE:
-    {program} <input.asm> [OPTIONS]
+    {program} [COMMAND] <input.asm> [OPTIONS]
 
 ARGS:
-    <input.asm>    Assembly source file to bytecode
+    <input.asm>    Assembly source file
 
-OPTIONS:
-    -o, --output <file>                   Optional output file path
-    -a, --audit [file]                    Print in-place audit view
-    -p, --predict [price] [func(args...)...] Estimate gas costs
-    -h, --help                            Print this help message
+COMMANDS:
+    help                                 Print this help message
+    build                                Compile and print summary (default)
+    output [file]                        Compile and write bytecode
+    audit  [file]                        Generate audit listing
+    predict [price] [func(args)...]      Estimate gas costs
 
 DESCRIPTION:
-    The -p/--predict option estimates gas costs for:
-    - Deployment: always predicted when -p is used
+    If no command is given, defaults to 'help' (no file output).
+
+    Default output paths when no file is specified:
+    - output:  <input>.bin
+    - audit:   <input>.audit.txt
+
+    The 'predict' command estimates gas costs for:
+    - Deployment: always predicted
     - Execution: predicted only for explicitly specified function calls
 
-    Function call syntax: func(arg1,arg2,...) where args are integers.
+    Function call syntax: func(arg1,arg2,...) where args can be:
+    - Integers: 42, -1, 0
+    - Booleans: true, false
+    - Strings:  \"hello\"
     Public functions are ordered alphabetically for the dispatcher.
 
 EXAMPLES:
-    # Compile to default output name
     {program} program.asm
-
-    # Compile and save the output
-    {program} program.asm -o output.bin
-
-    # Print audit listing to stdout
-    {program} program.asm -a
-
-    # Write audit listing to file
-    {program} program.asm --audit audit.txt
-
-    # Predict deployment only (price = 1)
-    {program} program.asm -p
-
-    # Predict deployment only with custom price
-    {program} program.asm -p 100
-
-    # Predict deployment + specific function execution
-    {program} program.asm -p 100 'factorial(5)'
-
-    # Predict deployment + multiple function executions
-    {program} program.asm -p 100 'factorial(5)' 'factorial(10)'
+    {program} build program.asm
+    {program} output program.asm
+    {program} output program.asm out.bin
+    {program} audit program.asm
+    {program} audit program.asm out.txt
+    {program} predict program.asm
+    {program} predict program.asm 100
+    {program} predict program.asm 100 'transfer(\"addr\",100)'
+    {program} predict program.asm 100 'factorial(5)' 'factorial(10)'
 ";
 
 fn print_usage(program: &str) {

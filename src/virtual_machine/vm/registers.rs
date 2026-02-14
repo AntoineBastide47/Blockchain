@@ -30,6 +30,7 @@ impl Value {
             (Value::Bool(b1), Value::Bool(b2)) => b1 == b2,
             (Value::Ref(r1), Value::Ref(r2)) => r1 == r2,
             (Value::Int(i1), Value::Int(i2)) => i1 == i2,
+            (Value::Bool(b), Value::Int(i)) | (Value::Int(i), Value::Bool(b)) => b as i64 == i,
             _ => {
                 return Err(VMError::InvalidComparison {
                     type1: va.type_name(),

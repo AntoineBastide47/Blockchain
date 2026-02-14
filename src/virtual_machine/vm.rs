@@ -519,13 +519,32 @@ impl VM {
     /// to execute from ip=0. For runtime calls, use [`new_execute`](Self::new_execute).
     ///
     /// Returns `OutOfGas` if the base deployment cost exceeds `max_gas`.
-    pub fn new_deploy(program: DeployProgram, max_gas: u64) -> Result<Self, VMError> {
+    pub fn new_deploy(
+        program: DeployProgram,
+        max_gas: u64,
+        constructor_args: Vec<Value>,
+        constructor_items: Vec<Vec<u8>>,
+    ) -> Result<Self, VMError> {
         let init_size = program.init_code.len();
         let total_bytes = init_size + program.runtime_code.len();
 
         // Concatenate init_code + runtime_code
         let mut data = program.init_code;
         data.extend(program.runtime_code);
+
+        let mut heap = Heap::new(program.memory);
+        let ref_offsets: Vec<u32> = constructor_items
+            .into_iter()
+            .map(|item| heap.append(item))
+            .collect();
+
+        let args: Vec<Value> = constructor_args
+            .into_iter()
+            .map(|arg| match arg {
+                Value::Ref(r) => Value::Ref(ref_offsets[r as usize]),
+                other => other,
+            })
+            .collect();
 
         let mut vm = Self {
             data,
@@ -534,12 +553,12 @@ impl VM {
             operand_metadata: None,
             operand_metadata_cursor: 0,
             registers: Registers::new(),
-            heap: Heap::new(program.memory),
+            heap,
             call_stack: Vec::new(),
             gas_used: 0,
             max_gas,
             gas_profile: GasProfile::new(),
-            args: vec![],
+            args,
             dispatch_selector: 0,
         };
 
@@ -561,17 +580,18 @@ impl VM {
         // the heap with any argument-owned items referenced via Value::Ref.
         // Labels are resolved as PC-relative offsets, so init_size is not needed.
         let mut heap = Heap::new(deploy.memory);
-        let heap_arg_base = heap.memory.len() as u32;
-        for item in execute.arg_items {
-            heap.append(item);
-        }
+        let ref_offsets: Vec<u32> = execute
+            .arg_items
+            .into_iter()
+            .map(|item| heap.append(item))
+            .collect();
 
-        // Pre-remap refs to point to their actual heap locations
+        // Remap refs from sequential indices to actual heap byte offsets
         let args: Vec<Value> = execute
             .args
             .into_iter()
             .map(|arg| match arg {
-                Value::Ref(r) => Value::Ref(heap_arg_base + r),
+                Value::Ref(r) => Value::Ref(ref_offsets[r as usize]),
                 other => other,
             })
             .collect();
@@ -1151,7 +1171,9 @@ impl VM {
                 Ge => op_ge(rd: Reg, rs1: Src, rs2: Src),
                 // Control Flow
                 CallHost => op_call_host(state, ctx; dst: Reg, fn_id: RefU32, argv: Reg),
+                CallHost0 => op_call_host0(state, ctx; dst: Reg, fn_id: RefU32),
                 Call => op_call(dst: Reg, offset: ImmI32, argv: Reg),
+                Call0 => op_call0(dst: Reg, offset: ImmI32),
                 Jal => op_jal(rd: Reg, offset: ImmI32),
                 Jalr => op_jalr(rd: Reg, rs: Reg, offset: ImmI32),
                 Beq => op_beq(rs1: Src, rs2: Src, offset: ImmI32),
@@ -1883,6 +1905,17 @@ impl VM {
         }
     }
 
+    fn op_call_host0<S: State>(
+        &mut self,
+        instr: &'static str,
+        state: &mut S,
+        ctx: &ExecContext,
+        dst: u8,
+        fn_id: u32,
+    ) -> Result<(), VMError> {
+        self.op_call_host(instr, state, ctx, dst, fn_id, 0)
+    }
+
     fn op_call(
         &mut self,
         instr: &'static str,
@@ -1905,6 +1938,10 @@ impl VM {
         });
 
         self.op_jump(instr, offset)
+    }
+
+    fn op_call0(&mut self, instr: &'static str, dst: u8, offset: i32) -> Result<(), VMError> {
+        self.op_call(instr, dst, offset, 0)
     }
 
     fn op_jal(&mut self, instr: &'static str, rd: u8, offset: i32) -> Result<(), VMError> {

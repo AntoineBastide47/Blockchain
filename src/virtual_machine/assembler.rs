@@ -1982,14 +1982,10 @@ pub fn extract_label_data<'a>(
 ///
 /// Collects tokenization errors into the provided vector and continues processing.
 /// Returns the processed source and optional dispatcher info for line adjustment.
-fn assemble_source_step_1<'a>(
-    source: &'a str,
+fn assemble_source_step_1(
+    source: &str,
     errors: &mut Vec<VMError>,
-) -> (
-    Option<String>,
-    Option<DispatcherInfo>,
-    Option<Vec<Label<'a>>>,
-) {
+) -> (Option<String>, Option<DispatcherInfo>) {
     // Track where to insert the dispatcher (line number where runtime starts).
     let mut insert_point = 0usize;
     // Collect all public label names (including trailing ':')
@@ -1997,12 +1993,12 @@ fn assemble_source_step_1<'a>(
         Ok(p) => p,
         Err(e) => {
             errors.push(e);
-            return (None, None, None);
+            return (None, None);
         }
     };
 
     if label_data.names.is_empty() && label_data.init_label.as_ref().is_none_or(|l| l.argc == 0) {
-        return (None, None, Some(label_data.data));
+        return (None, None);
     }
 
     let mut base = String::new();
@@ -2071,69 +2067,7 @@ fn assemble_source_step_1<'a>(
         init_calldata_after,
     };
 
-    (Some(out), Some(dispatcher_info), Some(label_data.data))
-}
-
-/// Validates that a `CALL` source argument count matches the target label's declared argc.
-fn validate_call_argc_against_label(
-    tokens: &[Token],
-    label_data: &[Label],
-    line_no: usize,
-    argc: u8,
-) -> Result<(), VMError> {
-    let func_name = tokens[2].text;
-    for label in label_data {
-        if label.name == func_name && label.argc != argc {
-            return Err(VMError::ParseErrorString {
-                line: line_no + 1,
-                offset: tokens[0].offset,
-                length: tokens[0].text.len(),
-                message: if argc == 1 {
-                    format!(
-                        "function '{}' expects {} argument, but 1 was provided",
-                        label.name, label.argc
-                    )
-                } else {
-                    format!(
-                        "function '{}' expects {} argument, but {} were provided",
-                        label.name, label.argc, argc
-                    )
-                },
-            });
-        }
-    }
-    Ok(())
-}
-
-/// Validates that a `CALL` source argv register matches the target label's declared `argr`.
-///
-/// This check is applied only when `argc > 0`, because argv is irrelevant for zero-arg calls.
-fn validate_call_argv_against_label(
-    tokens: &[Token],
-    label_data: &[Label],
-    line_no: usize,
-    argc: u8,
-) -> Result<(), VMError> {
-    if argc == 0 {
-        return Ok(());
-    }
-
-    let func_name = tokens[2].text;
-    let argv = parse_reg(tokens[4].text)?;
-    for label in label_data {
-        if label.name == func_name && label.argr != argv {
-            return Err(VMError::ParseErrorString {
-                line: line_no + 1,
-                offset: tokens[4].offset,
-                length: tokens[4].text.len(),
-                message: format!(
-                    "function '{}' expects argv register r{}, but r{} was provided",
-                    label.name, label.argr, argv
-                ),
-            });
-        }
-    }
-    Ok(())
+    (Some(out), Some(dispatcher_info))
 }
 
 /// Validates that a `CALL_HOST` source argument count matches host function arity.
@@ -2179,12 +2113,11 @@ fn validate_call_host_argc(tokens: &[Token], line_no: usize, argc: u8) -> Result
     Ok(())
 }
 
-/// Normalizes `CALL` and `CALL_HOST` source forms:
+/// Normalizes `CALL_HOST` source forms:
 /// - Source must include `argc` for validation.
 /// - Bytecode form omits `argc`, so this strips it before instruction parsing.
 fn normalize_call_tokens<'a>(
     tokens: &[Token<'a>],
-    label_data: &[Label<'a>],
     line_no: usize,
 ) -> Result<Vec<Token<'a>>, VMError> {
     if tokens.is_empty() {
@@ -2192,25 +2125,6 @@ fn normalize_call_tokens<'a>(
     }
 
     let opcode = tokens[0].text;
-
-    if opcode == Instruction::Call.mnemonic() {
-        if tokens.len() != 5 {
-            return Err(VMError::ArityMismatch {
-                instruction: tokens[0].text.to_string(),
-                expected: 4,
-                actual: tokens.len() as u8 - 1,
-            });
-        }
-        let argc = parse_u8(tokens[3].text, line_no + 1, tokens[3].offset)?;
-        validate_call_argc_against_label(tokens, label_data, line_no, argc)?;
-        validate_call_argv_against_label(tokens, label_data, line_no, argc)?;
-        return Ok(vec![
-            tokens[0].clone(),
-            tokens[1].clone(),
-            tokens[2].clone(),
-            tokens[4].clone(),
-        ]);
-    }
 
     if opcode == Instruction::CallHost.mnemonic() {
         if tokens.len() != 5 {
@@ -2278,11 +2192,7 @@ struct LabelAnchor {
 /// concatenated address space (init || runtime).
 ///
 /// Collects errors into the provided vector and continues processing where possible.
-fn assemble_source_step_2<'a>(
-    source: &'a str,
-    label_data: Vec<Label<'a>>,
-    errors: &mut Vec<VMError>,
-) -> Pass1Result<'a> {
+fn assemble_source_step_2<'a>(source: &'a str, errors: &mut Vec<VMError>) -> Pass1Result<'a> {
     let mut asm_context = AsmContext::new();
 
     // First pass: tokenize all lines, detect sections, compute global offsets
@@ -2363,7 +2273,7 @@ fn assemble_source_step_2<'a>(
         if raw_tokens.is_empty() {
             continue;
         }
-        let tokens = match normalize_call_tokens(&raw_tokens, &label_data, line_no) {
+        let tokens = match normalize_call_tokens(&raw_tokens, line_no) {
             Ok(t) => t,
             Err(e) => {
                 errors.push(e);
@@ -2852,8 +2762,7 @@ pub fn assemble_source_audit(source: impl Into<String>) -> Result<String, VMErro
     }
     let normalized_source = normalized.unwrap_or_else(|| source.clone());
 
-    let (processed, dispatcher_info, label_data) =
-        assemble_source_step_1(&normalized_source, &mut errors);
+    let (processed, dispatcher_info) = assemble_source_step_1(&normalized_source, &mut errors);
     if processed.is_none() && !errors.is_empty() {
         let err = errors.into_iter().next().unwrap_or(VMError::AssemblyError {
             line: 0,
@@ -2865,8 +2774,7 @@ pub fn assemble_source_audit(source: impl Into<String>) -> Result<String, VMErro
     }
 
     let final_source = processed.unwrap_or_else(|| normalized_source.clone());
-    let mut pass1 =
-        assemble_source_step_2(&final_source, label_data.unwrap_or_default(), &mut errors);
+    let mut pass1 = assemble_source_step_2(&final_source, &mut errors);
     if !errors.is_empty() {
         let err = errors.remove(0);
         return Err(adjust_error_line(err, dispatcher_info));
@@ -2965,8 +2873,7 @@ fn assemble_source_with_name(source: String, source_name: &str) -> Result<Deploy
     }
     let normalized_source = normalized.unwrap_or_else(|| source.clone());
 
-    let (processed, dispatcher_info, label_data) =
-        assemble_source_step_1(&normalized_source, &mut errors);
+    let (processed, dispatcher_info) = assemble_source_step_1(&normalized_source, &mut errors);
     if processed.is_none() {
         flush_assembly_errors(
             &mut errors,
@@ -2977,8 +2884,7 @@ fn assemble_source_with_name(source: String, source_name: &str) -> Result<Deploy
     }
 
     let final_source = processed.unwrap_or_else(|| normalized_source.clone());
-    let mut pass1 =
-        assemble_source_step_2(&final_source, label_data.unwrap_or_default(), &mut errors);
+    let mut pass1 = assemble_source_step_2(&final_source, &mut errors);
     flush_assembly_errors(
         &mut errors,
         source_name,
@@ -3551,25 +3457,13 @@ MOVE r3, 42
     }
 
     #[test]
-    fn assemble_call_argc_u8() {
-        // CALL source keeps argc for validation, bytecode omits it.
-        // Label-based fn_id is relaxed after step 2.5 and may use 1/2/4 bytes.
-        let program = assemble_source("my_func(5, r2):\nCALL r0, my_func, 5, r2").unwrap();
-        let (instr, has_metadata) = Instruction::decode_opcode(program.runtime_code[0]).unwrap();
+    fn assemble_call_simple() {
+        // CALL func — label-based fn_id may use 1/2/4 bytes.
+        let program = assemble_source("my_func:\nCALL my_func").unwrap();
+        let (instr, _has_metadata) = Instruction::decode_opcode(program.runtime_code[0]).unwrap();
         assert_eq!(instr, Instruction::Call);
-        let dst_index = if has_metadata {
-            assert!(matches!(
-                program.runtime_code[1],
-                x if x == ImmI32MetadataState::Len2 as u8 || x == ImmI32MetadataState::Len4 as u8
-            ));
-            2usize
-        } else {
-            // Len1 is default, so metadata byte is omitted.
-            1usize
-        };
-        assert_eq!(program.runtime_code[dst_index], 0); // dst = r0
-        assert_eq!(*program.runtime_code.last().unwrap(), 2); // argv = r2
-        assert!((4..=8).contains(&program.runtime_code.len()));
+        // opcode + fn_id (variable length)
+        assert!((2..=6).contains(&program.runtime_code.len()));
     }
 
     #[test]
@@ -3582,16 +3476,9 @@ MOVE r3, 42
     }
 
     #[test]
-    fn assemble_call_argc_max_u8() {
-        let source = "f(255, r0):\nRET r0\nCALL r0, f, 255, r0";
+    fn assemble_call_with_ret() {
+        let source = "f:\nRET\nCALL f";
         assert!(assemble_source(source).is_ok());
-    }
-
-    #[test]
-    fn assemble_call_argc_overflow() {
-        // 256 exceeds u8 range
-        let err = assemble_source("f(1, r0):\nRET r0\nCALL r0, f, 256, r0").unwrap_err();
-        assert!(matches!(err, VMError::ParseErrorString { .. }));
     }
 
     // ==================== Sections ====================
@@ -3686,7 +3573,7 @@ MOVE r1, "runtime"
 
     #[test]
     fn init_rejects_ret() {
-        let source = "__init__:\nMOVE r0, 1\nRET r0\nmain:\nMOVE r1, 2";
+        let source = "__init__:\nMOVE r0, 1\nRET\nmain:\nMOVE r1, 2";
         let err = assemble_source(source).unwrap_err();
         assert!(matches!(
             err,
@@ -3710,7 +3597,7 @@ MOVE r0, 1
 HALT
 
 pub factorial(1, r1):
-RET r1
+RET
 "#;
         let program = assemble_source(source).unwrap();
         assert_eq!(program.init_code[0], Instruction::Move as u8);
@@ -3885,33 +3772,7 @@ RET r1
         assert!(matches!(err, VMError::ParseErrorString { line: 100, .. }));
     }
 
-    // ==================== Call argc validation ====================
-
-    #[test]
-    fn call_argc_mismatch() {
-        let source = "add(2, r0):\nRET r0\nCALL r1, add, 3, r2";
-        let err = assemble_source(source).unwrap_err();
-        assert!(matches!(err, VMError::ParseErrorString { .. }));
-    }
-
-    #[test]
-    fn call_argc_correct() {
-        let source = "add(2, r0):\nADD r0, r0, r1\nRET r0\nCALL r1, add, 2, r0";
-        assert!(assemble_source(source).is_ok());
-    }
-
-    #[test]
-    fn call_argv_mismatch() {
-        let source = "add(2, r5):\nADD r5, r5, r6\nRET r5\nCALL r1, add, 2, r2";
-        let err = assemble_source(source).unwrap_err();
-        assert!(matches!(err, VMError::ParseErrorString { .. }));
-    }
-
-    #[test]
-    fn call_argv_ignored_when_argc_zero() {
-        let source = "noop:\nRET r0\nCALL r1, noop, 0, r255";
-        assert!(assemble_source(source).is_ok());
-    }
+    // ==================== Call host argc validation ====================
 
     #[test]
     fn call_host_argc_mismatch() {

@@ -26,7 +26,6 @@ mod gas;
 mod heap;
 mod registers;
 
-use context::CallFrame;
 pub use context::ExecContext;
 pub use gas::{BLOCK_GAS_LIMIT, GasCategory, GasProfile};
 use heap::Heap;
@@ -497,8 +496,8 @@ pub struct VM {
     registers: Registers,
     /// Heap for const and execution memory.
     heap: Heap,
-    /// Call stack for function calls.
-    call_stack: Vec<CallFrame>,
+    /// Call stack storing return addresses for function calls.
+    call_stack: Vec<usize>,
     /// Total gas consumed during execution.
     gas_used: u64,
     /// Maximum gas allowed for this execution; exceeding it triggers `OutOfGas`.
@@ -646,11 +645,8 @@ impl VM {
             eprintln!("note: call stack is empty");
         } else {
             eprintln!("note: call stack (most recent first):");
-            for (depth, frame) in self.call_stack.iter().rev().enumerate() {
-                eprintln!(
-                    "  {depth}: return to ip {} -> r{}",
-                    frame.return_addr, frame.dst_reg
-                );
+            for (depth, return_addr) in self.call_stack.iter().rev().enumerate() {
+                eprintln!("  {depth}: return to ip {return_addr}");
             }
         }
 
@@ -1172,8 +1168,7 @@ impl VM {
                 // Control Flow
                 CallHost => op_call_host(state, ctx; dst: Reg, fn_id: RefU32, argv: Reg),
                 CallHost0 => op_call_host0(state, ctx; dst: Reg, fn_id: RefU32),
-                Call => op_call(dst: Reg, offset: ImmI32, argv: Reg),
-                Call0 => op_call0(dst: Reg, offset: ImmI32),
+                Call => op_call(offset: ImmI32),
                 Jal => op_jal(rd: Reg, offset: ImmI32),
                 Jalr => op_jalr(rd: Reg, rs: Reg, offset: ImmI32),
                 Beq => op_beq(rs1: Src, rs2: Src, offset: ImmI32),
@@ -1183,7 +1178,7 @@ impl VM {
                 Bltu => op_bltu(rs1: Src, rs2: Src, offset: ImmI32),
                 Bgeu => op_bgeu(rs1: Src, rs2: Src, offset: ImmI32),
                 Jump => op_jump(offset: ImmI32),
-                Ret => op_ret(rs: Reg),
+                Ret => op_ret(),
                 Halt => op_halt(),
                 // Data and Memory access
                 CallDataLoad => op_call_data_load(rd: Reg),
@@ -1916,13 +1911,7 @@ impl VM {
         self.op_call_host(instr, state, ctx, dst, fn_id, 0)
     }
 
-    fn op_call(
-        &mut self,
-        instr: &'static str,
-        dst: u8,
-        offset: i32,
-        _argv: u8,
-    ) -> Result<(), VMError> {
+    fn op_call(&mut self, instr: &'static str, offset: i32) -> Result<(), VMError> {
         self.charge_call(self.call_stack.len(), 10)?;
 
         if self.call_stack.len() >= MAX_CALL_STACK_LEN {
@@ -1932,16 +1921,8 @@ impl VM {
             });
         }
 
-        self.call_stack.push(CallFrame {
-            return_addr: self.ip,
-            dst_reg: dst,
-        });
-
+        self.call_stack.push(self.ip);
         self.op_jump(instr, offset)
-    }
-
-    fn op_call0(&mut self, instr: &'static str, dst: u8, offset: i32) -> Result<(), VMError> {
-        self.op_call(instr, dst, offset, 0)
     }
 
     fn op_jal(&mut self, instr: &'static str, rd: u8, offset: i32) -> Result<(), VMError> {
@@ -2061,14 +2042,11 @@ impl VM {
         Ok(())
     }
 
-    fn op_ret(&mut self, _instr: &'static str, rs: u8) -> Result<(), VMError> {
-        let frame = self.call_stack.pop().ok_or(VMError::ReturnWithoutCall {
+    fn op_ret(&mut self, _instr: &'static str) -> Result<(), VMError> {
+        let return_addr = self.call_stack.pop().ok_or(VMError::ReturnWithoutCall {
             call_depth: self.call_stack.len(),
         })?;
-
-        let ret_val = *self.registers.get(rs)?;
-        self.registers.set(frame.dst_reg, ret_val)?;
-        self.ip = frame.return_addr;
+        self.ip = return_addr;
         Ok(())
     }
 
@@ -2272,10 +2250,7 @@ impl VM {
         self.op_call_data_load(instr, argr)?;
         // Push a call frame whose return address is past all bytecode,
         // so RET will cause the main loop to exit cleanly (like HALT).
-        self.call_stack.push(CallFrame {
-            return_addr: self.data.len(),
-            dst_reg: 0,
-        });
+        self.call_stack.push(self.data.len());
         // Jump to the target function
         self.op_jump(instr, offset)
     }

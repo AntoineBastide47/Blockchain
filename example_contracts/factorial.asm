@@ -1,7 +1,7 @@
 __init__:                         # Contract constructor
     MOVE r1, 5
-    CALL r2, factorial, 1, r1     # r2 = 5! = 120
-    SHA3 r2, 1, r2                # hash the value
+    CALL factorial                # r3 = 5! = 120
+    SHA3 r2, 1, r3                # hash the value
     STORE "hash", r2              # Store the hashes value at key "hash"
     HALT
 
@@ -13,4 +13,4 @@ pub factorial(1, r1):
         MUL r3, r3, r1            # result *= i
         DEC r1                    # i--
         BGE r1, 1, __fact_loop    # while n >= 1
-    RET r3
+    RET

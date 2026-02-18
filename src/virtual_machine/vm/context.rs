@@ -12,12 +12,3 @@ pub struct ExecContext {
     /// Address of the account that initiated the current transaction.
     pub caller: Hash,
 }
-
-/// Call stack frame storing return address and destination register.
-#[derive(Clone, Debug)]
-pub(super) struct CallFrame {
-    /// Return address (bytecode offset to resume after call).
-    pub(super) return_addr: usize,
-    /// Destination register for return value.
-    pub(super) dst_reg: u8,
-}

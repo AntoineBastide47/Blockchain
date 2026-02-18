@@ -137,10 +137,8 @@ macro_rules! for_each_instruction {
             CallHost = 0x40, "CALL_HOST" => [dst: Reg, fn_id: RefU32, argv: Reg], 100,
             /// CALL_HOST0 dst, fn ; call host function fn with no args ; return -> dst
             CallHost0 = 0x41, "CALL_HOST0" => [dst: Reg, fn_id: RefU32], 100,
-            /// CALL dst, fn, argv ; call function fn with args from regs[argv...] ; return -> dst
-            Call = 0x42, "CALL" => [dst: Reg, fn_id: ImmI32, argv: Reg], 50,
-            /// CALL0 dst, fn ; call function fn with no args ; return -> dst
-            Call0 = 0x43, "CALL0" => [dst: Reg, fn_id: ImmI32], 50,
+            /// CALL fn ; call function fn
+            Call = 0x42, "CALL" => [fn_id: ImmI32], 50,
             /// JAL rd, offset ; rd = PC + instr_size; PC += offset (jump and link)
             Jal = 0x44, "JAL" => [rd: Reg, offset: ImmI32], 5,
             /// JALR rd, rs, offset ; rd = PC + instr_size; PC = rs + offset (jump and link register)
@@ -159,8 +157,8 @@ macro_rules! for_each_instruction {
             Bgeu = 0x4B, "BGEU" => [rs1: Src, rs2: Src, offset: ImmI32], 5,
             /// JUMP offset ; PC += offset (unconditional jump)
             Jump = 0x4C, "JUMP" => [offset: ImmI32], 5,
-            /// RET rs ; return from function call with value in rs
-            Ret = 0x4D, "RET" => [rs: Reg], 5,
+            /// RET ; return from function call
+            Ret = 0x4D, "RET" => [], 5,
             /// HALT ; stop execution immediately
             Halt = 0x4E, "HALT" => [], 1,
             // =========================

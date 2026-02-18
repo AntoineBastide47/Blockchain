@@ -1347,15 +1347,15 @@ fn jalr_indirect_jump() {
 
 #[test]
 fn call_and_ret_simple() {
-    // Call a function that returns a constant
+    // Call a function that sets r1
     let source = r#"
             JAL r10, main
             main:
-            CALL r1, double, 0, r10
+            CALL double
             JAL r10, end
             double:
-            MOVE r10, 42
-            RET r10
+            MOVE r1, 42
+            RET
             end:
         "#;
     let vm = run_vm(source);
@@ -1364,18 +1364,18 @@ fn call_and_ret_simple() {
 
 #[test]
 fn call_nested() {
-    // Nested function calls
+    // Nested function calls — inner writes r1, outer propagates it
     let source = r#"
             JAL r10, main
             main:
-            CALL r1, outer, 0, r10
+            CALL outer
             JAL r10, end
             outer:
-            CALL r2, inner, 0, r10
-            RET r2
+            CALL inner
+            RET
             inner:
-            MOVE r10, 99
-            RET r10
+            MOVE r1, 99
+            RET
             end:
         "#;
     let vm = run_vm(source);
@@ -1384,14 +1384,14 @@ fn call_nested() {
 
 #[test]
 fn call_undefined_function() {
-    let source = r#"CALL r10, nonexistent, 0, r10"#;
+    let source = r#"CALL nonexistent"#;
     let err = run_expect_err(source);
     assert!(matches!(err, VMError::AssemblyError { .. }));
 }
 
 #[test]
 fn ret_without_call() {
-    let source = "MOVE r10, 1\nRET r10";
+    let source = "MOVE r10, 1\nRET";
     let err = run_expect_err(source);
     assert!(matches!(err, VMError::ReturnWithoutCall { .. }));
 }
@@ -1402,16 +1402,16 @@ fn call_preserves_registers() {
             JAL r10, main
             main:
             MOVE r5, 100
-            CALL r1, func, 0, r10
+            CALL func
             ADD r2, r1, r5
             JAL r10, end
             func:
-            MOVE r10, 50
-            RET r10
+            MOVE r1, 50
+            RET
             end:
         "#;
     let vm = run_vm(source);
-    // r1 = 50 (return value), r5 = 100, r2 = 150
+    // r1 = 50 (set by func), r5 = 100, r2 = 150
     assert_eq!(vm.registers.get_int(2, "").unwrap(), 150);
 }
 
@@ -1473,23 +1473,23 @@ fn deeply_nested_calls() {
     let source = r#"
             JAL r10, main
             main:
-            CALL r1, f1, 0, r10
+            CALL f1
             JAL r10, end
             f1:
-            CALL r2, f2, 0, r10
-            RET r2
+            CALL f2
+            RET
             f2:
-            CALL r3, f3, 0, r10
-            RET r3
+            CALL f3
+            RET
             f3:
-            CALL r4, f4, 0, r10
-            RET r4
+            CALL f4
+            RET
             f4:
-            CALL r5, f5, 0, r10
-            RET r5
+            CALL f5
+            RET
             f5:
-            MOVE r10, 777
-            RET r10
+            MOVE r1, 777
+            RET
             end:
         "#;
     let vm = run_vm(source);
@@ -1499,38 +1499,39 @@ fn deeply_nested_calls() {
 #[test]
 fn call_stack_unwind_on_multiple_returns() {
     // Each function returns, properly unwinding the stack
+    // Callee writes result to r20; caller accumulates into r4
     let source = r#"
             JAL r10, main
             main:
-            MOVE r10, 1
-            CALL r1, add_ten, 0, r10
-            CALL r2, add_ten, 0, r10
-            CALL r3, add_ten, 0, r10
-            ADD r4, r1, r2
-            ADD r4, r4, r3
+            CALL add_ten
+            ADD r4, r4, r20
+            CALL add_ten
+            ADD r4, r4, r20
+            CALL add_ten
+            ADD r4, r4, r20
             JAL r10, end
             add_ten:
             MOVE r20, 10
-            RET r20
+            RET
             end:
         "#;
     let vm = run_vm(source);
-    // Three calls each return 10, sum should be 30
+    // Three calls each set r20=10, accumulated sum should be 30
     assert_eq!(vm.registers.get_int(4, "").unwrap(), 30);
 }
 
 #[test]
-fn call_overwrites_dst_register_with_return_value() {
-    // Verify that the destination register is correctly overwritten
+fn call_overwrites_register_via_callee() {
+    // Callee directly writes to r5 in shared register file
     let source = r#"
             JAL r10, main
             main:
             MOVE r5, 999
-            CALL r5, get_42, 0, r10
+            CALL get_42
             JAL r10, end
             get_42:
-            MOVE r10, 42
-            RET r10
+            MOVE r5, 42
+            RET
             end:
         "#;
     let vm = run_vm(source);
@@ -1545,7 +1546,7 @@ fn return_from_recursive_call() {
             JAL r10, main
             main:
             MOVE r1, 3
-            CALL r2, countdown, 0, r10
+            CALL countdown
             JAL r10, end
 
             countdown:
@@ -1553,29 +1554,29 @@ fn return_from_recursive_call() {
             MOVE r11, 1
             BEQ r1, r10, done
             SUB r1, r1, r11
-            CALL r12, countdown, 0, r10
+            CALL countdown
             done:
-            RET r1
+            RET
 
             end:
         "#;
     let vm = run_vm(source);
     // After countdown, r1 should be 0
-    assert_eq!(vm.registers.get_int(2, "").unwrap(), 0);
+    assert_eq!(vm.registers.get_int(1, "").unwrap(), 0);
 }
 
 #[test]
 fn multiple_ret_without_call_fails() {
-    // First RET succeeds, second RET should fail
+    // First RET succeeds, second RET should fail (but is never reached)
     let source = r#"
             JAL r10, main
             main:
-            CALL r1, func, 0, r10
+            CALL func
             JAL r10, end
             func:
-            MOVE r10, 1
-            RET r10
-            RET r10
+            MOVE r1, 1
+            RET
+            RET
             end:
         "#;
     // This should succeed because the second RET is never reached
@@ -1586,27 +1587,26 @@ fn multiple_ret_without_call_fails() {
 #[test]
 fn ret_with_empty_stack_fails() {
     // Direct RET without any CALL
-    let source = "MOVE r10, 42\nRET r10";
+    let source = "MOVE r10, 42\nRET";
     let err = run_expect_err(source);
     assert!(matches!(err, VMError::ReturnWithoutCall { .. }));
 }
 
 #[test]
-fn call_then_jal_then_ret_fails() {
-    // CALL pushes frame, but JAL jumps away and RET finds wrong context
+fn call_then_jal_then_ret() {
+    // CALL pushes frame, JAL jumps within function, RET still finds frame
     let source = r#"
             JAL r10, main
             main:
-            CALL r1, func, 0, r10
+            CALL func
             JAL r10, end
             func:
             JAL r10, escape
             escape:
-            MOVE r10, 1
-            RET r10
+            MOVE r1, 1
+            RET
             end:
         "#;
-    // This should work because RET still finds the call frame
     let vm = run_vm(source);
     assert_eq!(vm.registers.get_int(1, "").unwrap(), 1);
 }
@@ -1617,19 +1617,22 @@ fn call_stack_isolation_between_calls() {
     let source = r#"
             JAL r10, main
             main:
-            CALL r1, ret_10, 0, r10
-            CALL r2, ret_20, 0, r10
-            CALL r3, ret_30, 0, r10
+            CALL ret_10
+            MOVE r1, r20
+            CALL ret_20
+            MOVE r2, r20
+            CALL ret_30
+            MOVE r3, r20
             JAL r10, end
             ret_10:
-            MOVE r10, 10
-            RET r10
+            MOVE r20, 10
+            RET
             ret_20:
-            MOVE r10, 20
-            RET r10
+            MOVE r20, 20
+            RET
             ret_30:
-            MOVE r10, 30
-            RET r10
+            MOVE r20, 30
+            RET
             end:
         "#;
     let vm = run_vm(source);
@@ -1639,48 +1642,45 @@ fn call_stack_isolation_between_calls() {
 }
 
 #[test]
-fn call_with_same_dst_as_return_reg() {
-    // Return value goes to same register used inside function
+fn call_writes_shared_register() {
+    // Callee writes directly to shared register
     let source = r#"
             JAL r9, main
             main:
-            CALL r10, func, 0, r10
+            CALL func
             JAL r9, end
             func:
             MOVE r10, 42
-            RET r10
+            RET
             end:
         "#;
     let vm = run_vm(source);
-    // r10 should have return value 42
     assert_eq!(vm.registers.get_int(10, "").unwrap(), 42);
 }
 
 #[test]
 fn nested_call_return_value_propagation() {
-    // Return value flows through nested calls
+    // Value accumulates through nested calls via shared r1
     let source = r#"
             JAL r10, main
             main:
-            CALL r1, outer, 0, r10
+            CALL outer
             JAL r10, end
             outer:
-            CALL r2, middle, 0, r10
-            MOVE r3, 1
-            ADD r2, r2, r3
-            RET r2
+            CALL middle
+            ADD r1, r1, 1
+            RET
             middle:
-            CALL r4, inner, 0, r10
-            MOVE r5, 1
-            ADD r4, r4, r5
-            RET r4
+            CALL inner
+            ADD r1, r1, 1
+            RET
             inner:
-            MOVE r6, 1
-            RET r6
+            MOVE r1, 1
+            RET
             end:
         "#;
     let vm = run_vm(source);
-    // inner returns 1, middle adds 1 = 2, outer adds 1 = 3
+    // inner sets 1, middle adds 1 = 2, outer adds 1 = 3
     assert_eq!(vm.registers.get_int(1, "").unwrap(), 3);
 }
 
@@ -1690,32 +1690,31 @@ fn call_stack_empty_after_balanced_calls() {
     let source = r#"
             JAL r10, main
             main:
-            CALL r1, a, 0, r10
-            CALL r2, b, 0, r10
+            CALL a
+            CALL b
             JAL r10, end
             a:
-            MOVE r10, 1
-            RET r10
+            MOVE r1, 1
+            RET
             b:
-            MOVE r10, 2
-            RET r10
+            MOVE r2, 2
+            RET
             end:
         "#;
     let vm = run_vm(source);
-    // Call stack should be empty after execution
     assert!(vm.call_stack.is_empty());
 }
 
 #[test]
 fn return_zero_value() {
-    // Return the Zero value from an uninitialized register
+    // Callee leaves r1 as default zero
     let source = r#"
             JAL r10, main
             main:
-            CALL r1, ret_zero, 0, r10
+            CALL ret_zero
             JAL r10, end
             ret_zero:
-            RET r50
+            RET
             end:
         "#;
     let vm = run_vm(source);
@@ -1724,15 +1723,15 @@ fn return_zero_value() {
 
 #[test]
 fn return_bool_value() {
-    // Return a boolean value
+    // Callee writes a boolean into r1
     let source = r#"
             JAL r10, main
             main:
-            CALL r1, ret_bool, 0, r10
+            CALL ret_bool
             JAL r10, end
             ret_bool:
-            MOVE r10, true
-            RET r10
+            MOVE r1, true
+            RET
             end:
         "#;
     let vm = run_vm(source);
@@ -1741,15 +1740,15 @@ fn return_bool_value() {
 
 #[test]
 fn return_ref_value() {
-    // Return a string reference
+    // Callee writes a string reference into r1
     let source = r#"
             JAL r10, main
             main:
-            CALL r1, ret_str, 0, r10
+            CALL ret_str
             JAL r10, end
             ret_str:
-            MOVE r10, "hello"
-            RET r10
+            MOVE r1, "hello"
+            RET
             end:
         "#;
     let vm = run_vm(source);
@@ -2113,7 +2112,7 @@ fn host_hash_is_now_invalid_function() {
     ));
 }
 
-// --- CALL_HOST0 / CALL0 direct mnemonics ---
+// --- CALL_HOST0 direct mnemonic ---
 
 #[test]
 fn call_host0_assembles() {
@@ -2165,18 +2164,18 @@ fn call_host_hash_is_now_invalid_function_with_string_arg() {
     ));
 }
 
-// --- removed call aliases ---
+// --- CALL with labels ---
 
 #[test]
-fn call_basic_with_explicit_argc_and_argv() {
+fn call_basic_with_label() {
     let source = r#"
             JUMP skip_fn
             my_func(1, r10):
-                MOVE r10, 100
-                RET r10
+                MOVE r1, 100
+                RET
             skip_fn:
             MOVE r10, 99
-            CALL r1, my_func, 1, r10
+            CALL my_func
         "#;
     assert_eq!(run_and_get_int(source, 1), 100);
 }
@@ -2186,26 +2185,26 @@ fn call_with_argument_register_preloaded() {
     let source = r#"
             JUMP skip_fn
             my_func(1, r255):
-                RET r255
+                RET
             skip_fn:
             MOVE r255, 42
-            CALL r1, my_func, 1, r255
+            CALL my_func
         "#;
-    assert_eq!(run_and_get_int(source, 1), 42);
+    assert_eq!(run_and_get_int(source, 255), 42);
 }
 
 #[test]
-fn call_to_public_function_uses_declared_arity_validation() {
+fn call_to_public_function() {
     let source = r#"
             __init__:
             MOVE r127, 42
-            CALL r9, foo, 1, r127
+            CALL foo
             HALT
 
             pub foo(1, r127):
-                RET r127
+                RET
         "#;
-    assert_eq!(run_and_get_int(source, 9), 42);
+    assert_eq!(run_and_get_int(source, 127), 42);
 }
 
 // ==================== CallDataLoad ====================

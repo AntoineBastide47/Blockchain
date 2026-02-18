@@ -456,12 +456,25 @@ impl<T: Transport> Server<T> {
                 header.state_root,
                 self.chain.state_root()
             );
-            let action = {
-                let mut sync = self.sync_manager.lock().unwrap();
-                sync.trigger_resync()
-            };
-            if let Err(e) = self.execute_sync_action(action).await {
-                warn!("failed to execute resync action: {e}");
+            match self.chain.replay_from_last_snapshot() {
+                Ok(height) => {
+                    info!("replayed from snapshot to height={height}");
+                    let mut sync = self.sync_manager.lock().unwrap();
+                    sync.update_local_state(
+                        self.chain.height(),
+                        self.chain.header_height(),
+                        self.chain.storage_tip(),
+                    );
+                }
+                Err(_) => {
+                    let action = {
+                        let mut sync = self.sync_manager.lock().unwrap();
+                        sync.trigger_resync()
+                    };
+                    if let Err(e) = self.execute_sync_action(action).await {
+                        warn!("failed to execute resync action: {e}");
+                    }
+                }
             }
             return Ok(());
         }
@@ -776,20 +789,35 @@ impl<T: Transport> Server<T> {
                     || err_str.contains("account not found")
                 {
                     warn!(
-                        "block {} replay failed: {err} - state mismatch, attempting genesis reset",
+                        "block {} replay failed: {err} - state mismatch, attempting snapshot replay",
                         block.header.height
                     );
-                    // Reset to genesis and retry block sync from the beginning
-                    let genesis = Self::genesis_block(DEV_CHAIN_ID, &self.genesis_accounts);
-                    if let Err(reset_err) =
-                        self.chain.reset_to_genesis(genesis, &self.genesis_accounts)
-                    {
-                        error!("failed to reset to genesis: {reset_err}");
+                    // Try replaying from the nearest snapshot first.
+                    let replay_ok = match self.chain.replay_from_last_snapshot() {
+                        Ok(height) => {
+                            info!("replayed from snapshot to height={height}");
+                            true
+                        }
+                        Err(replay_err) => {
+                            warn!(
+                                "snapshot replay failed: {replay_err}, falling back to genesis reset"
+                            );
+                            let genesis = Self::genesis_block(DEV_CHAIN_ID, &self.genesis_accounts);
+                            match self.chain.reset_to_genesis(genesis, &self.genesis_accounts) {
+                                Ok(()) => true,
+                                Err(reset_err) => {
+                                    error!("failed to reset to genesis: {reset_err}");
+                                    false
+                                }
+                            }
+                        }
+                    };
+                    if !replay_ok {
                         let mut sync = self.sync_manager.lock().unwrap();
                         sync.set_idle_failed();
                         return Ok(());
                     }
-                    info!("reset to genesis successful, restarting sync");
+                    info!("recovery successful, restarting sync");
                     let action = {
                         let mut sync = self.sync_manager.lock().unwrap();
                         sync.update_local_state(

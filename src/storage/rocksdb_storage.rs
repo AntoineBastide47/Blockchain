@@ -27,7 +27,7 @@ use sparse_merkle_tree::default_store::DefaultStore;
 use sparse_merkle_tree::traits::Value;
 use sparse_merkle_tree::{H256, SparseMerkleTree};
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// Column family name for block headers indexed by hash.
 pub const CF_HEADERS: &str = "headers";
@@ -186,26 +186,51 @@ impl Inner {
 /// State is managed via an in-memory sparse Merkle tree with leaves persisted to
 /// CF_STATE. The SMT is rebuilt from disk on startup, enabling fast merkle proofs
 /// without disk I/O during execution.
+///
+/// Uses [`RwLock`] for concurrent read access (block/header lookups, state queries)
+/// with exclusive writes (block append, state mutations, resets). State reads that
+/// find the SMT unloaded transparently fall back to a write lock to reload from disk.
 pub struct RocksDbStorage {
-    inner: Mutex<Inner>,
+    /// Inner state protected by a read-write lock for concurrent reads.
+    inner: RwLock<Inner>,
 }
 
 impl RocksDbStorage {
-    fn lock_inner(&self) -> std::sync::MutexGuard<'_, Inner> {
-        // If a previous panic occurred while holding the lock, recover the inner state.
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    /// Acquires a read lock on inner state.
+    fn read_inner(&self) -> RwLockReadGuard<'_, Inner> {
+        self.inner.read().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn ensure_state_loaded_or_panic(
-        mut inner: std::sync::MutexGuard<'_, Inner>,
-    ) -> std::sync::MutexGuard<'_, Inner> {
+    /// Acquires a write lock on inner state.
+    fn write_inner(&self) -> RwLockWriteGuard<'_, Inner> {
+        self.inner.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Acquires a write lock with state guaranteed to be loaded.
+    ///
+    /// Panics if state cannot be loaded from disk (unrecoverable).
+    fn write_inner_with_state(&self) -> RwLockWriteGuard<'_, Inner> {
+        let mut inner = self.write_inner();
         if let Err(e) = Self::ensure_state_loaded(&mut inner) {
-            // Drop the lock before panicking to avoid poisoning the mutex.
             let msg = format!("state load failed: {e}");
             drop(inner);
             panic!("{msg}");
         }
         inner
+    }
+
+    /// Calls `f` with a read lock if state is already loaded, otherwise
+    /// falls back to a write lock to reload state first.
+    fn with_state_read<R>(&self, f: impl FnOnce(&Inner) -> R) -> R {
+        {
+            let inner = self.read_inner();
+            if inner.state_loaded {
+                return f(&inner);
+            }
+        }
+        // Slow path: take write lock and reload state.
+        let inner = self.write_inner_with_state();
+        f(&inner)
     }
 
     /// Creates a new RocksDB-backed storage with the given database.
@@ -295,7 +320,7 @@ impl RocksDbStorage {
         };
 
         Ok(Self {
-            inner: Mutex::new(inner),
+            inner: RwLock::new(inner),
         })
     }
 
@@ -362,7 +387,9 @@ impl RocksDbStorage {
         Ok(())
     }
 
-    fn flush_state_to_disk_and_discard(inner: &mut Inner) -> Result<(), StorageError> {
+    /// Adds all in-memory SMT state entries and the state root to the given
+    /// write batch. Does not write the batch or discard in-memory state.
+    fn write_state_to_batch(inner: &Inner, batch: &mut WriteBatch) -> Result<(), StorageError> {
         if !inner.state_loaded {
             return Ok(());
         }
@@ -371,198 +398,22 @@ impl RocksDbStorage {
         let cf_state = db.cf_handle(CF_STATE).expect("CF_STATE must exist");
         let cf_meta = db.cf_handle(CF_META).expect("CF_META must exist");
 
-        // Capture state before flush for debugging
-        let smt_root_before = h256_to_hash(inner.state.root());
-        if smt_root_before != inner.state_root {
-            error!(
-                "CONSISTENCY ERROR: in-memory SMT root {} differs from cached state_root {}",
-                smt_root_before, inner.state_root
-            );
-        }
-
         // Clear existing state entries.
-        let mut batch = WriteBatch::default();
         let iter = db.iterator_cf(cf_state, IteratorMode::Start);
         for item in iter {
             let (key, _) = item.map_err(|e| StorageError::ValidationFailed(e.to_string()))?;
             batch.delete_cf(cf_state, key);
         }
 
-        // Persist all current leaves from memory and verify they're non-empty.
-        let mut written_count = 0u64;
-        let leaves: Vec<_> = inner.state.store().leaves_map().iter().collect();
-        for (key, value) in &leaves {
-            if value.0.is_empty() {
-                warn!("flush: skipping empty value for key {:?}", key.as_slice());
-                continue;
+        // Write all current leaves.
+        for (key, value) in inner.state.store().leaves_map().iter() {
+            if !value.0.is_empty() {
+                batch.put_cf(cf_state, key.as_slice(), &value.0);
             }
-            let key_bytes = key.as_slice();
-            batch.put_cf(cf_state, key_bytes, &value.0);
-            written_count += 1;
         }
 
-        // Persist authoritative state_root.
+        // Write state root.
         batch.put_cf(cf_meta, meta_keys::STATE_ROOT, inner.state_root.as_slice());
-
-        db.write(batch)
-            .map_err(|e| StorageError::ValidationFailed(e.to_string()))?;
-
-        // Direct read-back check before rebuild
-        let cf_state = db.cf_handle(CF_STATE).expect("CF_STATE must exist");
-        for (key, value) in &leaves {
-            if let Ok(Some(read_back)) = db.get_cf(cf_state, key.as_slice()) {
-                if read_back.as_slice() != value.0.as_slice() {
-                    let wrote_first_8: [u8; 8] = value.0[..8].try_into().unwrap_or([0; 8]);
-                    let read_first_8: [u8; 8] = read_back[..8].try_into().unwrap_or([0; 8]);
-                    error!(
-                        "READBACK MISMATCH for key={}: wrote {:02x?}... but read {:02x?}...",
-                        Hash::from_slice(key.as_slice()).unwrap_or(Hash::zero()),
-                        wrote_first_8,
-                        read_first_8
-                    );
-                }
-            } else {
-                error!(
-                    "READBACK MISSING for key={}",
-                    Hash::from_slice(key.as_slice()).unwrap_or(Hash::zero())
-                );
-            }
-        }
-
-        // Verify: rebuild SMT from what we just wrote and check root matches
-        let verify_smt = Inner::rebuild_smt_from_disk(db);
-        let verify_root = h256_to_hash(verify_smt.root());
-        if verify_root != inner.state_root {
-            error!(
-                "FLUSH VERIFICATION FAILED: wrote state_root={} but rebuilt root={}",
-                inner.state_root, verify_root
-            );
-            // Log the entries we wrote vs what we read back
-            let cf_state = db.cf_handle(CF_STATE).expect("CF_STATE must exist");
-            let mut readback_count = 0u64;
-            let iter = db.iterator_cf(cf_state, IteratorMode::Start);
-            for item in iter {
-                if item.is_ok() {
-                    readback_count += 1;
-                }
-            }
-            error!(
-                "  wrote {} entries, read back {} entries",
-                written_count, readback_count
-            );
-
-            // Deep compare: memory vs disk values for each leaf
-            let mut dumped = false;
-            for (key, value) in &leaves {
-                let mem_hash = value.to_h256();
-                match db.get_cf(cf_state, key.as_slice()) {
-                    Ok(Some(read_back)) => {
-                        let disk_hash = SmtValue(read_back.clone()).to_h256();
-                        if read_back.as_slice() != value.0.as_slice() || mem_hash != disk_hash {
-                            error!(
-                                "  LEAF MISMATCH key={} mem_hash={:?} disk_hash={:?} mem_len={} disk_len={} mem_first8={:02x?} disk_first8={:02x?}",
-                                Hash::from_slice(key.as_slice()).unwrap_or(Hash::zero()),
-                                mem_hash,
-                                disk_hash,
-                                value.0.len(),
-                                read_back.len(),
-                                value.0[..8.min(value.0.len())].try_into().unwrap_or([0; 8]),
-                                read_back[..8.min(read_back.len())]
-                                    .try_into()
-                                    .unwrap_or([0; 8]),
-                            );
-                            let min_len = value.0.len().min(read_back.len());
-                            let mut first_diff: Option<(usize, u8, u8)> = None;
-                            for (i, _) in read_back.iter().enumerate().take(min_len) {
-                                let a = value.0[i];
-                                let b = read_back[i];
-                                if a != b {
-                                    first_diff = Some((i, a, b));
-                                    break;
-                                }
-                            }
-                            if let Some((idx, a, b)) = first_diff {
-                                error!(
-                                    "  BYTE DIFF key={} idx={} mem={:02x} disk={:02x}",
-                                    Hash::from_slice(key.as_slice()).unwrap_or(Hash::zero()),
-                                    idx,
-                                    a,
-                                    b
-                                );
-                            } else if value.0.len() == read_back.len() {
-                                error!(
-                                    "  BYTE DIFF key={} none (bytes identical but hash mismatch)",
-                                    Hash::from_slice(key.as_slice()).unwrap_or(Hash::zero())
-                                );
-                            } else {
-                                error!(
-                                    "  BYTE DIFF key={} none within min_len (len mem={} disk={})",
-                                    Hash::from_slice(key.as_slice()).unwrap_or(Hash::zero()),
-                                    value.0.len(),
-                                    read_back.len()
-                                );
-                            }
-                            if !dumped {
-                                let mem_hex: String =
-                                    value.0.iter().map(|b| format!("{:02x}", b)).collect();
-                                let disk_hex: String =
-                                    read_back.iter().map(|b| format!("{:02x}", b)).collect();
-                                error!(
-                                    "  MEM HEX key={} {}",
-                                    Hash::from_slice(key.as_slice()).unwrap_or(Hash::zero()),
-                                    mem_hex
-                                );
-                                error!(
-                                    "  DISK HEX key={} {}",
-                                    Hash::from_slice(key.as_slice()).unwrap_or(Hash::zero()),
-                                    disk_hex
-                                );
-                                dumped = true;
-                            }
-                            let mut mem_slice = value.0.as_slice();
-                            let mut disk_slice = read_back.as_slice();
-                            if let (Ok(mem_account), Ok(disk_account)) = (
-                                Account::decode(&mut mem_slice),
-                                Account::decode(&mut disk_slice),
-                            ) {
-                                error!(
-                                    "  ACCOUNT DIFF key={} mem(nonce={}, balance={}, code_hash={}, storage_root={}, trailing={}) disk(nonce={}, balance={}, code_hash={}, storage_root={}, trailing={})",
-                                    Hash::from_slice(key.as_slice()).unwrap_or(Hash::zero()),
-                                    mem_account.nonce(),
-                                    mem_account.balance(),
-                                    mem_account.code_hash(),
-                                    mem_account.storage_root(),
-                                    mem_slice.len(),
-                                    disk_account.nonce(),
-                                    disk_account.balance(),
-                                    disk_account.code_hash(),
-                                    disk_account.storage_root(),
-                                    disk_slice.len()
-                                );
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        error!(
-                            "  LEAF MISSING ON DISK key={} mem_len={}",
-                            Hash::from_slice(key.as_slice()).unwrap_or(Hash::zero()),
-                            value.0.len()
-                        );
-                    }
-                    Err(e) => {
-                        error!(
-                            "  LEAF READ ERROR key={} err={}",
-                            Hash::from_slice(key.as_slice()).unwrap_or(Hash::zero()),
-                            e
-                        );
-                    }
-                }
-            }
-        }
-
-        // Drop in-memory SMT to force reload before next execution.
-        inner.state = Smt::new(H256::zero(), DefaultStore::default());
-        inner.state_loaded = false;
 
         Ok(())
     }
@@ -732,7 +583,7 @@ impl RocksDbStorage {
         chain_id: u64,
         initial_accounts: &[(Address, Account)],
     ) -> Result<(), StorageError> {
-        let mut inner = self.lock_inner();
+        let mut inner = self.write_inner();
         let db = &inner.db;
 
         let cf_headers = db.cf_handle(CF_HEADERS).expect("CF_HEADERS must exist");
@@ -794,14 +645,14 @@ impl RocksDbStorage {
 
     /// Returns the list of available snapshot heights (ascending).
     pub fn snapshot_heights(&self) -> Result<Vec<u64>, StorageError> {
-        let inner = self.lock_inner();
+        let inner = self.read_inner();
         let cf_meta = inner.db.cf_handle(CF_META).expect("CF_META must exist");
         Self::load_snapshot_heights(&inner.db, cf_meta)
     }
 
     /// Returns the tip hash recorded for the snapshot at the given height.
     pub fn snapshot_tip(&self, height: u64) -> Result<Option<Hash>, StorageError> {
-        let inner = self.lock_inner();
+        let inner = self.read_inner();
         let cf_meta = inner.db.cf_handle(CF_META).expect("CF_META must exist");
         let key = snapshot_meta_key(height);
         let bytes = inner
@@ -818,7 +669,7 @@ impl RocksDbStorage {
     /// Used during header-first sync to store headers before downloading block bodies.
     /// The header_tip is updated if this header extends the header chain.
     pub fn store_header_only(&self, header: &Header, hash: Hash) -> Result<(), StorageError> {
-        let inner = self.lock_inner();
+        let inner = self.write_inner();
         let db = &inner.db;
         let cf_headers = db.cf_handle(CF_HEADERS).expect("CF_HEADERS must exist");
         let cf_meta = db.cf_handle(CF_META).expect("CF_META must exist");
@@ -872,7 +723,7 @@ impl RocksDbStorage {
             return Ok(());
         }
 
-        let inner = self.lock_inner();
+        let inner = self.write_inner();
         let db = &inner.db;
         let cf_headers = db.cf_handle(CF_HEADERS).expect("CF_HEADERS must exist");
         let cf_meta = db.cf_handle(CF_META).expect("CF_META must exist");
@@ -939,7 +790,7 @@ impl RocksDbStorage {
     /// During sync, this may be ahead of the block tip. Returns None if no headers
     /// have been stored yet.
     pub fn header_tip(&self) -> Option<Hash> {
-        let inner = self.lock_inner();
+        let inner = self.read_inner();
         let cf_meta = inner.db.cf_handle(CF_META).expect("CF_META must exist");
         inner
             .db
@@ -963,7 +814,7 @@ impl RocksDbStorage {
     ///
     /// Returns None if no header exists at that height.
     pub fn get_header_by_height(&self, target_height: u64) -> Option<Header> {
-        let inner = self.lock_inner();
+        let inner = self.read_inner();
         let db = &inner.db;
         let cf_headers = db.cf_handle(CF_HEADERS).expect("CF_HEADERS must exist");
         let cf_meta = db.cf_handle(CF_META).expect("CF_META must exist");
@@ -1003,7 +854,7 @@ impl RocksDbStorage {
     /// Returns a vector of (key, value) pairs representing the full state at that height.
     /// Used for state sync to send snapshot data to peers.
     pub fn export_snapshot(&self, height: u64) -> Result<Vec<(Hash, Vec<u8>)>, StorageError> {
-        let inner = self.lock_inner();
+        let inner = self.read_inner();
         let db = &inner.db;
         let cf_snapshots = db.cf_handle(CF_SNAPSHOTS).expect("CF_SNAPSHOTS must exist");
 
@@ -1051,7 +902,7 @@ impl RocksDbStorage {
         entries: Vec<(Hash, Vec<u8>)>,
         chain_id: u64,
     ) -> Result<(), StorageError> {
-        let mut inner = self.lock_inner();
+        let mut inner = self.write_inner();
         let db = &inner.db;
 
         // Make sure the block is a valid one
@@ -1147,7 +998,7 @@ impl RocksDbStorage {
 
     /// Resets state to the snapshot at the given height and truncates headers/blocks above it.
     pub fn reset_to_snapshot(&self, height: u64) -> Result<(), StorageError> {
-        let mut inner = self.lock_inner();
+        let mut inner = self.write_inner();
         let db = &inner.db;
 
         let cf_headers = db.cf_handle(CF_HEADERS).expect("CF_HEADERS must exist");
@@ -1232,11 +1083,87 @@ impl RocksDbStorage {
 
         Ok(())
     }
+
+    /// Returns all current live state entries as `(key, value)` pairs.
+    ///
+    /// Takes a read lock if state is already loaded, falling back to a write
+    /// lock to reload from disk. The returned vector is an owned snapshot;
+    /// no lock is held after the call returns.
+    pub fn iter_state(&self) -> Vec<(Hash, Vec<u8>)> {
+        self.with_state_read(|inner| {
+            inner
+                .state
+                .store()
+                .leaves_map()
+                .iter()
+                .filter(|(_, v)| !v.0.is_empty())
+                .map(|(k, v)| (h256_to_hash(k), v.0.clone()))
+                .collect()
+        })
+    }
+
+    /// Returns stored block bodies for heights in `[start, end]`.
+    ///
+    /// Walks headers backward from the current tip to locate each block.
+    /// Returns `None` entries for heights whose block bodies have been pruned.
+    pub fn get_blocks_in_range(&self, start: u64, end: u64) -> Vec<Option<Block>> {
+        if start > end {
+            return vec![];
+        }
+
+        let inner = self.read_inner();
+        let db = &inner.db;
+        let cf_headers = db.cf_handle(CF_HEADERS).expect("CF_HEADERS must exist");
+        let cf_blocks = db.cf_handle(CF_BLOCKS).expect("CF_BLOCKS must exist");
+
+        // Walk back from tip to the hash at height `end`.
+        let mut hash = inner.tip;
+        let current_height = db
+            .get_cf(cf_headers, hash.as_slice())
+            .ok()
+            .flatten()
+            .and_then(|bytes| Header::decode(&mut bytes.as_slice()).ok())
+            .map(|h| h.height)
+            .unwrap_or(0);
+
+        if end > current_height {
+            return vec![];
+        }
+
+        let mut height = current_height;
+        while height > end {
+            match Self::get_header_by_hash(db, cf_headers, hash) {
+                Ok(Some(h)) => {
+                    hash = h.previous_block;
+                    height -= 1;
+                }
+                _ => return vec![],
+            }
+        }
+
+        // Collect blocks from `end` down to `start`.
+        let count = (end - start + 1) as usize;
+        let mut blocks = std::collections::VecDeque::with_capacity(count);
+        for _ in 0..count {
+            let block = db
+                .get_cf(cf_blocks, hash.as_slice())
+                .ok()
+                .flatten()
+                .and_then(|bytes| Block::decode(&mut bytes.as_slice()).ok());
+            blocks.push_front(block);
+            match Self::get_header_by_hash(db, cf_headers, hash) {
+                Ok(Some(h)) => hash = h.previous_block,
+                _ => break,
+            }
+        }
+
+        blocks.into()
+    }
 }
 
 impl Storage for RocksDbStorage {
     fn has_block(&self, hash: Hash) -> bool {
-        let inner = self.lock_inner();
+        let inner = self.read_inner();
         // Check CF_BLOCKS, not CF_HEADERS - a "block" means the full block with transactions,
         // not just the header (which may exist from header-first sync)
         let cf = inner.db.cf_handle(CF_BLOCKS).expect("CF_BLOCKS must exist");
@@ -1249,7 +1176,7 @@ impl Storage for RocksDbStorage {
     }
 
     fn get_header(&self, hash: Hash) -> Option<Header> {
-        let inner = self.lock_inner();
+        let inner = self.read_inner();
         let cf = inner
             .db
             .cf_handle(CF_HEADERS)
@@ -1263,7 +1190,7 @@ impl Storage for RocksDbStorage {
     }
 
     fn get_block(&self, hash: Hash) -> Option<Arc<Block>> {
-        let inner = self.lock_inner();
+        let inner = self.read_inner();
         let cf = inner.db.cf_handle(CF_BLOCKS).expect("CF_BLOCKS must exist");
         inner
             .db
@@ -1275,7 +1202,7 @@ impl Storage for RocksDbStorage {
     }
 
     fn append_block(&self, block: Block, chain_id: u64) -> Result<(), StorageError> {
-        let mut inner = self.lock_inner();
+        let mut inner = self.write_inner();
         let db = inner.db.clone();
 
         if block.header.previous_block != inner.tip {
@@ -1286,10 +1213,12 @@ impl Storage for RocksDbStorage {
         }
 
         let hash = block.header_hash(chain_id);
+        let height = block.header.height;
         let cf_headers = db.cf_handle(CF_HEADERS).expect("CF_HEADERS must exist");
         let cf_blocks = db.cf_handle(CF_BLOCKS).expect("CF_BLOCKS must exist");
         let cf_meta = db.cf_handle(CF_META).expect("CF_META must exist");
 
+        // Phase 1: atomic write — block + header + tip + state + state_root
         let mut batch = WriteBatch::default();
         batch.put_cf(
             cf_headers,
@@ -1298,21 +1227,23 @@ impl Storage for RocksDbStorage {
         );
         batch.put_cf(cf_blocks, hash.as_slice(), block.to_bytes().as_slice());
         batch.put_cf(cf_meta, meta_keys::TIP, hash.as_slice());
+        Self::write_state_to_batch(&inner, &mut batch)?;
 
         db.write(batch)
             .map_err(|e| StorageError::ValidationFailed(e.to_string()))?;
 
         inner.tip = hash;
 
-        let height = block.header.height;
-
-        // Flush state to disk BEFORE creating snapshot so snapshot reads correct data
+        // Phase 2: snapshot creation (reads from disk, which is now consistent)
         if height != 0 && height.is_multiple_of(SNAPSHOT_INTERVAL) {
-            Self::flush_state_to_disk_and_discard(&mut inner)?;
-            Self::ensure_state_loaded(&mut inner)?;
             Self::create_snapshot_with_inner(&mut inner, height, hash)?;
         }
 
+        // Phase 3: discard in-memory state
+        inner.state = Smt::new(H256::zero(), DefaultStore::default());
+        inner.state_loaded = false;
+
+        // Phase 4: prune old block bodies
         if height > BLOCK_BODY_RETENTION {
             let target_height = height - BLOCK_BODY_RETENTION;
             // Never prune genesis (height 0) or snapshot blocks
@@ -1330,16 +1261,11 @@ impl Storage for RocksDbStorage {
             }
         }
 
-        // Persist full SMT state to disk and drop in-memory copy
-        // (skip if we already flushed for snapshot creation)
-        if inner.state_loaded {
-            Self::flush_state_to_disk_and_discard(&mut inner)?;
-        }
         Ok(())
     }
 
     fn height(&self) -> u64 {
-        let inner = self.lock_inner();
+        let inner = self.read_inner();
         let cf = inner
             .db
             .cf_handle(CF_HEADERS)
@@ -1358,43 +1284,44 @@ impl Storage for RocksDbStorage {
     }
 
     fn tip(&self) -> Hash {
-        self.lock_inner().tip
+        self.read_inner().tip
     }
 }
 
 impl StateStore for RocksDbStorage {
     fn preview_root(&self, writes: &[(Hash, Option<Vec<u8>>)]) -> Hash {
-        let inner = Self::ensure_state_loaded_or_panic(self.lock_inner());
-        let mut leaves_map: BTreeMap<H256, SmtValue> = inner
-            .state
-            .store()
-            .leaves_map()
-            .iter()
-            .map(|(key, value)| (*key, value.clone()))
-            .collect();
+        self.with_state_read(|inner| {
+            let mut leaves_map: BTreeMap<H256, SmtValue> = inner
+                .state
+                .store()
+                .leaves_map()
+                .iter()
+                .map(|(key, value)| (*key, value.clone()))
+                .collect();
 
-        for (key, value_opt) in writes {
-            let key_h = hash_to_h256(key);
-            match value_opt {
-                Some(v) => {
-                    leaves_map.insert(key_h, SmtValue(v.clone()));
-                }
-                None => {
-                    leaves_map.remove(&key_h);
+            for (key, value_opt) in writes {
+                let key_h = hash_to_h256(key);
+                match value_opt {
+                    Some(v) => {
+                        leaves_map.insert(key_h, SmtValue(v.clone()));
+                    }
+                    None => {
+                        leaves_map.remove(&key_h);
+                    }
                 }
             }
-        }
 
-        let mut state = Smt::new(H256::zero(), DefaultStore::default());
-        if !leaves_map.is_empty() {
-            let leaves: Vec<(H256, SmtValue)> = leaves_map.into_iter().collect();
-            state.update_all(leaves).expect("SMT update failed");
-        }
-        h256_to_hash(state.root())
+            let mut state = Smt::new(H256::zero(), DefaultStore::default());
+            if !leaves_map.is_empty() {
+                let leaves: Vec<(H256, SmtValue)> = leaves_map.into_iter().collect();
+                state.update_all(leaves).expect("SMT update failed");
+            }
+            h256_to_hash(state.root())
+        })
     }
 
     fn apply_batch(&self, writes: Vec<(Hash, Option<Vec<u8>>)>) {
-        let mut inner = Self::ensure_state_loaded_or_panic(self.lock_inner());
+        let mut inner = self.write_inner_with_state();
         // Update in-memory SMT first
         let mut leaves_map: BTreeMap<H256, SmtValue> = inner
             .state
@@ -1426,47 +1353,50 @@ impl StateStore for RocksDbStorage {
     }
 
     fn state_root(&self) -> Hash {
-        self.lock_inner().state_root
+        self.read_inner().state_root
     }
 }
 
 impl VmStorage for RocksDbStorage {
     fn contains_key(&self, key: Hash) -> bool {
-        let inner = Self::ensure_state_loaded_or_panic(self.lock_inner());
-        inner
-            .state
-            .get(&hash_to_h256(&key))
-            .ok()
-            .map(|v| !v.0.is_empty())
-            .unwrap_or(false)
+        self.with_state_read(|inner| {
+            inner
+                .state
+                .get(&hash_to_h256(&key))
+                .ok()
+                .map(|v| !v.0.is_empty())
+                .unwrap_or(false)
+        })
     }
 
     fn get(&self, key: Hash) -> Option<Vec<u8>> {
-        let inner = Self::ensure_state_loaded_or_panic(self.lock_inner());
-        let result = inner
-            .state
-            .get(&hash_to_h256(&key))
-            .ok()
-            .filter(|v| !v.0.is_empty());
-        result.map(|v| v.0)
+        self.with_state_read(|inner| {
+            inner
+                .state
+                .get(&hash_to_h256(&key))
+                .ok()
+                .filter(|v| !v.0.is_empty())
+                .map(|v| v.0)
+        })
     }
 }
 
 impl AccountStorage for RocksDbStorage {
     fn get_account(&self, addr: Address) -> Option<Account> {
-        let inner = Self::ensure_state_loaded_or_panic(self.lock_inner());
-        inner
-            .state
-            .get(&hash_to_h256(&addr))
-            .ok()
-            .filter(|v| !v.0.is_empty())
-            .and_then(|v| match Account::decode(&mut v.0.as_slice()) {
-                Ok(acc) => Some(acc),
-                Err(e) => {
-                    warn!("failed to decode account {addr}: {e} (len={})", v.0.len());
-                    None
-                }
-            })
+        self.with_state_read(|inner| {
+            inner
+                .state
+                .get(&hash_to_h256(&addr))
+                .ok()
+                .filter(|v| !v.0.is_empty())
+                .and_then(|v| match Account::decode(&mut v.0.as_slice()) {
+                    Ok(acc) => Some(acc),
+                    Err(e) => {
+                        warn!("failed to decode account {addr}: {e} (len={})", v.0.len());
+                        None
+                    }
+                })
+        })
     }
 
     fn set_account(&self, addr: Address, account: Account) {
@@ -2168,5 +2098,103 @@ mod tests {
         // Block body at height 1 should be pruned, header should remain.
         assert!(!storage.has_block(hash_height1));
         assert!(storage.get_header(hash_height1).is_some());
+    }
+
+    // ==================== get_blocks_in_range Tests ====================
+
+    #[test]
+    fn get_blocks_in_range_returns_ordered_blocks() {
+        let storage = create_storage(&[]);
+        let mut prev = storage.tip();
+        for height in 1..=5 {
+            prev = append_empty_block(&storage, height, prev);
+        }
+
+        let blocks = storage.get_blocks_in_range(1, 5);
+        assert_eq!(blocks.len(), 5);
+        for (i, block) in blocks.iter().enumerate() {
+            let block = block.as_ref().expect("block should exist");
+            assert_eq!(block.header.height, (i + 1) as u64);
+        }
+
+        // Single-element range is a subset of the same logic.
+        let single = storage.get_blocks_in_range(3, 3);
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].as_ref().unwrap().header.height, 3);
+    }
+
+    #[test]
+    fn get_blocks_in_range_edge_cases_return_empty() {
+        let storage = create_storage(&[]);
+        append_empty_block(&storage, 1, storage.tip());
+
+        // Inverted range.
+        assert!(storage.get_blocks_in_range(5, 3).is_empty());
+        // End beyond chain height.
+        assert!(storage.get_blocks_in_range(1, 100).is_empty());
+    }
+
+    #[test]
+    fn get_blocks_in_range_includes_genesis_and_detects_pruned() {
+        let storage = create_storage(&[]);
+
+        // Genesis at height 0.
+        let blocks = storage.get_blocks_in_range(0, 0);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].as_ref().unwrap().header.height, 0);
+
+        // Build past BLOCK_BODY_RETENTION to trigger pruning.
+        let mut prev = storage.tip();
+        for height in 1..=31 {
+            prev = append_empty_block(&storage, height, prev);
+        }
+
+        // Height 1 body should be pruned.
+        let pruned = storage.get_blocks_in_range(1, 1);
+        assert_eq!(pruned.len(), 1);
+        assert!(pruned[0].is_none());
+    }
+
+    // ==================== iter_state Tests ====================
+
+    #[test]
+    fn iter_state_returns_initial_accounts() {
+        let key = PrivateKey::new();
+        let addr = key.public_key().address();
+        let account = Account::new(42);
+
+        let storage = create_storage(&[(addr, account)]);
+        let entries = storage.iter_state();
+
+        let found = entries.iter().find(|(k, _)| *k == addr);
+        assert!(
+            found.is_some(),
+            "initial account should appear in iter_state"
+        );
+    }
+
+    #[test]
+    fn iter_state_reflects_mutations() {
+        let key = PrivateKey::new();
+        let addr = key.public_key().address();
+        let account = Account::new(100);
+
+        let storage = create_storage(&[(addr, account)]);
+        let before_count = storage.iter_state().len();
+
+        // Add a second account via apply_batch.
+        let key2 = PrivateKey::new();
+        let addr2 = key2.public_key().address();
+        storage.set_account(addr2, Account::new(200));
+
+        let after = storage.iter_state();
+        assert_eq!(after.len(), before_count + 1);
+        assert!(after.iter().any(|(k, _)| *k == addr2));
+    }
+
+    #[test]
+    fn iter_state_empty_on_fresh_storage() {
+        let storage = create_storage(&[]);
+        assert!(storage.iter_state().is_empty());
     }
 }

@@ -2113,15 +2113,12 @@ fn host_hash_is_now_invalid_function() {
     ));
 }
 
-// --- removed call host aliases ---
+// --- CALL_HOST0 / CALL0 direct mnemonics ---
 
 #[test]
-fn call_host0_is_rejected() {
-    let source = r#"CALL_HOST0 r10, "nonexistent""#;
-    assert!(matches!(
-        run_expect_err(source),
-        VMError::ParseErrorString { .. }
-    ));
+fn call_host0_assembles() {
+    let source = r#"CALL_HOST0 r1, "caller""#;
+    assert!(assemble_source(source).is_ok());
 }
 
 // --- call_host ---

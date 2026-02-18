@@ -1,6 +1,6 @@
 [package]
 name = "blockchain"
-version = "0.19.1"
+version = "0.19.2"
 edition = "2024"
 default-run = "blockchain"
 
@@ -23,7 +23,7 @@ k256 = { version = "=0.13.4", default-features = false, features = ["ecdsa", "sc
 # Storage and data structures.
 fs2 = "0.4.3"
 dashmap = "6.1.0"
-rocksdb = { version = "0.24.0", default-features = false, features = ["lz4", "snappy"] }
+rocksdb = { version = "0.24.0", default-features = false, features = ["lz4", "snappy", "zstd"] }
 sparse-merkle-tree = { version = "0.6.1", default-features = false }
 
 # CLI and system utilities.

@@ -75,16 +75,26 @@ struct DispatcherInfo {
     insert_after: usize,
     /// Number of lines added by the dispatcher.
     lines_added: usize,
+    /// Line number (1-indexed) after which a `CALLDATA_LOAD` was injected into
+    /// the init section, or `None` if no injection occurred.
+    init_calldata_after: Option<usize>,
 }
 
 impl DispatcherInfo {
     /// Adjusts a processed-source line number back to original source line number.
     fn adjust_line(&self, processed_line: usize) -> usize {
-        if processed_line > self.insert_after {
-            processed_line.saturating_sub(self.lines_added)
-        } else {
-            processed_line
+        let mut line = processed_line;
+        // Account for CALLDATA_LOAD injected after the __init__ label.
+        if let Some(after) = self.init_calldata_after
+            && line > after
+        {
+            line = line.saturating_sub(1);
         }
+        // Account for dispatcher lines injected at the runtime boundary.
+        if line > self.insert_after {
+            line = line.saturating_sub(self.lines_added);
+        }
+        line
     }
 }
 
@@ -1983,7 +1993,7 @@ fn assemble_source_step_1<'a>(
     // Track where to insert the dispatcher (line number where runtime starts).
     let mut insert_point = 0usize;
     // Collect all public label names (including trailing ':')
-    let lll = match extract_label_data(source, &mut insert_point) {
+    let label_data = match extract_label_data(source, &mut insert_point) {
         Ok(p) => p,
         Err(e) => {
             errors.push(e);
@@ -1991,14 +2001,14 @@ fn assemble_source_step_1<'a>(
         }
     };
 
-    if lll.names.is_empty() && lll.init_label.as_ref().is_none_or(|l| l.argc == 0) {
-        return (None, None, Some(lll.data));
+    if label_data.names.is_empty() && label_data.init_label.as_ref().is_none_or(|l| l.argc == 0) {
+        return (None, None, Some(label_data.data));
     }
 
     let mut base = String::new();
-    let mut labels = Vec::<Label>::with_capacity(lll.names.len());
-    for name in lll.names {
-        for label in &lll.data {
+    let mut labels = Vec::<Label>::with_capacity(label_data.names.len());
+    for name in label_data.names {
+        for label in &label_data.data {
             if label.name == name {
                 labels.push(label.clone())
             }
@@ -2014,7 +2024,7 @@ fn assemble_source_step_1<'a>(
     base.push('\n');
 
     // Build CALLDATA_LOAD to inject after __init__ label if it declares arguments.
-    let init_calldata = lll
+    let init_calldata = label_data
         .init_label
         .as_ref()
         .filter(|l| l.argc > 0)
@@ -2029,6 +2039,7 @@ fn assemble_source_step_1<'a>(
     // Reassemble source with dispatcher inserted at runtime start
     // and CALLDATA_LOAD injected after the __init__ label line.
     let mut out = String::with_capacity(source.len() + base.len());
+    let mut init_calldata_after = None;
     for (i, line) in source.lines().enumerate() {
         // Insert dispatcher just before the first runtime line.
         if i == insert_point {
@@ -2044,6 +2055,7 @@ fn assemble_source_step_1<'a>(
             && let Ok(label) = tokenize_label(i + 1, line)
             && label.name == INIT_LABEL
         {
+            init_calldata_after = Some(i + 1); // 1-indexed line of __init__ label
             out.push_str(calldata);
         }
     }
@@ -2056,9 +2068,10 @@ fn assemble_source_step_1<'a>(
     let dispatcher_info = DispatcherInfo {
         insert_after: insert_point + 1,
         lines_added,
+        init_calldata_after,
     };
 
-    (Some(out), Some(dispatcher_info), Some(lll.data))
+    (Some(out), Some(dispatcher_info), Some(label_data.data))
 }
 
 /// Validates that a `CALL` source argument count matches the target label's declared argc.
@@ -2179,21 +2192,6 @@ fn normalize_call_tokens<'a>(
     }
 
     let opcode = tokens[0].text;
-
-    if matches!(opcode, "CALL0" | "CALL1" | "CALL_HOST0" | "CALL_HOST1") {
-        return Err(VMError::ParseErrorString {
-            line: line_no + 1,
-            offset: tokens[0].offset,
-            length: tokens[0].text.len(),
-            message: match opcode {
-                "CALL_HOST0" | "CALL_HOST1" => {
-                    "CALL_HOST0/CALL_HOST1 were removed; use CALL_HOST dst, fn, argc, argv"
-                        .to_string()
-                }
-                _ => "CALL0/CALL1 were removed; use CALL dst, fn, argc, argv".to_string(),
-            },
-        });
-    }
 
     if opcode == Instruction::Call.mnemonic() {
         if tokens.len() != 5 {
@@ -3890,20 +3888,6 @@ RET r1
     // ==================== Call argc validation ====================
 
     #[test]
-    fn call0_removed() {
-        let source = "add(2, r0):\nRET r0\nCALL0 r1, add";
-        let err = assemble_source(source).unwrap_err();
-        assert!(matches!(err, VMError::ParseErrorString { .. }));
-    }
-
-    #[test]
-    fn call1_removed() {
-        let source = "add(2, r0):\nRET r0\nCALL1 r1, add, r2";
-        let err = assemble_source(source).unwrap_err();
-        assert!(matches!(err, VMError::ParseErrorString { .. }));
-    }
-
-    #[test]
     fn call_argc_mismatch() {
         let source = "add(2, r0):\nRET r0\nCALL r1, add, 3, r2";
         let err = assemble_source(source).unwrap_err();
@@ -3927,20 +3911,6 @@ RET r1
     fn call_argv_ignored_when_argc_zero() {
         let source = "noop:\nRET r0\nCALL r1, noop, 0, r255";
         assert!(assemble_source(source).is_ok());
-    }
-
-    #[test]
-    fn call_host0_removed() {
-        let source = r#"CALL_HOST0 r0, "len""#;
-        let err = assemble_source(source).unwrap_err();
-        assert!(matches!(err, VMError::ParseErrorString { .. }));
-    }
-
-    #[test]
-    fn call_host1_removed() {
-        let source = r#"CALL_HOST1 r0, "slice", r1"#;
-        let err = assemble_source(source).unwrap_err();
-        assert!(matches!(err, VMError::ParseErrorString { .. }));
     }
 
     #[test]

@@ -31,6 +31,7 @@ use blockchain::storage::rocksdb_storage::RocksDbStorage;
 use blockchain::storage::state_store::{StateStore, VmStorage};
 use blockchain::storage::state_view::{StateView, StateViewProvider};
 use blockchain::types::bytes::Bytes;
+use blockchain::types::encoding::Encode;
 use blockchain::types::hash::Hash;
 use blockchain::utils::log::SHOW_TIMESTAMP;
 use blockchain::virtual_machine::assembler::{
@@ -246,7 +247,7 @@ fn assemble(input_path: &str) -> AssembleResult {
     };
     let elapsed = assemble_start.elapsed();
 
-    let program_bytes = program.to_bytes();
+    let program_bytes = program.to_vec();
 
     let source = fs::read_to_string(input_path).unwrap_or_else(|e| {
         error!("Failed to read source file: {}", e);
@@ -260,16 +261,20 @@ fn assemble(input_path: &str) -> AssembleResult {
         .map(|s| s.to_string())
         .collect();
 
+    let code_size = program.init_code.len() + program.runtime_code.len();
+    let heap_size = program.memory.len();
     info!(
-        "Assembled {} ({} bytes) in {:?}",
+        "Assembled {} (code: {} + heap: {} + encoding: 24 = {} bytes) in {:?}",
         input_path,
+        code_size,
+        heap_size,
         program_bytes.len(),
         elapsed
     );
 
     AssembleResult {
         program,
-        program_bytes: program_bytes.to_vec(),
+        program_bytes,
         public_functions,
     }
 }

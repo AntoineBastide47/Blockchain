@@ -147,6 +147,61 @@ impl Blockchain<BlockValidator, RocksDbStorage> {
     pub fn store_headers(&self, headers: &[Header]) -> Result<(), StorageError> {
         self.storage.store_headers(headers, self.id)
     }
+
+    /// Resets to the nearest snapshot and replays stored block bodies forward.
+    ///
+    /// Reads all needed block bodies into memory before resetting state, since
+    /// `reset_to_snapshot` deletes both headers and block bodies above the snapshot
+    /// height. Returns the height reached after replay. Stops early if a block body
+    /// was pruned or replay fails.
+    pub fn replay_from_last_snapshot(&self) -> Result<u64, StorageError> {
+        let old_height = self.storage.height();
+        let snapshots = self.storage.snapshot_heights()?;
+
+        // Find the highest snapshot at or below the current height.
+        let snap_height = snapshots
+            .into_iter()
+            .rev()
+            .find(|&h| h <= old_height)
+            .ok_or_else(|| {
+                StorageError::ValidationFailed("no snapshot available for replay".into())
+            })?;
+
+        if snap_height >= old_height {
+            // Already at or behind the snapshot; nothing to replay.
+            self.storage.reset_to_snapshot(snap_height)?;
+            return Ok(snap_height);
+        }
+
+        // Read block bodies into memory *before* the reset deletes them.
+        let blocks = self
+            .storage
+            .get_blocks_in_range(snap_height + 1, old_height);
+
+        self.storage.reset_to_snapshot(snap_height)?;
+
+        let mut reached = snap_height;
+        for (i, maybe_block) in blocks.into_iter().enumerate() {
+            let Some(block) = maybe_block else {
+                // Block body was pruned; stop here.
+                warn!(
+                    "replay stopped at height {}: block body pruned",
+                    snap_height + 1 + i as u64
+                );
+                break;
+            };
+            if let Err(e) = self.apply_block(block) {
+                warn!(
+                    "replay failed at height {}: {e}",
+                    snap_height + 1 + i as u64
+                );
+                break;
+            }
+            reached = snap_height + 1 + i as u64;
+        }
+
+        Ok(reached)
+    }
 }
 
 impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
@@ -1442,5 +1497,102 @@ MOVE r1, 2
         let mut pg2 = program.clone();
         pg2.init_code = vec![];
         assert_eq!(stored_code, pg2.to_vec());
+    }
+
+    // ==================== replay_from_last_snapshot Tests ====================
+
+    mod replay_tests {
+        use super::*;
+        use crate::core::blockchain::Blockchain;
+        use crate::core::validator::BlockValidator;
+        use crate::network::server::DEV_CHAIN_ID;
+        use crate::network::server::tests::test_db;
+        use crate::storage::rocksdb_storage::{RocksDbStorage, SNAPSHOT_INTERVAL};
+        use crate::storage::txpool::TxPool;
+
+        /// Creates a blockchain with a single validator account.
+        fn make_chain(validator_key: &PrivateKey) -> Blockchain<BlockValidator, RocksDbStorage> {
+            let validator_account = (validator_key.public_key().address(), Account::new(0));
+            let initial = [validator_account];
+            let genesis = crate::network::server::Server::<
+                crate::network::local_transport::tests::LocalTransport,
+            >::genesis_block(DEV_CHAIN_ID, &initial);
+            Blockchain::new(DEV_CHAIN_ID, test_db(), genesis, &initial)
+                .expect("failed to create chain")
+        }
+
+        /// Builds `n` empty blocks using the given validator key.
+        fn build_n_blocks(
+            chain: &Blockchain<BlockValidator, RocksDbStorage>,
+            key: &PrivateKey,
+            n: u64,
+        ) {
+            let pool = TxPool::new(Some(1), DEV_CHAIN_ID);
+            for _ in 0..n {
+                chain
+                    .build_block(key.clone(), &pool)
+                    .expect("build_block failed");
+            }
+        }
+
+        #[test]
+        fn replay_restores_height_tip_root_and_account_state() {
+            let key = PrivateKey::new();
+            let chain = make_chain(&key);
+            let validator_addr = key.public_key().address();
+
+            build_n_blocks(&chain, &key, SNAPSHOT_INTERVAL + 2);
+            let original_height = chain.height();
+
+            let tip_before = chain.storage_tip();
+            let root_before = chain.state_root();
+            let balance_before = chain
+                .get_account(validator_addr)
+                .expect("validator account should exist")
+                .balance();
+
+            let reached = chain.replay_from_last_snapshot().expect("replay failed");
+
+            assert_eq!(reached, original_height);
+            assert_eq!(chain.height(), original_height);
+            assert_eq!(chain.storage_tip(), tip_before);
+            assert_eq!(chain.state_root(), root_before);
+            assert_eq!(
+                chain
+                    .get_account(validator_addr)
+                    .expect("account missing")
+                    .balance(),
+                balance_before
+            );
+        }
+
+        #[test]
+        fn replay_fails_without_snapshot() {
+            let key = PrivateKey::new();
+            let chain = make_chain(&key);
+
+            // Fewer blocks than SNAPSHOT_INTERVAL — no snapshot created.
+            build_n_blocks(&chain, &key, 2);
+
+            let result = chain.replay_from_last_snapshot();
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn replay_succeeds_across_pruning_boundary() {
+            let key = PrivateKey::new();
+            let chain = make_chain(&key);
+
+            // SNAPSHOT_INTERVAL=10, BLOCK_BODY_RETENTION=30.
+            // At height 31 block 1 is pruned. Snapshots exist at 20 and 30.
+            // Replay should use snapshot 30 and re-apply blocks 31-35.
+            build_n_blocks(&chain, &key, 35);
+            let root_before = chain.state_root();
+
+            let reached = chain.replay_from_last_snapshot().expect("replay failed");
+
+            assert_eq!(reached, 35);
+            assert_eq!(chain.state_root(), root_before);
+        }
     }
 }

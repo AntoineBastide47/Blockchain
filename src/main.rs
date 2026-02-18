@@ -239,7 +239,7 @@ async fn main() {
             let sender_addr = validator_key_clone.public_key().address();
 
             // Deploy contract first
-            let deploy_data = assemble_file("../example_contracts/factorial.asm")
+            let deploy_data = assemble_file("./example_contracts/factorial.asm")
                 .expect("assembly failed")
                 .to_bytes();
 
@@ -443,6 +443,7 @@ fn rocksdb_init(chain_id: u64, node_name: &str) -> io::Result<DB> {
     opts.set_compression_type(DBCompressionType::Lz4);
     opts.set_write_buffer_size(64 * 1024 * 1024);
     opts.optimize_level_style_compaction(512 * 1024 * 1024);
+    opts.set_bottommost_compression_type(DBCompressionType::Zstd);
 
     // Headers CF: point lookups by hash, write-once read-many
     let headers_opts = cf_options_with_bloom(&cache, 10.0);
@@ -457,12 +458,16 @@ fn rocksdb_init(chain_id: u64, node_name: &str) -> io::Result<DB> {
     // State CF: SMT nodes, high read/write during execution
     let state_opts = cf_options_with_bloom(&cache, 10.0);
 
+    // Snapshot CF: Full Chain State, low read/write during execution
+    let mut snapshots_opts = cf_options_with_bloom(&cache, 10.0);
+    snapshots_opts.set_compression_type(DBCompressionType::Zstd);
+
     let cfs = vec![
         ColumnFamilyDescriptor::new(CF_HEADERS, headers_opts),
         ColumnFamilyDescriptor::new(CF_BLOCKS, blocks_opts),
         ColumnFamilyDescriptor::new(CF_META, meta_opts),
         ColumnFamilyDescriptor::new(CF_STATE, state_opts),
-        ColumnFamilyDescriptor::new(CF_SNAPSHOTS, Options::default()),
+        ColumnFamilyDescriptor::new(CF_SNAPSHOTS, snapshots_opts),
     ];
 
     DB::open_cf_descriptors(&opts, &db_path, cfs)

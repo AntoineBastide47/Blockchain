@@ -10,11 +10,14 @@ use crate::types::hash::{HASH_LEN, Hash};
 use crate::utils::log::SHOW_TYPE;
 use crate::virtual_machine::assembler::parse_i64;
 use crate::virtual_machine::errors::VMError;
-use crate::virtual_machine::isa::Instruction;
+use crate::virtual_machine::isa::{Instruction, OPCODE_METADATA_FLAG};
 use crate::virtual_machine::operand::{
     AddrMetadataState, AddrOperand, SrcMetadataState, SrcOperand, decode_i32_compact,
-    decode_i64_compact, decode_u32_compact, metadata_concat_flag, metadata_consume_addr_state,
-    metadata_consume_imm_i32_state, metadata_consume_src_state, metadata_len_from_code,
+    decode_i32_compact_unchecked, decode_i64_compact, decode_i64_compact_unchecked,
+    decode_u32_compact, decode_u32_compact_unchecked, metadata_concat_flag,
+    metadata_consume_addr_state, metadata_consume_addr_state_unchecked,
+    metadata_consume_imm_i32_state, metadata_consume_imm_i32_state_unchecked,
+    metadata_consume_src_state, metadata_consume_src_state_unchecked, metadata_len_from_code,
     metadata_payload_value,
 };
 use crate::virtual_machine::program::{DeployProgram, ExecuteProgram};
@@ -81,24 +84,44 @@ fn read_bytes<'a>(
     len: usize,
     ip: usize,
 ) -> Result<&'a [u8], VMError> {
-    let end = cursor
-        .checked_add(len)
-        .ok_or(VMError::InvalidIP { ip: *cursor })?;
+    let deref = *cursor;
+    let end = deref + len;
     if end > data.len() {
         return Err(VMError::UnexpectedEndOfBytecode {
             ip,
             requested: len,
-            available: data.len().saturating_sub(*cursor),
+            available: data.len().saturating_sub(deref),
         });
     }
-    let slice = &data[*cursor..end];
+    let slice = &data[deref..end];
     *cursor = end;
     Ok(slice)
 }
 
 /// Reads a single byte from `data` at `cursor`, advancing the cursor.
 fn read_u8(data: &[u8], cursor: &mut usize, ip: usize) -> Result<u8, VMError> {
-    Ok(*read_bytes(data, cursor, 1, ip)?.first().unwrap())
+    let deref = *cursor;
+    if deref >= data.len() {
+        return Err(VMError::UnexpectedEndOfBytecode {
+            ip,
+            requested: 1,
+            available: data.len().saturating_sub(deref),
+        });
+    }
+    *cursor += 1;
+    Ok(data[deref])
+}
+
+/// Reads `len` bytes from `data` starting at `cursor` without bounds checking.
+///
+/// # Safety
+///
+/// The caller must guarantee that `data[*cursor..*cursor + len]` is in bounds.
+#[inline(always)]
+unsafe fn read_bytes_unchecked<'a>(data: &'a [u8], cursor: &mut usize, len: usize) -> &'a [u8] {
+    let start = *cursor;
+    *cursor = start + len;
+    unsafe { data.get_unchecked(start..start + len) }
 }
 
 /// Returns the number of packed width bytes for a DISPATCH table.
@@ -124,6 +147,8 @@ fn metadata_concat_for_instruction(metadata: Option<u8>, instr: Instruction) -> 
 }
 
 /// Decodes a [`SrcOperand`] from the bytecode stream using metadata encoding.
+///
+/// Used by the debug instruction decoder (non-hot path). Retains full validation.
 fn decode_src_operand_from_stream(
     data: &[u8],
     cursor: &mut usize,
@@ -157,7 +182,59 @@ fn decode_src_operand_from_stream(
     }
 }
 
+/// Decodes a [`SrcOperand`] from the bytecode stream without validation.
+///
+/// # Safety
+///
+/// The bytecode must be well-formed (produced by the assembler). The caller must
+/// guarantee that all reads within `data[*cursor..]` are in bounds.
+#[inline(always)]
+unsafe fn decode_src_operand_from_stream_unchecked(
+    data: &[u8],
+    cursor: &mut usize,
+    instr_offset: usize,
+    metadata_cursor: &mut u16,
+) -> Result<SrcOperand, VMError> {
+    let state = unsafe { metadata_consume_src_state_unchecked(metadata_cursor) };
+    let len = state.payload_len();
+    if *cursor + len > data.len() {
+        return Err(VMError::UnexpectedEndOfBytecode {
+            ip: instr_offset,
+            requested: len,
+            available: data.len().saturating_sub(*cursor),
+        });
+    }
+    Ok(match state {
+        SrcMetadataState::Reg => {
+            let reg = unsafe { *data.get_unchecked(*cursor) };
+            *cursor += 1;
+            SrcOperand::Reg(reg)
+        }
+        SrcMetadataState::I64Len1
+        | SrcMetadataState::I64Len2
+        | SrcMetadataState::I64Len4
+        | SrcMetadataState::I64Len8 => {
+            let byte_len = unsafe { state.i64_len().unwrap_unchecked() };
+            let payload = unsafe { read_bytes_unchecked(data, cursor, byte_len as usize) };
+            let value = unsafe { decode_i64_compact_unchecked(payload, byte_len) };
+            if matches!(state, SrcMetadataState::I64Len1) && (value == 0 || value == 1) {
+                SrcOperand::Bool(value != 0)
+            } else {
+                SrcOperand::I64(value)
+            }
+        }
+        _ => {
+            let byte_len = unsafe { state.ref_len().unwrap_unchecked() };
+            let payload = unsafe { read_bytes_unchecked(data, cursor, byte_len as usize) };
+            let value = unsafe { decode_u32_compact_unchecked(payload, byte_len) };
+            SrcOperand::Ref(value)
+        }
+    })
+}
+
 /// Decodes an [`AddrOperand`] from the bytecode stream using metadata encoding.
+///
+/// Used by the debug instruction decoder (non-hot path). Retains full validation.
 fn decode_addr_operand_from_stream(
     data: &[u8],
     cursor: &mut usize,
@@ -178,7 +255,46 @@ fn decode_addr_operand_from_stream(
     }
 }
 
+/// Decodes an [`AddrOperand`] from the bytecode stream without validation.
+///
+/// # Safety
+///
+/// The bytecode must be well-formed (produced by the assembler). The caller must
+/// guarantee that all reads within `data[*cursor..]` are in bounds.
+#[inline(always)]
+unsafe fn decode_addr_operand_from_stream_unchecked(
+    data: &[u8],
+    cursor: &mut usize,
+    instr_offset: usize,
+    metadata_cursor: &mut u16,
+) -> Result<AddrOperand, VMError> {
+    let state = unsafe { metadata_consume_addr_state_unchecked(metadata_cursor) };
+    let len = state.payload_len();
+    if *cursor + len > data.len() {
+        return Err(VMError::UnexpectedEndOfBytecode {
+            ip: instr_offset,
+            requested: len,
+            available: data.len().saturating_sub(*cursor),
+        });
+    }
+    Ok(match state {
+        AddrMetadataState::Reg => {
+            let reg = unsafe { *data.get_unchecked(*cursor) };
+            *cursor += 1;
+            AddrOperand::Reg(reg)
+        }
+        _ => {
+            let byte_len = unsafe { state.u32_len().unwrap_unchecked() };
+            let payload = unsafe { read_bytes_unchecked(data, cursor, byte_len as usize) };
+            let value = unsafe { decode_u32_compact_unchecked(payload, byte_len) };
+            AddrOperand::U32(value)
+        }
+    })
+}
+
 /// Decodes a compact [`i32`] immediate from the bytecode stream using metadata encoding.
+///
+/// Used by the debug instruction decoder (non-hot path). Retains full validation.
 fn decode_i32_operand_from_stream(
     data: &[u8],
     cursor: &mut usize,
@@ -191,7 +307,35 @@ fn decode_i32_operand_from_stream(
     decode_i32_compact(payload, len as u8)
 }
 
+/// Decodes a compact [`i32`] immediate from the bytecode stream without validation.
+///
+/// # Safety
+///
+/// The bytecode must be well-formed (produced by the assembler). The caller must
+/// guarantee that all reads within `data[*cursor..]` are in bounds.
+#[inline(always)]
+unsafe fn decode_i32_operand_from_stream_unchecked(
+    data: &[u8],
+    cursor: &mut usize,
+    instr_offset: usize,
+    metadata_cursor: &mut u16,
+) -> Result<i32, VMError> {
+    let state = unsafe { metadata_consume_imm_i32_state_unchecked(metadata_cursor) };
+    let len = state.payload_len();
+    if *cursor + len > data.len() {
+        return Err(VMError::UnexpectedEndOfBytecode {
+            ip: instr_offset,
+            requested: len,
+            available: data.len().saturating_sub(*cursor),
+        });
+    }
+    let payload = unsafe { read_bytes_unchecked(data, cursor, len) };
+    Ok(unsafe { decode_i32_compact_unchecked(payload, len as u8) })
+}
+
 /// Decodes a compact [`u32`] reference from the bytecode stream using metadata encoding.
+///
+/// Used by the debug instruction decoder (non-hot path). Retains full validation.
 fn decode_ref_u32_operand_from_stream(
     data: &[u8],
     cursor: &mut usize,
@@ -202,6 +346,32 @@ fn decode_ref_u32_operand_from_stream(
     let len = state.payload_len();
     let payload = read_bytes(data, cursor, len, instr_offset)?;
     decode_u32_compact(payload, len as u8)
+}
+
+/// Decodes a compact [`u32`] reference from the bytecode stream without validation.
+///
+/// # Safety
+///
+/// The bytecode must be well-formed (produced by the assembler). The caller must
+/// guarantee that all reads within `data[*cursor..]` are in bounds.
+#[inline(always)]
+unsafe fn decode_ref_u32_operand_from_stream_unchecked(
+    data: &[u8],
+    cursor: &mut usize,
+    instr_offset: usize,
+    metadata_cursor: &mut u16,
+) -> Result<u32, VMError> {
+    let state = unsafe { metadata_consume_imm_i32_state_unchecked(metadata_cursor) };
+    let len = state.payload_len();
+    if *cursor + len > data.len() {
+        return Err(VMError::UnexpectedEndOfBytecode {
+            ip: instr_offset,
+            requested: len,
+            available: data.len().saturating_sub(*cursor),
+        });
+    }
+    let payload = unsafe { read_bytes_unchecked(data, cursor, len) };
+    Ok(unsafe { decode_u32_compact_unchecked(payload, len as u8) })
 }
 
 macro_rules! define_instruction_decoder {
@@ -375,7 +545,7 @@ const STORE_BYTE_COST: u64 = 10;
 const READ_BYTE_COST: u64 = 5;
 
 macro_rules! exec_vm {
-    // Entry point
+    // Entry point: gas cost is derived from the variant's const base_gas().
     (
         vm = $vm:ident,
         state = $state:ident,
@@ -386,52 +556,52 @@ macro_rules! exec_vm {
         match $instr {
             $(
                 Instruction::$variant => {
-                    let instr_name = $instr.mnemonic();
-                    exec_vm!(@call $vm, $state, $ctx, instr_name, $handler, $args)
+                    $vm.charge_opcode_gas(Instruction::$variant.base_gas())?;
+                    exec_vm!(@call $vm, $state, $ctx, $instr, $handler, $args)
                 }
             ),*
         }
     }};
 
     // Handler with storage and chain_id (semicolon separator)
-    (@call $vm:ident, $state:ident, $ctx:ident, $instr_name:expr, $handler:ident,
+    (@call $vm:ident, $state:ident, $ctx:ident, $instr:expr, $handler:ident,
         (state, ctx; $( $field:ident : $kind:ident ),* $(,)? )
     ) => {{
         $( let $field = exec_vm!(@read $vm, $kind)?; )*
-        $vm.$handler($instr_name, $state, $ctx, $( $field ),*)
+        $vm.$handler($instr, $state, $ctx, $( $field ),*)
     }};
 
     // Compact concat form: when metadata A=1, rs1 is omitted and equals rd.
-    (@call $vm:ident, $state:ident, $ctx:ident, $instr_name:expr, $handler:ident,
+    (@call $vm:ident, $state:ident, $ctx:ident, $instr:expr, $handler:ident,
         (rd: Reg, rs1: Src, rs2: Src $(,)? )
     ) => {{
         let rd = exec_vm!(@read $vm, Reg)?;
         let rs1 = if $vm.operand_concat_flag() {
-            $vm.consume_concat_src_slot()?;
+            $vm.consume_concat_src_slot();
             SrcOperand::Reg(rd)
         } else {
             exec_vm!(@read $vm, Src)?
         };
         let rs2 = exec_vm!(@read $vm, Src)?;
-        $vm.$handler($instr_name, rd, rs1, rs2)
+        $vm.$handler($instr, rd, rs1, rs2)
     }};
 
     // Handler without storage (no semicolon)
-    (@call $vm:ident, $state:ident, $ctx:ident, $instr_name:expr, $handler:ident,
+    (@call $vm:ident, $state:ident, $ctx:ident, $instr:expr, $handler:ident,
         ( $( $field:ident : $kind:ident ),* $(,)? )
     ) => {{
         $( let $field = exec_vm!(@read $vm, $kind)?; )*
-        $vm.$handler($instr_name, $( $field ),*)
+        $vm.$handler($instr, $( $field ),*)
     }};
 
     // Decode a u8 register index
     (@read $vm:ident, Reg) => {{
-        Ok::<u8, VMError>($vm.read_exact(1)?[0])
+        $vm.read_u8_operand()
     }};
 
     // Decode a u8 immediate (1 byte)
     (@read $vm:ident, ImmU8) => {{
-        Ok::<u8, VMError>($vm.read_exact(1)?[0])
+        $vm.read_u8_operand()
     }};
 
     // Decode an i32 immediate (compact width from metadata)
@@ -464,6 +634,74 @@ macro_rules! exec_vm {
     // Decode a bool (1 byte, 0 = false, nonzero = true)
     (@read $vm:ident, Src) => {{
         $vm.read_src_operand()
+    }};
+
+    // -----------------------------------------------------------------------
+    // Table dispatch: generates one handler fn per variant + a [fn; 128] table.
+    // -----------------------------------------------------------------------
+
+    // Entry point: builds the dispatch table inside a generic context.
+    // $S is the State type parameter from the enclosing generic function.
+    (
+        @table $S:ident,
+        { $( $variant:ident => $handler:ident $args:tt ),* $(,)? }
+    ) => {{
+        use crate::virtual_machine::isa::{Instruction, OPCODE_BASE_MASK};
+
+        type Handler<$S> = fn(&mut VM, &mut $S, &ExecContext) -> Result<(), VMError>;
+
+        #[cold]
+        fn invalid_opcode<$S: State>(
+            vm: &mut VM, _: &mut $S, _: &ExecContext,
+        ) -> Result<(), VMError> {
+            Err(VMError::InvalidInstruction { opcode: 0xFF, offset: vm.instr_offset })
+        }
+
+        $(
+            #[allow(non_snake_case, unused_variables)]
+            fn $variant<$S: State>(
+                vm: &mut VM, state: &mut $S, ctx: &ExecContext,
+            ) -> Result<(), VMError> {
+                vm.charge_opcode_gas(Instruction::$variant.base_gas())?;
+                exec_vm!(@table_call vm, state, ctx, Instruction::$variant, $handler, $args)
+            }
+        )*
+
+        let mut table: [Handler<$S>; 128] = [invalid_opcode::<$S>; 128];
+        $(
+            table[(Instruction::$variant as u8 & OPCODE_BASE_MASK) as usize] = $variant::<$S>;
+        )*
+        table
+    }};
+
+    // Table call variants — mirror the @call rules but for standalone fns.
+
+    (@table_call $vm:ident, $state:ident, $ctx:ident, $instr:expr, $handler:ident,
+        (state, ctx; $( $field:ident : $kind:ident ),* $(,)? )
+    ) => {{
+        $( let $field = exec_vm!(@read $vm, $kind)?; )*
+        $vm.$handler($instr, $state, $ctx, $( $field ),*)
+    }};
+
+    (@table_call $vm:ident, $state:ident, $ctx:ident, $instr:expr, $handler:ident,
+        (rd: Reg, rs1: Src, rs2: Src $(,)? )
+    ) => {{
+        let rd = exec_vm!(@read $vm, Reg)?;
+        let rs1 = if $vm.operand_concat_flag() {
+            $vm.consume_concat_src_slot();
+            SrcOperand::Reg(rd)
+        } else {
+            exec_vm!(@read $vm, Src)?
+        };
+        let rs2 = exec_vm!(@read $vm, Src)?;
+        $vm.$handler($instr, rd, rs1, rs2)
+    }};
+
+    (@table_call $vm:ident, $state:ident, $ctx:ident, $instr:expr, $handler:ident,
+        ( $( $field:ident : $kind:ident ),* $(,)? )
+    ) => {{
+        $( let $field = exec_vm!(@read $vm, $kind)?; )*
+        $vm.$handler($instr, $( $field ),*)
     }};
 }
 
@@ -817,9 +1055,18 @@ impl VM {
         Ok(())
     }
 
-    /// Charges the base gas cost for the given instruction.
-    fn charge_base(&mut self, instruction: Instruction) -> Result<(), VMError> {
-        self.charge_gas_categorized(instruction.base_gas(), GasCategory::OpcodeBase)
+    /// Charges the base gas cost for an opcode with a compile-time-known cost.
+    #[inline(always)]
+    fn charge_opcode_gas(&mut self, cost: u64) -> Result<(), VMError> {
+        self.gas_profile.add(GasCategory::OpcodeBase, cost);
+        self.gas_used = self.gas_used.saturating_add(cost);
+        if self.gas_used > self.max_gas {
+            return Err(VMError::OutOfGas {
+                used: self.gas_used,
+                limit: self.max_gas,
+            });
+        }
+        Ok(())
     }
 
     /// Charges gas for a function call based on argument count and call stack depth.
@@ -841,7 +1088,7 @@ impl VM {
     fn bool_from_operand(
         &self,
         src_operand: SrcOperand,
-        instruction: &'static str,
+        instruction: Instruction,
         argc: usize,
     ) -> Result<bool, VMError> {
         Ok(match src_operand {
@@ -849,7 +1096,7 @@ impl VM {
             SrcOperand::Bool(b) => b,
             _ => {
                 return Err(VMError::InvalidOperand {
-                    instruction,
+                    instruction: instruction.mnemonic(),
                     argc,
                     expected: SrcOperand::Bool(false).to_string(),
                     actual: src_operand.to_string(),
@@ -862,7 +1109,7 @@ impl VM {
     fn ref_from_operand(
         &self,
         src_operand: SrcOperand,
-        instruction: &'static str,
+        instruction: Instruction,
         argc: usize,
     ) -> Result<u32, VMError> {
         Ok(match src_operand {
@@ -870,7 +1117,7 @@ impl VM {
             SrcOperand::Ref(r) => r,
             _ => {
                 return Err(VMError::InvalidOperand {
-                    instruction,
+                    instruction: instruction.mnemonic(),
                     argc,
                     expected: SrcOperand::Ref(0).to_string(),
                     actual: src_operand.to_string(),
@@ -883,7 +1130,7 @@ impl VM {
     fn int_from_operand(
         &self,
         src_operand: SrcOperand,
-        instruction: &'static str,
+        instruction: Instruction,
         argc: usize,
     ) -> Result<i64, VMError> {
         Ok(match src_operand {
@@ -891,7 +1138,7 @@ impl VM {
             SrcOperand::I64(i) => i,
             _ => {
                 return Err(VMError::InvalidOperand {
-                    instruction,
+                    instruction: instruction.mnemonic(),
                     argc,
                     expected: SrcOperand::I64(0).to_string(),
                     actual: src_operand.to_string(),
@@ -903,7 +1150,7 @@ impl VM {
     /// Converts a [`SrcOperand`] to a [`Value`], reading from the register file if needed.
     fn value_from_operand(&self, src_operand: SrcOperand) -> Result<Value, VMError> {
         Ok(match src_operand {
-            SrcOperand::Reg(idx) => *self.registers.get(idx)?,
+            SrcOperand::Reg(idx) => *self.registers.get(idx),
             SrcOperand::Bool(b) => Value::Bool(b),
             SrcOperand::I64(i) => Value::Int(i),
             SrcOperand::Ref(r) => Value::Ref(r),
@@ -913,7 +1160,7 @@ impl VM {
     /// Serializes a [`SrcOperand`] to its raw byte representation for storage keys.
     fn bytes_from_operand(&mut self, src_operand: SrcOperand) -> Result<Vec<u8>, VMError> {
         Ok(match src_operand {
-            SrcOperand::Reg(idx) => match self.registers.get(idx)? {
+            SrcOperand::Reg(idx) => match self.registers.get(idx) {
                 Value::Bool(b) => vec![*b as u8],
                 Value::Ref(r) => self.heap_get_data(*r)?.to_vec(),
                 Value::Int(i) => i.to_le_bytes().to_vec(),
@@ -999,137 +1246,16 @@ impl VM {
 
 /// impl block for VM execution functions
 impl VM {
-    /// Executes the bytecode from ip=0.
+    /// Executes bytecode using function-pointer table dispatch.
     ///
-    /// For deployment, init_code runs first and may call into runtime_code.
-    /// For contract calls, use [`new_execute`](Self::new_execute) and then `run`.
+    /// Uses an indirect call through a `[fn; 128]` dispatch table.
+    /// Each opcode maps to its own function pointer,
+    /// giving the CPU separate branch-prediction slots per call site.
     pub fn run<S: State>(&mut self, state: &mut S, ctx: &ExecContext) -> Result<(), VMError> {
-        let result = (|| {
-            while self.ip < self.data.len() {
-                self.instr_offset = self.ip;
-                let opcode = self.data[self.instr_offset];
-                self.ip += 1;
+        use crate::virtual_machine::isa::OPCODE_BASE_MASK;
 
-                let (instr, has_metadata) = Instruction::decode_opcode(opcode).map_err(|_| {
-                    VMError::InvalidInstruction {
-                        opcode,
-                        offset: self.instr_offset,
-                    }
-                })?;
-                let metadata = if has_metadata {
-                    Some(self.read_exact(1)?[0])
-                } else {
-                    None
-                };
-                self.set_operand_metadata(metadata, instr);
-                self.charge_base(instr)?;
-                self.exec(instr, state, ctx)?;
-            }
-            Ok(())
-        })();
-
-        if let Err(err) = &result {
-            self.log_runtime_error(err);
-        }
-
-        result
-    }
-
-    /// Reads exactly `count` bytes from the bytecode at the current IP.
-    ///
-    /// Advances the instruction pointer by `count` bytes.
-    fn read_exact(&mut self, count: usize) -> Result<&[u8], VMError> {
-        let start = self.ip;
-        let end = self
-            .ip
-            .checked_add(count)
-            .ok_or(VMError::InvalidIP { ip: self.ip })?;
-        let available = self.data.len().saturating_sub(start);
-
-        let slice = self
-            .data
-            .get(start..end)
-            .ok_or(VMError::UnexpectedEndOfBytecode {
-                ip: start,
-                requested: count,
-                available,
-            })?;
-
-        self.ip = end;
-        Ok(slice)
-    }
-
-    /// Stores per-instruction metadata and resets the mixed-radix decode cursor.
-    fn set_operand_metadata(&mut self, metadata: Option<u8>, instr: Instruction) {
-        self.operand_metadata = metadata;
-        self.operand_metadata_cursor = metadata.map_or(0u16, |value| {
-            metadata_payload_value(value, instr.supports_concat_compact())
-        });
-    }
-
-    /// Returns `true` when the current instruction's metadata has the concat flag set.
-    fn operand_concat_flag(&self) -> bool {
-        self.operand_metadata.is_some_and(metadata_concat_flag)
-    }
-
-    /// Consumes the implicit `rs1` Src metadata slot used by compact concat form.
-    fn consume_concat_src_slot(&mut self) -> Result<(), VMError> {
-        let _ = metadata_consume_src_state(&mut self.operand_metadata_cursor)?;
-        Ok(())
-    }
-
-    /// Reads the next [`SrcOperand`] from the bytecode at the current instruction pointer.
-    fn read_src_operand(&mut self) -> Result<SrcOperand, VMError> {
-        decode_src_operand_from_stream(
-            &self.data,
-            &mut self.ip,
-            self.instr_offset,
-            &mut self.operand_metadata_cursor,
-        )
-    }
-
-    /// Reads the next [`AddrOperand`] from the bytecode at the current instruction pointer.
-    fn read_addr_operand(&mut self) -> Result<AddrOperand, VMError> {
-        decode_addr_operand_from_stream(
-            &self.data,
-            &mut self.ip,
-            self.instr_offset,
-            &mut self.operand_metadata_cursor,
-        )
-    }
-
-    /// Reads the next compact i32 immediate from bytecode at current IP.
-    fn read_imm_i32(&mut self) -> Result<i32, VMError> {
-        decode_i32_operand_from_stream(
-            &self.data,
-            &mut self.ip,
-            self.instr_offset,
-            &mut self.operand_metadata_cursor,
-        )
-    }
-
-    /// Reads the next compact u32 reference from bytecode at current IP.
-    fn read_ref_u32(&mut self) -> Result<u32, VMError> {
-        decode_ref_u32_operand_from_stream(
-            &self.data,
-            &mut self.ip,
-            self.instr_offset,
-            &mut self.operand_metadata_cursor,
-        )
-    }
-
-    /// Executes a single instruction.
-    fn exec<S: State>(
-        &mut self,
-        instruction: Instruction,
-        state: &mut S,
-        ctx: &ExecContext,
-    ) -> Result<(), VMError> {
-        exec_vm! {
-            vm = self,
-            state = state,
-            ctx = ctx,
-            instr = instruction,
+        let table = exec_vm! {
+            @table S,
             {
                 // Move, Casts and Misc
                 Noop => op_noop(),
@@ -1210,21 +1336,180 @@ impl VM {
                 // Special Op Codes
                 Dispatch => op_dispatch(),
             }
+        };
+
+        let result = (|| {
+            while self.ip < self.data.len() {
+                self.instr_offset = self.ip;
+                let opcode = unsafe { *self.data.get_unchecked(self.instr_offset) };
+                self.ip += 1;
+
+                let has_metadata = (opcode & OPCODE_METADATA_FLAG) != 0;
+                let base = (opcode & OPCODE_BASE_MASK) as usize;
+
+                // Still need Instruction for metadata setup (supports_concat_compact).
+                let instr = Instruction::decode_opcode(opcode)
+                    .map_err(|_| VMError::InvalidInstruction {
+                        opcode,
+                        offset: self.instr_offset,
+                    })?
+                    .0;
+
+                let metadata = if has_metadata {
+                    Some(self.read_u8_operand()?)
+                } else {
+                    None
+                };
+                self.set_operand_metadata(metadata, instr);
+
+                table[base](self, state, ctx)?;
+            }
+            Ok(())
+        })();
+
+        if let Err(err) = &result {
+            self.log_runtime_error(err);
+        }
+
+        result
+    }
+
+    /// Reads exactly `count` bytes from the bytecode at the current IP.
+    ///
+    /// Advances the instruction pointer by `count` bytes.
+    fn read_exact(&mut self, count: usize) -> Result<&[u8], VMError> {
+        let start = self.ip;
+        let end = start + count;
+        if end > self.data.len() {
+            return Err(VMError::UnexpectedEndOfBytecode {
+                ip: self.instr_offset,
+                requested: count,
+                available: self.data.len().saturating_sub(self.ip),
+            });
+        }
+        let slice = unsafe { self.data.get_unchecked(start..end) };
+
+        self.ip = end;
+        Ok(slice)
+    }
+
+    /// Reads a single byte operand from bytecode at the current IP.
+    #[inline(always)]
+    fn read_u8_operand(&mut self) -> Result<u8, VMError> {
+        if self.ip >= self.data.len() {
+            return Err(VMError::UnexpectedEndOfBytecode {
+                ip: self.instr_offset,
+                requested: 1,
+                available: self.data.len().saturating_sub(self.ip),
+            });
+        }
+        let byte = unsafe { *self.data.get_unchecked(self.ip) };
+        self.ip += 1;
+        Ok(byte)
+    }
+
+    /// Stores per-instruction metadata and resets the mixed-radix decode cursor.
+    fn set_operand_metadata(&mut self, metadata: Option<u8>, instr: Instruction) {
+        self.operand_metadata = metadata;
+        self.operand_metadata_cursor = metadata.map_or(0u16, |value| {
+            metadata_payload_value(value, instr.supports_concat_compact())
+        });
+    }
+
+    /// Returns `true` when the current instruction's metadata has the concat flag set.
+    fn operand_concat_flag(&self) -> bool {
+        self.operand_metadata.is_some_and(metadata_concat_flag)
+    }
+
+    /// Consumes the implicit `rs1` Src metadata slot used by compact concat form.
+    fn consume_concat_src_slot(&mut self) {
+        unsafe {
+            metadata_consume_src_state_unchecked(&mut self.operand_metadata_cursor);
         }
     }
 
-    fn op_noop(&self, _instr: &'static str) -> Result<(), VMError> {
+    /// Reads the next [`SrcOperand`] from the bytecode at the current instruction pointer.
+    #[inline(always)]
+    fn read_src_operand(&mut self) -> Result<SrcOperand, VMError> {
+        if self.operand_metadata.is_none() {
+            return Ok(SrcOperand::Reg(self.read_u8_operand()?));
+        }
+        // SAFETY: metadata cursor arithmetic is sound for assembler-produced
+        // bytecode. Bounds are checked before unchecked slice access.
+        unsafe {
+            decode_src_operand_from_stream_unchecked(
+                &self.data,
+                &mut self.ip,
+                self.instr_offset,
+                &mut self.operand_metadata_cursor,
+            )
+        }
+    }
+
+    /// Reads the next [`AddrOperand`] from the bytecode at the current instruction pointer.
+    #[inline(always)]
+    fn read_addr_operand(&mut self) -> Result<AddrOperand, VMError> {
+        if self.operand_metadata.is_none() {
+            return Ok(AddrOperand::Reg(self.read_u8_operand()?));
+        }
+        // SAFETY: metadata cursor arithmetic is sound for assembler-produced bytecode.
+        unsafe {
+            decode_addr_operand_from_stream_unchecked(
+                &self.data,
+                &mut self.ip,
+                self.instr_offset,
+                &mut self.operand_metadata_cursor,
+            )
+        }
+    }
+
+    /// Reads the next compact i32 immediate from bytecode at current IP.
+    #[inline(always)]
+    fn read_imm_i32(&mut self) -> Result<i32, VMError> {
+        if self.operand_metadata.is_none() {
+            return Ok((self.read_u8_operand()? as i8) as i32);
+        }
+        // SAFETY: metadata cursor arithmetic is sound for assembler-produced bytecode.
+        unsafe {
+            decode_i32_operand_from_stream_unchecked(
+                &self.data,
+                &mut self.ip,
+                self.instr_offset,
+                &mut self.operand_metadata_cursor,
+            )
+        }
+    }
+
+    /// Reads the next compact u32 reference from bytecode at current IP.
+    #[inline(always)]
+    fn read_ref_u32(&mut self) -> Result<u32, VMError> {
+        if self.operand_metadata.is_none() {
+            return Ok(self.read_u8_operand()? as u32);
+        }
+        // SAFETY: metadata cursor arithmetic is sound for assembler-produced bytecode.
+        unsafe {
+            decode_ref_u32_operand_from_stream_unchecked(
+                &self.data,
+                &mut self.ip,
+                self.instr_offset,
+                &mut self.operand_metadata_cursor,
+            )
+        }
+    }
+
+    fn op_noop(&self, _instr: Instruction) -> Result<(), VMError> {
         Ok(())
     }
 
-    fn op_move(&mut self, _instr: &'static str, dst: u8, src: SrcOperand) -> Result<(), VMError> {
+    fn op_move(&mut self, _instr: Instruction, dst: u8, src: SrcOperand) -> Result<(), VMError> {
         let v: Value = match src {
-            SrcOperand::Reg(idx) => *self.registers.get(idx)?,
+            SrcOperand::Reg(idx) => *self.registers.get(idx),
             SrcOperand::Bool(b) => Value::Bool(b),
             SrcOperand::I64(i) => Value::Int(i),
             SrcOperand::Ref(r) => Value::Ref(r),
         };
-        self.registers.set(dst, v)
+        self.registers.set(dst, v);
+        Ok(())
     }
 
     /// Conditional move: `dst = cond ? r1 : r2`.
@@ -1233,17 +1518,17 @@ impl VM {
     /// otherwise moves `r2` to `dst`. Reference operands for `cond` are rejected.
     fn op_cmove(
         &mut self,
-        instr: &'static str,
+        instr: Instruction,
         dst: u8,
         cond: u8,
         r1: SrcOperand,
         r2: SrcOperand,
     ) -> Result<(), VMError> {
-        let v: bool = match *self.registers.get(cond)? {
+        let v: bool = match *self.registers.get(cond) {
             Value::Bool(b) => b,
             Value::Ref(_) => {
                 return Err(VMError::TypeMismatchStatic {
-                    instruction: instr,
+                    instruction: instr.mnemonic(),
                     arg_index: 2,
                     expected: "Boolean or Integer",
                     actual: "Reference",
@@ -1258,33 +1543,36 @@ impl VM {
 
     fn op_i64_to_bool(
         &mut self,
-        instr: &'static str,
+        instr: Instruction,
         dst: u8,
         src: SrcOperand,
     ) -> Result<(), VMError> {
         let v = self.int_from_operand(src, instr, 1)?;
-        self.registers.set(dst, Value::Bool(v != 0))
+        self.registers.set(dst, Value::Bool(v != 0));
+        Ok(())
     }
 
     fn op_bool_to_i64(
         &mut self,
-        instr: &'static str,
+        instr: Instruction,
         dst: u8,
         src: SrcOperand,
     ) -> Result<(), VMError> {
         let v = self.bool_from_operand(src, instr, 1)?;
-        self.registers.set(dst, Value::Int(if v { 1 } else { 0 }))
+        self.registers.set(dst, Value::Int(if v { 1 } else { 0 }));
+        Ok(())
     }
 
     fn op_str_to_i64(
         &mut self,
-        instr: &'static str,
+        instr: Instruction,
         dst: u8,
         src: SrcOperand,
     ) -> Result<(), VMError> {
         let reg = self.ref_from_operand(src, instr, 1)?;
         let str = self.heap_get_string(reg)?;
-        self.registers.set(dst, Value::Int(parse_i64(&str, 0, 0)?))
+        self.registers.set(dst, Value::Int(parse_i64(&str, 0, 0)?));
+        Ok(())
     }
 
     /// Returns the number of characters in the decimal string representation of `n`.
@@ -1342,7 +1630,7 @@ impl VM {
 
     fn op_i64_to_str(
         &mut self,
-        instr: &'static str,
+        instr: Instruction,
         dst: u8,
         src: SrcOperand,
     ) -> Result<(), VMError> {
@@ -1350,12 +1638,13 @@ impl VM {
         // Charge gas manually before allocation instead of using heap_index()
         self.charge_gas_categorized(Self::digits_i64(reg), GasCategory::HeapAllocation)?;
         let str_ref = self.heap.append(reg.to_string().into_bytes());
-        self.registers.set(dst, Value::Ref(str_ref))
+        self.registers.set(dst, Value::Ref(str_ref));
+        Ok(())
     }
 
     fn op_str_to_bool(
         &mut self,
-        instr: &'static str,
+        instr: Instruction,
         dst: u8,
         src: SrcOperand,
     ) -> Result<(), VMError> {
@@ -1367,18 +1656,19 @@ impl VM {
             false
         } else {
             return Err(VMError::TypeMismatch {
-                instruction: instr,
+                instruction: instr.mnemonic(),
                 arg_index: 1,
                 expected: "\"true\" or \"false\"",
                 actual: str,
             });
         };
-        self.registers.set(dst, Value::Bool(b))
+        self.registers.set(dst, Value::Bool(b));
+        Ok(())
     }
 
     fn op_bool_to_str(
         &mut self,
-        instr: &'static str,
+        instr: Instruction,
         dst: u8,
         src: SrcOperand,
     ) -> Result<(), VMError> {
@@ -1387,12 +1677,13 @@ impl VM {
         self.charge_gas_categorized(if reg { 4 } else { 5 }, GasCategory::HeapAllocation)?;
         let str = (if reg { "true" } else { "false" }).to_string();
         let bool_ref = self.heap.append(str.into_bytes());
-        self.registers.set(dst, Value::Ref(bool_ref))
+        self.registers.set(dst, Value::Ref(bool_ref));
+        Ok(())
     }
 
     fn op_delete_state<S: State>(
         &mut self,
-        _instr: &'static str,
+        _instr: Instruction,
         state: &mut S,
         ctx: &ExecContext,
         key: SrcOperand,
@@ -1405,7 +1696,7 @@ impl VM {
 
     fn op_has_state<S: State>(
         &mut self,
-        _instr: &'static str,
+        _instr: Instruction,
         state: &mut S,
         ctx: &ExecContext,
         dst: u8,
@@ -1414,12 +1705,13 @@ impl VM {
         let key_ref = self.bytes_from_operand(key)?;
         let key = self.make_state_key(ctx.chain_id, &ctx.contract_id, &key_ref)?;
         self.registers
-            .set(dst, Value::Bool(state.contains_key(key)))
+            .set(dst, Value::Bool(state.contains_key(key)));
+        Ok(())
     }
 
     fn op_store_bytes<S: State>(
         &mut self,
-        _instr: &'static str,
+        _instr: Instruction,
         state: &mut S,
         ctx: &ExecContext,
         key: SrcOperand,
@@ -1444,7 +1736,7 @@ impl VM {
 
     fn op_load_bytes<S: State>(
         &mut self,
-        _instr: &'static str,
+        _instr: Instruction,
         state: &mut S,
         ctx: &ExecContext,
         dst: u8,
@@ -1452,12 +1744,13 @@ impl VM {
     ) -> Result<(), VMError> {
         let (_, value) = self.load_state_bytes(state, ctx, key)?;
         let index = self.heap_index(value)?;
-        self.registers.set(dst, Value::Ref(index))
+        self.registers.set(dst, Value::Ref(index));
+        Ok(())
     }
 
     fn op_load_i64<S: State>(
         &mut self,
-        _instr: &'static str,
+        _instr: Instruction,
         state: &mut S,
         ctx: &ExecContext,
         dst: u8,
@@ -1469,12 +1762,13 @@ impl VM {
             expected: "8 bytes for i64",
         })?;
         self.registers
-            .set(dst, Value::Int(i64::from_le_bytes(bytes)))
+            .set(dst, Value::Int(i64::from_le_bytes(bytes)));
+        Ok(())
     }
 
     fn op_load_bool<S: State>(
         &mut self,
-        _instr: &'static str,
+        _instr: Instruction,
         state: &mut S,
         ctx: &ExecContext,
         dst: u8,
@@ -1487,12 +1781,13 @@ impl VM {
                 expected: "1 byte for bool",
             });
         }
-        self.registers.set(dst, Value::Bool(value[0] != 0))
+        self.registers.set(dst, Value::Bool(value[0] != 0));
+        Ok(())
     }
 
     fn op_load_str<S: State>(
         &mut self,
-        _instr: &'static str,
+        _instr: Instruction,
         state: &mut S,
         ctx: &ExecContext,
         dst: u8,
@@ -1500,12 +1795,13 @@ impl VM {
     ) -> Result<(), VMError> {
         let (_, value) = self.load_state_bytes(state, ctx, key)?;
         let str_ref = self.heap_index(value)?;
-        self.registers.set(dst, Value::Ref(str_ref))
+        self.registers.set(dst, Value::Ref(str_ref));
+        Ok(())
     }
 
     fn op_load_hash<S: State>(
         &mut self,
-        _instr: &'static str,
+        _instr: Instruction,
         state: &mut S,
         ctx: &ExecContext,
         dst: u8,
@@ -1513,22 +1809,17 @@ impl VM {
     ) -> Result<(), VMError> {
         let (_, value) = self.load_state_bytes(state, ctx, key)?;
         let hash_ref = self.heap_index(value)?;
-        self.registers.set(dst, Value::Ref(hash_ref))
+        self.registers.set(dst, Value::Ref(hash_ref));
+        Ok(())
     }
 
-    fn op_sha3(
-        &mut self,
-        _instr: &'static str,
-        dst: u8,
-        argc: u8,
-        argv: u8,
-    ) -> Result<(), VMError> {
+    fn op_sha3(&mut self, _instr: Instruction, dst: u8, argc: u8, argv: u8) -> Result<(), VMError> {
         let mut hasher = Hash::sha3();
         let mut hashed_bytes = 0usize;
 
         for i in 0..argc {
             let idx = argv.wrapping_add(i);
-            match *self.registers.get(idx)? {
+            match *self.registers.get(idx) {
                 Value::Bool(b) => {
                     hasher.update(&[b as u8]);
                     hashed_bytes += 1;
@@ -1550,48 +1841,52 @@ impl VM {
 
         let hash = hasher.finalize();
         let hash_ref = self.heap_index(hash.to_vec())?;
-        self.registers.set(dst, Value::Ref(hash_ref))
+        self.registers.set(dst, Value::Ref(hash_ref));
+        Ok(())
     }
 
     fn op_add(
         &mut self,
-        instr: &'static str,
+        instr: Instruction,
         dst: u8,
         a: SrcOperand,
         b: SrcOperand,
     ) -> Result<(), VMError> {
         let va = self.int_from_operand(a, instr, 1)?;
         let vb = self.int_from_operand(b, instr, 2)?;
-        self.registers.set(dst, Value::Int(va.wrapping_add(vb)))
+        self.registers.set(dst, Value::Int(va.wrapping_add(vb)));
+        Ok(())
     }
 
     fn op_sub(
         &mut self,
-        instr: &'static str,
+        instr: Instruction,
         dst: u8,
         a: SrcOperand,
         b: SrcOperand,
     ) -> Result<(), VMError> {
         let va = self.int_from_operand(a, instr, 1)?;
         let vb = self.int_from_operand(b, instr, 2)?;
-        self.registers.set(dst, Value::Int(va.wrapping_sub(vb)))
+        self.registers.set(dst, Value::Int(va.wrapping_sub(vb)));
+        Ok(())
     }
 
     fn op_mul(
         &mut self,
-        instr: &'static str,
+        instr: Instruction,
         dst: u8,
         a: SrcOperand,
         b: SrcOperand,
     ) -> Result<(), VMError> {
         let va = self.int_from_operand(a, instr, 1)?;
         let vb = self.int_from_operand(b, instr, 2)?;
-        self.registers.set(dst, Value::Int(va.wrapping_mul(vb)))
+        self.registers.set(dst, Value::Int(va.wrapping_mul(vb)));
+        Ok(())
     }
 
     fn op_div(
         &mut self,
-        instr: &'static str,
+        instr: Instruction,
         dst: u8,
         a: SrcOperand,
         b: SrcOperand,
@@ -1601,12 +1896,13 @@ impl VM {
         if vb == 0 {
             return Err(VMError::DivisionByZero);
         }
-        self.registers.set(dst, Value::Int(va.wrapping_div(vb)))
+        self.registers.set(dst, Value::Int(va.wrapping_div(vb)));
+        Ok(())
     }
 
     fn op_mod(
         &mut self,
-        instr: &'static str,
+        instr: Instruction,
         dst: u8,
         a: SrcOperand,
         b: SrcOperand,
@@ -1616,46 +1912,51 @@ impl VM {
         if vb == 0 {
             return Err(VMError::DivisionByZero);
         }
-        self.registers.set(dst, Value::Int(va.wrapping_rem(vb)))
+        self.registers.set(dst, Value::Int(va.wrapping_rem(vb)));
+        Ok(())
     }
 
-    fn op_neg(&mut self, instr: &'static str, dst: u8, src: SrcOperand) -> Result<(), VMError> {
+    fn op_neg(&mut self, instr: Instruction, dst: u8, src: SrcOperand) -> Result<(), VMError> {
         let v = self.int_from_operand(src, instr, 1)?;
-        self.registers.set(dst, Value::Int(v.wrapping_neg()))
+        self.registers.set(dst, Value::Int(v.wrapping_neg()));
+        Ok(())
     }
 
-    fn op_abs(&mut self, instr: &'static str, dst: u8, src: SrcOperand) -> Result<(), VMError> {
+    fn op_abs(&mut self, instr: Instruction, dst: u8, src: SrcOperand) -> Result<(), VMError> {
         let v = self.int_from_operand(src, instr, 1)?;
-        self.registers.set(dst, Value::Int(v.wrapping_abs()))
+        self.registers.set(dst, Value::Int(v.wrapping_abs()));
+        Ok(())
     }
 
     fn op_min(
         &mut self,
-        instr: &'static str,
+        instr: Instruction,
         dst: u8,
         a: SrcOperand,
         b: SrcOperand,
     ) -> Result<(), VMError> {
         let va = self.int_from_operand(a, instr, 1)?;
         let vb = self.int_from_operand(b, instr, 2)?;
-        self.registers.set(dst, Value::Int(va.min(vb)))
+        self.registers.set(dst, Value::Int(va.min(vb)));
+        Ok(())
     }
 
     fn op_max(
         &mut self,
-        instr: &'static str,
+        instr: Instruction,
         dst: u8,
         a: SrcOperand,
         b: SrcOperand,
     ) -> Result<(), VMError> {
         let va = self.int_from_operand(a, instr, 1)?;
         let vb = self.int_from_operand(b, instr, 2)?;
-        self.registers.set(dst, Value::Int(va.max(vb)))
+        self.registers.set(dst, Value::Int(va.max(vb)));
+        Ok(())
     }
 
     fn op_shl(
         &mut self,
-        instr: &'static str,
+        instr: Instruction,
         dst: u8,
         a: SrcOperand,
         b: SrcOperand,
@@ -1663,12 +1964,13 @@ impl VM {
         let va = self.int_from_operand(a, instr, 1)?;
         let vb = self.int_from_operand(b, instr, 2)?;
         self.registers
-            .set(dst, Value::Int(va.wrapping_shl(vb as u32)))
+            .set(dst, Value::Int(va.wrapping_shl(vb as u32)));
+        Ok(())
     }
 
     fn op_shr(
         &mut self,
-        instr: &'static str,
+        instr: Instruction,
         dst: u8,
         a: SrcOperand,
         b: SrcOperand,
@@ -1676,75 +1978,83 @@ impl VM {
         let va = self.int_from_operand(a, instr, 1)?;
         let vb = self.int_from_operand(b, instr, 2)?;
         self.registers
-            .set(dst, Value::Int(va.wrapping_shr(vb as u32)))
+            .set(dst, Value::Int(va.wrapping_shr(vb as u32)));
+        Ok(())
     }
 
-    fn op_inc(&mut self, instr: &'static str, dst: u8) -> Result<(), VMError> {
+    fn op_inc(&mut self, instr: Instruction, dst: u8) -> Result<(), VMError> {
         let r = self.registers.get_int(dst, instr)?;
-        self.registers.set(dst, Value::Int(r.wrapping_add(1)))
+        self.registers.set(dst, Value::Int(r.wrapping_add(1)));
+        Ok(())
     }
 
-    fn op_dec(&mut self, instr: &'static str, dst: u8) -> Result<(), VMError> {
+    fn op_dec(&mut self, instr: Instruction, dst: u8) -> Result<(), VMError> {
         let r = self.registers.get_int(dst, instr)?;
-        self.registers.set(dst, Value::Int(r.wrapping_sub(1)))
+        self.registers.set(dst, Value::Int(r.wrapping_sub(1)));
+        Ok(())
     }
 
-    fn op_not(&mut self, instr: &'static str, dst: u8, src: SrcOperand) -> Result<(), VMError> {
+    fn op_not(&mut self, instr: Instruction, dst: u8, src: SrcOperand) -> Result<(), VMError> {
         let v = self.bool_from_operand(src, instr, 1)?;
-        self.registers.set(dst, Value::Bool(!v))
+        self.registers.set(dst, Value::Bool(!v));
+        Ok(())
     }
 
     fn op_and(
         &mut self,
-        instr: &'static str,
+        instr: Instruction,
         dst: u8,
         a: SrcOperand,
         b: SrcOperand,
     ) -> Result<(), VMError> {
         let va = self.bool_from_operand(a, instr, 1)?;
         let vb = self.bool_from_operand(b, instr, 2)?;
-        self.registers.set(dst, Value::Bool(va && vb))
+        self.registers.set(dst, Value::Bool(va && vb));
+        Ok(())
     }
 
     fn op_or(
         &mut self,
-        instr: &'static str,
+        instr: Instruction,
         dst: u8,
         a: SrcOperand,
         b: SrcOperand,
     ) -> Result<(), VMError> {
         let va = self.bool_from_operand(a, instr, 1)?;
         let vb = self.bool_from_operand(b, instr, 2)?;
-        self.registers.set(dst, Value::Bool(va || vb))
+        self.registers.set(dst, Value::Bool(va || vb));
+        Ok(())
     }
 
     fn op_xor(
         &mut self,
-        instr: &'static str,
+        instr: Instruction,
         dst: u8,
         a: SrcOperand,
         b: SrcOperand,
     ) -> Result<(), VMError> {
         let va = self.bool_from_operand(a, instr, 1)?;
         let vb = self.bool_from_operand(b, instr, 2)?;
-        self.registers.set(dst, Value::Bool(va ^ vb))
+        self.registers.set(dst, Value::Bool(va ^ vb));
+        Ok(())
     }
 
     fn op_eq(
         &mut self,
-        _instr: &'static str,
+        _instr: Instruction,
         dst: u8,
         a: SrcOperand,
         b: SrcOperand,
     ) -> Result<(), VMError> {
         let va = self.value_from_operand(a)?;
         let vb = self.value_from_operand(b)?;
-        self.registers.set(dst, Value::Bool(Value::equals(va, vb)?))
+        self.registers.set(dst, Value::Bool(Value::equals(va, vb)?));
+        Ok(())
     }
 
     fn op_ne(
         &mut self,
-        _instr: &'static str,
+        _instr: Instruction,
         dst: u8,
         a: SrcOperand,
         b: SrcOperand,
@@ -1752,61 +2062,65 @@ impl VM {
         let va = self.value_from_operand(a)?;
         let vb = self.value_from_operand(b)?;
         self.registers
-            .set(dst, Value::Bool(!Value::equals(va, vb)?))
+            .set(dst, Value::Bool(!Value::equals(va, vb)?));
+        Ok(())
     }
 
     fn op_lt(
         &mut self,
-        instr: &'static str,
+        instr: Instruction,
         dst: u8,
         a: SrcOperand,
         b: SrcOperand,
     ) -> Result<(), VMError> {
         let va = self.int_from_operand(a, instr, 1)?;
         let vb = self.int_from_operand(b, instr, 2)?;
-        self.registers.set(dst, Value::Bool(va < vb))
+        self.registers.set(dst, Value::Bool(va < vb));
+        Ok(())
     }
 
     fn op_gt(
         &mut self,
-        instr: &'static str,
+        instr: Instruction,
         dst: u8,
         a: SrcOperand,
         b: SrcOperand,
     ) -> Result<(), VMError> {
         let va = self.int_from_operand(a, instr, 1)?;
         let vb = self.int_from_operand(b, instr, 2)?;
-        self.registers.set(dst, Value::Bool(va > vb))
+        self.registers.set(dst, Value::Bool(va > vb));
+        Ok(())
     }
 
     fn op_le(
         &mut self,
-        instr: &'static str,
+        instr: Instruction,
         dst: u8,
         a: SrcOperand,
         b: SrcOperand,
     ) -> Result<(), VMError> {
         let va = self.int_from_operand(a, instr, 1)?;
         let vb = self.int_from_operand(b, instr, 2)?;
-        self.registers.set(dst, Value::Bool(va <= vb))
+        self.registers.set(dst, Value::Bool(va <= vb));
+        Ok(())
     }
 
     fn op_ge(
         &mut self,
-        instr: &'static str,
+        instr: Instruction,
         dst: u8,
         a: SrcOperand,
         b: SrcOperand,
     ) -> Result<(), VMError> {
         let va = self.int_from_operand(a, instr, 1)?;
         let vb = self.int_from_operand(b, instr, 2)?;
-        self.registers.set(dst, Value::Bool(va >= vb))
+        self.registers.set(dst, Value::Bool(va >= vb));
+        Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn op_call_host<S: State>(
         &mut self,
-        _: &'static str,
+        _: Instruction,
         _: &mut S,
         ctx: &ExecContext,
         dst: u8,
@@ -1822,8 +2136,8 @@ impl VM {
                 name: fn_name.clone(),
             })?;
         let args: Vec<Value> = (0..argc)
-            .map(|i| self.registers.get(argv.wrapping_add(i)).copied())
-            .collect::<Result<_, _>>()?;
+            .map(|i| *self.registers.get(argv.wrapping_add(i)))
+            .collect::<_>();
 
         /// Converts the given value to an u32 (ref), returns an error if it isn't a Value::Ref
         fn get_ref(val: Value) -> Result<u32, VMError> {
@@ -1856,7 +2170,8 @@ impl VM {
                 let str_ref = get_ref(args[0])?;
                 let len = self.heap.get_data(str_ref)?.len();
                 self.charge_gas_categorized(len as u64, GasCategory::HostFunction)?;
-                self.registers.set(dst, Value::Int(len as i64))
+                self.registers.set(dst, Value::Int(len as i64));
+                Ok(())
             }
             SLICE => {
                 let str_ref = get_ref(args[0])?;
@@ -1872,7 +2187,8 @@ impl VM {
 
                 let sliced = data[start..end].to_vec();
                 let new_ref = self.heap_index(sliced)?;
-                self.registers.set(dst, Value::Ref(new_ref))
+                self.registers.set(dst, Value::Ref(new_ref));
+                Ok(())
             }
             CONCAT => {
                 let ref1 = get_ref(args[0])?;
@@ -1886,7 +2202,8 @@ impl VM {
                 result.extend_from_slice(self.heap.get_data(ref2)?);
 
                 let new_ref = self.heap_index(result)?;
-                self.registers.set(dst, Value::Ref(new_ref))
+                self.registers.set(dst, Value::Ref(new_ref));
+                Ok(())
             }
             COMPARE => {
                 let ref1 = get_ref(args[0])?;
@@ -1903,11 +2220,13 @@ impl VM {
                     std::cmp::Ordering::Equal => 0,
                     std::cmp::Ordering::Greater => 1,
                 };
-                self.registers.set(dst, Value::Int(cmp))
+                self.registers.set(dst, Value::Int(cmp));
+                Ok(())
             }
             CALLER => {
                 let reference = self.heap_index(ctx.caller.to_vec())?;
-                self.registers.set(dst, Value::Ref(reference))
+                self.registers.set(dst, Value::Ref(reference));
+                Ok(())
             }
             _ => Err(VMError::InvalidCallHostFunction { name: fn_name }),
         }
@@ -1915,7 +2234,7 @@ impl VM {
 
     fn op_call_host0<S: State>(
         &mut self,
-        instr: &'static str,
+        instr: Instruction,
         state: &mut S,
         ctx: &ExecContext,
         dst: u8,
@@ -1924,7 +2243,7 @@ impl VM {
         self.op_call_host(instr, state, ctx, dst, fn_id, 0)
     }
 
-    fn op_call(&mut self, instr: &'static str, offset: i32) -> Result<(), VMError> {
+    fn op_call(&mut self, instr: Instruction, offset: i32) -> Result<(), VMError> {
         self.charge_call(self.call_stack.len(), 10)?;
 
         if self.call_stack.len() >= MAX_CALL_STACK_LEN {
@@ -1938,21 +2257,21 @@ impl VM {
         self.op_jump(instr, offset)
     }
 
-    fn op_jal(&mut self, instr: &'static str, rd: u8, offset: i32) -> Result<(), VMError> {
-        self.registers.set(rd, Value::Int(self.ip as i64))?;
+    fn op_jal(&mut self, instr: Instruction, rd: u8, offset: i32) -> Result<(), VMError> {
+        self.registers.set(rd, Value::Int(self.ip as i64));
         self.op_jump(instr, offset)
     }
 
-    fn op_jalr(&mut self, instr: &'static str, rd: u8, rs: u8, offset: i32) -> Result<(), VMError> {
+    fn op_jalr(&mut self, instr: Instruction, rd: u8, rs: u8, offset: i32) -> Result<(), VMError> {
         let base = self.registers.get_int(rs, instr)?;
-        self.registers.set(rd, Value::Int(self.ip as i64))?;
+        self.registers.set(rd, Value::Int(self.ip as i64));
         self.ip = base as usize;
         self.op_jump(instr, offset)
     }
 
     fn op_beq(
         &mut self,
-        instr: &'static str,
+        instr: Instruction,
         rs1: SrcOperand,
         rs2: SrcOperand,
         offset: i32,
@@ -1968,7 +2287,7 @@ impl VM {
 
     fn op_bne(
         &mut self,
-        instr: &'static str,
+        instr: Instruction,
         rs1: SrcOperand,
         rs2: SrcOperand,
         offset: i32,
@@ -1984,7 +2303,7 @@ impl VM {
 
     fn op_blt(
         &mut self,
-        instr: &'static str,
+        instr: Instruction,
         rs1: SrcOperand,
         rs2: SrcOperand,
         offset: i32,
@@ -1999,7 +2318,7 @@ impl VM {
 
     fn op_bge(
         &mut self,
-        instr: &'static str,
+        instr: Instruction,
         rs1: SrcOperand,
         rs2: SrcOperand,
         offset: i32,
@@ -2014,7 +2333,7 @@ impl VM {
 
     fn op_bltu(
         &mut self,
-        instr: &'static str,
+        instr: Instruction,
         rs1: SrcOperand,
         rs2: SrcOperand,
         offset: i32,
@@ -2029,7 +2348,7 @@ impl VM {
 
     fn op_bgeu(
         &mut self,
-        instr: &'static str,
+        instr: Instruction,
         rs1: SrcOperand,
         rs2: SrcOperand,
         offset: i32,
@@ -2042,7 +2361,7 @@ impl VM {
         Ok(())
     }
 
-    fn op_jump(&mut self, _instr: &'static str, offset: i32) -> Result<(), VMError> {
+    fn op_jump(&mut self, _instr: Instruction, offset: i32) -> Result<(), VMError> {
         let new_ip = self.ip as i32 + offset;
         if new_ip < 0 || new_ip as usize > self.data.len() {
             return Err(VMError::JumpOutOfBounds {
@@ -2055,7 +2374,7 @@ impl VM {
         Ok(())
     }
 
-    fn op_ret(&mut self, _instr: &'static str) -> Result<(), VMError> {
+    fn op_ret(&mut self, _instr: Instruction) -> Result<(), VMError> {
         let return_addr = self.call_stack.pop().ok_or(VMError::ReturnWithoutCall {
             call_depth: self.call_stack.len(),
         })?;
@@ -2063,7 +2382,7 @@ impl VM {
         Ok(())
     }
 
-    fn op_halt(&mut self, _instr: &'static str) -> Result<(), VMError> {
+    fn op_halt(&mut self, _instr: Instruction) -> Result<(), VMError> {
         // Move IP to the end to exit the execution loop cleanly.
         self.ip = self.data.len();
         Ok(())
@@ -2071,7 +2390,7 @@ impl VM {
 
     fn op_return(
         &mut self,
-        instr: &'static str,
+        instr: Instruction,
         addr: AddrOperand,
         len: AddrOperand,
     ) -> Result<(), VMError> {
@@ -2081,30 +2400,39 @@ impl VM {
         } else {
             let addr = addr as usize;
             let len = self.addr_operand_to_u32(instr, len)? as usize;
-            self.return_data = self.heap[addr..addr + len].to_vec();
+            if addr + len > self.heap.len() {
+                return Err(VMError::MemoryOOBRead {
+                    got: addr + len,
+                    max: self.heap.len(),
+                });
+            }
+            // SAFETY: `addr + len <= self.heap.len()` is validated above.
+            self.return_data = unsafe { self.heap.exec_slice_unchecked(addr, len) }.to_vec();
         }
         self.op_halt(instr)
     }
 
-    fn op_call_data_load(&mut self, _instr: &'static str, dst: u8) -> Result<(), VMError> {
+    fn op_call_data_load(&mut self, _instr: Instruction, dst: u8) -> Result<(), VMError> {
         for (i, arg) in self.args.iter().enumerate() {
-            self.registers.set(dst + i as u8, *arg)?;
+            self.registers.set(dst + i as u8, *arg);
         }
         Ok(())
     }
 
-    fn op_call_data_copy(&mut self, instr: &'static str, dst: AddrOperand) -> Result<(), VMError> {
+    fn op_call_data_copy(&mut self, instr: Instruction, dst: AddrOperand) -> Result<(), VMError> {
         let bytes = self.args_to_vec();
         let len = bytes.len() as u32;
         self.op_memset(instr, dst.clone(), AddrOperand::U32(len), 0x00)?;
         let dst = self.addr_operand_to_u32(instr, dst)? as usize;
-        self.heap[dst..dst + bytes.len()].copy_from_slice(&bytes);
+        // SAFETY: `op_memset` expanded memory to cover `dst + len`, and `len == bytes.len()`.
+        unsafe { self.heap.exec_slice_unchecked_mut(dst, bytes.len()) }.copy_from_slice(&bytes);
         Ok(())
     }
 
-    fn op_call_data_len(&mut self, _instr: &'static str, dst: u8) -> Result<(), VMError> {
+    fn op_call_data_len(&mut self, _instr: Instruction, dst: u8) -> Result<(), VMError> {
         let size = self.args_to_vec().len();
-        self.registers.set(dst, Value::Int(size as i64))
+        self.registers.set(dst, Value::Int(size as i64));
+        Ok(())
     }
 
     /// Ensures execution memory spans `[base, base + len)`.
@@ -2127,23 +2455,23 @@ impl VM {
     ///
     /// For immediate addresses, returns the value directly. For register addresses,
     /// reads the integer value from the register and truncates to u32.
-    fn addr_operand_to_u32(&self, instr: &'static str, addr: AddrOperand) -> Result<u32, VMError> {
+    fn addr_operand_to_u32(&self, instr: Instruction, addr: AddrOperand) -> Result<u32, VMError> {
         Ok(self.addr_operand_to_u32_with_ref(instr, addr)?.0)
     }
 
     fn addr_operand_to_u32_with_ref(
         &self,
-        instr: &'static str,
+        instr: Instruction,
         addr: AddrOperand,
     ) -> Result<(u32, bool), VMError> {
         Ok(match addr {
             AddrOperand::U32(u) => (u, false),
-            AddrOperand::Reg(r) => match self.registers.get(r)? {
+            AddrOperand::Reg(r) => match self.registers.get(r) {
                 Value::Ref(r) => (*r, true),
                 Value::Int(_) => (self.registers.get_int(r, instr)? as u32, false),
                 other => {
                     return Err(VMError::TypeMismatchStatic {
-                        instruction: instr,
+                        instruction: instr.mnemonic(),
                         arg_index: r as i32,
                         expected: "Int",
                         actual: other.type_name(),
@@ -2160,22 +2488,22 @@ impl VM {
     /// most significant bit of the loaded value.
     fn memload<const COUNT: usize>(
         &mut self,
-        instr: &'static str,
+        instr: Instruction,
         rd: u8,
         addr: AddrOperand,
         unsigned: bool,
     ) -> Result<(), VMError> {
         let addr = self.addr_operand_to_u32(instr, addr)? as usize;
-        if addr + WORD_SIZE > self.heap.len() {
+        if addr + COUNT > self.heap.len() {
             return Err(VMError::MemoryOOBRead {
-                got: addr + WORD_SIZE,
+                got: addr + COUNT,
                 max: self.heap.len(),
             });
         }
 
-        // Load the requested number of bytes
+        // SAFETY: `addr + COUNT <= self.heap.len()` is validated above.
         let mut result: [u8; WORD_SIZE] = [0u8; WORD_SIZE];
-        result[..COUNT].copy_from_slice(&self.heap[addr..addr + COUNT]);
+        result[..COUNT].copy_from_slice(unsafe { self.heap.exec_slice_unchecked(addr, COUNT) });
         // Sign or Zero extend the bytes
         let extension: u8 = if !unsigned && (result[COUNT - 1] >> 7) != 0 {
             0xFF
@@ -2185,21 +2513,17 @@ impl VM {
         result[COUNT..].fill(extension);
 
         self.registers
-            .set(rd, Value::Int(i64::from_le_bytes(result)))
+            .set(rd, Value::Int(i64::from_le_bytes(result)));
+        Ok(())
     }
 
-    fn op_memload(
-        &mut self,
-        instr: &'static str,
-        rd: u8,
-        addr: AddrOperand,
-    ) -> Result<(), VMError> {
+    fn op_memload(&mut self, instr: Instruction, rd: u8, addr: AddrOperand) -> Result<(), VMError> {
         self.memload::<WORD_SIZE>(instr, rd, addr, true)
     }
 
     fn op_memstore(
         &mut self,
-        instr: &'static str,
+        instr: Instruction,
         addr: AddrOperand,
         rs: SrcOperand,
     ) -> Result<(), VMError> {
@@ -2208,14 +2532,15 @@ impl VM {
 
         let value = self.int_from_operand(rs, instr, 2)?;
         let data = value.to_le_bytes();
-        self.heap[addr..addr + WORD_SIZE].copy_from_slice(&data);
+        // SAFETY: `expand_memory(addr, WORD_SIZE)` guarantees `addr + WORD_SIZE <= self.heap.len()`.
+        unsafe { self.heap.exec_slice_unchecked_mut(addr, WORD_SIZE) }.copy_from_slice(&data);
 
         Ok(())
     }
 
     fn op_memcpy(
         &mut self,
-        instr: &'static str,
+        instr: Instruction,
         dst: AddrOperand,
         src: AddrOperand,
         len: AddrOperand,
@@ -2237,14 +2562,15 @@ impl VM {
         }
 
         self.charge_gas_categorized(len as u64 * 3, GasCategory::Memory)?;
-        self.heap.copy_within(src..src + len, dst);
+        // SAFETY: `expand_memory(dst, len)` guarantees dst bounds; `src + len <= self.heap.len()` is checked above.
+        unsafe { self.heap.exec_copy_within_unchecked(src, dst, len) };
 
         Ok(())
     }
 
     fn op_memset(
         &mut self,
-        instr: &'static str,
+        instr: Instruction,
         dst: AddrOperand,
         len: AddrOperand,
         val: u8,
@@ -2257,12 +2583,14 @@ impl VM {
         let dst = self.addr_operand_to_u32(instr, dst)? as usize;
         self.expand_memory(dst, len)?;
         self.charge_gas_categorized(len as u64 * 3, GasCategory::Memory)?;
-        self.heap[dst..dst + len].fill(val);
+        // SAFETY: `expand_memory(dst, len)` guarantees `dst + len <= self.heap.len()`.
+        unsafe { self.heap.exec_fill_unchecked(dst, len, val) };
         Ok(())
     }
 
-    fn op_memlen(&mut self, _instr: &'static str, dst: u8) -> Result<(), VMError> {
-        self.registers.set(dst, Value::Int(self.heap.len() as i64))
+    fn op_memlen(&mut self, _instr: Instruction, dst: u8) -> Result<(), VMError> {
+        self.registers.set(dst, Value::Int(self.heap.len() as i64));
+        Ok(())
     }
 
     /// Dispatches to a public function by selector index.
@@ -2273,8 +2601,8 @@ impl VM {
     /// Uses the execute-program selector, loads call arguments via
     /// `CALLDATA_LOAD` semantics into the entry's `argr`, calls the target
     /// function, and halts.
-    fn op_dispatch(&mut self, instr: &'static str) -> Result<(), VMError> {
-        let count = self.read_exact(1)?[0] as usize;
+    fn op_dispatch(&mut self, instr: Instruction) -> Result<(), VMError> {
+        let count = self.read_u8_operand()? as usize;
         let selector = self.dispatch_selector as usize;
         if selector >= count {
             return Err(VMError::DispatchOutOfBounds { selector, count });
@@ -2291,7 +2619,7 @@ impl VM {
             let offset = i32::try_from(offset_i64).map_err(|_| VMError::DecodeError {
                 reason: format!("dispatch offset {offset_i64} is out of i32 range"),
             })?;
-            let argr = self.read_exact(1)?[0];
+            let argr = self.read_u8_operand()?;
             if entry_index == selector {
                 selected = Some((offset, argr));
             }
@@ -2309,7 +2637,7 @@ impl VM {
 
     fn op_memload_8u(
         &mut self,
-        instr: &'static str,
+        instr: Instruction,
         rd: u8,
         addr: AddrOperand,
     ) -> Result<(), VMError> {
@@ -2318,7 +2646,7 @@ impl VM {
 
     fn op_memload_8s(
         &mut self,
-        instr: &'static str,
+        instr: Instruction,
         rd: u8,
         addr: AddrOperand,
     ) -> Result<(), VMError> {
@@ -2327,7 +2655,7 @@ impl VM {
 
     fn op_memload_16u(
         &mut self,
-        instr: &'static str,
+        instr: Instruction,
         rd: u8,
         addr: AddrOperand,
     ) -> Result<(), VMError> {
@@ -2336,7 +2664,7 @@ impl VM {
 
     fn op_memload_16s(
         &mut self,
-        instr: &'static str,
+        instr: Instruction,
         rd: u8,
         addr: AddrOperand,
     ) -> Result<(), VMError> {
@@ -2345,7 +2673,7 @@ impl VM {
 
     fn op_memload_32u(
         &mut self,
-        instr: &'static str,
+        instr: Instruction,
         rd: u8,
         addr: AddrOperand,
     ) -> Result<(), VMError> {
@@ -2354,7 +2682,7 @@ impl VM {
 
     fn op_memload_32s(
         &mut self,
-        instr: &'static str,
+        instr: Instruction,
         rd: u8,
         addr: AddrOperand,
     ) -> Result<(), VMError> {

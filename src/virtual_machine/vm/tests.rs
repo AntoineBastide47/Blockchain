@@ -77,19 +77,25 @@ fn run_vm(source: &str) -> VM {
 }
 
 fn run_and_get_int(source: &str, reg: u8) -> i64 {
-    run_vm(source).registers.get_int(test_reg(reg), "").unwrap()
+    run_vm(source)
+        .registers
+        .get_int(test_reg(reg), Instruction::Noop)
+        .unwrap()
 }
 
 fn run_and_get_bool(source: &str, reg: u8) -> bool {
     run_vm(source)
         .registers
-        .get_bool(test_reg(reg), "")
+        .get_bool(test_reg(reg), Instruction::Noop)
         .unwrap()
 }
 
 fn run_and_get_str(source: &str, reg: u8) -> String {
     let vm = run_vm(source);
-    let r = vm.registers.get_ref(test_reg(reg), "").unwrap();
+    let r = vm
+        .registers
+        .get_ref(test_reg(reg), Instruction::Noop)
+        .unwrap();
     vm.heap.get_string(r).unwrap()
 }
 
@@ -131,8 +137,8 @@ fn r0_is_hardwired_zero() {
             MOVE r1, r0
         "#,
     );
-    assert_eq!(vm.registers.get_int(0, "").unwrap(), 0);
-    assert_eq!(vm.registers.get_int(1, "").unwrap(), 0);
+    assert_eq!(vm.registers.get_int(0, Instruction::Noop).unwrap(), 0);
+    assert_eq!(vm.registers.get_int(1, Instruction::Noop).unwrap(), 0);
 }
 
 #[test]
@@ -144,14 +150,14 @@ fn load_bool() {
 #[test]
 fn load_str() {
     let vm = run_vm(r#"MOVE r10, "hello""#);
-    let ref_id = vm.registers.get_ref(10, "").unwrap();
+    let ref_id = vm.registers.get_ref(10, Instruction::Noop).unwrap();
     assert_eq!(vm.heap.get_string(ref_id).unwrap(), "hello");
 }
 
 #[test]
 fn load_hash() {
     let vm = run_vm(r#"MOVE r10, "00000000000000000000000000000000""#);
-    let ref_id = vm.registers.get_ref(10, "").unwrap();
+    let ref_id = vm.registers.get_ref(10, Instruction::Noop).unwrap();
     let expected = Hash::from_slice(b"00000000000000000000000000000000").unwrap();
     assert_eq!(vm.heap.get_hash(ref_id).unwrap(), expected);
 }
@@ -164,7 +170,7 @@ fn sha3_single_string_arg() {
             SHA3 r10, 1, r2
         "#,
     );
-    let ref_id = vm.registers.get_ref(10, "").unwrap();
+    let ref_id = vm.registers.get_ref(10, Instruction::Noop).unwrap();
     let expected = Hash::sha3().chain(b"hello").finalize();
     assert_eq!(vm.heap.get_hash(ref_id).unwrap(), expected);
 }
@@ -179,7 +185,7 @@ fn sha3_multiple_args_from_argv_range() {
             SHA3 r10, 3, r2
         "#,
     );
-    let ref_id = vm.registers.get_ref(10, "").unwrap();
+    let ref_id = vm.registers.get_ref(10, Instruction::Noop).unwrap();
     let expected = Hash::sha3()
         .chain(b"ab")
         .chain(&42i64.to_le_bytes())
@@ -191,7 +197,7 @@ fn sha3_multiple_args_from_argv_range() {
 #[test]
 fn noop_does_not_modify_registers() {
     let vm = run_vm("MOVE r10, 7\nNOOP");
-    assert_eq!(vm.registers.get_int(10, "").unwrap(), 7);
+    assert_eq!(vm.registers.get_int(10, Instruction::Noop).unwrap(), 7);
 }
 
 // ==================== Moves / Casts ====================
@@ -501,7 +507,7 @@ fn src_operand_store_immediate_key() {
         r#"STORE "mykey", 123
 LOAD_I64 r10, "mykey""#,
     );
-    assert_eq!(vm.registers.get_int(10, "").unwrap(), 123);
+    assert_eq!(vm.registers.get_int(10, Instruction::Noop).unwrap(), 123);
 }
 
 #[test]
@@ -512,7 +518,7 @@ fn src_operand_store_immediate_value() {
 STORE r10, 999
 LOAD_I64 r1, r10"#,
     );
-    assert_eq!(vm.registers.get_int(1, "").unwrap(), 999);
+    assert_eq!(vm.registers.get_int(1, Instruction::Noop).unwrap(), 999);
 }
 
 #[test]
@@ -522,7 +528,7 @@ fn src_operand_store_both_immediate() {
         r#"STORE "flag", true
 LOAD_BOOL r10, "flag""#,
     );
-    assert!(vm.registers.get_bool(10, "").unwrap());
+    assert!(vm.registers.get_bool(10, Instruction::Noop).unwrap());
 }
 
 #[test]
@@ -839,7 +845,7 @@ fn store_i64_inline_key() {
         r#"STORE "counter", 42
 LOAD_I64 r10, "counter""#,
     );
-    assert_eq!(vm.registers.get_int(10, "").unwrap(), 42);
+    assert_eq!(vm.registers.get_int(10, Instruction::Noop).unwrap(), 42);
 }
 
 #[test]
@@ -901,7 +907,7 @@ MOVE r1, "hello"
 STORE r10, r1
 LOAD r2, r10"#,
     );
-    let ref_id = vm.registers.get_ref(2, "").unwrap();
+    let ref_id = vm.registers.get_ref(2, Instruction::Noop).unwrap();
     assert_eq!(vm.heap.get_data(ref_id).unwrap(), b"hello");
 }
 
@@ -923,7 +929,7 @@ fn load_i64_state() {
 LOAD_I64 r1, r10"#,
         &mut state,
     );
-    assert_eq!(vm.registers.get_int(1, "").unwrap(), 42);
+    assert_eq!(vm.registers.get_int(1, Instruction::Noop).unwrap(), 42);
 }
 
 #[test]
@@ -935,7 +941,7 @@ fn load_i64_state_negative() {
 LOAD_I64 r1, r10"#,
         &mut state,
     );
-    assert_eq!(vm.registers.get_int(1, "").unwrap(), -999);
+    assert_eq!(vm.registers.get_int(1, Instruction::Noop).unwrap(), -999);
 }
 
 #[test]
@@ -961,7 +967,7 @@ fn load_bool_state_true() {
 LOAD_BOOL r1, r10"#,
         &mut state,
     );
-    assert!(vm.registers.get_bool(1, "").unwrap());
+    assert!(vm.registers.get_bool(1, Instruction::Noop).unwrap());
 }
 
 #[test]
@@ -973,7 +979,7 @@ fn load_bool_state_false() {
 LOAD_BOOL r1, r10"#,
         &mut state,
     );
-    assert!(!vm.registers.get_bool(1, "").unwrap());
+    assert!(!vm.registers.get_bool(1, Instruction::Noop).unwrap());
 }
 
 #[test]
@@ -1001,8 +1007,8 @@ HAS_STATE r2, r10
 HAS_STATE r3, r1"#,
         &mut state,
     );
-    assert!(vm.registers.get_bool(2, "").unwrap());
-    assert!(!vm.registers.get_bool(3, "").unwrap());
+    assert!(vm.registers.get_bool(2, Instruction::Noop).unwrap());
+    assert!(!vm.registers.get_bool(3, Instruction::Noop).unwrap());
 }
 
 #[test]
@@ -1014,7 +1020,7 @@ fn load_str_state() {
 LOAD_STR r1, r10"#,
         &mut state,
     );
-    let ref_id = vm.registers.get_ref(1, "").unwrap();
+    let ref_id = vm.registers.get_ref(1, Instruction::Noop).unwrap();
     assert_eq!(vm.heap.get_string(ref_id).unwrap(), "alice");
 }
 
@@ -1027,7 +1033,7 @@ fn load_str_state_empty() {
 LOAD_STR r1, r10"#,
         &mut state,
     );
-    let ref_id = vm.registers.get_ref(1, "").unwrap();
+    let ref_id = vm.registers.get_ref(1, Instruction::Noop).unwrap();
     assert_eq!(vm.heap.get_string(ref_id).unwrap(), "");
 }
 
@@ -1041,7 +1047,7 @@ fn load_hash_state() {
 LOAD_HASH r1, r10"#,
         &mut state,
     );
-    let ref_id = vm.registers.get_ref(1, "").unwrap();
+    let ref_id = vm.registers.get_ref(1, Instruction::Noop).unwrap();
     assert_eq!(vm.heap.get_hash(ref_id).unwrap(), expected);
 }
 
@@ -1067,7 +1073,7 @@ MOVE r1, 123
 STORE r10, r1
 LOAD_I64 r2, r10"#,
     );
-    assert_eq!(vm.registers.get_int(2, "").unwrap(), 123);
+    assert_eq!(vm.registers.get_int(2, Instruction::Noop).unwrap(), 123);
 }
 
 #[test]
@@ -1078,7 +1084,7 @@ MOVE r1, true
 STORE r10, r1
 LOAD_BOOL r2, r10"#,
     );
-    assert!(vm.registers.get_bool(2, "").unwrap());
+    assert!(vm.registers.get_bool(2, Instruction::Noop).unwrap());
 }
 
 #[test]
@@ -1089,7 +1095,7 @@ MOVE r1, "hello"
 STORE r10, r1
 LOAD_STR r2, r10"#,
     );
-    let ref_id = vm.registers.get_ref(2, "").unwrap();
+    let ref_id = vm.registers.get_ref(2, Instruction::Noop).unwrap();
     assert_eq!(vm.heap.get_string(ref_id).unwrap(), "hello");
 }
 
@@ -1101,7 +1107,7 @@ MOVE r1, "22222222222222222222222222222222"
 STORE r10, r1
 LOAD_HASH r2, r10"#,
     );
-    let ref_id = vm.registers.get_ref(2, "").unwrap();
+    let ref_id = vm.registers.get_ref(2, Instruction::Noop).unwrap();
     let expected = Hash::from_slice(b"22222222222222222222222222222222").unwrap();
     assert_eq!(vm.heap.get_hash(ref_id).unwrap(), expected);
 }
@@ -1114,7 +1120,7 @@ fn jal_saves_return_address() {
     // JAL r10, 0 means jump to current position (no-op) but save return addr
     let vm = run_vm("JAL r10, 0");
     // After JAL (3 bytes: opcode + reg + i32_1), ip should be saved as 3.
-    assert_eq!(vm.registers.get_int(10, "").unwrap(), 3);
+    assert_eq!(vm.registers.get_int(10, Instruction::Noop).unwrap(), 3);
 }
 
 #[test]
@@ -1127,9 +1133,9 @@ fn jal_forward_jump() {
         "#;
     let vm = run_vm(source);
     // r1 should still be zero (skipped)
-    assert_eq!(vm.registers.get(1).unwrap(), &Value::Int(0));
+    assert_eq!(vm.registers.get(1), &Value::Int(0));
     // r2 should be 42
-    assert_eq!(vm.registers.get_int(2, "").unwrap(), 42);
+    assert_eq!(vm.registers.get_int(2, Instruction::Noop).unwrap(), 42);
 }
 
 #[test]
@@ -1142,7 +1148,7 @@ fn jump_skips_instructions() {
             done:
         "#,
     );
-    assert_eq!(vm.registers.get_int(10, "").unwrap(), 1);
+    assert_eq!(vm.registers.get_int(10, Instruction::Noop).unwrap(), 1);
 }
 
 #[test]
@@ -1156,8 +1162,8 @@ fn beq_taken() {
             skip: MOVE r3, 42
         "#;
     let vm = run_vm(source);
-    assert_eq!(vm.registers.get(2).unwrap(), &Value::Int(0));
-    assert_eq!(vm.registers.get_int(3, "").unwrap(), 42);
+    assert_eq!(vm.registers.get(2), &Value::Int(0));
+    assert_eq!(vm.registers.get_int(3, Instruction::Noop).unwrap(), 42);
 }
 
 #[test]
@@ -1171,8 +1177,8 @@ fn beq_not_taken() {
             skip: MOVE r3, 42
         "#;
     let vm = run_vm(source);
-    assert_eq!(vm.registers.get_int(2, "").unwrap(), 99);
-    assert_eq!(vm.registers.get_int(3, "").unwrap(), 42);
+    assert_eq!(vm.registers.get_int(2, Instruction::Noop).unwrap(), 99);
+    assert_eq!(vm.registers.get_int(3, Instruction::Noop).unwrap(), 42);
 }
 
 #[test]
@@ -1185,8 +1191,8 @@ fn bne_taken() {
             skip: MOVE r3, 42
         "#;
     let vm = run_vm(source);
-    assert_eq!(vm.registers.get(2).unwrap(), &Value::Int(0));
-    assert_eq!(vm.registers.get_int(3, "").unwrap(), 42);
+    assert_eq!(vm.registers.get(2), &Value::Int(0));
+    assert_eq!(vm.registers.get_int(3, Instruction::Noop).unwrap(), 42);
 }
 
 #[test]
@@ -1199,7 +1205,7 @@ fn bne_not_taken() {
             skip: MOVE r3, 42
         "#;
     let vm = run_vm(source);
-    assert_eq!(vm.registers.get_int(2, "").unwrap(), 99);
+    assert_eq!(vm.registers.get_int(2, Instruction::Noop).unwrap(), 99);
 }
 
 #[test]
@@ -1212,8 +1218,8 @@ fn blt_taken() {
             skip: MOVE r3, 42
         "#;
     let vm = run_vm(source);
-    assert_eq!(vm.registers.get(2).unwrap(), &Value::Int(0));
-    assert_eq!(vm.registers.get_int(3, "").unwrap(), 42);
+    assert_eq!(vm.registers.get(2), &Value::Int(0));
+    assert_eq!(vm.registers.get_int(3, Instruction::Noop).unwrap(), 42);
 }
 
 #[test]
@@ -1226,7 +1232,7 @@ fn blt_not_taken() {
             skip: MOVE r3, 42
         "#;
     let vm = run_vm(source);
-    assert_eq!(vm.registers.get_int(2, "").unwrap(), 99);
+    assert_eq!(vm.registers.get_int(2, Instruction::Noop).unwrap(), 99);
 }
 
 #[test]
@@ -1240,7 +1246,7 @@ fn blt_signed() {
             skip: MOVE r3, 42
         "#;
     let vm = run_vm(source);
-    assert_eq!(vm.registers.get(2).unwrap(), &Value::Int(0));
+    assert_eq!(vm.registers.get(2), &Value::Int(0));
 }
 
 #[test]
@@ -1253,7 +1259,7 @@ fn bge_taken() {
             skip: MOVE r3, 42
         "#;
     let vm = run_vm(source);
-    assert_eq!(vm.registers.get(2).unwrap(), &Value::Int(0));
+    assert_eq!(vm.registers.get(2), &Value::Int(0));
 }
 
 #[test]
@@ -1266,7 +1272,7 @@ fn bge_greater() {
             skip: MOVE r3, 42
         "#;
     let vm = run_vm(source);
-    assert_eq!(vm.registers.get(2).unwrap(), &Value::Int(0));
+    assert_eq!(vm.registers.get(2), &Value::Int(0));
 }
 
 #[test]
@@ -1281,7 +1287,7 @@ fn bltu_unsigned() {
         "#;
     let vm = run_vm(source);
     // Branch NOT taken because -1 as u64 > 1
-    assert_eq!(vm.registers.get_int(2, "").unwrap(), 99);
+    assert_eq!(vm.registers.get_int(2, Instruction::Noop).unwrap(), 99);
 }
 
 #[test]
@@ -1296,7 +1302,7 @@ fn bgeu_unsigned() {
         "#;
     let vm = run_vm(source);
     // Branch taken because -1 as u64 > 1
-    assert_eq!(vm.registers.get(2).unwrap(), &Value::Int(0));
+    assert_eq!(vm.registers.get(2), &Value::Int(0));
 }
 
 #[test]
@@ -1307,7 +1313,7 @@ fn halt_stops_execution() {
             MOVE r10, 99
         "#;
     let vm = run_vm(source);
-    assert_eq!(vm.registers.get_int(10, "").unwrap(), 1);
+    assert_eq!(vm.registers.get_int(10, Instruction::Noop).unwrap(), 1);
 }
 
 #[test]
@@ -1323,7 +1329,7 @@ fn loop_with_backward_branch() {
         "#;
     let vm = run_vm(source);
     // r10 should be 3 after loop exits
-    assert_eq!(vm.registers.get_int(10, "").unwrap(), 3);
+    assert_eq!(vm.registers.get_int(10, Instruction::Noop).unwrap(), 3);
 }
 
 #[test]
@@ -1340,8 +1346,8 @@ fn jalr_indirect_jump() {
         "#;
     let vm = run_vm(source);
     // Should skip MOVE r2, 99 and execute MOVE r3, 42.
-    assert_eq!(vm.registers.get(2).unwrap(), &Value::Int(0));
-    assert_eq!(vm.registers.get_int(3, "").unwrap(), 42);
+    assert_eq!(vm.registers.get(2), &Value::Int(0));
+    assert_eq!(vm.registers.get_int(3, Instruction::Noop).unwrap(), 42);
 }
 
 // ==================== Function Calls ====================
@@ -1360,7 +1366,7 @@ fn call_and_ret_simple() {
             end:
         "#;
     let vm = run_vm(source);
-    assert_eq!(vm.registers.get_int(1, "").unwrap(), 42);
+    assert_eq!(vm.registers.get_int(1, Instruction::Noop).unwrap(), 42);
 }
 
 #[test]
@@ -1380,7 +1386,7 @@ fn call_nested() {
             end:
         "#;
     let vm = run_vm(source);
-    assert_eq!(vm.registers.get_int(1, "").unwrap(), 99);
+    assert_eq!(vm.registers.get_int(1, Instruction::Noop).unwrap(), 99);
 }
 
 #[test]
@@ -1413,7 +1419,7 @@ fn call_preserves_registers() {
         "#;
     let vm = run_vm(source);
     // r1 = 50 (set by func), r5 = 100, r2 = 150
-    assert_eq!(vm.registers.get_int(2, "").unwrap(), 150);
+    assert_eq!(vm.registers.get_int(2, Instruction::Noop).unwrap(), 150);
 }
 
 #[test]
@@ -1494,7 +1500,7 @@ fn deeply_nested_calls() {
             end:
         "#;
     let vm = run_vm(source);
-    assert_eq!(vm.registers.get_int(1, "").unwrap(), 777);
+    assert_eq!(vm.registers.get_int(1, Instruction::Noop).unwrap(), 777);
 }
 
 #[test]
@@ -1518,7 +1524,7 @@ fn call_stack_unwind_on_multiple_returns() {
         "#;
     let vm = run_vm(source);
     // Three calls each set r20=10, accumulated sum should be 30
-    assert_eq!(vm.registers.get_int(4, "").unwrap(), 30);
+    assert_eq!(vm.registers.get_int(4, Instruction::Noop).unwrap(), 30);
 }
 
 #[test]
@@ -1537,7 +1543,7 @@ fn call_overwrites_register_via_callee() {
         "#;
     let vm = run_vm(source);
     // r5 should be overwritten with 42, not 999
-    assert_eq!(vm.registers.get_int(5, "").unwrap(), 42);
+    assert_eq!(vm.registers.get_int(5, Instruction::Noop).unwrap(), 42);
 }
 
 #[test]
@@ -1563,7 +1569,7 @@ fn return_from_recursive_call() {
         "#;
     let vm = run_vm(source);
     // After countdown, r1 should be 0
-    assert_eq!(vm.registers.get_int(1, "").unwrap(), 0);
+    assert_eq!(vm.registers.get_int(1, Instruction::Noop).unwrap(), 0);
 }
 
 #[test]
@@ -1582,7 +1588,7 @@ fn multiple_ret_without_call_fails() {
         "#;
     // This should succeed because the second RET is never reached
     let vm = run_vm(source);
-    assert_eq!(vm.registers.get_int(1, "").unwrap(), 1);
+    assert_eq!(vm.registers.get_int(1, Instruction::Noop).unwrap(), 1);
 }
 
 #[test]
@@ -1609,7 +1615,7 @@ fn call_then_jal_then_ret() {
             end:
         "#;
     let vm = run_vm(source);
-    assert_eq!(vm.registers.get_int(1, "").unwrap(), 1);
+    assert_eq!(vm.registers.get_int(1, Instruction::Noop).unwrap(), 1);
 }
 
 #[test]
@@ -1637,9 +1643,9 @@ fn call_stack_isolation_between_calls() {
             end:
         "#;
     let vm = run_vm(source);
-    assert_eq!(vm.registers.get_int(1, "").unwrap(), 10);
-    assert_eq!(vm.registers.get_int(2, "").unwrap(), 20);
-    assert_eq!(vm.registers.get_int(3, "").unwrap(), 30);
+    assert_eq!(vm.registers.get_int(1, Instruction::Noop).unwrap(), 10);
+    assert_eq!(vm.registers.get_int(2, Instruction::Noop).unwrap(), 20);
+    assert_eq!(vm.registers.get_int(3, Instruction::Noop).unwrap(), 30);
 }
 
 #[test]
@@ -1656,7 +1662,7 @@ fn call_writes_shared_register() {
             end:
         "#;
     let vm = run_vm(source);
-    assert_eq!(vm.registers.get_int(10, "").unwrap(), 42);
+    assert_eq!(vm.registers.get_int(10, Instruction::Noop).unwrap(), 42);
 }
 
 #[test]
@@ -1682,7 +1688,7 @@ fn nested_call_return_value_propagation() {
         "#;
     let vm = run_vm(source);
     // inner sets 1, middle adds 1 = 2, outer adds 1 = 3
-    assert_eq!(vm.registers.get_int(1, "").unwrap(), 3);
+    assert_eq!(vm.registers.get_int(1, Instruction::Noop).unwrap(), 3);
 }
 
 #[test]
@@ -1719,7 +1725,7 @@ fn return_zero_value() {
             end:
         "#;
     let vm = run_vm(source);
-    assert_eq!(vm.registers.get(1).unwrap(), &Value::Int(0));
+    assert_eq!(vm.registers.get(1), &Value::Int(0));
 }
 
 #[test]
@@ -1736,7 +1742,7 @@ fn return_bool_value() {
             end:
         "#;
     let vm = run_vm(source);
-    assert_eq!(vm.registers.get(1).unwrap(), &Value::Bool(true));
+    assert_eq!(vm.registers.get(1), &Value::Bool(true));
 }
 
 #[test]
@@ -1753,7 +1759,7 @@ fn return_ref_value() {
             end:
         "#;
     let vm = run_vm(source);
-    let ref_id = match vm.registers.get(1).unwrap() {
+    let ref_id = match vm.registers.get(1) {
         Value::Ref(r) => *r,
         other => panic!("expected Ref, got {:?}", other),
     };
@@ -1768,7 +1774,7 @@ fn new_execute_stores_args_for_calldata_load() {
     let vm = VM::new_execute(exec, deploy, BLOCK_GAS_LIMIT).unwrap();
 
     // r0 is hardwired to zero
-    assert_eq!(vm.registers.get_int(0, "").unwrap(), 0);
+    assert_eq!(vm.registers.get_int(0, Instruction::Noop).unwrap(), 0);
     // function selector is stored separately for DISPATCH
     assert_eq!(vm.dispatch_selector, 3);
     // Args are stored for later CALLDATA_LOAD, not preloaded into registers
@@ -1846,7 +1852,7 @@ fn host_slice_middle() {
             CALL_HOST r10, "slice", 3, r1
         "#;
     let vm = run_vm(source);
-    let ref_id = vm.registers.get_ref(10, "").unwrap();
+    let ref_id = vm.registers.get_ref(10, Instruction::Noop).unwrap();
     assert_eq!(vm.heap.get_string(ref_id).unwrap(), "hello");
 }
 
@@ -1859,7 +1865,7 @@ fn host_slice_from_offset() {
             CALL_HOST r10, "slice", 3, r1
         "#;
     let vm = run_vm(source);
-    let ref_id = vm.registers.get_ref(10, "").unwrap();
+    let ref_id = vm.registers.get_ref(10, Instruction::Noop).unwrap();
     assert_eq!(vm.heap.get_string(ref_id).unwrap(), "world");
 }
 
@@ -1872,7 +1878,7 @@ fn host_slice_empty_result() {
             CALL_HOST r10, "slice", 3, r1
         "#;
     let vm = run_vm(source);
-    let ref_id = vm.registers.get_ref(10, "").unwrap();
+    let ref_id = vm.registers.get_ref(10, Instruction::Noop).unwrap();
     assert_eq!(vm.heap.get_string(ref_id).unwrap(), "");
 }
 
@@ -1885,7 +1891,7 @@ fn host_slice_full_string() {
             CALL_HOST r10, "slice", 3, r1
         "#;
     let vm = run_vm(source);
-    let ref_id = vm.registers.get_ref(10, "").unwrap();
+    let ref_id = vm.registers.get_ref(10, Instruction::Noop).unwrap();
     assert_eq!(vm.heap.get_string(ref_id).unwrap(), "abc");
 }
 
@@ -1898,7 +1904,7 @@ fn host_slice_clamps_end_beyond_length() {
             CALL_HOST r10, "slice", 3, r1
         "#;
     let vm = run_vm(source);
-    let ref_id = vm.registers.get_ref(10, "").unwrap();
+    let ref_id = vm.registers.get_ref(10, Instruction::Noop).unwrap();
     assert_eq!(vm.heap.get_string(ref_id).unwrap(), "short");
 }
 
@@ -1911,7 +1917,7 @@ fn host_slice_clamps_start_beyond_end() {
             CALL_HOST r10, "slice", 3, r1
         "#;
     let vm = run_vm(source);
-    let ref_id = vm.registers.get_ref(10, "").unwrap();
+    let ref_id = vm.registers.get_ref(10, Instruction::Noop).unwrap();
     assert_eq!(vm.heap.get_string(ref_id).unwrap(), "");
 }
 
@@ -1938,7 +1944,7 @@ fn host_concat_two_strings() {
             CALL_HOST r10, "concat", 2, r1
         "#;
     let vm = run_vm(source);
-    let ref_id = vm.registers.get_ref(10, "").unwrap();
+    let ref_id = vm.registers.get_ref(10, Instruction::Noop).unwrap();
     assert_eq!(vm.heap.get_string(ref_id).unwrap(), "hello world");
 }
 
@@ -1950,7 +1956,7 @@ fn host_concat_empty_left() {
             CALL_HOST r10, "concat", 2, r1
         "#;
     let vm = run_vm(source);
-    let ref_id = vm.registers.get_ref(10, "").unwrap();
+    let ref_id = vm.registers.get_ref(10, Instruction::Noop).unwrap();
     assert_eq!(vm.heap.get_string(ref_id).unwrap(), "world");
 }
 
@@ -1962,7 +1968,7 @@ fn host_concat_empty_right() {
             CALL_HOST r10, "concat", 2, r1
         "#;
     let vm = run_vm(source);
-    let ref_id = vm.registers.get_ref(10, "").unwrap();
+    let ref_id = vm.registers.get_ref(10, Instruction::Noop).unwrap();
     assert_eq!(vm.heap.get_string(ref_id).unwrap(), "hello");
 }
 
@@ -1974,7 +1980,7 @@ fn host_concat_both_empty() {
             CALL_HOST r10, "concat", 2, r1
         "#;
     let vm = run_vm(source);
-    let ref_id = vm.registers.get_ref(10, "").unwrap();
+    let ref_id = vm.registers.get_ref(10, Instruction::Noop).unwrap();
     assert_eq!(vm.heap.get_string(ref_id).unwrap(), "");
 }
 
@@ -2266,8 +2272,8 @@ fn calldata_load_int_args() {
         vec![Value::Int(10), Value::Int(20)],
         vec![],
     );
-    assert_eq!(vm.registers.get_int(1, "").unwrap(), 10);
-    assert_eq!(vm.registers.get_int(2, "").unwrap(), 20);
+    assert_eq!(vm.registers.get_int(1, Instruction::Noop).unwrap(), 10);
+    assert_eq!(vm.registers.get_int(2, Instruction::Noop).unwrap(), 20);
 }
 
 #[test]
@@ -2277,8 +2283,8 @@ fn calldata_load_mixed_args() {
         vec![Value::Int(42), Value::Bool(true)],
         vec![],
     );
-    assert_eq!(vm.registers.get_int(10, "").unwrap(), 42);
-    assert!(vm.registers.get_bool(11, "").unwrap());
+    assert_eq!(vm.registers.get_int(10, Instruction::Noop).unwrap(), 42);
+    assert!(vm.registers.get_bool(11, Instruction::Noop).unwrap());
 }
 
 #[test]
@@ -2289,7 +2295,7 @@ fn calldata_load_remaps_refs() {
         vec![Value::Ref(0)],
         vec![b"hello".to_vec()],
     );
-    let r = vm.registers.get_ref(10, "").unwrap();
+    let r = vm.registers.get_ref(10, Instruction::Noop).unwrap();
     assert_eq!(vm.heap.get_string(r).unwrap(), "hello");
 }
 
@@ -2297,7 +2303,7 @@ fn calldata_load_remaps_refs() {
 fn calldata_load_no_args_is_noop() {
     // With no args, registers should remain at their default (Int(0)).
     let vm = run_vm_with_args("CALLDATA_LOAD r5\nMOVE r10, 1", vec![], vec![]);
-    assert_eq!(vm.registers.get_int(10, "").unwrap(), 1);
+    assert_eq!(vm.registers.get_int(10, Instruction::Noop).unwrap(), 1);
 }
 
 #[test]
@@ -2307,8 +2313,8 @@ fn calldata_load_at_high_register() {
         vec![Value::Int(7), Value::Int(8)],
         vec![],
     );
-    assert_eq!(vm.registers.get_int(250, "").unwrap(), 7);
-    assert_eq!(vm.registers.get_int(251, "").unwrap(), 8);
+    assert_eq!(vm.registers.get_int(250, Instruction::Noop).unwrap(), 7);
+    assert_eq!(vm.registers.get_int(251, Instruction::Noop).unwrap(), 8);
 }
 
 #[test]
@@ -2318,7 +2324,10 @@ fn calldata_len_and_copy_match_serialized_args() {
     let expected = expected_calldata(&args, &arg_items);
     let vm = run_vm_with_args("CALLDATA_LEN r10\nCALLDATA_COPY 64", args, arg_items);
     assert!(!expected.is_empty());
-    assert_eq!(vm.registers.get_int(10, "").unwrap(), expected.len() as i64);
+    assert_eq!(
+        vm.registers.get_int(10, Instruction::Noop).unwrap(),
+        expected.len() as i64
+    );
     assert_eq!(
         &vm.exec_memory()[64..64 + expected.len()],
         expected.as_slice()
@@ -2368,7 +2377,7 @@ fn memload_test() {
     let vm = run_vm(code);
     assert_eq!(vm.exec_memory().len(), 8);
     assert_eq!(&vm.exec_memory()[..8], &12i64.to_le_bytes());
-    assert_eq!(vm.registers.get(10).unwrap(), &Value::Int(12));
+    assert_eq!(vm.registers.get(10), &Value::Int(12));
 }
 
 #[test]
@@ -2487,7 +2496,7 @@ fn memload_hex_addr() {
         MEM_LOAD r10, 0x08
         "#;
     let vm = run_vm(code);
-    assert_eq!(vm.registers.get(10).unwrap(), &Value::Int(0xDEAD));
+    assert_eq!(vm.registers.get(10), &Value::Int(0xDEAD));
 }
 
 #[test]
@@ -2497,7 +2506,7 @@ fn memload_8u_hex_addr() {
         MEM_LOAD_8U r10, 0x08
         "#;
     let vm = run_vm(code);
-    assert_eq!(vm.registers.get(10).unwrap(), &Value::Int(0xAD));
+    assert_eq!(vm.registers.get(10), &Value::Int(0xAD));
 }
 
 #[test]
@@ -2509,7 +2518,7 @@ fn memload_8s_hex_addr() {
     let vm = run_vm(code);
 
     assert_eq!(
-        vm.registers.get(10).unwrap(),
+        vm.registers.get(10),
         &Value::Int(0xFFFFFFFFFFFFFFADu64 as i64)
     );
 }
@@ -2522,7 +2531,7 @@ fn memload_8s_hex_addr2() {
         "#;
     let vm = run_vm(code);
 
-    assert_eq!(vm.registers.get(10).unwrap(), &Value::Int(0x7Du64 as i64));
+    assert_eq!(vm.registers.get(10), &Value::Int(0x7Du64 as i64));
 }
 
 // ==================== 16-bit memory loads ====================
@@ -2534,7 +2543,7 @@ fn memload_16u_zero_extends() {
         MEM_LOAD_16U r10, 0x00
         "#;
     let vm = run_vm(code);
-    assert_eq!(vm.registers.get(10).unwrap(), &Value::Int(0xFFFF));
+    assert_eq!(vm.registers.get(10), &Value::Int(0xFFFF));
 }
 
 #[test]
@@ -2545,7 +2554,7 @@ fn memload_16s_sign_extends_negative() {
         "#;
     let vm = run_vm(code);
     assert_eq!(
-        vm.registers.get(10).unwrap(),
+        vm.registers.get(10),
         &Value::Int(0xFFFFFFFFFFFF8000u64 as i64)
     );
 }
@@ -2557,7 +2566,7 @@ fn memload_16s_no_extend_positive() {
         MEM_LOAD_16S r10, 0x00
         "#;
     let vm = run_vm(code);
-    assert_eq!(vm.registers.get(10).unwrap(), &Value::Int(0x7FFF));
+    assert_eq!(vm.registers.get(10), &Value::Int(0x7FFF));
 }
 
 // ==================== 32-bit memory loads ====================
@@ -2569,7 +2578,7 @@ fn memload_32u_zero_extends() {
         MEM_LOAD_32U r10, 0x00
         "#;
     let vm = run_vm(code);
-    assert_eq!(vm.registers.get(10).unwrap(), &Value::Int(0xFFFFFFFF));
+    assert_eq!(vm.registers.get(10), &Value::Int(0xFFFFFFFF));
 }
 
 #[test]
@@ -2580,7 +2589,7 @@ fn memload_32s_sign_extends_negative() {
         "#;
     let vm = run_vm(code);
     assert_eq!(
-        vm.registers.get(10).unwrap(),
+        vm.registers.get(10),
         &Value::Int(0xFFFFFFFF80000000u64 as i64)
     );
 }
@@ -2592,7 +2601,7 @@ fn memload_32s_no_extend_positive() {
         MEM_LOAD_32S r10, 0x00
         "#;
     let vm = run_vm(code);
-    assert_eq!(vm.registers.get(10).unwrap(), &Value::Int(0x7FFFFFFF));
+    assert_eq!(vm.registers.get(10), &Value::Int(0x7FFFFFFF));
 }
 
 // ==================== Register-based addressing ====================
@@ -2605,7 +2614,7 @@ fn memstore_register_addr() {
         MEM_LOAD r10, 0x10
         "#;
     let vm = run_vm(code);
-    assert_eq!(vm.registers.get(10).unwrap(), &Value::Int(0xABCD));
+    assert_eq!(vm.registers.get(10), &Value::Int(0xABCD));
 }
 
 #[test]
@@ -2616,7 +2625,7 @@ fn memload_register_addr() {
         MEM_LOAD r10, r1
         "#;
     let vm = run_vm(code);
-    assert_eq!(vm.registers.get(10).unwrap(), &Value::Int(0x1234));
+    assert_eq!(vm.registers.get(10), &Value::Int(0x1234));
 }
 
 #[test]
@@ -2631,7 +2640,7 @@ fn memcpy_register_addrs() {
         "#;
     let vm = run_vm(code);
     assert_eq!(
-        vm.registers.get(10).unwrap(),
+        vm.registers.get(10),
         &Value::Int(i64::from_le_bytes([0xAA; 8]))
     );
 }
@@ -2646,7 +2655,7 @@ fn memset_register_addrs() {
         "#;
     let vm = run_vm(code);
     assert_eq!(
-        vm.registers.get(10).unwrap(),
+        vm.registers.get(10),
         &Value::Int(i64::from_le_bytes([0xFF; 8]))
     );
 }
@@ -2659,7 +2668,7 @@ fn memload_8u_register_addr() {
         MEM_LOAD_8U r10, r1
         "#;
     let vm = run_vm(code);
-    assert_eq!(vm.registers.get(10).unwrap(), &Value::Int(0xCD));
+    assert_eq!(vm.registers.get(10), &Value::Int(0xCD));
 }
 
 #[test]
@@ -2671,7 +2680,7 @@ fn memload_16s_register_addr() {
         "#;
     let vm = run_vm(code);
     assert_eq!(
-        vm.registers.get(10).unwrap(),
+        vm.registers.get(10),
         &Value::Int(0xFFFFFFFFFFFF8001u64 as i64)
     );
 }
@@ -2687,7 +2696,7 @@ fn cmove_true_condition() {
         CMOVE r4, r3, r1, r2
         "#;
     let vm = run_vm(code);
-    assert_eq!(vm.registers.get(4).unwrap(), &Value::Int(100));
+    assert_eq!(vm.registers.get(4), &Value::Int(100));
 }
 
 #[test]
@@ -2699,7 +2708,7 @@ fn cmove_false_condition() {
         CMOVE r4, r3, r1, r2
         "#;
     let vm = run_vm(code);
-    assert_eq!(vm.registers.get(4).unwrap(), &Value::Int(200));
+    assert_eq!(vm.registers.get(4), &Value::Int(200));
 }
 
 #[test]
@@ -2711,7 +2720,7 @@ fn cmove_nonzero_int_is_true() {
         CMOVE r4, r3, r1, r2
         "#;
     let vm = run_vm(code);
-    assert_eq!(vm.registers.get(4).unwrap(), &Value::Int(100));
+    assert_eq!(vm.registers.get(4), &Value::Int(100));
 }
 
 #[test]
@@ -2723,7 +2732,7 @@ fn cmove_zero_int_is_false() {
         CMOVE r4, r3, r1, r2
         "#;
     let vm = run_vm(code);
-    assert_eq!(vm.registers.get(4).unwrap(), &Value::Int(200));
+    assert_eq!(vm.registers.get(4), &Value::Int(200));
 }
 
 #[test]
@@ -2735,7 +2744,7 @@ fn cmove_negative_int_is_true() {
         CMOVE r4, r3, r1, r2
         "#;
     let vm = run_vm(code);
-    assert_eq!(vm.registers.get(4).unwrap(), &Value::Int(100));
+    assert_eq!(vm.registers.get(4), &Value::Int(100));
 }
 
 #[test]
@@ -2747,7 +2756,7 @@ fn cmove_register_condition_true() {
         CMOVE r4, r3, r1, r2
         "#;
     let vm = run_vm(code);
-    assert_eq!(vm.registers.get(4).unwrap(), &Value::Int(100));
+    assert_eq!(vm.registers.get(4), &Value::Int(100));
 }
 
 #[test]
@@ -2759,7 +2768,7 @@ fn cmove_register_condition_false() {
         CMOVE r4, r3, r1, r2
         "#;
     let vm = run_vm(code);
-    assert_eq!(vm.registers.get(4).unwrap(), &Value::Int(200));
+    assert_eq!(vm.registers.get(4), &Value::Int(200));
 }
 
 #[test]
@@ -2771,12 +2780,12 @@ fn cmove_bool_register_condition() {
         CMOVE r4, r3, r1, r2
         "#;
     let vm = run_vm(code);
-    assert_eq!(vm.registers.get(4).unwrap(), &Value::Int(100));
+    assert_eq!(vm.registers.get(4), &Value::Int(100));
 }
 
 #[test]
 fn cmove_immediate_operands() {
     let code = "MOVE r3, true\nCMOVE r4, r3, 42, 99";
     let vm = run_vm(code);
-    assert_eq!(vm.registers.get(4).unwrap(), &Value::Int(42));
+    assert_eq!(vm.registers.get(4), &Value::Int(42));
 }

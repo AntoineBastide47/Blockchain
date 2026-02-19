@@ -222,23 +222,16 @@ macro_rules! define_instructions {
             Dispatch = 0x7F,
         }
 
-        impl TryFrom<u8> for Instruction {
-            type Error = VMError;
-
-            fn try_from(value: u8) -> Result<Self, Self::Error> {
-                match value {
-                    $( v if v == define_instructions!(@opcode_value $opcode; $( $kind ),*) => Ok(Instruction::$name), )*
-                    0x7F => Ok(Instruction::Dispatch),
-                    _ => Err(VMError::InvalidInstruction {
-                        opcode: value,
-                        offset: 0,
-                    }),
-                }
-            }
-        }
+        static DECODE_TABLE: [Option<Instruction>; 128] = {
+            let mut table: [Option<Instruction>; 128] = [None; 128];
+            $( table[($opcode as u8 & OPCODE_BASE_MASK) as usize] = Some(Instruction::$name); )*
+            table[0x7F] = Some(Instruction::Dispatch);
+            table
+        };
 
         impl Instruction {
             /// Returns the assembly mnemonic for this instruction.
+            #[inline(always)]
             pub const fn mnemonic(&self) -> &'static str {
                 match self {
                     $( Instruction::$name => $mnemonic, )*
@@ -247,6 +240,7 @@ macro_rules! define_instructions {
             }
 
             /// Returns the base gas cost for this instruction.
+            #[inline(always)]
             pub const fn base_gas(&self) -> u64 {
                 match self {
                     $( Instruction::$name => $gas, )*
@@ -256,6 +250,7 @@ macro_rules! define_instructions {
 
             /// Returns true when this instruction accepts compact concat form
             /// (`rd, rs2` with metadata A=1 representing `rd, rd, rs2`).
+            #[inline(always)]
             pub const fn supports_concat_compact(self) -> bool {
                 matches!(
                     self,
@@ -281,6 +276,7 @@ macro_rules! define_instructions {
             }
 
             /// Returns true when this instruction may carry one operand metadata byte.
+            #[inline(always)]
             pub const fn supports_operand_metadata(self) -> bool {
                 match self {
                     $( Instruction::$name => define_instructions!(@has_dynamic $( $kind ),*), )*
@@ -294,30 +290,25 @@ macro_rules! define_instructions {
             /// - `ooooooo` is the 7-bit opcode value
             /// - `Z=1` means one metadata byte follows the opcode
             pub const fn encode_opcode(self, has_metadata: bool) -> u8 {
-                let base = (self as u8) & OPCODE_BASE_MASK;
-                if has_metadata {
-                    base | OPCODE_METADATA_FLAG
-                } else {
-                    base
-                }
+                (self as u8 & OPCODE_BASE_MASK) | (OPCODE_METADATA_FLAG * has_metadata as u8)
             }
 
             /// Decodes an opcode byte into `(instruction, has_metadata)`.
             ///
             /// This strips the metadata flag bit and decodes the base opcode.
-            pub fn decode_opcode(opcode: u8) -> Result<(Self, bool), VMError> {
+            #[inline(always)]
+            pub fn decode_opcode(opcode: u8) -> Result<(Instruction, bool), VMError> {
                 let has_metadata = (opcode & OPCODE_METADATA_FLAG) != 0;
-                let instruction = match opcode & OPCODE_BASE_MASK {
-                    $( v if v == (($opcode as u8) & OPCODE_BASE_MASK) => Instruction::$name, )*
-                    0x7F => Instruction::Dispatch,
-                    _ => {
-                        return Err(VMError::InvalidInstruction { opcode, offset: 0 });
+                let base = opcode & OPCODE_BASE_MASK;
+                match DECODE_TABLE[base as usize] {
+                    Some(instr) => {
+                        if has_metadata && !instr.supports_operand_metadata() {
+                            return Err(VMError::InvalidInstruction { opcode, offset: 0 });
+                        }
+                        Ok((instr, has_metadata))
                     }
-                };
-                if has_metadata && !instruction.supports_operand_metadata() {
-                    return Err(VMError::InvalidInstruction { opcode, offset: 0 });
+                    None => Err(VMError::InvalidInstruction { opcode, offset: 0 }),
                 }
-                Ok((instruction, has_metadata))
             }
         }
     };

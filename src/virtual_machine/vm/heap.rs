@@ -1,7 +1,7 @@
 use super::WORD_SIZE;
 use crate::types::encoding::{Decode, Encode};
 use crate::virtual_machine::errors::VMError;
-use std::ops::{Index, IndexMut, RangeBounds};
+use std::ops::{Index, IndexMut};
 
 /// Unified memory for the VM, combining constant and execution regions.
 ///
@@ -42,15 +42,20 @@ impl Heap {
     /// Includes the length prefix.
     pub(super) fn get_raw_ref(&self, reference: u32) -> Result<&[u8], VMError> {
         let reference = reference as usize;
-        self.memory
-            .get(reference)
-            .ok_or(VMError::ReferenceOutOfBounds {
+        if reference + WORD_SIZE > self.memory.len() {
+            return Err(VMError::ReferenceOutOfBounds {
                 reference,
-                max: self.memory.len() - 1,
-            })?;
-        let data: [u8; WORD_SIZE] = self.memory[reference..reference + WORD_SIZE]
-            .try_into()
-            .unwrap();
+                max: self.memory.len().saturating_sub(1),
+            });
+        }
+        // SAFETY: `reference + WORD_SIZE <= self.memory.len()` is validated above.
+        let data: [u8; WORD_SIZE] = unsafe {
+            *self
+                .memory
+                .as_ptr()
+                .add(reference)
+                .cast::<[u8; WORD_SIZE]>()
+        };
         let size = usize::from_le_bytes(data);
 
         let bound = reference + WORD_SIZE + size;
@@ -61,13 +66,15 @@ impl Heap {
             });
         }
 
-        Ok(&self.memory[reference..bound])
+        // SAFETY: `bound <= self.memory.len()` is validated above.
+        Ok(unsafe { self.memory.get_unchecked(reference..bound) })
     }
 
     /// Returns just the data bytes stored at the given index (without length prefix).
     pub(super) fn get_data(&self, reference: u32) -> Result<&[u8], VMError> {
         let raw = self.get_raw_ref(reference)?;
-        Ok(&raw[WORD_SIZE..])
+        // SAFETY: `reference + WORD_SIZE <= self.memory.len()` is validated above.
+        Ok(unsafe { raw.get_unchecked(WORD_SIZE..) })
     }
 
     /// Returns the size of the execution memory region in bytes.
@@ -80,15 +87,64 @@ impl Heap {
         self.memory.resize(new_len, value);
     }
 
-    /// Copies bytes within the memory buffer from `src` range to `dest` offset.
-    pub(super) fn copy_within<R: RangeBounds<usize>>(&mut self, src: R, dest: usize) {
-        self.memory.copy_within(src, dest);
-    }
-
     /// Retrieves a string by its reference index.
     pub(super) fn get_string(&self, id: u32) -> Result<String, VMError> {
         let mut bytes = self.get_raw_ref(id)?;
         String::decode(&mut bytes).map_err(|_| VMError::InvalidUtf8 { string_ref: id })
+    }
+
+    /// Returns an unchecked slice of the execution region.
+    ///
+    /// # Safety
+    ///
+    /// `start + len <= self.len()` must hold.
+    #[inline(always)]
+    pub(super) unsafe fn exec_slice_unchecked(&self, start: usize, len: usize) -> &[u8] {
+        let abs = self.exec_offset + start;
+        unsafe { self.memory.get_unchecked(abs..abs + len) }
+    }
+
+    /// Returns an unchecked mutable slice of the execution region.
+    ///
+    /// # Safety
+    ///
+    /// `start + len <= self.len()` must hold.
+    #[inline(always)]
+    pub(super) unsafe fn exec_slice_unchecked_mut(
+        &mut self,
+        start: usize,
+        len: usize,
+    ) -> &mut [u8] {
+        let abs = self.exec_offset + start;
+        unsafe { self.memory.get_unchecked_mut(abs..abs + len) }
+    }
+
+    /// Fills `len` bytes starting at `start` in the execution region with `value`.
+    ///
+    /// # Safety
+    ///
+    /// `start + len <= self.len()` must hold.
+    #[inline(always)]
+    pub(super) unsafe fn exec_fill_unchecked(&mut self, start: usize, len: usize, value: u8) {
+        unsafe { self.exec_slice_unchecked_mut(start, len) }.fill(value);
+    }
+
+    /// Copies `len` bytes within the execution region from `src` to `dst`.
+    ///
+    /// # Safety
+    ///
+    /// Both `src + len <= self.len()` and `dst + len <= self.len()` must hold.
+    #[inline(always)]
+    pub(super) unsafe fn exec_copy_within_unchecked(&mut self, src: usize, dst: usize, len: usize) {
+        let abs_src = self.exec_offset + src;
+        let abs_dst = self.exec_offset + dst;
+        unsafe {
+            std::ptr::copy(
+                self.memory.as_ptr().add(abs_src),
+                self.memory.as_mut_ptr().add(abs_dst),
+                len,
+            );
+        }
     }
 
     /// Returns a slice of the execution memory (memory after exec_offset).

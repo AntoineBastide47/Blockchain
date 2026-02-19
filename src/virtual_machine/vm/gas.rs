@@ -1,26 +1,30 @@
+/// Number of gas categories tracked by [`GasProfile`].
+const GAS_CATEGORY_COUNT: usize = 10;
+
 /// Categories of gas consumption for profiling and debugging.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[repr(u8)]
 pub enum GasCategory {
     /// Intrinsic cost of the transaction
-    Intrinsic,
+    Intrinsic = 0,
     /// Initial contract deployment cost (base + bytecode size).
-    Deploy,
+    Deploy = 1,
     /// Base cost for executing opcodes.
-    OpcodeBase,
+    OpcodeBase = 2,
     /// Cost for deriving state storage keys.
-    StateKeyDerivation,
+    StateKeyDerivation = 3,
     /// Cost for writing to state storage.
-    StateStore,
+    StateStore = 4,
     /// Cost for reading from state storage.
-    StateRead,
+    StateRead = 5,
     /// Cost for heap allocations (strings, hashes).
-    HeapAllocation,
+    HeapAllocation = 6,
     /// Cost for function call overhead (arguments, stack depth).
-    CallOverhead,
+    CallOverhead = 7,
     /// Cost for host function execution.
-    HostFunction,
+    HostFunction = 8,
     /// Cost for memory interactions.
-    Memory,
+    Memory = 9,
 }
 
 impl GasCategory {
@@ -38,24 +42,39 @@ impl GasCategory {
             GasCategory::Memory => "Memory",
         }
     }
+
+    /// All categories in discriminant order.
+    const ALL: [GasCategory; GAS_CATEGORY_COUNT] = [
+        GasCategory::Intrinsic,
+        GasCategory::Deploy,
+        GasCategory::OpcodeBase,
+        GasCategory::StateKeyDerivation,
+        GasCategory::StateStore,
+        GasCategory::StateRead,
+        GasCategory::HeapAllocation,
+        GasCategory::CallOverhead,
+        GasCategory::HostFunction,
+        GasCategory::Memory,
+    ];
 }
 
 /// Gas consumption profile for debugging and optimization.
 ///
 /// Tracks how gas is distributed across different execution categories,
 /// enabling developers to identify expensive operations in their contracts.
-#[derive(Clone, Debug, Default)]
+/// Backed by a flat array indexed by [`GasCategory`] discriminant for
+/// branch-free accumulation on the hot path.
+#[derive(Clone, Debug)]
 pub struct GasProfile {
-    intrinsic: u64,
-    deploy: u64,
-    opcode_base: u64,
-    state_key_derivation: u64,
-    state_store: u64,
-    state_read: u64,
-    heap_allocation: u64,
-    call_overhead: u64,
-    host_function: u64,
-    memory: u64,
+    counts: [u64; GAS_CATEGORY_COUNT],
+}
+
+impl Default for GasProfile {
+    fn default() -> Self {
+        Self {
+            counts: [0; GAS_CATEGORY_COUNT],
+        }
+    }
 }
 
 impl GasProfile {
@@ -65,58 +84,22 @@ impl GasProfile {
     }
 
     /// Adds gas to the specified category.
+    #[inline(always)]
     pub fn add(&mut self, category: GasCategory, amount: u64) {
-        match category {
-            GasCategory::Intrinsic => self.intrinsic = self.intrinsic.saturating_add(amount),
-            GasCategory::Deploy => self.deploy = self.deploy.saturating_add(amount),
-            GasCategory::OpcodeBase => self.opcode_base = self.opcode_base.saturating_add(amount),
-            GasCategory::StateKeyDerivation => {
-                self.state_key_derivation = self.state_key_derivation.saturating_add(amount)
-            }
-            GasCategory::StateStore => self.state_store = self.state_store.saturating_add(amount),
-            GasCategory::StateRead => self.state_read = self.state_read.saturating_add(amount),
-            GasCategory::HeapAllocation => {
-                self.heap_allocation = self.heap_allocation.saturating_add(amount)
-            }
-            GasCategory::CallOverhead => {
-                self.call_overhead = self.call_overhead.saturating_add(amount)
-            }
-            GasCategory::HostFunction => {
-                self.host_function = self.host_function.saturating_add(amount)
-            }
-            GasCategory::Memory => self.memory = self.memory.saturating_add(amount),
-        }
+        let slot = &mut self.counts[category as usize];
+        *slot = slot.saturating_add(amount);
     }
 
     /// Returns the total gas across all categories.
     pub fn total(&self) -> u64 {
-        self.deploy
-            .saturating_add(self.intrinsic)
-            .saturating_add(self.opcode_base)
-            .saturating_add(self.state_key_derivation)
-            .saturating_add(self.state_store)
-            .saturating_add(self.state_read)
-            .saturating_add(self.heap_allocation)
-            .saturating_add(self.call_overhead)
-            .saturating_add(self.host_function)
-            .saturating_add(self.memory)
+        self.counts
+            .iter()
+            .fold(0u64, |acc, &v| acc.saturating_add(v))
     }
 
     /// Returns an iterator over all categories and their gas costs.
     pub fn iter(&self) -> impl Iterator<Item = (GasCategory, u64)> {
-        [
-            (GasCategory::Intrinsic, self.intrinsic),
-            (GasCategory::Deploy, self.deploy),
-            (GasCategory::OpcodeBase, self.opcode_base),
-            (GasCategory::StateKeyDerivation, self.state_key_derivation),
-            (GasCategory::StateStore, self.state_store),
-            (GasCategory::StateRead, self.state_read),
-            (GasCategory::HeapAllocation, self.heap_allocation),
-            (GasCategory::CallOverhead, self.call_overhead),
-            (GasCategory::HostFunction, self.host_function),
-            (GasCategory::Memory, self.memory),
-        ]
-        .into_iter()
+        GasCategory::ALL.into_iter().zip(self.counts)
     }
 }
 

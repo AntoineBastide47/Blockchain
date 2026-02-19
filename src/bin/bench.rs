@@ -3,6 +3,7 @@
 //! Measures assembly + execution time for representative contracts.
 //! Run with: `cargo run --release --bin bench`
 
+use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use blockchain::types::hash::Hash;
@@ -83,29 +84,37 @@ impl BenchResult {
     }
 }
 
-/// Runs `f` for at least `min_duration`, returning aggregated results.
-fn bench<F>(
+/// Runs `f` for at least `min_duration`, timing only the closure itself (not setup).
+///
+/// `setup` builds a fresh value each iteration; `f` receives it and returns gas_used.
+/// Only `f` is timed.
+fn bench<S, Setup, F>(
     name: &'static str,
     min_duration: Duration,
     est_instructions: Option<u64>,
+    mut setup: Setup,
     mut f: F,
 ) -> BenchResult
 where
-    F: FnMut() -> u64,
+    Setup: FnMut() -> S,
+    F: FnMut(S) -> u64,
 {
     // Warmup
     for _ in 0..5 {
-        f();
+        let s = setup();
+        black_box(f(s));
     }
 
     let mut iterations = 0u64;
     let mut last_gas = 0u64;
-    let start = Instant::now();
-    while start.elapsed() < min_duration {
-        last_gas = f();
+    let mut total = Duration::ZERO;
+    while total < min_duration {
+        let s = black_box(setup());
+        let start = Instant::now();
+        last_gas = black_box(f(s));
+        total += start.elapsed();
         iterations += 1;
     }
-    let total = start.elapsed();
 
     BenchResult {
         name,
@@ -116,12 +125,10 @@ where
     }
 }
 
-/// Assembles, deploys (runs init code), returns gas_used.
-fn deploy_gas(prog: &DeployProgram) -> u64 {
-    let mut vm =
-        VM::new_deploy(prog.clone(), BLOCK_GAS_LIMIT, vec![], vec![]).expect("vm new failed");
-    vm.run(&mut BenchState::new(), &CTX).expect("deploy failed");
-    vm.gas_used()
+/// Creates a deploy VM ready to run.
+fn make_deploy_vm(prog: &DeployProgram) -> (VM, BenchState) {
+    let vm = VM::new_deploy(prog.clone(), BLOCK_GAS_LIMIT, vec![], vec![]).expect("vm new failed");
+    (vm, BenchState::new())
 }
 
 // ---------------------------------------------------------------------------
@@ -242,9 +249,9 @@ const MEM_INSTRS: u64 = 3 + 5_000 * 4;
 // ---------------------------------------------------------------------------
 
 fn main() {
-    let min = Duration::from_secs(2);
+    let min = Duration::from_secs(5);
 
-    println!("VM Benchmarks (each runs for >= 2s)\n");
+    println!("VM Benchmarks (each runs for >= {}s)\n", min.as_secs());
     println!(
         "  {:<30} {:>7}       {:>14} {:>12}  {:>10}",
         "benchmark", "iters", "avg time", "gas/run", "ns/instr"
@@ -268,48 +275,88 @@ fn main() {
             _ => unreachable!(),
         };
         let prog = factorial_prog.clone();
-        let r = bench(name, min, Some(factorial_instrs(n)), || {
-            let exec = ExecuteProgram::new(
-                Hash::zero(),
-                0, // only one pub fn: "factorial" = selector 0
-                vec![Value::Int(n as i64)],
-                vec![],
-            );
-            let mut vm = VM::new_execute(exec, prog.clone(), BLOCK_GAS_LIMIT).expect("exec");
-            vm.run(&mut BenchState::new(), &CTX).expect("run");
-            vm.gas_used()
-        });
+        let r = bench(
+            name,
+            min,
+            Some(factorial_instrs(n)),
+            || {
+                let exec = ExecuteProgram::new(Hash::zero(), 0, vec![Value::Int(n as i64)], vec![]);
+                (
+                    VM::new_execute(exec, prog.clone(), BLOCK_GAS_LIMIT).expect("exec"),
+                    BenchState::new(),
+                )
+            },
+            |(mut vm, mut state)| {
+                vm.run(&mut state, &CTX).expect("run");
+                vm.gas_used()
+            },
+        );
         r.print();
     }
 
     // 2. Tight loop (100K iterations)
-    let r = bench("tight_loop(100K)", min, Some(TIGHT_LOOP_INSTRS), || {
-        deploy_gas(&tight_prog)
-    });
+    let r = bench(
+        "tight_loop(100K)",
+        min,
+        Some(TIGHT_LOOP_INSTRS),
+        || make_deploy_vm(&tight_prog),
+        |(mut vm, mut state)| {
+            vm.run(&mut state, &CTX).expect("run");
+            vm.gas_used()
+        },
+    );
     r.print();
 
     // 3. Arithmetic mix (10K iterations)
-    let r = bench("arithmetic_mix(10K)", min, Some(ARITH_MIX_INSTRS), || {
-        deploy_gas(&arith_prog)
-    });
+    let r = bench(
+        "arithmetic_mix(10K)",
+        min,
+        Some(ARITH_MIX_INSTRS),
+        || make_deploy_vm(&arith_prog),
+        |(mut vm, mut state)| {
+            vm.run(&mut state, &CTX).expect("run");
+            vm.gas_used()
+        },
+    );
     r.print();
 
     // 4. Branch-heavy (50K iterations)
-    let r = bench("branch_heavy(50K)", min, Some(BRANCH_INSTRS), || {
-        deploy_gas(&branch_prog)
-    });
+    let r = bench(
+        "branch_heavy(50K)",
+        min,
+        Some(BRANCH_INSTRS),
+        || make_deploy_vm(&branch_prog),
+        |(mut vm, mut state)| {
+            vm.run(&mut state, &CTX).expect("run");
+            vm.gas_used()
+        },
+    );
     r.print();
 
     // 5. CALL overhead (10K calls)
-    let r = bench("call_overhead(10K)", min, Some(CALL_INSTRS), || {
-        deploy_gas(&call_prog)
-    });
+    let r = bench(
+        "call_overhead(10K)",
+        min,
+        Some(CALL_INSTRS),
+        || make_deploy_vm(&call_prog),
+        |(mut vm, mut state)| {
+            vm.run(&mut state, &CTX).expect("run");
+            vm.gas_used()
+        },
+    );
     r.print();
 
     // 6. Memory load/store (5K iterations)
-    let r = bench("mem_load_store(5K)", min, Some(MEM_INSTRS), || {
-        deploy_gas(&mem_prog)
-    });
+    let r = bench(
+        "mem_load_store(5K)",
+        min,
+        Some(MEM_INSTRS),
+        || make_deploy_vm(&mem_prog),
+        |(mut vm, mut state)| {
+            vm.run(&mut state, &CTX).expect("run");
+            vm.gas_used()
+        },
+    );
     r.print();
 
     println!();

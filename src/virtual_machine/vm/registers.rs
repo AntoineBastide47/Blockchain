@@ -1,4 +1,5 @@
 use crate::virtual_machine::errors::VMError;
+use crate::virtual_machine::isa::Instruction;
 use blockchain_derive::BinaryCodec;
 
 /// Runtime value stored in registers and used for typed call arguments.
@@ -63,26 +64,20 @@ impl Registers {
     /// Returns a reference to the value in register `idx`.
     ///
     /// Returns [`VMError::InvalidRegisterIndex`] if `idx` is out of bounds.
-    pub(super) fn get(&self, idx: u8) -> Result<&Value, VMError> {
-        if idx == Self::ZERO_REG {
-            return Ok(&self.regs[Self::ZERO_REG as usize]);
-        }
-        self.regs
-            .get(idx as usize)
-            .ok_or(VMError::InvalidRegisterIndex {
-                index: idx,
-                available: self.regs.len(),
-            })
+    pub(super) fn get(&self, idx: u8) -> &Value {
+        // Unsafe can be used here for performance since we can't get an out of index
+        // read due to having u8::MAX registers and indexing with a u8
+        unsafe { self.regs.get_unchecked(idx as usize) }
     }
 
     /// Returns the boolean value in register `idx`.
     ///
     /// Returns [`VMError::TypeMismatch`] if the value is not a boolean.
-    pub(super) fn get_bool(&self, idx: u8, instr: &'static str) -> Result<bool, VMError> {
-        match self.get(idx)? {
+    pub(super) fn get_bool(&self, idx: u8, instr: Instruction) -> Result<bool, VMError> {
+        match self.get(idx) {
             Value::Bool(v) => Ok(*v),
             other => Err(VMError::TypeMismatchStatic {
-                instruction: instr,
+                instruction: instr.mnemonic(),
                 arg_index: idx as i32,
                 expected: "Bool",
                 actual: other.type_name(),
@@ -93,11 +88,11 @@ impl Registers {
     /// Returns the reference value in register `idx`.
     ///
     /// Returns [`VMError::TypeMismatch`] if the value is not a reference.
-    pub(super) fn get_ref(&self, idx: u8, instr: &'static str) -> Result<u32, VMError> {
-        match self.get(idx)? {
+    pub(super) fn get_ref(&self, idx: u8, instr: Instruction) -> Result<u32, VMError> {
+        match self.get(idx) {
             Value::Ref(v) => Ok(*v),
             other => Err(VMError::TypeMismatchStatic {
-                instruction: instr,
+                instruction: instr.mnemonic(),
                 arg_index: idx as i32,
                 expected: "Ref",
                 actual: other.type_name(),
@@ -108,11 +103,11 @@ impl Registers {
     /// Returns the integer value in register `idx`.
     ///
     /// Returns [`VMError::TypeMismatch`] if the value is not an integer.
-    pub(super) fn get_int(&self, idx: u8, instr: &'static str) -> Result<i64, VMError> {
-        match self.get(idx)? {
+    pub(super) fn get_int(&self, idx: u8, instr: Instruction) -> Result<i64, VMError> {
+        match self.get(idx) {
             Value::Int(v) => Ok(*v),
             other => Err(VMError::TypeMismatchStatic {
-                instruction: instr,
+                instruction: instr.mnemonic(),
                 arg_index: idx as i32,
                 expected: "Int",
                 actual: other.type_name(),
@@ -123,20 +118,16 @@ impl Registers {
     /// Stores a value into register `idx`.
     ///
     /// Returns [`VMError::InvalidRegisterIndex`] if `idx` is out of bounds.
-    pub(super) fn set(&mut self, idx: u8, v: Value) -> Result<(), VMError> {
+    pub(super) fn set(&mut self, idx: u8, v: Value) {
         if idx == Self::ZERO_REG {
             // r0 is hardwired to integer zero; writes are discarded.
-            return Ok(());
+            return;
         }
-        let available = self.regs.len();
-        let slot = self
-            .regs
-            .get_mut(idx as usize)
-            .ok_or(VMError::InvalidRegisterIndex {
-                index: idx,
-                available,
-            })?;
-        *slot = v;
-        Ok(())
+        // Unsafe can be used here for performance since we can't get an out of index
+        // write due to having u8::MAX registers and indexing with a u8
+        unsafe {
+            let slot = self.regs.get_unchecked_mut(idx as usize);
+            *slot = v;
+        }
     }
 }

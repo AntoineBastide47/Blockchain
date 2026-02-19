@@ -10,8 +10,8 @@ pub const METADATA_DYNAMIC_SLOT_COUNT: usize = 3;
 pub const SRC_METADATA_RADIX: u8 = 8;
 /// Radix used by Addr metadata states.
 pub const ADDR_METADATA_RADIX: u8 = 4;
-/// Radix used by ImmI32 metadata states.
-pub const IMM_I32_METADATA_RADIX: u8 = 3;
+/// Radix used by ImmI32 metadata states (power of 2 for shift-based decoding).
+pub const IMM_I32_METADATA_RADIX: u8 = 4;
 
 /// Shorthand for constructing a [`VMError::DecodeError`] from a string-like reason.
 fn decode_error(reason: impl Into<String>) -> VMError {
@@ -154,12 +154,18 @@ impl TryFrom<u8> for AddrMetadataState {
 }
 
 /// ImmI32 metadata state used by mixed-radix metadata encoding.
+///
+/// State 3 (`Reserved`) is never emitted but exists so that the radix is 4
+/// (a power of two), allowing the compiler to replace `%` / `/` with
+/// bitwise `&` / `>>` during metadata decoding.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImmI32MetadataState {
     Len1 = 0,
     Len2 = 1,
     Len4 = 2,
+    /// Padding state to make the radix a power of two. Never emitted.
+    Reserved = 3,
 }
 
 impl ImmI32MetadataState {
@@ -168,7 +174,7 @@ impl ImmI32MetadataState {
         match self {
             Self::Len1 => 1,
             Self::Len2 => 2,
-            Self::Len4 => 4,
+            Self::Len4 | Self::Reserved => 4,
         }
     }
 
@@ -192,6 +198,7 @@ impl TryFrom<u8> for ImmI32MetadataState {
             0 => Ok(Self::Len1),
             1 => Ok(Self::Len2),
             2 => Ok(Self::Len4),
+            3 => Ok(Self::Reserved),
             _ => Err(decode_error(format!(
                 "invalid ImmI32 metadata state {value}"
             ))),
@@ -384,6 +391,55 @@ pub(crate) fn decode_u32_compact(bytes: &[u8], len: u8) -> Result<u32, VMError> 
     Ok(u32::from_le_bytes(out))
 }
 
+/// Decodes a compact i64 payload without bounds or length validation.
+/// # Safety
+/// `bytes` must contain at least `len` readable bytes. `len` must be `1`, `2`,
+/// `4`, or `8`.
+#[inline(always)]
+pub(crate) unsafe fn decode_i64_compact_unchecked(bytes: &[u8], len: u8) -> i64 {
+    unsafe {
+        let p = bytes.as_ptr();
+        match len {
+            1 => *p as i8 as i64,
+            2 => i16::from_le_bytes(*(p as *const [u8; 2])) as i64,
+            4 => i32::from_le_bytes(*(p as *const [u8; 4])) as i64,
+            _ => i64::from_le_bytes(*(p as *const [u8; 8])),
+        }
+    }
+}
+
+/// Decodes a compact i32 payload without bounds or length validation.
+/// # Safety
+/// `bytes` must contain at least `len` readable bytes. `len` must be `1`, `2`,
+/// or `4`.
+#[inline(always)]
+pub(crate) unsafe fn decode_i32_compact_unchecked(bytes: &[u8], len: u8) -> i32 {
+    unsafe {
+        let p = bytes.as_ptr();
+        match len {
+            1 => *p as i8 as i32,
+            2 => i16::from_le_bytes(*(p as *const [u8; 2])) as i32,
+            _ => i32::from_le_bytes(*(p as *const [u8; 4])),
+        }
+    }
+}
+
+/// Decodes a compact u32 payload without bounds or length validation.
+/// # Safety
+/// `bytes` must contain at least `len` readable bytes. `len` must be `1`, `2`,
+/// or `4`.
+#[inline(always)]
+pub(crate) unsafe fn decode_u32_compact_unchecked(bytes: &[u8], len: u8) -> u32 {
+    unsafe {
+        let p = bytes.as_ptr();
+        match len {
+            1 => *p as u32,
+            2 => u16::from_le_bytes(*(p as *const [u8; 2])) as u32,
+            _ => u32::from_le_bytes(*(p as *const [u8; 4])),
+        }
+    }
+}
+
 /// Returns `(byte_len, len_code)` for compact i64 metadata encoding.
 pub(crate) fn metadata_i64_len_and_code(value: i64) -> (u8, u8) {
     let min_len = compact_i64_len(value);
@@ -432,11 +488,35 @@ pub(crate) fn metadata_consume_src_state(cursor: &mut u16) -> Result<SrcMetadata
     SrcMetadataState::try_from(raw)
 }
 
+/// Consumes and returns the next Src metadata state from a mixed-radix cursor.
+/// # Safety
+/// The caller must guarantee that the cursor was produced by valid metadata
+/// encoding. The raw value `cursor % 8` is transmuted directly to
+/// [`SrcMetadataState`], which is `#[repr(u8)]` with discriminants `0..8`.
+#[inline(always)]
+pub(crate) unsafe fn metadata_consume_src_state_unchecked(cursor: &mut u16) -> SrcMetadataState {
+    let raw = (*cursor & 7) as u8;
+    *cursor >>= 3;
+    unsafe { std::mem::transmute(raw) }
+}
+
 /// Consumes and returns the next Addr metadata state from a mixed-radix cursor.
 pub(crate) fn metadata_consume_addr_state(cursor: &mut u16) -> Result<AddrMetadataState, VMError> {
     let raw = (*cursor % ADDR_METADATA_RADIX as u16) as u8;
     *cursor /= ADDR_METADATA_RADIX as u16;
     AddrMetadataState::try_from(raw)
+}
+
+/// Consumes and returns the next Addr metadata state from a mixed-radix cursor.
+/// # Safety
+/// The caller must guarantee that the cursor was produced by valid metadata
+/// encoding. The raw value `cursor % 4` is transmuted directly to
+/// [`AddrMetadataState`], which is `#[repr(u8)]` with discriminants `0..4`.
+#[inline(always)]
+pub(crate) unsafe fn metadata_consume_addr_state_unchecked(cursor: &mut u16) -> AddrMetadataState {
+    let raw = (*cursor & 3) as u8;
+    *cursor >>= 2;
+    unsafe { std::mem::transmute(raw) }
 }
 
 /// Consumes and returns the next ImmI32 metadata state from a mixed-radix cursor.
@@ -446,6 +526,20 @@ pub(crate) fn metadata_consume_imm_i32_state(
     let raw = (*cursor % IMM_I32_METADATA_RADIX as u16) as u8;
     *cursor /= IMM_I32_METADATA_RADIX as u16;
     ImmI32MetadataState::try_from(raw)
+}
+
+/// Consumes and returns the next ImmI32 metadata state from a mixed-radix cursor.
+/// # Safety
+/// The caller must guarantee that the cursor was produced by valid metadata
+/// encoding. The raw value `cursor % 4` is transmuted directly to
+/// [`ImmI32MetadataState`], which is `#[repr(u8)]` with discriminants `0..4`.
+#[inline(always)]
+pub(crate) unsafe fn metadata_consume_imm_i32_state_unchecked(
+    cursor: &mut u16,
+) -> ImmI32MetadataState {
+    let raw = (*cursor & 3) as u8;
+    *cursor >>= 2;
+    unsafe { std::mem::transmute(raw) }
 }
 
 /// Encodes one metadata byte from up to three dynamic Src/Addr slots.

@@ -29,6 +29,7 @@ impl VM {
             gas_profile: GasProfile::new(),
             args: vec![],
             dispatch_selector: 0,
+            return_data: Vec::new(),
         };
 
         vm.charge_gas_categorized(init_cost, GasCategory::Deploy)?;
@@ -2233,6 +2234,7 @@ fn run_vm_with_args(source: &str, args: Vec<Value>, arg_items: Vec<Vec<u8>>) -> 
         gas_profile: GasProfile::new(),
         args,
         dispatch_selector: 0,
+        return_data: Vec::new(),
     };
 
     vm.run(&mut TestState::new(), EXECUTION_CONTEXT)
@@ -2344,7 +2346,7 @@ fn host_func_argc_unknown_panics() {
 fn expand_mem_test() {
     let mut vm = run_vm("");
     vm.expand_memory(0, 8).unwrap();
-    assert_eq!(vm.exec_memory().len(), 64);
+    assert_eq!(vm.exec_memory().len(), 8);
 }
 
 #[test]
@@ -2354,7 +2356,7 @@ fn memstore_test() {
         MEM_STORE 64, 2
         "#;
     let vm = run_vm(code);
-    assert_eq!(vm.exec_memory().len(), 128);
+    assert_eq!(vm.exec_memory().len(), 72);
 }
 
 #[test]
@@ -2364,7 +2366,7 @@ fn memload_test() {
         MEM_LOAD r10, 0
         "#;
     let vm = run_vm(code);
-    assert_eq!(vm.exec_memory().len(), 64);
+    assert_eq!(vm.exec_memory().len(), 8);
     assert_eq!(&vm.exec_memory()[..8], &12i64.to_le_bytes());
     assert_eq!(vm.registers.get(10).unwrap(), &Value::Int(12));
 }
@@ -2375,7 +2377,7 @@ fn memset_test() {
         MEM_SET 0, 64, 255
         "#;
     let vm = run_vm(code);
-    assert_eq!(vm.exec_memory().len(), 512);
+    assert_eq!(vm.exec_memory().len(), 64);
     assert_eq!(&vm.exec_memory()[..64], &[255u8; 64]);
 }
 
@@ -2446,17 +2448,17 @@ fn memcpy_zero_length() {
 
 #[test]
 fn expand_memory_alignment() {
-    // Storing at offset 1 should expand by (9 needed bytes) * WORD_SIZE = 72
+    // Storing at offset 1 with len 8 needs 9 bytes -> rounded up to 16 bytes.
     let mut vm = run_vm("");
     vm.expand_memory(1, 8).unwrap();
-    assert_eq!(vm.exec_memory().len(), 72);
+    assert_eq!(vm.exec_memory().len(), 16);
 }
 
 #[test]
 fn memset_hex_addr_and_len() {
     let code = "MEM_SET 0x10, 0x20, 0xAB";
     let vm = run_vm(code);
-    assert_eq!(vm.exec_memory().len(), 384);
+    assert_eq!(vm.exec_memory().len(), 48);
     assert_eq!(&vm.exec_memory()[0x10..0x30], &[0xABu8; 0x20]);
 }
 
@@ -2474,7 +2476,7 @@ fn memcpy_hex_params() {
 fn memstore_hex_addr() {
     let code = "MEM_STORE 0x40, 0x1234";
     let vm = run_vm(code);
-    assert_eq!(vm.exec_memory().len(), 576);
+    assert_eq!(vm.exec_memory().len(), 72);
     assert_eq!(&vm.exec_memory()[0x40..0x48], &0x1234i64.to_le_bytes());
 }
 

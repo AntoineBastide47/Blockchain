@@ -2,7 +2,7 @@
 mod tests {
     const FNV_OFFSET: u64 = 0xcbf29ce484222325;
     const FNV_PRIME: u64 = 0x100000001b3;
-    const EXPECTED_ISA_HASH: u64 = 10137370753225132244;
+    const EXPECTED_ISA_HASH: u64 = 15158108811100570629;
 
     fn fnv1a64(mut h: u64, bytes: &[u8]) -> u64 {
         for b in bytes {

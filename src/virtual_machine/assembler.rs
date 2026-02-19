@@ -32,13 +32,13 @@
 //!
 //! ```text
 //! Src states (radix 8): Reg, Ref_1, Ref_2, Ref_4, I64_1, I64_2, I64_4, I64_8
-//! Addr states (radix 2): Reg, U32
+//! Addr states (radix 4): Reg, U32_1, U32_2, U32_4
 //! Len states (radix 3): 1B, 2B, 4B (used by ImmI32 and RefU32)
 //! ```
 //!
 //! - `3-dyn Src`: `meta = s0 + 8*s1 + 64*s2` (fits in one byte)
 //! - `2-dyn arithmetic`: `meta = (concat << 7) | (s0 + 8*s1)`
-//! - `3-dyn Addr` (e.g. `MEM_COPY`): `meta = a0 + 2*a1 + 4*a2`
+//! - `3-dyn Addr` (e.g. `MEM_COPY`): `meta = a0 + 4*a1 + 16*a2`
 //!
 //! Booleans are not a dedicated dynamic Src state; immediates are encoded via
 //! compact i64 states.
@@ -910,12 +910,19 @@ fn emit_addr_payload_from_metadata(
 ) {
     let state =
         metadata_consume_addr_state(metadata_cursor).expect("invalid Addr metadata state cursor");
-    match (state, operand) {
-        (AddrMetadataState::Reg, AddrOperand::Reg(reg)) => out.push(*reg),
-        (AddrMetadataState::U32, AddrOperand::U32(value)) => {
-            out.extend_from_slice(&value.to_le_bytes());
+    if let Some(len) = state.u32_len() {
+        let value = match operand {
+            AddrOperand::U32(value) => *value,
+            _ => panic!("metadata state {state:?} expects U32 Addr payload"),
+        };
+        let bytes = encode_u32_compact(value, len)
+            .expect("metadata u32 length must be valid for Addr payload");
+        out.extend_from_slice(&bytes);
+    } else {
+        match (state, operand) {
+            (AddrMetadataState::Reg, AddrOperand::Reg(reg)) => out.push(*reg),
+            _ => panic!("metadata state {state:?} does not match Addr operand {operand:?}"),
         }
-        _ => panic!("metadata state {state:?} does not match Addr operand {operand:?}"),
     }
 }
 
@@ -963,10 +970,24 @@ fn src_metadata_slot_from_token(tok: &str, ctx: &mut AsmContext) -> MetadataSlot
 
 /// Returns metadata slot encoding for an Addr token.
 fn addr_metadata_slot_from_token(tok: &str) -> MetadataSlotEncoding {
+    MetadataSlotEncoding::addr(addr_metadata_state_from_token(tok))
+}
+
+/// Returns Addr metadata state for a token.
+fn addr_metadata_state_from_token(tok: &str) -> AddrMetadataState {
     if is_register_token(tok) {
-        MetadataSlotEncoding::addr(AddrMetadataState::Reg)
+        AddrMetadataState::Reg
+    } else if let Ok(value) = parse_u32(tok, 0, 0) {
+        if value <= u8::MAX as u32 {
+            AddrMetadataState::U32Len1
+        } else if value <= u16::MAX as u32 {
+            AddrMetadataState::U32Len2
+        } else {
+            AddrMetadataState::U32Len4
+        }
     } else {
-        MetadataSlotEncoding::addr(AddrMetadataState::U32)
+        // Addr immediates are u32-only; keep len4 fallback for token-size pass robustness.
+        AddrMetadataState::U32Len4
     }
 }
 
@@ -977,7 +998,7 @@ fn src_size_from_token_metadata(tok: &str, ctx: &mut AsmContext) -> usize {
 
 /// Computes Addr payload size under metadata encoding (no per-operand tag bytes).
 fn addr_size_from_token_metadata(tok: &str) -> usize {
-    if is_register_token(tok) { 1 } else { 4 }
+    addr_metadata_state_from_token(tok).payload_len()
 }
 
 /// Returns ImmI32 metadata state for a token.
@@ -1160,13 +1181,15 @@ fn assemble_source_step_0(source: &str, errors: &mut Vec<VMError>) -> Option<Str
                         line: line_no + 1,
                         offset: tok.offset,
                         length: tok.text.len(),
-                        source: "RET is not allowed inside '__init__'; use HALT to end init code"
+                        source: "RET is not allowed inside '__init__'; use HALT or RETURN to end init code"
                             .to_string(),
                     });
                     return None;
                 }
                 last_init_instr = Some((line_no + 1, tok.offset, tok.text.to_string()));
-                if tok.text == Instruction::Halt.mnemonic() {
+                if tok.text == Instruction::Halt.mnemonic()
+                    || tok.text == Instruction::Return.mnemonic()
+                {
                     in_init = false;
                 }
             }
@@ -1177,13 +1200,15 @@ fn assemble_source_step_0(source: &str, errors: &mut Vec<VMError>) -> Option<Str
 
     if has_init {
         match last_init_instr {
-            Some((_, _, mnemonic)) if mnemonic == Instruction::Halt.mnemonic() => {}
+            Some((_, _, mnemonic))
+                if mnemonic == Instruction::Halt.mnemonic()
+                    || mnemonic == Instruction::Return.mnemonic() => {}
             Some((line, offset, mnemonic)) => {
                 errors.push(VMError::AssemblyError {
                     line,
                     offset,
                     length: mnemonic.len().max(1),
-                    source: "label '__init__' must end with HALT".to_string(),
+                    source: "label '__init__' must end with HALT or RETURN".to_string(),
                 });
                 return None;
             }
@@ -1192,7 +1217,7 @@ fn assemble_source_step_0(source: &str, errors: &mut Vec<VMError>) -> Option<Str
                     line: 1,
                     offset: 1,
                     length: INIT_LABEL.len(),
-                    source: "label '__init__' must end with HALT".to_string(),
+                    source: "label '__init__' must end with HALT or RETURN".to_string(),
                 });
                 return None;
             }

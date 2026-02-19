@@ -9,7 +9,7 @@ pub const METADATA_DYNAMIC_SLOT_COUNT: usize = 3;
 /// Radix used by Src metadata states.
 pub const SRC_METADATA_RADIX: u8 = 8;
 /// Radix used by Addr metadata states.
-pub const ADDR_METADATA_RADIX: u8 = 2;
+pub const ADDR_METADATA_RADIX: u8 = 4;
 /// Radix used by ImmI32 metadata states.
 pub const IMM_I32_METADATA_RADIX: u8 = 3;
 
@@ -112,7 +112,9 @@ impl TryFrom<u8> for SrcMetadataState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AddrMetadataState {
     Reg = 0,
-    U32 = 1,
+    U32Len1 = 1,
+    U32Len2 = 2,
+    U32Len4 = 3,
 }
 
 impl AddrMetadataState {
@@ -120,7 +122,19 @@ impl AddrMetadataState {
     pub const fn payload_len(self) -> usize {
         match self {
             Self::Reg => 1,
-            Self::U32 => 4,
+            Self::U32Len1 => 1,
+            Self::U32Len2 => 2,
+            Self::U32Len4 => 4,
+        }
+    }
+
+    /// Returns the compact u32 byte length if this state is a u32 variant, or `None`.
+    pub const fn u32_len(self) -> Option<u8> {
+        match self {
+            Self::U32Len1 => Some(1),
+            Self::U32Len2 => Some(2),
+            Self::U32Len4 => Some(4),
+            _ => None,
         }
     }
 }
@@ -131,7 +145,9 @@ impl TryFrom<u8> for AddrMetadataState {
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             0 => Ok(Self::Reg),
-            1 => Ok(Self::U32),
+            1 => Ok(Self::U32Len1),
+            2 => Ok(Self::U32Len2),
+            3 => Ok(Self::U32Len4),
             _ => Err(decode_error(format!("invalid Addr metadata state {value}"))),
         }
     }

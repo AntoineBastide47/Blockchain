@@ -1,9 +1,7 @@
 __init__:                         # Contract constructor
     MOVE r1, 5
     CALL factorial                # r3 = 5! = 120
-    SHA3 r2, 1, r3                # hash the value
-    STORE "hash", r2              # Store the hashes value at key "hash"
-    HALT
+    RETURN 0, 0
 
 # factorial(n): computes n! iteratively
 # input: r1 = n, output: r3 = n!
@@ -13,4 +11,5 @@ pub factorial(1, r1):
         MUL r3, r3, r1            # result *= i
         DEC r1                    # i--
         BGE r1, 1, __fact_loop    # while n >= 1
-    RET
+    MEM_STORE 0x00, r3
+    RETURN 0x00, 8

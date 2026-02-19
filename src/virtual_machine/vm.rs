@@ -167,11 +167,13 @@ fn decode_addr_operand_from_stream(
     let state = metadata_consume_addr_state(metadata_cursor)?;
     match state {
         AddrMetadataState::Reg => Ok(AddrOperand::Reg(read_u8(data, cursor, instr_offset)?)),
-        AddrMetadataState::U32 => {
-            let bytes = read_bytes(data, cursor, 4, instr_offset)?;
-            Ok(AddrOperand::U32(u32::from_le_bytes(
-                bytes.try_into().unwrap(),
-            )))
+        _ => {
+            let len = state
+                .u32_len()
+                .expect("Addr u32 metadata state must include len");
+            let payload = read_bytes(data, cursor, len as usize, instr_offset)?;
+            let value = decode_u32_compact(payload, len)?;
+            Ok(AddrOperand::U32(value))
         }
     }
 }
@@ -508,6 +510,8 @@ pub struct VM {
     args: Vec<Value>,
     /// Root dispatcher selector for runtime entry.
     dispatch_selector: i64,
+    /// The data returned by the VM's execution
+    return_data: Vec<u8>,
 }
 
 /// impl block for basic VM functions
@@ -559,6 +563,7 @@ impl VM {
             gas_profile: GasProfile::new(),
             args,
             dispatch_selector: 0,
+            return_data: Vec::new(),
         };
 
         vm.charge_gas_categorized(20_000 + total_bytes as u64 * 200, GasCategory::Deploy)?;
@@ -609,6 +614,7 @@ impl VM {
             gas_profile: GasProfile::new(),
             args,
             dispatch_selector: execute.function_id,
+            return_data: Vec::new(),
         };
         Ok(vm)
     }
@@ -783,6 +789,11 @@ impl VM {
     /// Returns the gas profile for this execution.
     pub fn gas_profile(&self) -> GasProfile {
         self.gas_profile.clone()
+    }
+
+    /// Returns the return data buffer for this execution.
+    pub fn return_data(self) -> Vec<u8> {
+        self.return_data
     }
 
     /// Adds gas to the running total with category tracking.
@@ -1180,6 +1191,7 @@ impl VM {
                 Jump => op_jump(offset: ImmI32),
                 Ret => op_ret(),
                 Halt => op_halt(),
+                Return => op_return(addr: Addr, len: Addr),
                 // Data and Memory access
                 CallDataLoad => op_call_data_load(rd: Reg),
                 CallDataCopy => op_call_data_copy(dst: Addr),
@@ -1188,6 +1200,7 @@ impl VM {
                 MemStore => op_memstore(addr: Addr, rs: Src),
                 MemCpy => op_memcpy(dst: Addr, src: Addr, len: Addr),
                 MemSet => op_memset(dst: Addr, len: Addr, val: ImmU8),
+                MemLen => op_memlen(dst: Reg),
                 MemLoad8U => op_memload_8u(rd: Reg, addr: Addr),
                 MemLoad8S => op_memload_8s(rd: Reg, addr: Addr),
                 MemLoad16U => op_memload_16u(rd: Reg, addr: Addr),
@@ -2056,6 +2069,23 @@ impl VM {
         Ok(())
     }
 
+    fn op_return(
+        &mut self,
+        instr: &'static str,
+        addr: AddrOperand,
+        len: AddrOperand,
+    ) -> Result<(), VMError> {
+        let (addr, from_ref) = self.addr_operand_to_u32_with_ref(instr, addr)?;
+        if from_ref {
+            self.return_data = self.heap_get_data(addr)?.to_vec();
+        } else {
+            let addr = addr as usize;
+            let len = self.addr_operand_to_u32(instr, len)? as usize;
+            self.return_data = self.heap[addr..addr + len].to_vec();
+        }
+        self.op_halt(instr)
+    }
+
     fn op_call_data_load(&mut self, _instr: &'static str, dst: u8) -> Result<(), VMError> {
         for (i, arg) in self.args.iter().enumerate() {
             self.registers.set(dst + i as u8, *arg)?;
@@ -2082,12 +2112,12 @@ impl VM {
     /// Memory grows in word-sized chunks and charges gas proportional to the
     /// number of bytes expanded.
     fn expand_memory(&mut self, base: usize, len: usize) -> Result<(), VMError> {
-        let max = base.saturating_add(len);
-        if self.heap.len() < max {
-            let expanded = max.saturating_sub(self.heap.len()) * WORD_SIZE;
+        let needed = base.saturating_add(len);
+        let aligned = needed.div_ceil(WORD_SIZE) * WORD_SIZE;
+        if self.heap.len() < aligned {
+            let expanded = aligned - self.heap.len();
             self.charge_gas_categorized(expanded as u64 * 5, GasCategory::Memory)?;
-            self.heap
-                .resize(self.heap.len().saturating_add(expanded), 0);
+            self.heap.resize(self.heap.exec_offset + aligned, 0);
         }
 
         Ok(())
@@ -2098,9 +2128,28 @@ impl VM {
     /// For immediate addresses, returns the value directly. For register addresses,
     /// reads the integer value from the register and truncates to u32.
     fn addr_operand_to_u32(&self, instr: &'static str, addr: AddrOperand) -> Result<u32, VMError> {
+        Ok(self.addr_operand_to_u32_with_ref(instr, addr)?.0)
+    }
+
+    fn addr_operand_to_u32_with_ref(
+        &self,
+        instr: &'static str,
+        addr: AddrOperand,
+    ) -> Result<(u32, bool), VMError> {
         Ok(match addr {
-            AddrOperand::U32(u) => u,
-            AddrOperand::Reg(r) => self.registers.get_int(r, instr)? as u32,
+            AddrOperand::U32(u) => (u, false),
+            AddrOperand::Reg(r) => match self.registers.get(r)? {
+                Value::Ref(r) => (*r, true),
+                Value::Int(_) => (self.registers.get_int(r, instr)? as u32, false),
+                other => {
+                    return Err(VMError::TypeMismatchStatic {
+                        instruction: instr,
+                        arg_index: r as i32,
+                        expected: "Int",
+                        actual: other.type_name(),
+                    });
+                }
+            },
         })
     }
 
@@ -2155,7 +2204,6 @@ impl VM {
         rs: SrcOperand,
     ) -> Result<(), VMError> {
         let addr = self.addr_operand_to_u32(instr, addr)? as usize;
-        error!("{} {} {}", addr, self.heap.len(), self.ip);
         self.expand_memory(addr, WORD_SIZE)?;
 
         let value = self.int_from_operand(rs, instr, 2)?;
@@ -2211,6 +2259,10 @@ impl VM {
         self.charge_gas_categorized(len as u64 * 3, GasCategory::Memory)?;
         self.heap[dst..dst + len].fill(val);
         Ok(())
+    }
+
+    fn op_memlen(&mut self, _instr: &'static str, dst: u8) -> Result<(), VMError> {
+        self.registers.set(dst, Value::Int(self.heap.len() as i64))
     }
 
     /// Dispatches to a public function by selector index.

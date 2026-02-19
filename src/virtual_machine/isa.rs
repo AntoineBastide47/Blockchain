@@ -161,6 +161,8 @@ macro_rules! for_each_instruction {
             Ret = 0x4D, "RET" => [], 5,
             /// HALT ; stop execution immediately
             Halt = 0x4E, "HALT" => [], 1,
+            /// RETURN addr, len ; moves memory[addr..addr+len] into the VM return buffer, ends the VM's execution
+            Return = 0x4F, "RETURN" => [addr: Addr, len: Addr], 5,
             // =========================
             // Data and Memory access
             // =========================
@@ -178,18 +180,20 @@ macro_rules! for_each_instruction {
             MemCpy = 0x55, "MEM_COPY" => [dst: Addr, src: Addr, len: Addr], 5,
             /// MEM_SET dst, val, len ; for i in 0..len: memory[dst+i] = val
             MemSet = 0x56, "MEM_SET" => [dst: Addr, len: Addr, val: ImmU8], 5,
+            /// MEM_LEN dst ; set's dst to the size in bytes of the VM's memory buffer
+            MemLen = 0x57, "MEM_LEN" => [dst: Reg], 1,
             /// MEM_LOAD_8U rd, addr ; rd = memory[addr .. addr + 1], zero extended
-            MemLoad8U = 0x57, "MEM_LOAD_8U" => [rd: Reg, addr: Addr], 2,
+            MemLoad8U = 0x58, "MEM_LOAD_8U" => [rd: Reg, addr: Addr], 2,
             /// MEM_LOAD_8S rd, addr ; rd = memory[addr .. addr + 1], sign extended
-            MemLoad8S = 0x58, "MEM_LOAD_8S" => [rd: Reg, addr: Addr], 2,
+            MemLoad8S = 0x59, "MEM_LOAD_8S" => [rd: Reg, addr: Addr], 2,
             /// MEM_LOAD_16U rd, addr ; rd = memory[addr .. addr + 2], zero extended
-            MemLoad16U = 0x59, "MEM_LOAD_16U" => [rd: Reg, addr: Addr], 3,
+            MemLoad16U = 0x5A, "MEM_LOAD_16U" => [rd: Reg, addr: Addr], 3,
             /// MEM_LOAD_16S rd, addr ; rd = memory[addr .. addr + 2], sign extended
-            MemLoad16S = 0x5A, "MEM_LOAD_16S" => [rd: Reg, addr: Addr], 3,
+            MemLoad16S = 0x5B, "MEM_LOAD_16S" => [rd: Reg, addr: Addr], 3,
             /// MEM_LOAD_32U rd, addr ; rd = memory[addr .. addr + 4], zero extended
-            MemLoad32U = 0x5B, "MEM_LOAD_32U" => [rd: Reg, addr: Addr], 4,
+            MemLoad32U = 0x5C, "MEM_LOAD_32U" => [rd: Reg, addr: Addr], 4,
             /// MEM_LOAD_32S rd, addr ; rd = memory[addr .. addr + 4], sign extended
-            MemLoad32S = 0x5C, "MEM_LOAD_32S" => [rd: Reg, addr: Addr], 4,
+            MemLoad32S = 0x5D, "MEM_LOAD_32S" => [rd: Reg, addr: Addr], 4,
         }
     };
 }

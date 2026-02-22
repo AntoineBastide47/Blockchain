@@ -5,10 +5,11 @@
 
 use crate::core::account::Account;
 use crate::core::block::{Block, Header};
-use crate::crypto::key_pair::{Address, PrivateKey};
+use crate::crypto::key_pair::{Address, PrivateKey, PublicKey};
 use crate::storage::rocksdb_storage::SmtValue;
 use crate::types::encoding::Encode;
 use crate::types::hash::Hash;
+use crate::types::serializable_signature::SerializableSignature;
 use blockchain_derive::BinaryCodec;
 use sparse_merkle_tree::blake2b::Blake2bHasher;
 use sparse_merkle_tree::default_store::DefaultStore;
@@ -19,6 +20,32 @@ use sparse_merkle_tree::{H256, SparseMerkleTree};
 pub enum ConsensusKind {
     /// Weighted proof-of-stake with deterministic proposer selection.
     ProofOfStakeV1,
+}
+
+/// Domain-separated key used to store global consensus state in VM storage.
+pub fn consensus_state_key() -> Hash {
+    Hash::sha3().chain(b"CONSENSUS:STATE").finalize()
+}
+
+/// Domain-separated key used to store the active validator set snapshot.
+pub fn validator_set_key() -> Hash {
+    Hash::sha3().chain(b"CONSENSUS:VALIDATOR_SET").finalize()
+}
+
+/// Domain-separated key used to store a validator record.
+pub fn validator_record_key(address: Address) -> Hash {
+    let mut h = Hash::sha3();
+    h.update(b"CONSENSUS:VALIDATOR:");
+    h.update(address.as_slice());
+    h.finalize()
+}
+
+/// Domain-separated key used to mark slashing evidence as already processed.
+pub fn slashing_evidence_seen_key(evidence_id: Hash) -> Hash {
+    let mut h = Hash::sha3();
+    h.update(b"CONSENSUS:SLASHED_EVIDENCE:");
+    h.update(evidence_id.as_slice());
+    h.finalize()
 }
 
 /// Staking-related chain parameters.
@@ -50,6 +77,294 @@ pub struct SyncLimits {
     pub max_blocks_per_request: u16,
     /// Maximum number of hashes in a locator list.
     pub max_locator_hashes: u16,
+}
+
+/// Current lifecycle state of a validator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, BinaryCodec)]
+pub enum ValidatorStatus {
+    /// Validator is actively participating in proposer selection.
+    Active,
+    /// Validator exists but has no active stake.
+    Inactive,
+    /// Validator has pending activation stake not yet active.
+    PendingActivation,
+    /// Validator has requested unbonding and is waiting for claim.
+    Unbonding,
+    /// Validator has been slashed and currently has no active stake.
+    Slashed,
+}
+
+/// Stake amount scheduled to become active at a future height.
+#[derive(Clone, Debug, PartialEq, Eq, BinaryCodec)]
+pub struct PendingActivation {
+    /// Stake amount to activate.
+    pub amount: u128,
+    /// Height at which this stake becomes active.
+    pub activate_height: u64,
+}
+
+/// Stake amount scheduled to become claimable after unbonding.
+#[derive(Clone, Debug, PartialEq, Eq, BinaryCodec)]
+pub struct PendingUnbond {
+    /// Stake amount that will be claimable.
+    pub amount: u128,
+    /// Height at which funds become claimable.
+    pub claim_height: u64,
+}
+
+/// Persistent validator record tracked in consensus state.
+#[derive(Clone, Debug, PartialEq, Eq, BinaryCodec)]
+pub struct ValidatorRecord {
+    /// Validator address.
+    pub address: Address,
+    /// Currently active stake used for proposer selection and rewards.
+    pub active_stake: u128,
+    /// Stake pending activation after bonding period.
+    pub pending_activations: Vec<PendingActivation>,
+    /// Stake pending claim after unbonding period.
+    pub pending_unbonds: Vec<PendingUnbond>,
+    /// Cumulative amount slashed from this validator.
+    pub slashed_total: u128,
+}
+
+impl ValidatorRecord {
+    /// Creates an empty validator record for the given address.
+    pub fn new(address: Address) -> Self {
+        Self {
+            address,
+            active_stake: 0,
+            pending_activations: Vec::new(),
+            pending_unbonds: Vec::new(),
+            slashed_total: 0,
+        }
+    }
+
+    /// Returns the validator lifecycle status.
+    pub fn status(&self) -> ValidatorStatus {
+        if self.active_stake > 0 {
+            ValidatorStatus::Active
+        } else if !self.pending_unbonds.is_empty() {
+            ValidatorStatus::Unbonding
+        } else if !self.pending_activations.is_empty() {
+            ValidatorStatus::PendingActivation
+        } else if self.slashed_total > 0 {
+            ValidatorStatus::Slashed
+        } else {
+            ValidatorStatus::Inactive
+        }
+    }
+}
+
+/// Active validator entry used for weighted proposer selection.
+#[derive(Clone, Debug, PartialEq, Eq, BinaryCodec)]
+pub struct ActiveValidatorEntry {
+    /// Validator address.
+    pub address: Address,
+    /// Active stake weight.
+    pub stake: u128,
+}
+
+/// Snapshot of the active validator set used for deterministic leader selection.
+#[derive(Clone, Debug, PartialEq, Eq, Default, BinaryCodec)]
+pub struct ValidatorSetSnapshot {
+    /// All known validator addresses (active or pending), sorted by address.
+    pub tracked_validators: Vec<Address>,
+    /// Active validators sorted by address for deterministic iteration.
+    pub validators: Vec<ActiveValidatorEntry>,
+    /// Sum of all active stake in `validators`.
+    pub total_active_stake: u128,
+}
+
+impl ValidatorSetSnapshot {
+    /// Returns an empty validator set snapshot.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Sorts validators by address and recomputes total active stake.
+    pub fn normalize(&mut self) {
+        self.tracked_validators.sort_unstable();
+        self.tracked_validators.dedup();
+        self.validators.sort_unstable_by_key(|v| v.address);
+        self.validators.retain(|v| v.stake > 0);
+        self.total_active_stake = self
+            .validators
+            .iter()
+            .fold(0u128, |acc, v| acc.saturating_add(v.stake));
+    }
+
+    /// Returns the active stake for a validator address.
+    pub fn stake_of(&self, address: Address) -> u128 {
+        self.validators
+            .iter()
+            .find(|v| v.address == address)
+            .map(|v| v.stake)
+            .unwrap_or(0)
+    }
+}
+
+/// Global consensus state persisted in VM storage.
+#[derive(Clone, Debug, PartialEq, Eq, BinaryCodec)]
+pub struct ConsensusState {
+    /// Latest block height for which scheduled transitions were processed.
+    pub last_processed_height: u64,
+    /// Total active stake used for rewards and proposer selection.
+    pub total_active_stake: u128,
+    /// Pseudo-randomness seed updated each block.
+    pub randomness_seed: Hash,
+}
+
+impl Default for ConsensusState {
+    fn default() -> Self {
+        Self {
+            last_processed_height: 0,
+            total_active_stake: 0,
+            randomness_seed: Hash::zero(),
+        }
+    }
+}
+
+/// Signed header data used as slashable evidence.
+#[derive(Clone, Debug, PartialEq, Eq, BinaryCodec)]
+pub struct SignedHeaderEvidence {
+    /// Conflicting header.
+    pub header: Header,
+    /// Validator public key that signed the header.
+    pub validator: PublicKey,
+    /// Signature over the header hash in the block-signing domain.
+    pub signature: SerializableSignature,
+}
+
+impl SignedHeaderEvidence {
+    /// Computes the signed header hash.
+    pub fn header_hash(&self, chain_id: u64) -> Hash {
+        self.header.header_hash(chain_id)
+    }
+
+    /// Verifies the signature for this header.
+    pub fn verify(&self, chain_id: u64) -> bool {
+        let hash = self.header_hash(chain_id);
+        self.validator
+            .verify(block_sign_data(chain_id, &hash).as_slice(), self.signature)
+    }
+}
+
+/// Slashing evidence for double-signing / double-proposing.
+#[derive(Clone, Debug, PartialEq, Eq, BinaryCodec)]
+pub struct SlashingEvidence {
+    /// First signed header.
+    pub first: SignedHeaderEvidence,
+    /// Second conflicting signed header.
+    pub second: SignedHeaderEvidence,
+}
+
+impl SlashingEvidence {
+    /// Computes a domain-separated identifier for evidence deduplication.
+    pub fn evidence_id(&self, chain_id: u64) -> Hash {
+        let h1 = self.first.header_hash(chain_id);
+        let h2 = self.second.header_hash(chain_id);
+        let (a, b) = if h1 <= h2 { (h1, h2) } else { (h2, h1) };
+        let mut h = Hash::sha3();
+        h.update(b"SLASH_EVIDENCE");
+        h.update(a.as_slice());
+        h.update(b.as_slice());
+        h.finalize()
+    }
+
+    /// Returns true if this evidence proves a slashable double-sign fault.
+    pub fn is_valid_double_sign(&self, chain_id: u64) -> bool {
+        if !self.first.verify(chain_id) || !self.second.verify(chain_id) {
+            return false;
+        }
+        if self.first.validator.address() != self.second.validator.address() {
+            return false;
+        }
+        if self.first.header.height != self.second.header.height {
+            return false;
+        }
+        self.first.header_hash(chain_id) != self.second.header_hash(chain_id)
+    }
+}
+
+/// Payload for a stake transaction.
+#[derive(Clone, Debug, PartialEq, Eq, BinaryCodec)]
+pub struct StakeTxData {
+    /// Stake amount to lock and activate after the bonding period.
+    pub amount: u128,
+}
+
+/// Payload for an unstake transaction.
+#[derive(Clone, Debug, PartialEq, Eq, BinaryCodec)]
+pub struct UnstakeTxData {
+    /// Amount of active stake to begin unbonding.
+    pub amount: u128,
+}
+
+/// Payload for a claim-unbonded transaction.
+#[derive(Clone, Debug, PartialEq, Eq, BinaryCodec)]
+pub struct ClaimUnbondedTxData {
+    /// Optional exact amount to claim. `0` means claim all matured unbonds.
+    pub amount: u128,
+}
+
+/// Payload for a slashing-evidence transaction.
+#[derive(Clone, Debug, PartialEq, Eq, BinaryCodec)]
+pub struct SlashingEvidenceTxData {
+    /// Slashable evidence to process.
+    pub evidence: SlashingEvidence,
+}
+
+/// Selects the proposer for a block height using weighted deterministic sampling.
+///
+/// Returns `None` when the validator set is empty or total active stake is zero.
+pub fn select_leader(
+    height: u64,
+    randomness: Hash,
+    validator_set: &ValidatorSetSnapshot,
+) -> Option<Address> {
+    if validator_set.validators.is_empty() || validator_set.total_active_stake == 0 {
+        return None;
+    }
+
+    let mut h = Hash::sha3();
+    h.update(b"LEADER_SELECT");
+    height.encode(&mut h);
+    randomness.encode(&mut h);
+    let draw = h.finalize();
+    let mut buf = [0u8; 16];
+    buf.copy_from_slice(&draw.as_slice()[..16]);
+    let mut ticket = u128::from_le_bytes(buf) % validator_set.total_active_stake;
+
+    for v in &validator_set.validators {
+        if ticket < v.stake {
+            return Some(v.address);
+        }
+        ticket -= v.stake;
+    }
+
+    validator_set.validators.last().map(|v| v.address)
+}
+
+/// Computes the next consensus randomness seed from the current seed and block hash.
+pub fn next_randomness_seed(current_seed: Hash, block_hash: Hash) -> Hash {
+    let mut h = Hash::sha3();
+    h.update(b"CONSENSUS:RAND");
+    h.update(current_seed.as_slice());
+    h.update(block_hash.as_slice());
+    h.finalize()
+}
+
+/// Returns the development-chain staking parameters.
+pub fn default_staking_params() -> StakingParams {
+    ChainParams::dev_with_allocations(vec![]).staking
+}
+
+fn block_sign_data(chain_id: u64, hash: &Hash) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"BLOCK");
+    chain_id.encode(&mut buf);
+    hash.encode(&mut buf);
+    buf
 }
 
 /// A genesis state allocation entry.
@@ -239,5 +554,38 @@ mod tests {
         let genesis = params.genesis.build_genesis_block(params.chain_id);
         assert_eq!(genesis.header.receipt_root, Hash::zero());
         assert_eq!(genesis.header.height, 0);
+    }
+
+    #[test]
+    fn select_leader_is_deterministic() {
+        let mut set = ValidatorSetSnapshot {
+            tracked_validators: vec![
+                Hash::sha3().chain(b"v2").finalize(),
+                Hash::sha3().chain(b"v1").finalize(),
+            ],
+            validators: vec![
+                ActiveValidatorEntry {
+                    address: Hash::sha3().chain(b"v2").finalize(),
+                    stake: 5,
+                },
+                ActiveValidatorEntry {
+                    address: Hash::sha3().chain(b"v1").finalize(),
+                    stake: 10,
+                },
+            ],
+            total_active_stake: 0,
+        };
+        set.normalize();
+
+        let rand = Hash::sha3().chain(b"rand").finalize();
+        let a = select_leader(42, rand, &set);
+        let b = select_leader(42, rand, &set);
+        assert_eq!(a, b);
+        assert!(a.is_some());
+    }
+
+    #[test]
+    fn select_leader_none_for_empty_set() {
+        assert!(select_leader(1, Hash::zero(), &ValidatorSetSnapshot::empty()).is_none());
     }
 }

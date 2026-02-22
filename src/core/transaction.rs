@@ -16,6 +16,14 @@ pub enum TransactionType {
     DeployContract,
     /// Invokes an existing smart contract.
     InvokeContract,
+    /// Locks native tokens as validator stake.
+    Stake,
+    /// Starts unbonding a portion of active validator stake.
+    Unstake,
+    /// Claims funds whose unbonding period has completed.
+    ClaimUnbonded,
+    /// Submits slashing evidence for a slashable validator fault.
+    SubmitSlashingEvidence,
 }
 
 /// A blockchain transaction containing arbitrary data.
@@ -421,5 +429,25 @@ mod tests {
         assert_eq!(tx1, decoded1);
         assert_eq!(tx2, decoded2);
         assert_eq!(tx3, decoded3);
+    }
+
+    #[test]
+    fn transaction_type_roundtrips_new_consensus_variants() {
+        let variants = [
+            TransactionType::Stake,
+            TransactionType::Unstake,
+            TransactionType::ClaimUnbonded,
+            TransactionType::SubmitSlashingEvidence,
+        ];
+
+        for variant in variants {
+            let mut encoded = Vec::new();
+            variant.encode(&mut encoded);
+
+            let mut slice = encoded.as_slice();
+            let decoded = TransactionType::decode(&mut slice).expect("variant decode failed");
+            assert!(slice.is_empty(), "variant decode should consume all bytes");
+            assert_eq!(decoded, variant);
+        }
     }
 }

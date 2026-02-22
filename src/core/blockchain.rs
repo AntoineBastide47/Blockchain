@@ -2,13 +2,19 @@
 
 use crate::core::account::Account;
 use crate::core::block::{Block, Header};
+use crate::core::consensus::{
+    ClaimUnbondedTxData, ConsensusState, SlashingEvidenceTxData, StakeTxData, UnstakeTxData,
+    ValidatorRecord, ValidatorSetSnapshot, consensus_state_key, default_staking_params,
+    next_randomness_seed, select_leader, slashing_evidence_seen_key, validator_record_key,
+    validator_set_key,
+};
 use crate::core::receipt::Receipt;
 use crate::core::transaction::{Transaction, TransactionType};
 use crate::core::validator::{BLOCK_MAX_BYTES, BlockValidator, BlockValidatorError, Validator};
 use crate::crypto::key_pair::{Address, PrivateKey};
 use crate::network::server::BLOCK_TIME;
 use crate::storage::rocksdb_storage::RocksDbStorage;
-use crate::storage::state_store::{AccountStorage, VmStorage};
+use crate::storage::state_store::{AccountStorage, StateStore, VmStorage};
 use crate::storage::state_view::StateViewProvider;
 use crate::storage::storage_trait::{Storage, StorageError};
 use crate::storage::txpool::TxPool;
@@ -35,12 +41,6 @@ const MAX_BLOCK_TIME_DRIFT: u64 = 3 * BLOCK_TIME.as_secs();
 /// Combined with the square root of total stake to compute per-block rewards,
 /// incentivizing validators proportionally to their stake.
 const BASE_REWARD: u128 = 64_000_000_000;
-
-/// Placeholder for total active stake across all validators.
-///
-/// TODO: Replace with real staking accounting once the staking module is implemented.
-const TEMP_TOTAL_STAKE: u128 = 32_000_000_000 * 32;
-const TEMP_STAKER_BALANCE: u128 = 10;
 
 /// Combined storage trait for blockchain operations.
 ///
@@ -128,6 +128,52 @@ impl Blockchain<BlockValidator, RocksDbStorage> {
     ) -> Result<(), StorageError> {
         self.storage
             .import_snapshot(height, block, entries, self.id)
+    }
+
+    /// Initializes consensus state from genesis allocations if it is not yet present.
+    ///
+    /// This is idempotent and only writes state keys when they are missing.
+    #[allow(dead_code)]
+    fn initialize_consensus_from_genesis_accounts(&self, initial_accounts: &[(Address, Account)]) {
+        if self.storage.get(consensus_state_key()).is_some()
+            && self.storage.get(validator_set_key()).is_some()
+        {
+            return;
+        }
+
+        let params = default_staking_params();
+        let mut writes: Vec<(Hash, Option<Vec<u8>>)> = Vec::new();
+
+        let mut validator_set = ValidatorSetSnapshot::empty();
+        for (address, account) in initial_accounts {
+            // Bootstrap active stake from genesis balances above the minimum threshold.
+            if account.balance() < params.min_stake {
+                continue;
+            }
+
+            let mut record = ValidatorRecord::new(*address);
+            record.active_stake = account.balance();
+            validator_set.tracked_validators.push(*address);
+            validator_set
+                .validators
+                .push(crate::core::consensus::ActiveValidatorEntry {
+                    address: *address,
+                    stake: record.active_stake,
+                });
+
+            writes.push((validator_record_key(*address), Some(record.to_vec())));
+        }
+        validator_set.normalize();
+
+        let consensus_state = ConsensusState {
+            last_processed_height: 0,
+            total_active_stake: validator_set.total_active_stake,
+            randomness_seed: self.storage.tip(),
+        };
+
+        writes.push((validator_set_key(), Some(validator_set.to_vec())));
+        writes.push((consensus_state_key(), Some(consensus_state.to_vec())));
+        self.storage.apply_batch(writes);
     }
 
     /// Returns the height of the highest header we have stored.
@@ -240,6 +286,201 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
         self.storage.get_account(address)
     }
 
+    /// Loads the consensus state from persistent storage, defaulting if absent.
+    fn load_consensus_state(&self) -> Result<ConsensusState, StorageError> {
+        match self.storage.get(consensus_state_key()) {
+            Some(bytes) => ConsensusState::decode(&mut bytes.as_slice())
+                .map_err(|e| StorageError::DecodeError(e.to_string())),
+            None => Ok(ConsensusState::default()),
+        }
+    }
+
+    /// Loads the active validator set snapshot from persistent storage.
+    fn load_validator_set(&self) -> Result<ValidatorSetSnapshot, StorageError> {
+        match self.storage.get(validator_set_key()) {
+            Some(bytes) => ValidatorSetSnapshot::decode(&mut bytes.as_slice())
+                .map_err(|e| StorageError::DecodeError(e.to_string())),
+            None => Ok(ValidatorSetSnapshot::empty()),
+        }
+    }
+
+    /// Loads a validator record from persistent storage, returning an empty record if absent.
+    fn load_validator_record(&self, address: Address) -> Result<ValidatorRecord, StorageError> {
+        let key = validator_record_key(address);
+        match self.storage.get(key) {
+            Some(bytes) => ValidatorRecord::decode(&mut bytes.as_slice())
+                .map_err(|e| StorageError::DecodeError(e.to_string())),
+            None => Ok(ValidatorRecord::new(address)),
+        }
+    }
+
+    /// Loads the consensus state from the overlay if present, otherwise falls back to storage.
+    fn load_consensus_state_overlay<T: State>(
+        &self,
+        overlay: &OverlayState<T>,
+    ) -> Result<ConsensusState, StorageError> {
+        match overlay.get(consensus_state_key()) {
+            Some(bytes) => ConsensusState::decode(&mut bytes.as_slice())
+                .map_err(|e| StorageError::DecodeError(e.to_string())),
+            None => self.load_consensus_state(),
+        }
+    }
+
+    /// Loads the validator set snapshot from the overlay if present, otherwise from storage.
+    fn load_validator_set_overlay<T: State>(
+        &self,
+        overlay: &OverlayState<T>,
+    ) -> Result<ValidatorSetSnapshot, StorageError> {
+        match overlay.get(validator_set_key()) {
+            Some(bytes) => ValidatorSetSnapshot::decode(&mut bytes.as_slice())
+                .map_err(|e| StorageError::DecodeError(e.to_string())),
+            None => self.load_validator_set(),
+        }
+    }
+
+    /// Loads a validator record from the overlay if present, otherwise from storage.
+    fn load_validator_record_overlay<T: State>(
+        &self,
+        address: Address,
+        overlay: &OverlayState<T>,
+    ) -> Result<ValidatorRecord, StorageError> {
+        let key = validator_record_key(address);
+        match overlay.get(key) {
+            Some(bytes) => ValidatorRecord::decode(&mut bytes.as_slice())
+                .map_err(|e| StorageError::DecodeError(e.to_string())),
+            None => self.load_validator_record(address),
+        }
+    }
+
+    /// Stores consensus state into the given overlay.
+    fn store_consensus_state_overlay<T: State>(
+        &self,
+        overlay: &mut OverlayState<T>,
+        state: &ConsensusState,
+    ) {
+        overlay.push(consensus_state_key(), state.to_vec());
+    }
+
+    /// Stores validator set snapshot into the given overlay.
+    fn store_validator_set_overlay<T: State>(
+        &self,
+        overlay: &mut OverlayState<T>,
+        set: &ValidatorSetSnapshot,
+    ) {
+        overlay.push(validator_set_key(), set.to_vec());
+    }
+
+    /// Stores validator record into the given overlay.
+    fn store_validator_record_overlay<T: State>(
+        &self,
+        overlay: &mut OverlayState<T>,
+        record: &ValidatorRecord,
+    ) {
+        overlay.push(validator_record_key(record.address), record.to_vec());
+    }
+
+    /// Returns true when explicit consensus state has been initialized.
+    fn has_initialized_consensus<T: State>(&self, overlay: &OverlayState<T>) -> bool {
+        overlay.contains_key(consensus_state_key())
+            || self.storage.contains_key(consensus_state_key())
+    }
+
+    /// Updates or inserts a validator's active stake in the validator set snapshot.
+    fn upsert_validator_stake(
+        set: &mut ValidatorSetSnapshot,
+        address: Address,
+        new_active_stake: u128,
+    ) {
+        if !set.tracked_validators.contains(&address) {
+            set.tracked_validators.push(address);
+        }
+
+        if let Some(entry) = set.validators.iter_mut().find(|v| v.address == address) {
+            entry.stake = new_active_stake;
+        } else if new_active_stake > 0 {
+            set.validators
+                .push(crate::core::consensus::ActiveValidatorEntry {
+                    address,
+                    stake: new_active_stake,
+                });
+        }
+        set.normalize();
+    }
+
+    /// Applies scheduled stake activations and unbonding transitions for the block height.
+    fn process_scheduled_staking_transitions<T: State>(
+        &self,
+        block_height: u64,
+        overlay: &mut OverlayState<T>,
+    ) -> Result<(ConsensusState, ValidatorSetSnapshot), StorageError> {
+        let mut state = self.load_consensus_state_overlay(overlay)?;
+        let mut set = self.load_validator_set_overlay(overlay)?;
+
+        if state.last_processed_height >= block_height {
+            return Ok((state, set));
+        }
+
+        let tracked = set.tracked_validators.clone();
+        for address in tracked {
+            let mut record = self.load_validator_record_overlay(address, overlay)?;
+
+            let mut activated_total = 0u128;
+            let mut remaining_activations = Vec::with_capacity(record.pending_activations.len());
+            for pending in record.pending_activations.drain(..) {
+                if pending.activate_height <= block_height {
+                    activated_total = activated_total.saturating_add(pending.amount);
+                } else {
+                    remaining_activations.push(pending);
+                }
+            }
+            record.pending_activations = remaining_activations;
+            if activated_total > 0 {
+                record.active_stake = record.active_stake.saturating_add(activated_total);
+            }
+
+            Self::upsert_validator_stake(&mut set, address, record.active_stake);
+            self.store_validator_record_overlay(overlay, &record);
+        }
+
+        set.normalize();
+        state.last_processed_height = block_height;
+        state.total_active_stake = set.total_active_stake;
+        self.store_validator_set_overlay(overlay, &set);
+        self.store_consensus_state_overlay(overlay, &state);
+        Ok((state, set))
+    }
+
+    /// Validates that the expected proposer is selected for the target block height.
+    fn validate_selected_proposer<T: State>(
+        &self,
+        block_height: u64,
+        proposer: Address,
+        overlay: &mut OverlayState<T>,
+    ) -> Result<(ConsensusState, ValidatorSetSnapshot), StorageError> {
+        let (state, set) = if self.has_initialized_consensus(overlay) {
+            self.process_scheduled_staking_transitions(block_height, overlay)?
+        } else {
+            (ConsensusState::default(), ValidatorSetSnapshot::empty())
+        };
+
+        if set.total_active_stake == 0 || set.validators.is_empty() {
+            // Bootstrap grace: allow block production while stake is bonding and no active
+            // validators are available yet. Rewards are already zeroed by `validator_reward`.
+            return Ok((state, set));
+        }
+
+        let expected = select_leader(block_height, state.randomness_seed, &set)
+            .ok_or_else(|| StorageError::ValidationFailed("no leader could be selected".into()))?;
+        if expected != proposer {
+            return Err(StorageError::ValidationFailed(format!(
+                "unexpected proposer for height {}: expected {} got {}",
+                block_height, expected, proposer
+            )));
+        }
+
+        Ok((state, set))
+    }
+
     /// Computes a deterministic contract identifier from a deployment transaction.
     ///
     /// The ID is derived from the sender, nonce, and bytecode, ensuring each
@@ -267,6 +508,8 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
     /// - `TransferFunds`: 0 gas per byte (data ignored)
     /// - `DeployContract`: 200 gas per byte (bytecode storage)
     /// - `InvokeContract`: 20 gas per byte (call data processing)
+    /// - Consensus txs (`Stake`, `Unstake`, `ClaimUnbonded`, `SubmitSlashingEvidence`):
+    ///   standard per-byte pricing with no extra base surcharge
     pub fn intrinsic_gas_units(tx_type: TransactionType, data: &Bytes) -> u64 {
         let mut gas = 21_000 + ((tx_type == TransactionType::DeployContract) as u64 * 32_000);
         for b in data {
@@ -303,6 +546,241 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
         }
     }
 
+    /// Applies a stake transaction by locking funds and scheduling activation.
+    fn apply_stake_tx<T: State>(
+        &self,
+        transaction: &Transaction,
+        tx_overlay: &mut OverlayState<T>,
+        from: (Address, &mut Account),
+    ) -> Result<(), StorageError> {
+        if transaction.amount != 0 {
+            return Err(StorageError::ValidationFailed(
+                "stake transaction amount field must be zero (use payload amount)".into(),
+            ));
+        }
+
+        let payload = StakeTxData::decode(&mut transaction.data.as_slice())
+            .map_err(|e| StorageError::DecodeError(e.to_string()))?;
+        if payload.amount == 0 {
+            return Err(StorageError::ValidationFailed(
+                "stake amount must be non-zero".into(),
+            ));
+        }
+
+        let params = default_staking_params();
+        let current_height = self.storage.height().saturating_add(1);
+        let mut record = self.load_validator_record_overlay(from.0, tx_overlay)?;
+        let total_tracked = record.active_stake.saturating_add(
+            record
+                .pending_activations
+                .iter()
+                .fold(0u128, |acc, p| acc.saturating_add(p.amount)),
+        );
+        if total_tracked == 0 && payload.amount < params.min_stake {
+            return Err(StorageError::ValidationFailed(format!(
+                "stake amount below minimum: {} < {}",
+                payload.amount, params.min_stake
+            )));
+        }
+
+        from.1.charge(payload.amount)?;
+        record
+            .pending_activations
+            .push(crate::core::consensus::PendingActivation {
+                amount: payload.amount,
+                activate_height: current_height.saturating_add(params.bonding_period_blocks),
+            });
+
+        let mut set = self.load_validator_set_overlay(tx_overlay)?;
+        if !set.tracked_validators.contains(&from.0) {
+            set.tracked_validators.push(from.0);
+            set.normalize();
+            self.store_validator_set_overlay(tx_overlay, &set);
+        }
+        let mut state = self.load_consensus_state_overlay(tx_overlay)?;
+        state.total_active_stake = set.total_active_stake;
+        self.store_consensus_state_overlay(tx_overlay, &state);
+        self.store_validator_record_overlay(tx_overlay, &record);
+        Ok(())
+    }
+
+    /// Applies an unstake transaction by moving active stake into the unbonding queue.
+    fn apply_unstake_tx<T: State>(
+        &self,
+        transaction: &Transaction,
+        tx_overlay: &mut OverlayState<T>,
+        from_address: Address,
+    ) -> Result<(), StorageError> {
+        if transaction.amount != 0 {
+            return Err(StorageError::ValidationFailed(
+                "unstake transaction amount field must be zero (use payload amount)".into(),
+            ));
+        }
+        let payload = UnstakeTxData::decode(&mut transaction.data.as_slice())
+            .map_err(|e| StorageError::DecodeError(e.to_string()))?;
+        if payload.amount == 0 {
+            return Err(StorageError::ValidationFailed(
+                "unstake amount must be non-zero".into(),
+            ));
+        }
+
+        let params = default_staking_params();
+        let current_height = self.storage.height().saturating_add(1);
+        let mut record = self.load_validator_record_overlay(from_address, tx_overlay)?;
+        if record.active_stake < payload.amount {
+            return Err(StorageError::ValidationFailed(format!(
+                "insufficient active stake: have {} need {}",
+                record.active_stake, payload.amount
+            )));
+        }
+
+        record.active_stake -= payload.amount;
+        record
+            .pending_unbonds
+            .push(crate::core::consensus::PendingUnbond {
+                amount: payload.amount,
+                claim_height: current_height.saturating_add(params.unbonding_period_blocks),
+            });
+
+        let mut set = self.load_validator_set_overlay(tx_overlay)?;
+        Self::upsert_validator_stake(&mut set, from_address, record.active_stake);
+        let mut state = self.load_consensus_state_overlay(tx_overlay)?;
+        state.total_active_stake = set.total_active_stake;
+
+        self.store_validator_record_overlay(tx_overlay, &record);
+        self.store_validator_set_overlay(tx_overlay, &set);
+        self.store_consensus_state_overlay(tx_overlay, &state);
+        Ok(())
+    }
+
+    /// Applies a claim-unbonded transaction by crediting matured unbonded funds.
+    fn apply_claim_unbonded_tx<T: State>(
+        &self,
+        transaction: &Transaction,
+        tx_overlay: &mut OverlayState<T>,
+        from: (Address, &mut Account),
+    ) -> Result<(), StorageError> {
+        if transaction.amount != 0 {
+            return Err(StorageError::ValidationFailed(
+                "claim transaction amount field must be zero (use payload amount)".into(),
+            ));
+        }
+        let payload = ClaimUnbondedTxData::decode(&mut transaction.data.as_slice())
+            .map_err(|e| StorageError::DecodeError(e.to_string()))?;
+
+        let current_height = self.storage.height().saturating_add(1);
+        let mut record = self.load_validator_record_overlay(from.0, tx_overlay)?;
+        let matured_total = record
+            .pending_unbonds
+            .iter()
+            .filter(|p| p.claim_height <= current_height)
+            .fold(0u128, |acc, p| acc.saturating_add(p.amount));
+        if matured_total == 0 {
+            return Err(StorageError::ValidationFailed(
+                "no matured unbonded funds to claim".into(),
+            ));
+        }
+
+        let claim_amount = if payload.amount == 0 {
+            matured_total
+        } else {
+            payload.amount
+        };
+        if claim_amount > matured_total {
+            return Err(StorageError::ValidationFailed(format!(
+                "claim amount exceeds matured total: {} > {}",
+                claim_amount, matured_total
+            )));
+        }
+
+        let mut remaining = claim_amount;
+        let mut next_unbonds = Vec::with_capacity(record.pending_unbonds.len());
+        for mut pending in record.pending_unbonds.drain(..) {
+            if pending.claim_height > current_height || remaining == 0 {
+                next_unbonds.push(pending);
+                continue;
+            }
+
+            let take = pending.amount.min(remaining);
+            pending.amount -= take;
+            remaining -= take;
+            if pending.amount > 0 {
+                next_unbonds.push(pending);
+            }
+        }
+        if remaining != 0 {
+            return Err(StorageError::ValidationFailed(
+                "internal error while claiming unbonded funds".into(),
+            ));
+        }
+
+        record.pending_unbonds = next_unbonds;
+        from.1.credit(claim_amount)?;
+        self.store_validator_record_overlay(tx_overlay, &record);
+        Ok(())
+    }
+
+    /// Applies slashing evidence against a double-signed validator.
+    fn apply_slashing_evidence_tx<T: State>(
+        &self,
+        transaction: &Transaction,
+        tx_overlay: &mut OverlayState<T>,
+    ) -> Result<(), StorageError> {
+        if transaction.amount != 0 {
+            return Err(StorageError::ValidationFailed(
+                "slashing evidence transaction amount field must be zero".into(),
+            ));
+        }
+
+        let payload = SlashingEvidenceTxData::decode(&mut transaction.data.as_slice())
+            .map_err(|e| StorageError::DecodeError(e.to_string()))?;
+        if !payload.evidence.is_valid_double_sign(self.id) {
+            return Err(StorageError::ValidationFailed(
+                "invalid slashing evidence".into(),
+            ));
+        }
+
+        let evidence_id = payload.evidence.evidence_id(self.id);
+        let seen_key = slashing_evidence_seen_key(evidence_id);
+        if tx_overlay
+            .get(seen_key)
+            .or_else(|| self.storage.get(seen_key))
+            .is_some()
+        {
+            return Err(StorageError::ValidationFailed(
+                "slashing evidence already processed".into(),
+            ));
+        }
+
+        let offender = payload.evidence.first.validator.address();
+        let mut record = self.load_validator_record_overlay(offender, tx_overlay)?;
+        if record.active_stake == 0 {
+            return Err(StorageError::ValidationFailed(
+                "validator has no active stake to slash".into(),
+            ));
+        }
+
+        let params = default_staking_params();
+        let mut slash_amount =
+            record.active_stake.saturating_mul(params.slash_bps as u128) / 10_000u128;
+        if slash_amount == 0 {
+            slash_amount = 1.min(record.active_stake);
+        }
+        record.active_stake = record.active_stake.saturating_sub(slash_amount);
+        record.slashed_total = record.slashed_total.saturating_add(slash_amount);
+
+        let mut set = self.load_validator_set_overlay(tx_overlay)?;
+        Self::upsert_validator_stake(&mut set, offender, record.active_stake);
+        let mut state = self.load_consensus_state_overlay(tx_overlay)?;
+        state.total_active_stake = set.total_active_stake;
+
+        self.store_validator_record_overlay(tx_overlay, &record);
+        self.store_validator_set_overlay(tx_overlay, &set);
+        self.store_consensus_state_overlay(tx_overlay, &state);
+        tx_overlay.push(seen_key, vec![1]);
+        Ok(())
+    }
+
     /// Executes a transaction based on its type and updates gas usage.
     ///
     /// Handles three transaction types:
@@ -310,6 +788,7 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
     /// - `DeployContract`: runs init_code, then persists the contract account and
     ///   runtime bytecode under a namespaced `code_hash` key
     /// - `InvokeContract`: loads stored runtime bytecode and executes
+    /// - Staking txs: mutate consensus validator state in VM storage
     fn execute_tx<T: State>(
         &self,
         transaction: &Transaction,
@@ -422,6 +901,22 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
 
                 Ok(return_data)
             }
+            TransactionType::Stake => {
+                self.apply_stake_tx(transaction, tx_overlay, from)?;
+                Ok(vec![])
+            }
+            TransactionType::Unstake => {
+                self.apply_unstake_tx(transaction, tx_overlay, from.0)?;
+                Ok(vec![])
+            }
+            TransactionType::ClaimUnbonded => {
+                self.apply_claim_unbonded_tx(transaction, tx_overlay, from)?;
+                Ok(vec![])
+            }
+            TransactionType::SubmitSlashingEvidence => {
+                self.apply_slashing_evidence_tx(transaction, tx_overlay)?;
+                Ok(vec![])
+            }
         }
     }
 
@@ -453,8 +948,18 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
         // Make sure an account exists for the transaction sender and receiver
         let from_hash = transaction.from.address();
         let mut from = self.try_get_account_overlay(from_hash, block_overlay)?;
-        let to_hash = transaction.to;
-        let mut to = self.try_get_account_overlay(to_hash, block_overlay)?;
+        let to_hash = match transaction.tx_type {
+            TransactionType::Stake
+            | TransactionType::Unstake
+            | TransactionType::ClaimUnbonded
+            | TransactionType::SubmitSlashingEvidence => from_hash,
+            _ => transaction.to,
+        };
+        let mut to = if to_hash == from_hash {
+            from.clone()
+        } else {
+            self.try_get_account_overlay(to_hash, block_overlay)?
+        };
 
         // Make sure the account has enough funds if the gas limit is attained
         let user_total = transaction
@@ -535,6 +1040,9 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
     /// diminishing returns as network stake grows, while distributing rewards
     /// proportionally to individual validator stakes.
     fn validator_reward(validator_stake: u128, total_active_stake: u128) -> u128 {
+        if validator_stake == 0 || total_active_stake == 0 {
+            return 0;
+        }
         let total = total_active_stake.isqrt() * BASE_REWARD;
         // Divide first to reduce overflow risk, accepting minor precision loss
         total / total_active_stake * validator_stake
@@ -550,11 +1058,16 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
         validator: PrivateKey,
         tx_pool: &TxPool,
     ) -> Result<Block, StorageError> {
+        let parent_tip = self.storage.tip();
+        let next_height = self.storage.height().saturating_add(1);
         // Make sure the validator actually exists
         let validator_address = validator.public_key().address();
         let base = self.storage.state_view();
         let mut block_overlay = OverlayState::new(&base);
+        let (pre_consensus_state, pre_validator_set) =
+            self.validate_selected_proposer(next_height, validator_address, &mut block_overlay)?;
         self.try_get_account_overlay(validator_address, &block_overlay)?;
+        let proposer_stake = pre_validator_set.stake_of(validator_address);
 
         // Executes all transactions in the block and computes the resulting state root.
         let mut gas_left = BLOCK_GAS_LIMIT;
@@ -596,13 +1109,21 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
             }
         }
 
-        // Reward the validator for creating the block using: stacking + transaction fees
-        // TODO: replace with real staking instead of balance
+        // Reward the validator for creating the block using staking + transaction fees.
         let mut validator_account =
             self.try_get_account_overlay(validator_address, &block_overlay)?;
-        let reward = Self::validator_reward(TEMP_STAKER_BALANCE, TEMP_TOTAL_STAKE);
+        let reward = Self::validator_reward(proposer_stake, pre_validator_set.total_active_stake);
         validator_account.credit(reward + validator_fee)?;
         block_overlay.push(validator_address, validator_account.to_vec());
+
+        if self.has_initialized_consensus(&block_overlay) {
+            let mut state = self.load_consensus_state_overlay(&block_overlay)?;
+            let set = self.load_validator_set_overlay(&block_overlay)?;
+            state.total_active_stake = set.total_active_stake;
+            state.randomness_seed =
+                next_randomness_seed(pre_consensus_state.randomness_seed, parent_tip);
+            self.store_consensus_state_overlay(&mut block_overlay, &state);
+        }
 
         // Apply the block state changes to the chain
         self.storage.apply_batch(block_overlay.into_writes().0);
@@ -612,13 +1133,13 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
 
         let header = Header {
             version: 1,
-            height: self.storage.height() + 1,
+            height: next_height,
             timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_nanos() as u64)
                 .unwrap_or(0),
             gas_used: BLOCK_GAS_LIMIT - gas_left,
-            previous_block: self.storage.tip(),
+            previous_block: parent_tip,
             merkle_root: MerkleTree::from_transactions(&transactions, self.id),
             state_root: self.storage.state_root(),
             receipt_root,
@@ -670,7 +1191,13 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
         let validator_address = block.validator.address();
         let base = self.storage.state_view();
         let mut block_overlay = OverlayState::new(&base);
+        let (pre_consensus_state, pre_validator_set) = self.validate_selected_proposer(
+            block.header.height,
+            validator_address,
+            &mut block_overlay,
+        )?;
         self.try_get_account_overlay(validator_address, &block_overlay)?;
+        let proposer_stake = pre_validator_set.stake_of(validator_address);
 
         let mut validator_fee = 0u128;
         let mut cumulative_gas: u64 = 0;
@@ -702,9 +1229,20 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
         // Reward the validator for creating the block using: staking + transaction fees
         let mut validator_account =
             self.try_get_account_overlay(validator_address, &block_overlay)?;
-        let reward = Self::validator_reward(TEMP_STAKER_BALANCE, TEMP_TOTAL_STAKE);
+        let reward = Self::validator_reward(proposer_stake, pre_validator_set.total_active_stake);
         validator_account.credit(reward + validator_fee)?;
         block_overlay.push(validator_address, validator_account.to_vec());
+
+        if self.has_initialized_consensus(&block_overlay) {
+            let mut state = self.load_consensus_state_overlay(&block_overlay)?;
+            let set = self.load_validator_set_overlay(&block_overlay)?;
+            state.total_active_stake = set.total_active_stake;
+            state.randomness_seed = next_randomness_seed(
+                pre_consensus_state.randomness_seed,
+                block.header.previous_block,
+            );
+            self.store_consensus_state_overlay(&mut block_overlay, &state);
+        }
 
         // Compute expected post-storage root deterministically
         let writes = block_overlay.into_writes();
@@ -1725,6 +2263,363 @@ MOVE r1, 2
             .get_receipts(block.header_hash(TEST_CHAIN_ID))
             .expect("receipts should be stored");
         assert!(receipts.is_empty());
+    }
+
+    fn make_consensus_tx(
+        from_key: PrivateKey,
+        nonce: u64,
+        tx_type: TransactionType,
+        payload: Vec<u8>,
+    ) -> Transaction {
+        Transaction::new(
+            Address::zero(),
+            None,
+            payload,
+            0,
+            0,
+            1,
+            100_000,
+            nonce,
+            from_key,
+            TEST_CHAIN_ID,
+            tx_type,
+        )
+    }
+
+    fn seed_consensus_state(
+        storage: &TestStorage,
+        state: ConsensusState,
+        mut set: ValidatorSetSnapshot,
+        records: &[ValidatorRecord],
+    ) {
+        set.normalize();
+        let mut writes = vec![
+            (consensus_state_key(), Some(state.to_vec())),
+            (validator_set_key(), Some(set.to_vec())),
+        ];
+        for record in records {
+            writes.push((validator_record_key(record.address), Some(record.to_vec())));
+        }
+        storage.apply_batch(writes);
+    }
+
+    #[test]
+    fn stake_tx_schedules_activation_and_bonding_transition_activates_later() {
+        let genesis = create_genesis(TEST_CHAIN_ID);
+        let storage = test_storage(genesis);
+
+        let staker_key = PrivateKey::new();
+        let staker = staker_key.public_key().address();
+        let initial_balance = 1_000_000u128;
+        let stake_amount = 25_000u128;
+        storage.set_account(staker, Account::new(initial_balance));
+
+        let bc = with_validator_and_storage(TEST_CHAIN_ID, AcceptAllValidator, storage);
+
+        let tx = make_consensus_tx(
+            staker_key,
+            0,
+            TransactionType::Stake,
+            StakeTxData {
+                amount: stake_amount,
+            }
+            .to_vec(),
+        );
+
+        let base = bc.storage.state_view();
+        let mut overlay = OverlayState::new(&base);
+        let mut tx_overlay = OverlayState::new(&overlay);
+
+        let (accounts, _, _) = bc
+            .apply_tx(&tx, &overlay, &mut tx_overlay)
+            .expect("stake tx should apply");
+        tx_overlay
+            .into_writes()
+            .apply_tx_overlay(accounts, &mut overlay);
+
+        let staker_account = Account::from_bytes(
+            &overlay
+                .get(staker)
+                .expect("staker account should exist after stake tx"),
+        )
+        .expect("staker account should decode");
+        assert_eq!(staker_account.nonce(), 1);
+        assert!(
+            staker_account.balance() <= initial_balance.saturating_sub(stake_amount),
+            "stake amount should be debited in addition to gas"
+        );
+
+        let record = ValidatorRecord::decode(
+            &mut overlay
+                .get(validator_record_key(staker))
+                .expect("validator record should be created")
+                .as_slice(),
+        )
+        .expect("validator record should decode");
+        assert_eq!(record.active_stake, 0);
+        assert_eq!(record.pending_activations.len(), 1);
+        assert_eq!(record.pending_activations[0].amount, stake_amount);
+
+        let activate_height = record.pending_activations[0].activate_height;
+        let params = default_staking_params();
+        assert_eq!(activate_height, 1 + params.bonding_period_blocks);
+
+        let (state_before, set_before) = bc
+            .process_scheduled_staking_transitions(activate_height - 1, &mut overlay)
+            .expect("scheduled transitions before bonding should succeed");
+        assert_eq!(state_before.total_active_stake, 0);
+        assert_eq!(set_before.total_active_stake, 0);
+
+        let record_before = ValidatorRecord::decode(
+            &mut overlay
+                .get(validator_record_key(staker))
+                .expect("validator record should remain present")
+                .as_slice(),
+        )
+        .expect("validator record should decode");
+        assert_eq!(record_before.active_stake, 0);
+        assert_eq!(record_before.pending_activations.len(), 1);
+
+        let (state_after, set_after) = bc
+            .process_scheduled_staking_transitions(activate_height, &mut overlay)
+            .expect("scheduled transitions at activation height should succeed");
+        assert_eq!(state_after.total_active_stake, stake_amount);
+        assert_eq!(set_after.total_active_stake, stake_amount);
+        assert_eq!(set_after.stake_of(staker), stake_amount);
+
+        let record_after = ValidatorRecord::decode(
+            &mut overlay
+                .get(validator_record_key(staker))
+                .expect("validator record should remain present")
+                .as_slice(),
+        )
+        .expect("validator record should decode");
+        assert_eq!(record_after.active_stake, stake_amount);
+        assert!(record_after.pending_activations.is_empty());
+    }
+
+    #[test]
+    fn unstake_and_claim_unbonded_update_validator_and_account_state() {
+        let genesis = create_genesis(TEST_CHAIN_ID);
+        let storage = test_storage(genesis);
+
+        let staker_key = PrivateKey::new();
+        let staker = staker_key.public_key().address();
+        let initial_balance = 500_000u128;
+        storage.set_account(staker, Account::new(initial_balance));
+
+        let mut set = ValidatorSetSnapshot {
+            tracked_validators: vec![staker],
+            validators: vec![crate::core::consensus::ActiveValidatorEntry {
+                address: staker,
+                stake: 40_000,
+            }],
+            total_active_stake: 0,
+        };
+        set.normalize();
+
+        let mut record = ValidatorRecord::new(staker);
+        record.active_stake = 40_000;
+
+        seed_consensus_state(
+            &storage,
+            ConsensusState {
+                last_processed_height: 0,
+                total_active_stake: set.total_active_stake,
+                randomness_seed: Hash::zero(),
+            },
+            set,
+            &[record.clone()],
+        );
+
+        let bc = with_validator_and_storage(TEST_CHAIN_ID, AcceptAllValidator, storage);
+
+        let unstake_amount = 10_000u128;
+        let unstake_tx = make_consensus_tx(
+            staker_key.clone(),
+            0,
+            TransactionType::Unstake,
+            UnstakeTxData {
+                amount: unstake_amount,
+            }
+            .to_vec(),
+        );
+
+        let base = bc.storage.state_view();
+        let mut overlay = OverlayState::new(&base);
+        let mut tx_overlay = OverlayState::new(&overlay);
+        let (unstake_accounts, unstake_gas_used, _) = bc
+            .apply_tx(&unstake_tx, &overlay, &mut tx_overlay)
+            .expect("unstake tx should apply");
+        tx_overlay
+            .into_writes()
+            .apply_tx_overlay(unstake_accounts, &mut overlay);
+
+        let account_after_unstake = Account::from_bytes(
+            &overlay
+                .get(staker)
+                .expect("staker account should exist after unstake"),
+        )
+        .expect("staker account should decode");
+        let unstake_gas_cost = unstake_gas_used as u128 * unstake_tx.gas_price;
+        assert_eq!(
+            account_after_unstake.balance(),
+            initial_balance - unstake_gas_cost
+        );
+        assert_eq!(account_after_unstake.nonce(), 1);
+
+        let record_after_unstake = ValidatorRecord::decode(
+            &mut overlay
+                .get(validator_record_key(staker))
+                .expect("validator record should exist")
+                .as_slice(),
+        )
+        .expect("validator record should decode");
+        assert_eq!(record_after_unstake.active_stake, 30_000);
+        assert_eq!(record_after_unstake.pending_unbonds.len(), 1);
+        assert_eq!(
+            record_after_unstake.pending_unbonds[0].amount,
+            unstake_amount
+        );
+
+        let set_after_unstake = ValidatorSetSnapshot::decode(
+            &mut overlay
+                .get(validator_set_key())
+                .expect("validator set should exist")
+                .as_slice(),
+        )
+        .expect("validator set should decode");
+        assert_eq!(set_after_unstake.total_active_stake, 30_000);
+        assert_eq!(set_after_unstake.stake_of(staker), 30_000);
+
+        // Make the pending unbond immediately claimable in overlay to test claim flow
+        // without producing hundreds of blocks in the unit test.
+        let mut claimable_record = record_after_unstake.clone();
+        claimable_record.pending_unbonds[0].claim_height = 1;
+        overlay.push(validator_record_key(staker), claimable_record.to_vec());
+
+        let claim_tx = make_consensus_tx(
+            staker_key,
+            1,
+            TransactionType::ClaimUnbonded,
+            ClaimUnbondedTxData { amount: 0 }.to_vec(),
+        );
+        let mut claim_tx_overlay = OverlayState::new(&overlay);
+        let (claim_accounts, claim_gas_used, _) = bc
+            .apply_tx(&claim_tx, &overlay, &mut claim_tx_overlay)
+            .expect("claim tx should apply");
+        claim_tx_overlay
+            .into_writes()
+            .apply_tx_overlay(claim_accounts, &mut overlay);
+
+        let claimed_account = Account::from_bytes(
+            &overlay
+                .get(staker)
+                .expect("staker account should exist after claim"),
+        )
+        .expect("staker account should decode");
+        let gas_cost = claim_gas_used as u128 * claim_tx.gas_price;
+        assert_eq!(
+            claimed_account.balance(),
+            account_after_unstake.balance() + unstake_amount - gas_cost
+        );
+        assert_eq!(claimed_account.nonce(), 2);
+
+        let record_after_claim = ValidatorRecord::decode(
+            &mut overlay
+                .get(validator_record_key(staker))
+                .expect("validator record should exist")
+                .as_slice(),
+        )
+        .expect("validator record should decode");
+        assert!(record_after_claim.pending_unbonds.is_empty());
+        assert_eq!(record_after_claim.active_stake, 30_000);
+    }
+
+    #[test]
+    fn build_block_rejects_unselected_proposer_when_consensus_is_active() {
+        let genesis = create_genesis(TEST_CHAIN_ID);
+        let storage = test_storage(genesis);
+
+        let selected_key = PrivateKey::new();
+        let selected_addr = selected_key.public_key().address();
+        let wrong_key = PrivateKey::new();
+        let wrong_addr = wrong_key.public_key().address();
+        storage.set_account(selected_addr, Account::new(0));
+        storage.set_account(wrong_addr, Account::new(0));
+
+        let mut selected_record = ValidatorRecord::new(selected_addr);
+        selected_record.active_stake = 50_000;
+
+        let set = ValidatorSetSnapshot {
+            tracked_validators: vec![selected_addr],
+            validators: vec![crate::core::consensus::ActiveValidatorEntry {
+                address: selected_addr,
+                stake: 50_000,
+            }],
+            total_active_stake: 50_000,
+        };
+        seed_consensus_state(
+            &storage,
+            ConsensusState {
+                last_processed_height: 0,
+                total_active_stake: 50_000,
+                randomness_seed: Hash::sha3().chain(b"seed").finalize(),
+            },
+            set,
+            &[selected_record],
+        );
+
+        let bc = with_validator_and_storage(TEST_CHAIN_ID, AcceptAllValidator, storage);
+        let pool = TxPool::new(Some(4), TEST_CHAIN_ID);
+
+        let result = bc.build_block(wrong_key, &pool);
+        assert!(matches!(
+            result,
+            Err(StorageError::ValidationFailed(msg)) if msg.contains("unexpected proposer")
+        ));
+    }
+
+    #[test]
+    fn build_block_allows_progress_when_consensus_initialized_but_no_active_stake() {
+        let genesis = create_genesis(TEST_CHAIN_ID);
+        let storage = test_storage(genesis);
+
+        let validator_key = PrivateKey::new();
+        let validator_addr = validator_key.public_key().address();
+        storage.set_account(validator_addr, Account::new(0));
+
+        let mut pending_record = ValidatorRecord::new(validator_addr);
+        pending_record
+            .pending_activations
+            .push(crate::core::consensus::PendingActivation {
+                amount: 10_000,
+                activate_height: default_staking_params().bonding_period_blocks + 1,
+            });
+
+        let set = ValidatorSetSnapshot {
+            tracked_validators: vec![validator_addr],
+            validators: vec![],
+            total_active_stake: 0,
+        };
+        seed_consensus_state(
+            &storage,
+            ConsensusState {
+                last_processed_height: 0,
+                total_active_stake: 0,
+                randomness_seed: Hash::zero(),
+            },
+            set,
+            &[pending_record],
+        );
+
+        let bc = with_validator_and_storage(TEST_CHAIN_ID, AcceptAllValidator, storage);
+        let pool = TxPool::new(Some(2), TEST_CHAIN_ID);
+        let block = bc
+            .build_block(validator_key, &pool)
+            .expect("bootstrap grace should allow progress while stake is bonding");
+
+        assert_eq!(block.header.height, 1);
     }
 
     // ==================== replay_from_last_snapshot Tests ====================

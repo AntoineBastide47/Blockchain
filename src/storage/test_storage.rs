@@ -7,6 +7,7 @@
 pub mod test {
     use crate::core::account::Account;
     use crate::core::block::{Block, Header};
+    use crate::core::receipt::Receipt;
     use crate::crypto::key_pair::Address;
     use crate::storage::state_store::{AccountStorage, StateStore, VmStorage};
     use crate::storage::state_view::{StateView, StateViewProvider};
@@ -28,6 +29,7 @@ pub mod test {
         tip: RwLock<Hash>,
         state: RwLock<HashMap<Hash, Vec<u8>>>,
         state_root: RwLock<Hash>,
+        receipts: RwLock<HashMap<Hash, Vec<Receipt>>>,
     }
 
     impl TestStorage {
@@ -39,12 +41,13 @@ pub mod test {
                 tip: RwLock::new(Hash::zero()),
                 state: RwLock::new(HashMap::new()),
                 state_root: RwLock::new(Hash::zero()),
+                receipts: RwLock::new(HashMap::new()),
             };
             for (addr, acc) in initial_accounts {
                 storage.set_account(*addr, acc.clone())
             }
             storage
-                .append_block(genesis, chain_id)
+                .append_block(genesis, vec![], chain_id)
                 .expect("append_block failed");
             storage
         }
@@ -63,7 +66,12 @@ pub mod test {
             self.blocks.read().unwrap().get(&hash).cloned()
         }
 
-        fn append_block(&self, block: Block, chain_id: u64) -> Result<(), StorageError> {
+        fn append_block(
+            &self,
+            block: Block,
+            receipts: Vec<Receipt>,
+            chain_id: u64,
+        ) -> Result<(), StorageError> {
             let current_tip = *self.tip.read().unwrap();
             if block.header.previous_block != current_tip {
                 panic!(
@@ -79,6 +87,7 @@ pub mod test {
                 .unwrap()
                 .insert(hash, block.header.clone());
             self.blocks.write().unwrap().insert(hash, Arc::new(block));
+            self.receipts.write().unwrap().insert(hash, receipts);
             *self.tip.write().unwrap() = hash;
 
             Ok(())
@@ -196,6 +205,13 @@ pub mod test {
         }
     }
 
+    impl TestStorage {
+        /// Retrieves the receipts stored for a given block hash.
+        pub fn get_receipts(&self, block_hash: Hash) -> Option<Vec<Receipt>> {
+            self.receipts.read().unwrap().get(&block_hash).cloned()
+        }
+    }
+
     const TEST_CHAIN_ID: u64 = 78909876543;
 
     fn test_storage(block: Block) -> TestStorage {
@@ -219,7 +235,9 @@ pub mod test {
         let storage = test_storage(genesis.clone());
 
         let block1 = create_test_block(1, genesis.header_hash(TEST_CHAIN_ID), TEST_CHAIN_ID);
-        storage.append_block(block1.clone(), TEST_CHAIN_ID).unwrap();
+        storage
+            .append_block(block1.clone(), vec![], TEST_CHAIN_ID)
+            .unwrap();
 
         assert_eq!(storage.height(), 1);
         assert_eq!(storage.tip(), block1.header_hash(TEST_CHAIN_ID));
@@ -260,7 +278,7 @@ pub mod test {
         let storage = test_storage(genesis);
 
         let orphan = create_test_block(1, random_hash(), TEST_CHAIN_ID);
-        storage.append_block(orphan, TEST_CHAIN_ID).unwrap();
+        storage.append_block(orphan, vec![], TEST_CHAIN_ID).unwrap();
     }
 
     fn h(data: &[u8]) -> Hash {

@@ -670,6 +670,7 @@ mod tests {
             previous_block,
             merkle_root: Hash::zero(),
             state_root: Hash::zero(),
+            receipt_root: Hash::zero(),
         }
     }
 

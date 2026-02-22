@@ -2,6 +2,7 @@
 
 use crate::core::account::Account;
 use crate::core::block::{Block, Header};
+use crate::core::receipt::Receipt;
 use crate::core::transaction::{Transaction, TransactionType};
 use crate::core::validator::{BLOCK_MAX_BYTES, BlockValidator, BlockValidatorError, Validator};
 use crate::crypto::key_pair::{Address, PrivateKey};
@@ -316,15 +317,16 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
         gas_used: &mut u64,
         from: (Address, &mut Account),
         to: (Address, &mut Account),
-    ) -> Result<(), StorageError> {
+    ) -> Result<Vec<u8>, StorageError> {
         match transaction.tx_type {
             TransactionType::TransferFunds => {
                 if from.0 == to.0 {
-                    return Ok(());
+                    return Ok(vec![]);
                 }
 
                 from.1.charge(transaction.amount)?;
-                to.1.credit(transaction.amount)
+                to.1.credit(transaction.amount)?;
+                Ok(vec![])
             }
             TransactionType::DeployContract => {
                 let mut program = DeployProgram::from_bytes(transaction.data.as_slice())?;
@@ -350,6 +352,7 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
                 // Run init_code (may call into runtime_code for setup)
                 let result = vm.run(tx_overlay, &ctx);
                 *gas_used += vm.gas_used();
+                let return_data = vm.return_data();
 
                 match result {
                     Ok(_) => {
@@ -372,7 +375,7 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
                             )
                             .to_vec(),
                         );
-                        Ok(())
+                        Ok(return_data)
                     }
                     Err(e) => Err(e.into()),
                 }
@@ -412,10 +415,12 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
                 };
 
                 // Run runtime_code
-                vm.run(tx_overlay, &ctx)?;
+                let result = vm.run(tx_overlay, &ctx);
                 *gas_used += vm.gas_used();
+                let return_data = vm.return_data();
+                result?;
 
-                Ok(())
+                Ok(return_data)
             }
         }
     }
@@ -430,7 +435,7 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
         transaction: &Transaction,
         block_overlay: &OverlayState<T>,
         tx_overlay: &mut OverlayState<OverlayState<T>>,
-    ) -> Result<(TxAccountChanges, u64), StorageError> {
+    ) -> Result<(TxAccountChanges, u64, Vec<u8>), StorageError> {
         if transaction.gas_price == 0 || transaction.gas_limit == 0 {
             return Err(StorageError::InvalidTransactionGasParams);
         }
@@ -497,21 +502,22 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
                 })?,
         )?;
 
-        transaction_result?;
+        let return_data = transaction_result?;
 
         let accounts: TxAccountChanges = if from_hash == to_hash {
             [(from_hash, from.to_vec()), (from_hash, from.to_vec())]
         } else {
             [(from_hash, from.to_vec()), (to_hash, to.to_vec())]
         };
-        Ok((accounts, gas_used))
+        Ok((accounts, gas_used, return_data))
     }
 
     /// Appends a block to storage and updates the chain tip (thread-safe).
     ///
     /// Logs an info message to notify the node owner
-    fn append_block(&self, block: &Block) -> Result<(), StorageError> {
-        self.storage.append_block(block.clone(), self.id)?;
+    fn append_block(&self, block: &Block, receipts: Vec<Receipt>) -> Result<(), StorageError> {
+        self.storage
+            .append_block(block.clone(), receipts, self.id)?;
 
         info!(
             "adding a new block to the chain: height={} hash={} transactions={}",
@@ -554,9 +560,11 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
         let mut gas_left = BLOCK_GAS_LIMIT;
         let mut validator_fee = 0u128;
         let mut size_left = BLOCK_MAX_BYTES;
+        let mut cumulative_gas: u64 = 0;
 
         let mut hashes = Vec::<Hash>::new();
         let mut transactions = Vec::<Transaction>::new();
+        let mut receipts = Vec::<Receipt>::new();
 
         // Take transactions from the pool while the block gas limit is not reached
         while let (Some(tx), size) = tx_pool.take_one(gas_left, size_left) {
@@ -565,14 +573,22 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
 
             // Try and apply the transaction to the current state
             match self.apply_tx(&tx, &block_overlay, &mut tx_overlay) {
-                Ok((accounts, gas_used)) => {
+                Ok((accounts, gas_used, return_data)) => {
                     tx_overlay
                         .into_writes()
                         .apply_tx_overlay(accounts, &mut block_overlay);
                     gas_left -= gas_used;
                     size_left -= size;
+                    cumulative_gas += gas_used;
                     validator_fee = validator_fee
                         .saturating_add(tx.priority_fee.saturating_mul(gas_used as u128));
+                    receipts.push(Receipt {
+                        tx_hash: hash,
+                        success: true,
+                        gas_used,
+                        cumulative_gas_used: cumulative_gas,
+                        return_data,
+                    });
                     hashes.push(hash);
                     transactions.push(tx);
                 }
@@ -592,6 +608,8 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
         self.storage.apply_batch(block_overlay.into_writes().0);
         tx_pool.remove_batch(&hashes);
 
+        let receipt_root = MerkleTree::from_raw(receipts.iter().map(|r| r.hash()).collect());
+
         let header = Header {
             version: 1,
             height: self.storage.height() + 1,
@@ -603,10 +621,11 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
             previous_block: self.storage.tip(),
             merkle_root: MerkleTree::from_transactions(&transactions, self.id),
             state_root: self.storage.state_root(),
+            receipt_root,
         };
 
         let block = Block::new(header, validator, transactions, self.id);
-        self.append_block(&block)?;
+        self.append_block(&block, receipts)?;
         Ok(block)
     }
 
@@ -654,16 +673,27 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
         self.try_get_account_overlay(validator_address, &block_overlay)?;
 
         let mut validator_fee = 0u128;
+        let mut cumulative_gas: u64 = 0;
+        let mut receipts = Vec::<Receipt>::new();
 
         for tx in &block.transactions {
+            let hash = tx.id(self.id);
             let mut tx_overlay = OverlayState::new(&block_overlay);
             match self.apply_tx(tx, &block_overlay, &mut tx_overlay) {
-                Ok((accounts, gas_used)) => {
+                Ok((accounts, gas_used, return_data)) => {
                     tx_overlay
                         .into_writes()
                         .apply_tx_overlay(accounts, &mut block_overlay);
+                    cumulative_gas += gas_used;
                     validator_fee = validator_fee
                         .saturating_add(tx.priority_fee.saturating_mul(gas_used as u128));
+                    receipts.push(Receipt {
+                        tx_hash: hash,
+                        success: true,
+                        gas_used,
+                        cumulative_gas_used: cumulative_gas,
+                        return_data,
+                    });
                 }
                 Err(e) => Err(e)?,
             }
@@ -686,8 +716,14 @@ impl<V: Validator, S: StorageTrait> Blockchain<V, S> {
             )));
         }
 
+        // Validate receipt root
+        let computed_receipt_root =
+            MerkleTree::from_raw(receipts.iter().map(|r| r.hash()).collect());
+        BlockValidator::validate_receipt_root(&block, computed_receipt_root)
+            .map_err(|e| StorageError::ValidationFailed(e.to_string()))?;
+
         self.storage.apply_batch(writes.0);
-        self.append_block(&block)
+        self.append_block(&block, receipts)
     }
 }
 
@@ -730,7 +766,7 @@ mod tests {
             .validator
             .validate_block(&block, &chain.storage, TEST_CHAIN_ID)
         {
-            Ok(_) => chain.storage.append_block(block, chain.id),
+            Ok(_) => chain.storage.append_block(block, vec![], chain.id),
             Err(err) => Err(StorageError::ValidationFailed(err.to_string())),
         }
     }
@@ -776,6 +812,7 @@ mod tests {
             previous_block: previous,
             merkle_root: Hash::zero(),
             state_root: random_hash(),
+            receipt_root: Hash::zero(),
         }
     }
 
@@ -907,6 +944,7 @@ mod tests {
             previous_block: genesis.header_hash(TEST_CHAIN_ID),
             merkle_root: MerkleTree::from_transactions(std::slice::from_ref(&tx), TEST_CHAIN_ID),
             state_root: random_hash(),
+            receipt_root: Hash::zero(),
         };
         let block = Block::new(header, block_validator, vec![tx], TEST_CHAIN_ID);
 
@@ -1082,6 +1120,7 @@ mod tests {
             previous_block: genesis.header_hash(TEST_CHAIN_ID),
             merkle_root: MerkleTree::from_transactions(&[], TEST_CHAIN_ID),
             state_root: random_hash(),
+            receipt_root: Hash::zero(),
         };
         let block = Block::new(header, block_validator, vec![], TEST_CHAIN_ID);
 
@@ -1122,7 +1161,7 @@ mod tests {
         let mut overlay = OverlayState::new(&base);
         let mut tx_overlay = OverlayState::new(&overlay);
 
-        let (account, _) = bc
+        let (account, _, _) = bc
             .apply_tx(&tx, &overlay, &mut tx_overlay)
             .expect("apply_tx failed");
         tx_overlay
@@ -1155,7 +1194,7 @@ mod tests {
         let mut overlay = OverlayState::new(&base);
         let mut tx_overlay = OverlayState::new(&overlay);
 
-        let (account, _) = bc
+        let (account, _, _) = bc
             .apply_tx(&tx, &overlay, &mut tx_overlay)
             .expect("apply_tx failed");
         tx_overlay
@@ -1189,7 +1228,7 @@ mod tests {
         let mut overlay = OverlayState::new(&base);
         let mut tx_overlay = OverlayState::new(&overlay);
 
-        let (account, _) = bc
+        let (account, _, _) = bc
             .apply_tx(&tx, &overlay, &mut tx_overlay)
             .expect("apply_tx failed");
         tx_overlay
@@ -1224,7 +1263,7 @@ mod tests {
             tx.nonce = i;
 
             let mut tx_overlay = OverlayState::new(&overlay);
-            let (account, _) = bc
+            let (account, _, _) = bc
                 .apply_tx(&tx, &overlay, &mut tx_overlay)
                 .expect("apply_tx failed");
 
@@ -1307,7 +1346,7 @@ mod tests {
         let mut overlay = OverlayState::new(&base);
         let mut tx_overlay = OverlayState::new(&overlay);
 
-        let (accounts, gas_used) = bc
+        let (accounts, gas_used, _) = bc
             .apply_tx(&tx, &overlay, &mut tx_overlay)
             .expect("apply_tx failed");
         tx_overlay
@@ -1374,7 +1413,7 @@ mod tests {
         let mut overlay = OverlayState::new(&base);
         let mut tx_overlay = OverlayState::new(&overlay);
 
-        let (accounts, _) = bc
+        let (accounts, _, _) = bc
             .apply_tx(&tx, &overlay, &mut tx_overlay)
             .expect("apply_tx failed");
         tx_overlay
@@ -1422,7 +1461,7 @@ mod tests {
         let mut overlay = OverlayState::new(&base);
         let mut tx_overlay = OverlayState::new(&overlay);
 
-        let (accounts, _) = bc
+        let (accounts, _, _) = bc
             .apply_tx(&tx, &overlay, &mut tx_overlay)
             .expect("apply_tx failed");
         tx_overlay
@@ -1481,7 +1520,7 @@ MOVE r1, 2
         let mut overlay = OverlayState::new(&base);
         let mut tx_overlay = OverlayState::new(&overlay);
 
-        let (accounts, _) = bc
+        let (accounts, _, _) = bc
             .apply_tx(&tx, &overlay, &mut tx_overlay)
             .expect("apply_tx failed");
         tx_overlay
@@ -1497,6 +1536,195 @@ MOVE r1, 2
         let mut pg2 = program.clone();
         pg2.init_code = vec![];
         assert_eq!(stored_code, pg2.to_vec());
+    }
+
+    #[test]
+    fn build_block_generates_receipts() {
+        let genesis = create_genesis(TEST_CHAIN_ID);
+        let storage = test_storage(genesis);
+
+        let validator_key = PrivateKey::new();
+        let validator_addr = validator_key.public_key().address();
+        storage.set_account(validator_addr, Account::new(0));
+
+        let sender_key = PrivateKey::new();
+        let sender = sender_key.public_key().address();
+        storage.set_account(sender, Account::new(10_000_000));
+        storage.set_account(Address::zero(), Account::new(0));
+
+        let bc = with_validator_and_storage(TEST_CHAIN_ID, AcceptAllValidator, storage);
+        let tx = make_deploy_tx(sender_key, TEST_CHAIN_ID);
+
+        let pool = TxPool::new(Some(4), TEST_CHAIN_ID);
+        let sender_account = bc
+            .storage
+            .get_account(sender)
+            .expect("sender account should exist");
+        assert!(pool.append(&sender_account, tx.clone()));
+
+        let block = bc
+            .build_block(validator_key, &pool)
+            .expect("build_block failed");
+        assert_ne!(block.header.receipt_root, Hash::zero());
+
+        let receipts = bc
+            .storage
+            .get_receipts(block.header_hash(TEST_CHAIN_ID))
+            .expect("receipts should be stored");
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].tx_hash, tx.id(TEST_CHAIN_ID));
+        assert!(receipts[0].success);
+    }
+
+    #[test]
+    fn apply_block_validates_receipt_root_mismatch() {
+        let genesis = create_genesis(TEST_CHAIN_ID);
+
+        let builder_storage = test_storage(genesis.clone());
+        let verifier_storage = test_storage(genesis);
+
+        let validator_key = PrivateKey::new();
+        let validator_addr = validator_key.public_key().address();
+        builder_storage.set_account(validator_addr, Account::new(0));
+        verifier_storage.set_account(validator_addr, Account::new(0));
+
+        let sender_key = PrivateKey::new();
+        let sender = sender_key.public_key().address();
+        builder_storage.set_account(sender, Account::new(10_000_000));
+        verifier_storage.set_account(sender, Account::new(10_000_000));
+        builder_storage.set_account(Address::zero(), Account::new(0));
+        verifier_storage.set_account(Address::zero(), Account::new(0));
+
+        let builder =
+            with_validator_and_storage(TEST_CHAIN_ID, AcceptAllValidator, builder_storage);
+        let verifier =
+            with_validator_and_storage(TEST_CHAIN_ID, AcceptAllValidator, verifier_storage);
+
+        let tx = make_deploy_tx(sender_key, TEST_CHAIN_ID);
+        let pool = TxPool::new(Some(4), TEST_CHAIN_ID);
+        let sender_account = builder
+            .storage
+            .get_account(sender)
+            .expect("sender account should exist");
+        assert!(pool.append(&sender_account, tx));
+
+        let mut block = builder
+            .build_block(validator_key, &pool)
+            .expect("build_block failed");
+        assert_ne!(block.header.receipt_root, Hash::zero());
+        block.header.receipt_root = Hash::zero();
+
+        let result = verifier.apply_block(block);
+        assert!(matches!(
+            result,
+            Err(StorageError::ValidationFailed(msg)) if msg.contains("receipt_root mismatch")
+        ));
+    }
+
+    #[test]
+    fn receipt_cumulative_gas_accumulates() {
+        let genesis = create_genesis(TEST_CHAIN_ID);
+        let storage = test_storage(genesis);
+
+        let validator_key = PrivateKey::new();
+        let validator_addr = validator_key.public_key().address();
+        storage.set_account(validator_addr, Account::new(0));
+
+        let sender_key = PrivateKey::new();
+        let sender = sender_key.public_key().address();
+        let receiver = PrivateKey::new().public_key().address();
+        storage.set_account(sender, Account::new(10_000_000));
+        storage.set_account(receiver, Account::new(0));
+
+        let bc = with_validator_and_storage(TEST_CHAIN_ID, AcceptAllValidator, storage);
+
+        let tx1 = make_transfer_tx(sender_key.clone(), receiver, 1_000, TEST_CHAIN_ID);
+        let mut tx2 = make_transfer_tx(sender_key, receiver, 2_000, TEST_CHAIN_ID);
+        tx2.nonce = 1;
+
+        let pool = TxPool::new(Some(8), TEST_CHAIN_ID);
+        let sender_account = bc
+            .storage
+            .get_account(sender)
+            .expect("sender account should exist");
+        assert!(pool.append(&sender_account, tx1));
+        assert!(pool.append(&sender_account, tx2));
+
+        let block = bc
+            .build_block(validator_key, &pool)
+            .expect("build_block failed");
+        let receipts = bc
+            .storage
+            .get_receipts(block.header_hash(TEST_CHAIN_ID))
+            .expect("receipts should be stored");
+
+        assert_eq!(receipts.len(), 2);
+        assert_eq!(receipts[0].cumulative_gas_used, receipts[0].gas_used);
+        assert_eq!(
+            receipts[1].cumulative_gas_used,
+            receipts[0].gas_used + receipts[1].gas_used
+        );
+    }
+
+    #[test]
+    fn transfer_tx_receipt_has_empty_return_data() {
+        let genesis = create_genesis(TEST_CHAIN_ID);
+        let storage = test_storage(genesis);
+
+        let validator_key = PrivateKey::new();
+        let validator_addr = validator_key.public_key().address();
+        storage.set_account(validator_addr, Account::new(0));
+
+        let sender_key = PrivateKey::new();
+        let sender = sender_key.public_key().address();
+        let receiver = PrivateKey::new().public_key().address();
+        storage.set_account(sender, Account::new(1_000_000));
+        storage.set_account(receiver, Account::new(0));
+
+        let bc = with_validator_and_storage(TEST_CHAIN_ID, AcceptAllValidator, storage);
+        let tx = make_transfer_tx(sender_key, receiver, 10_000, TEST_CHAIN_ID);
+
+        let pool = TxPool::new(Some(4), TEST_CHAIN_ID);
+        let sender_account = bc
+            .storage
+            .get_account(sender)
+            .expect("sender account should exist");
+        assert!(pool.append(&sender_account, tx));
+
+        let block = bc
+            .build_block(validator_key, &pool)
+            .expect("build_block failed");
+        let receipts = bc
+            .storage
+            .get_receipts(block.header_hash(TEST_CHAIN_ID))
+            .expect("receipts should be stored");
+
+        assert_eq!(receipts.len(), 1);
+        assert!(receipts[0].return_data.is_empty());
+    }
+
+    #[test]
+    fn receipt_root_zero_for_empty_block() {
+        let genesis = create_genesis(TEST_CHAIN_ID);
+        let storage = test_storage(genesis);
+
+        let validator_key = PrivateKey::new();
+        let validator_addr = validator_key.public_key().address();
+        storage.set_account(validator_addr, Account::new(0));
+
+        let bc = with_validator_and_storage(TEST_CHAIN_ID, AcceptAllValidator, storage);
+        let pool = TxPool::new(Some(4), TEST_CHAIN_ID);
+
+        let block = bc
+            .build_block(validator_key, &pool)
+            .expect("build_block failed");
+        assert_eq!(block.header.receipt_root, Hash::zero());
+
+        let receipts = bc
+            .storage
+            .get_receipts(block.header_hash(TEST_CHAIN_ID))
+            .expect("receipts should be stored");
+        assert!(receipts.is_empty());
     }
 
     // ==================== replay_from_last_snapshot Tests ====================

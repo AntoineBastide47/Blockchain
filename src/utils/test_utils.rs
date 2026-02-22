@@ -41,6 +41,7 @@ pub mod utils {
             previous_block: Hash::zero(),
             merkle_root: Hash::zero(),
             state_root: Hash::zero(),
+            receipt_root: Hash::zero(),
         };
         Block::new(header, PrivateKey::new(), vec![], chain_id)
     }
@@ -135,6 +136,7 @@ pub mod utils {
             previous_block: previous,
             merkle_root: Hash::zero(),
             state_root: Hash::zero(),
+            receipt_root: Hash::zero(),
         };
         Block::new(header, PrivateKey::new(), vec![], chain_id)
     }

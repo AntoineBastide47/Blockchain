@@ -13,6 +13,7 @@
 
 use crate::core::account::Account;
 use crate::core::block::{Block, Header};
+use crate::core::receipt::Receipt;
 use crate::crypto::key_pair::Address;
 use crate::storage::state_store::{AccountStorage, StateStore, VmStorage};
 use crate::storage::state_view::{StateView, StateViewProvider};
@@ -39,10 +40,12 @@ pub const CF_META: &str = "meta";
 pub const CF_STATE: &str = "state";
 /// Column family name for full state snapshots.
 pub const CF_SNAPSHOTS: &str = "snapshots";
+/// Column family name for transaction receipts indexed by block hash.
+pub const CF_RECEIPTS: &str = "receipts";
 
 /// Default snapshot interval in blocks.
 #[cfg(not(test))]
-pub const SNAPSHOT_INTERVAL: u64 = 1_000;
+pub const SNAPSHOT_INTERVAL: u64 = 1_0;
 /// Smaller default for unit tests to keep snapshots and pruning cheap.
 #[cfg(test)]
 pub const SNAPSHOT_INTERVAL: u64 = 10;
@@ -591,9 +594,17 @@ impl RocksDbStorage {
         let cf_meta = db.cf_handle(CF_META).expect("CF_META must exist");
         let cf_state = db.cf_handle(CF_STATE).expect("CF_STATE must exist");
         let cf_snapshots = db.cf_handle(CF_SNAPSHOTS).expect("CF_SNAPSHOTS must exist");
+        let cf_receipts = db.cf_handle(CF_RECEIPTS).expect("CF_RECEIPTS must exist");
 
         let mut batch = WriteBatch::default();
-        for cf in [cf_headers, cf_blocks, cf_meta, cf_state, cf_snapshots] {
+        for cf in [
+            cf_headers,
+            cf_blocks,
+            cf_meta,
+            cf_state,
+            cf_snapshots,
+            cf_receipts,
+        ] {
             let iter = db.iterator_cf(cf, IteratorMode::Start);
             for item in iter {
                 let (key, _) = item.map_err(|e| StorageError::ValidationFailed(e.to_string()))?;
@@ -1006,6 +1017,7 @@ impl RocksDbStorage {
         let cf_meta = db.cf_handle(CF_META).expect("CF_META must exist");
         let cf_state = db.cf_handle(CF_STATE).expect("CF_STATE must exist");
         let cf_snapshots = db.cf_handle(CF_SNAPSHOTS).expect("CF_SNAPSHOTS must exist");
+        let cf_receipts = db.cf_handle(CF_RECEIPTS).expect("CF_RECEIPTS must exist");
 
         let meta_key = snapshot_meta_key(height);
         let tip_bytes = db
@@ -1061,6 +1073,7 @@ impl RocksDbStorage {
 
             batch.delete_cf(cf_headers, current.as_slice());
             batch.delete_cf(cf_blocks, current.as_slice());
+            batch.delete_cf(cf_receipts, current.as_slice());
             current = header.previous_block;
         }
 
@@ -1100,6 +1113,23 @@ impl RocksDbStorage {
                 .map(|(k, v)| (h256_to_hash(k), v.0.clone()))
                 .collect()
         })
+    }
+
+    /// Retrieves the receipts stored for a given block hash.
+    ///
+    /// Returns `None` if no receipts exist for the hash.
+    pub fn get_receipts(&self, block_hash: Hash) -> Option<Vec<Receipt>> {
+        let inner = self.read_inner();
+        let cf = inner
+            .db
+            .cf_handle(CF_RECEIPTS)
+            .expect("CF_RECEIPTS must exist");
+        inner
+            .db
+            .get_cf(cf, block_hash.as_slice())
+            .ok()
+            .flatten()
+            .and_then(|bytes| Vec::<Receipt>::decode(&mut bytes.as_slice()).ok())
     }
 
     /// Returns stored block bodies for heights in `[start, end]`.
@@ -1201,7 +1231,12 @@ impl Storage for RocksDbStorage {
             .map(Arc::new)
     }
 
-    fn append_block(&self, block: Block, chain_id: u64) -> Result<(), StorageError> {
+    fn append_block(
+        &self,
+        block: Block,
+        receipts: Vec<Receipt>,
+        chain_id: u64,
+    ) -> Result<(), StorageError> {
         let mut inner = self.write_inner();
         let db = inner.db.clone();
 
@@ -1217,8 +1252,9 @@ impl Storage for RocksDbStorage {
         let cf_headers = db.cf_handle(CF_HEADERS).expect("CF_HEADERS must exist");
         let cf_blocks = db.cf_handle(CF_BLOCKS).expect("CF_BLOCKS must exist");
         let cf_meta = db.cf_handle(CF_META).expect("CF_META must exist");
+        let cf_receipts = db.cf_handle(CF_RECEIPTS).expect("CF_RECEIPTS must exist");
 
-        // Phase 1: atomic write — block + header + tip + state + state_root
+        // Phase 1: atomic write — block + header + tip + receipts + state + state_root
         let mut batch = WriteBatch::default();
         batch.put_cf(
             cf_headers,
@@ -1227,6 +1263,7 @@ impl Storage for RocksDbStorage {
         );
         batch.put_cf(cf_blocks, hash.as_slice(), block.to_bytes().as_slice());
         batch.put_cf(cf_meta, meta_keys::TIP, hash.as_slice());
+        batch.put_cf(cf_receipts, hash.as_slice(), receipts.to_bytes().as_slice());
         Self::write_state_to_batch(&inner, &mut batch)?;
 
         db.write(batch)
@@ -1437,6 +1474,7 @@ mod tests {
             ColumnFamilyDescriptor::new(CF_META, Options::default()),
             ColumnFamilyDescriptor::new(CF_STATE, Options::default()),
             ColumnFamilyDescriptor::new(CF_SNAPSHOTS, Options::default()),
+            ColumnFamilyDescriptor::new(CF_RECEIPTS, Options::default()),
         ]
     }
 
@@ -1479,6 +1517,7 @@ mod tests {
             previous_block: Hash::zero(),
             merkle_root: Hash::zero(),
             state_root: h256_to_hash(state.root()),
+            receipt_root: Hash::zero(),
         };
 
         let genesis_key = PrivateKey::new();
@@ -1756,10 +1795,13 @@ mod tests {
             previous_block: genesis_tip,
             merkle_root: MerkleTree::from_transactions(&[], TEST_CHAIN_ID),
             state_root: storage.state_root(),
+            receipt_root: Hash::zero(),
         };
         let block = Block::new(header, validator_key, vec![], TEST_CHAIN_ID);
 
-        storage.append_block(block.clone(), TEST_CHAIN_ID).unwrap();
+        storage
+            .append_block(block.clone(), vec![], TEST_CHAIN_ID)
+            .unwrap();
 
         assert_eq!(storage.tip(), block.header_hash(TEST_CHAIN_ID));
         assert_eq!(storage.height(), 1);
@@ -1778,11 +1820,62 @@ mod tests {
             previous_block: wrong_parent,
             merkle_root: Hash::zero(),
             state_root: storage.state_root(),
+            receipt_root: Hash::zero(),
         };
         let block = Block::new(header, PrivateKey::new(), vec![], TEST_CHAIN_ID);
 
-        let result = storage.append_block(block, TEST_CHAIN_ID);
+        let result = storage.append_block(block, vec![], TEST_CHAIN_ID);
         assert!(matches!(result, Err(StorageError::NotOnTip { .. })));
+    }
+
+    #[test]
+    fn append_block_stores_and_retrieves_receipts() {
+        let storage = create_storage(&[]);
+        let genesis_tip = storage.tip();
+
+        let receipts = vec![
+            Receipt {
+                tx_hash: Hash::sha3().chain(b"tx1").finalize(),
+                success: true,
+                gas_used: 21_000,
+                cumulative_gas_used: 21_000,
+                return_data: vec![],
+            },
+            Receipt {
+                tx_hash: Hash::sha3().chain(b"tx2").finalize(),
+                success: true,
+                gas_used: 35_000,
+                cumulative_gas_used: 56_000,
+                return_data: vec![1, 2, 3],
+            },
+        ];
+        let receipt_root = MerkleTree::from_raw(receipts.iter().map(|r| r.hash()).collect());
+
+        let header = Header {
+            version: 1,
+            height: 1,
+            timestamp: 1000,
+            gas_used: 56_000,
+            previous_block: genesis_tip,
+            merkle_root: Hash::zero(),
+            state_root: storage.state_root(),
+            receipt_root,
+        };
+        let block = Block::new(header, PrivateKey::new(), vec![], TEST_CHAIN_ID);
+        let hash = block.header_hash(TEST_CHAIN_ID);
+
+        storage
+            .append_block(block, receipts.clone(), TEST_CHAIN_ID)
+            .expect("append_block failed");
+
+        assert_eq!(storage.get_receipts(hash), Some(receipts));
+    }
+
+    #[test]
+    fn get_receipts_returns_none_for_unknown() {
+        let storage = create_storage(&[]);
+        let unknown = Hash::sha3().chain(b"unknown-receipts").finalize();
+        assert!(storage.get_receipts(unknown).is_none());
     }
 
     // ==================== Reset Tests ====================
@@ -1817,6 +1910,45 @@ mod tests {
         assert_eq!(storage.height(), 0);
     }
 
+    #[test]
+    fn receipts_cleared_on_reset() {
+        let storage = create_storage(&[]);
+        let genesis_tip = storage.tip();
+
+        let receipts = vec![Receipt {
+            tx_hash: Hash::sha3().chain(b"tx-reset").finalize(),
+            success: true,
+            gas_used: 21_000,
+            cumulative_gas_used: 21_000,
+            return_data: vec![9],
+        }];
+        let receipt_root = MerkleTree::from_raw(receipts.iter().map(|r| r.hash()).collect());
+
+        let header = Header {
+            version: 1,
+            height: 1,
+            timestamp: 1000,
+            gas_used: 21_000,
+            previous_block: genesis_tip,
+            merkle_root: Hash::zero(),
+            state_root: storage.state_root(),
+            receipt_root,
+        };
+        let block = Block::new(header, PrivateKey::new(), vec![], TEST_CHAIN_ID);
+        let block_hash = block.header_hash(TEST_CHAIN_ID);
+        storage
+            .append_block(block, receipts.clone(), TEST_CHAIN_ID)
+            .expect("append_block failed");
+        assert_eq!(storage.get_receipts(block_hash), Some(receipts));
+
+        let genesis = genesis_block(&[]);
+        storage
+            .reset(genesis, TEST_CHAIN_ID, &[])
+            .expect("reset failed");
+
+        assert!(storage.get_receipts(block_hash).is_none());
+    }
+
     // ==================== Header-Only Storage Tests ====================
 
     #[test]
@@ -1832,6 +1964,7 @@ mod tests {
             previous_block: genesis_tip,
             merkle_root: Hash::zero(),
             state_root: Hash::zero(),
+            receipt_root: Hash::zero(),
         };
         let hash = header.header_hash(TEST_CHAIN_ID);
 
@@ -1856,6 +1989,7 @@ mod tests {
             previous_block: genesis_tip,
             merkle_root: Hash::zero(),
             state_root: Hash::zero(),
+            receipt_root: Hash::zero(),
         };
         let hash1 = header1.header_hash(TEST_CHAIN_ID);
 
@@ -1867,6 +2001,7 @@ mod tests {
             previous_block: hash1,
             merkle_root: Hash::zero(),
             state_root: Hash::zero(),
+            receipt_root: Hash::zero(),
         };
 
         storage
@@ -1937,11 +2072,12 @@ mod tests {
             previous_block: previous,
             merkle_root: Hash::zero(),
             state_root: storage.state_root(),
+            receipt_root: Hash::zero(),
         };
         let block = Block::new(header, PrivateKey::new(), vec![], TEST_CHAIN_ID);
         let hash = block.header_hash(TEST_CHAIN_ID);
         storage
-            .append_block(block, TEST_CHAIN_ID)
+            .append_block(block, vec![], TEST_CHAIN_ID)
             .expect("append_block failed");
         hash
     }
@@ -2002,6 +2138,7 @@ mod tests {
             previous_block: Hash::zero(),
             merkle_root: Hash::zero(),
             state_root,
+            receipt_root: Hash::zero(),
         };
         let block = Block::new(header, PrivateKey::new(), vec![], TEST_CHAIN_ID);
         let entries = vec![(addr, account.to_vec())];

@@ -62,6 +62,8 @@ pub enum BlockValidatorError {
     InvalidTransactionSignature(Hash),
     #[error("invalid merkle root in block: block={0}")]
     InvalidMerkleRoot(Hash),
+    #[error("receipt_root mismatch: expected {expected} got {actual}")]
+    InvalidReceiptRoot { expected: Hash, actual: Hash },
     #[error("nonce mismatch: expected {expected}, got {actual}")]
     NonceMismatch { expected: u64, actual: u64 },
     #[error("insufficient balance: balance={balance}, required={required}")]
@@ -100,6 +102,25 @@ pub struct BlockValidator;
 pub const TRANSACTION_MAX_BYTES: usize = 100_000;
 /// Maximum allowed size for a single block in bytes.
 pub const BLOCK_MAX_BYTES: usize = 2_000_000;
+
+impl BlockValidator {
+    /// Validates the receipt root commitment against a computed root.
+    ///
+    /// The caller is responsible for computing `computed_receipt_root`
+    /// deterministically from transaction execution receipts.
+    pub fn validate_receipt_root(
+        block: &Block,
+        computed_receipt_root: Hash,
+    ) -> Result<(), BlockValidatorError> {
+        if computed_receipt_root != block.header.receipt_root {
+            return Err(BlockValidatorError::InvalidReceiptRoot {
+                expected: block.header.receipt_root,
+                actual: computed_receipt_root,
+            });
+        }
+        Ok(())
+    }
+}
 
 impl Validator for BlockValidator {
     type Error = BlockValidatorError;
@@ -201,6 +222,13 @@ impl Validator for BlockValidator {
             });
         }
 
+        // Full receipt-root validation is execution-dependent and is performed
+        // during block application. For empty blocks, the receipt root is
+        // deterministic (`Hash::zero()`), so we can validate it here too.
+        if block.transactions.is_empty() {
+            Self::validate_receipt_root(block, Hash::zero())?;
+        }
+
         block.verify(chain_id)
     }
 }
@@ -210,6 +238,7 @@ mod tests {
     use super::*;
     use crate::core::account::Account;
     use crate::core::block::{Block, Header};
+    use crate::core::receipt::Receipt;
     use crate::core::transaction::TransactionType;
     use crate::crypto::key_pair::{Address, PrivateKey};
     use crate::storage::storage_trait::StorageError;
@@ -280,6 +309,35 @@ mod tests {
                 .validate_block(&block, &storage, TEST_CHAIN_ID)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn empty_block_with_wrong_receipt_root_rejected() {
+        let genesis = create_genesis(TEST_CHAIN_ID);
+        let storage = test_storage(genesis.clone());
+        let validator = BlockValidator;
+
+        let mut block = create_test_block(1, genesis.header_hash(TEST_CHAIN_ID), TEST_CHAIN_ID);
+        block.header.receipt_root = random_hash();
+
+        let err = validator
+            .validate_block(&block, &storage, TEST_CHAIN_ID)
+            .expect_err("empty block with bad receipt_root should fail");
+        assert!(matches!(
+            err,
+            BlockValidatorError::InvalidReceiptRoot { .. }
+        ));
+    }
+
+    #[test]
+    fn validate_receipt_root_rejects_mismatch() {
+        let block = create_test_block(1, random_hash(), TEST_CHAIN_ID);
+        let err = BlockValidator::validate_receipt_root(&block, random_hash())
+            .expect_err("mismatch should fail");
+        assert!(matches!(
+            err,
+            BlockValidatorError::InvalidReceiptRoot { .. }
+        ));
     }
 
     #[test]
@@ -402,7 +460,7 @@ mod tests {
         fn get_block(&self, _: Hash) -> Option<Arc<Block>> {
             None
         }
-        fn append_block(&self, _: Block, _: u64) -> Result<(), StorageError> {
+        fn append_block(&self, _: Block, _: Vec<Receipt>, _: u64) -> Result<(), StorageError> {
             Ok(())
         }
         fn height(&self) -> u64 {

@@ -3,6 +3,7 @@
 //! Defines the [`Storage`] trait for persisting blocks and headers.
 
 use crate::core::block::{Block, Header};
+use crate::core::receipt::Receipt;
 use crate::types::encoding::DecodeError;
 use crate::types::hash::Hash;
 use crate::virtual_machine::errors::VMError;
@@ -76,8 +77,13 @@ pub trait Storage: Send + Sync {
     /// Retrieves a full block by its hash.
     fn get_block(&self, hash: Hash) -> Option<Arc<Block>>;
 
-    /// Appends a block to storage and updates the chain tip (thread-safe).
-    fn append_block(&self, block: Block, chain_id: u64) -> Result<(), StorageError>;
+    /// Appends a block and its receipts to storage and updates the chain tip (thread-safe).
+    fn append_block(
+        &self,
+        block: Block,
+        receipts: Vec<Receipt>,
+        chain_id: u64,
+    ) -> Result<(), StorageError>;
 
     /// Returns the current chain height (genesis = 0).
     fn height(&self) -> u64;

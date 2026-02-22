@@ -121,6 +121,7 @@ impl<T: Transport> Server<T> {
             previous_block: Hash::zero(),
             merkle_root: Hash::zero(),
             state_root: h256_to_hash(state.root()),
+            receipt_root: Hash::zero(),
         };
 
         let genesis_key = PrivateKey::from_bytes(&GENESIS_PRIVATE_KEY_BYTES)
@@ -1183,7 +1184,9 @@ pub mod tests {
     use crate::network::local_transport::tests::LocalTransport;
     use crate::network::rpc::Rpc;
     use crate::network::sync::SyncState;
-    use crate::storage::rocksdb_storage::{CF_BLOCKS, CF_HEADERS, CF_META, CF_SNAPSHOTS, CF_STATE};
+    use crate::storage::rocksdb_storage::{
+        CF_BLOCKS, CF_HEADERS, CF_META, CF_RECEIPTS, CF_SNAPSHOTS, CF_STATE,
+    };
     use crate::utils::test_utils::utils::{new_tx, test_rpc};
     use crate::virtual_machine::vm::BLOCK_GAS_LIMIT;
     use rocksdb::{ColumnFamilyDescriptor, DB, Options};
@@ -1206,6 +1209,7 @@ pub mod tests {
             ColumnFamilyDescriptor::new(CF_META, Options::default()),
             ColumnFamilyDescriptor::new(CF_STATE, Options::default()),
             ColumnFamilyDescriptor::new(CF_SNAPSHOTS, Options::default()),
+            ColumnFamilyDescriptor::new(CF_RECEIPTS, Options::default()),
         ];
 
         // Leak the tempdir to keep it alive for the duration of the test
@@ -1247,6 +1251,7 @@ pub mod tests {
                 previous_block: prev_hash,
                 merkle_root: Hash::zero(),
                 state_root: Hash::zero(),
+                receipt_root: Hash::zero(),
             };
             prev_hash = header.header_hash(DEV_CHAIN_ID);
             headers.push(header);
@@ -1345,6 +1350,7 @@ pub mod tests {
             previous_block: Hash::zero(),
             merkle_root: Hash::zero(),
             state_root: Hash::zero(),
+            receipt_root: Hash::zero(),
         };
         Block::new(header, PrivateKey::new(), transactions, TEST_CHAIN_ID)
     }
@@ -2310,6 +2316,7 @@ pub mod tests {
             previous_block: Hash::zero(),
             merkle_root: Hash::zero(),
             state_root,
+            receipt_root: Hash::zero(),
         };
         let block = Block::new(snap_header, PrivateKey::new(), vec![], DEV_CHAIN_ID);
         let response = SendSnapshotStateMessage {
@@ -2394,6 +2401,7 @@ pub mod tests {
             previous_block: Hash::zero(),
             merkle_root: Hash::zero(),
             state_root: Hash::zero(),
+            receipt_root: Hash::zero(),
         };
         let wrong_block = Block::new(wrong_header, PrivateKey::new(), vec![], DEV_CHAIN_ID);
         let response = SendSnapshotStateMessage {
@@ -2462,6 +2470,7 @@ pub mod tests {
                     previous_block: Hash::zero(),
                     merkle_root: Hash::zero(),
                     state_root: Hash::zero(),
+                    receipt_root: Hash::zero(),
                 },
                 PrivateKey::new(),
                 vec![],
@@ -2535,6 +2544,7 @@ pub mod tests {
                     previous_block: Hash::zero(),
                     merkle_root: Hash::zero(),
                     state_root: Hash::zero(),
+                    receipt_root: Hash::zero(),
                 },
                 PrivateKey::new(),
                 vec![],
@@ -2664,6 +2674,7 @@ pub mod tests {
             previous_block: Hash::zero(),
             merkle_root: Hash::zero(),
             state_root,
+            receipt_root: Hash::zero(),
         };
         let block = Block::new(snap_header, PrivateKey::new(), vec![], DEV_CHAIN_ID);
         let response = SendSnapshotStateMessage {
@@ -2692,6 +2703,7 @@ pub mod tests {
             previous_block: Hash::zero(),
             merkle_root: Hash::zero(),
             state_root: Hash::zero(),
+            receipt_root: Hash::zero(),
         };
         let block = Block::new(header, PrivateKey::new(), vec![], DEV_CHAIN_ID);
         let response = SendBlocksMessage {
@@ -2892,6 +2904,7 @@ pub mod tests {
             previous_block: Hash::zero(),
             merkle_root: Hash::zero(),
             state_root: Hash::zero(),
+            receipt_root: Hash::zero(),
         };
         let block = Block::new(header, PrivateKey::new(), vec![], DEV_CHAIN_ID);
         let response = SendBlocksMessage {

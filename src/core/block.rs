@@ -27,6 +27,8 @@ pub struct Header {
     pub merkle_root: Hash,
     /// Root hash of the VM storage after executing all transactions in this block
     pub state_root: Hash,
+    /// Root of merkle tree of transaction receipts
+    pub receipt_root: Hash,
 }
 
 impl Header {
@@ -164,6 +166,7 @@ mod tests {
             previous_block: random_hash(),
             merkle_root: MerkleTree::from_transactions(transactions, TEST_CHAIN_ID),
             state_root: random_hash(),
+            receipt_root: Hash::zero(),
         }
     }
 
@@ -206,6 +209,7 @@ mod tests {
             previous_block: Hash::zero(),
             merkle_root: Hash::zero(),
             state_root: Hash::zero(),
+            receipt_root: Hash::zero(),
         };
         let block = create_block(genesis_header, vec![]);
         assert_eq!(block.header.height, 0);
@@ -233,6 +237,7 @@ mod tests {
             previous_block: random_hash(),
             merkle_root: random_hash(),
             state_root: random_hash(),
+            receipt_root: random_hash(),
         };
 
         let buf = header.to_bytes();

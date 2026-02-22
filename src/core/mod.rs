@@ -11,5 +11,6 @@
 pub mod account;
 pub mod block;
 pub mod blockchain;
+pub mod receipt;
 pub mod transaction;
 pub mod validator;

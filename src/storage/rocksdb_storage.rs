@@ -45,7 +45,7 @@ pub const CF_RECEIPTS: &str = "receipts";
 
 /// Default snapshot interval in blocks.
 #[cfg(not(test))]
-pub const SNAPSHOT_INTERVAL: u64 = 1_0;
+pub const SNAPSHOT_INTERVAL: u64 = 1_000;
 /// Smaller default for unit tests to keep snapshots and pruning cheap.
 #[cfg(test)]
 pub const SNAPSHOT_INTERVAL: u64 = 10;

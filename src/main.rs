@@ -23,9 +23,10 @@
 
 use blockchain::core::account::Account;
 use blockchain::core::blockchain::Blockchain;
+use blockchain::core::consensus::{ChainParams, GenesisAllocation};
 use blockchain::core::transaction::{Transaction, TransactionType};
 use blockchain::core::validator::BlockValidator;
-use blockchain::crypto::key_pair::{Address, PublicKey, load_or_generate_validator_key};
+use blockchain::crypto::key_pair::{PublicKey, load_or_generate_validator_key};
 use blockchain::network::libp2p_transport::Libp2pTransport;
 use blockchain::network::message::{Message, MessageType};
 use blockchain::network::rpc::Rpc;
@@ -168,15 +169,24 @@ async fn main() {
         None
     };
 
-    let validators: Vec<(Address, Account)> = GENESIS_VALIDATORS
+    let genesis_allocations: Vec<GenesisAllocation> = GENESIS_VALIDATORS
         .iter()
         .map(|(pub_key_bytes, balance)| {
             let pubkey = PublicKey::from_bytes(pub_key_bytes).expect("invalid public key");
-            (pubkey.address(), Account::new(*balance))
+            GenesisAllocation::new(pubkey.address(), Account::new(*balance))
         })
         .collect();
+    let chain_params = ChainParams::dev_with_allocations(genesis_allocations);
 
-    let server = match Server::new(transport, db, validator_key.clone(), None, &validators).await {
+    let server = match Server::new_with_chain_params(
+        transport,
+        db,
+        validator_key.clone(),
+        None,
+        chain_params,
+    )
+    .await
+    {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Failed to create server: {}", e);

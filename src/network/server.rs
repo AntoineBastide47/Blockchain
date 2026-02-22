@@ -3,8 +3,9 @@
 //! Processes incoming RPCs from the server's transport in a unified event loop.
 
 use crate::core::account::Account;
-use crate::core::block::{Block, Header};
+use crate::core::block::Block;
 use crate::core::blockchain::Blockchain;
+use crate::core::consensus::ChainParams;
 use crate::core::transaction::Transaction;
 use crate::core::validator::BlockValidator;
 use crate::crypto::key_pair::{Address, PrivateKey};
@@ -44,14 +45,6 @@ pub const DEV_CHAIN_ID: u64 = 0;
 /// Validators attempt to produce one block per `BLOCK_TIME` interval. This constant
 /// also determines the maximum allowable timestamp drift for incoming blocks.
 pub const BLOCK_TIME: Duration = Duration::from_secs(6);
-
-/// Well-known private key bytes used exclusively for signing the genesis block.
-/// This key has no authority beyond genesis; it exists solely to produce a
-/// deterministic, verifiable genesis block signature across all nodes.
-const GENESIS_PRIVATE_KEY_BYTES: [u8; 32] = [
-    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
-    0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
-];
 
 /// Errors produced by the server while handling RPCs and storage updates.
 #[derive(Debug, blockchain_derive::Error)]
@@ -97,6 +90,8 @@ pub struct Server<T: Transport> {
     tx_pool: TxPool,
     /// The local blockchain storage with block validation and persistent storage.
     chain: Blockchain<BlockValidator, RocksDbStorage>,
+    /// Consensus and chain parameters used by this node.
+    chain_params: ChainParams,
     /// Genesis accounts used to initialize and potentially reset chain state.
     genesis_accounts: Box<[(Address, Account)]>,
     /// Sync manager handling the synchronization state machine.
@@ -106,28 +101,8 @@ pub struct Server<T: Transport> {
 impl<T: Transport> Server<T> {
     /// The genesis block, lazily initialized once and shared across all server instances.
     pub fn genesis_block(chain_id: u64, initial_accounts: &[(Address, Account)]) -> Block {
-        let mut state = Smt::new(H256::zero(), DefaultStore::default());
-        for (addr, account) in initial_accounts {
-            state
-                .update(hash_to_h256(addr), SmtValue(account.to_vec()))
-                .expect("smt update failed");
-        }
-
-        let header = Header {
-            version: 1,
-            height: 0,
-            timestamp: 0,
-            gas_used: 0,
-            previous_block: Hash::zero(),
-            merkle_root: Hash::zero(),
-            state_root: h256_to_hash(state.root()),
-            receipt_root: Hash::zero(),
-        };
-
-        let genesis_key = PrivateKey::from_bytes(&GENESIS_PRIVATE_KEY_BYTES)
-            .expect("GENESIS_PRIVATE_KEY_BYTES must be a valid secp256k1 scalar");
-
-        Block::new(header, genesis_key, vec![], chain_id)
+        let params = ChainParams::dev_from_initial_accounts(initial_accounts);
+        params.genesis.build_genesis_block(chain_id)
     }
 
     /// Creates a new server with full configuration options.
@@ -140,15 +115,39 @@ impl<T: Transport> Server<T> {
         transaction_pool_capacity: Option<usize>,
         initial_accounts: &[(Address, Account)],
     ) -> Result<Arc<Self>, StorageError> {
+        let chain_params = ChainParams::dev_from_initial_accounts(initial_accounts);
+        Self::new_with_chain_params(
+            transport,
+            db,
+            private_key,
+            transaction_pool_capacity,
+            chain_params,
+        )
+        .await
+    }
+
+    /// Creates a new server using explicit chain parameters and genesis specification.
+    ///
+    /// This is the preferred constructor for production code. The legacy [`Self::new`]
+    /// constructor remains as a compatibility wrapper for tests and existing call sites.
+    pub async fn new_with_chain_params(
+        transport: Arc<T>,
+        db: Arc<rocksdb::DB>,
+        private_key: Option<PrivateKey>,
+        transaction_pool_capacity: Option<usize>,
+        chain_params: ChainParams,
+    ) -> Result<Arc<Self>, StorageError> {
         let is_validator = private_key.is_some();
-        let chain_id = DEV_CHAIN_ID;
-        let genesis_accounts: Box<[(Address, Account)]> =
-            initial_accounts.to_vec().into_boxed_slice();
+        let chain_id = chain_params.chain_id;
+        let genesis_accounts: Box<[(Address, Account)]> = chain_params
+            .genesis
+            .derive_initial_accounts()
+            .into_boxed_slice();
 
         let chain = Blockchain::new(
             chain_id,
             db,
-            Self::genesis_block(chain_id, &genesis_accounts),
+            chain_params.genesis.build_genesis_block(chain_id),
             &genesis_accounts,
         )?;
 
@@ -166,6 +165,7 @@ impl<T: Transport> Server<T> {
             is_validator,
             tx_pool: TxPool::new(transaction_pool_capacity, chain_id),
             chain,
+            chain_params,
             genesis_accounts,
             sync_manager: Mutex::new(SyncManager::new(
                 local_height,
@@ -375,6 +375,11 @@ impl<T: Transport> Server<T> {
     /// Returns a reference to the server's transport.
     pub fn transport(&self) -> &Arc<T> {
         &self.transport
+    }
+
+    /// Returns the chain parameters used by this server instance.
+    pub fn chain_params(&self) -> &ChainParams {
+        &self.chain_params
     }
 
     /// Returns the account for the given address, if it exists.
@@ -1180,6 +1185,7 @@ fn handle_rpc(rpc: Rpc) -> Result<DecodedMessage, RpcError> {
 #[cfg(test)]
 pub mod tests {
     use super::*;
+    use crate::core::block::Header;
     use crate::crypto::key_pair::PrivateKey;
     use crate::network::local_transport::tests::LocalTransport;
     use crate::network::rpc::Rpc;

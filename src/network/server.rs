@@ -10,7 +10,8 @@ use crate::core::transaction::Transaction;
 use crate::core::validator::BlockValidator;
 use crate::crypto::key_pair::{Address, PrivateKey};
 use crate::network::message::{
-    GetBlocksMessage, GetHeadersMessage, GetSnapshotStateMessage, Message, MessageType,
+    GetBlockBodiesMessage, GetBlocksMessage, GetHeadersMessage, GetSnapshotStateMessage, Message,
+    MessageType, SYNC_CAP_BLOCK_BODIES_BY_HASH, SYNC_CAP_HEADER_LOCATORS, SendBlockBodiesMessage,
     SendBlocksMessage, SendHeadersMessage, SendSnapshotStateMessage, SendSyncStatusMessage,
     SnapshotEntry,
 };
@@ -27,6 +28,7 @@ use crate::types::wrapper_types::BoxFuture;
 use crate::{error, info, warn};
 use sparse_merkle_tree::H256;
 use sparse_merkle_tree::default_store::DefaultStore;
+use std::cmp::min;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -45,6 +47,8 @@ pub const DEV_CHAIN_ID: u64 = 0;
 /// Validators attempt to produce one block per `BLOCK_TIME` interval. This constant
 /// also determines the maximum allowable timestamp drift for incoming blocks.
 pub const BLOCK_TIME: Duration = Duration::from_secs(6);
+/// Sync manager timeout/retry tick interval.
+const SYNC_TICK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Errors produced by the server while handling RPCs and storage updates.
 #[derive(Debug, blockchain_derive::Error)]
@@ -159,6 +163,12 @@ impl<T: Transport> Server<T> {
             .map(|h| h.header_hash(chain.id))
             .unwrap_or(local_tip);
 
+        let expected_genesis_hash = chain_params
+            .genesis
+            .build_genesis_block(chain_id)
+            .header_hash(chain_id);
+        let expected_chain_params_hash = chain_params.hash();
+
         Ok(Arc::new(Self {
             transport,
             private_key,
@@ -167,12 +177,14 @@ impl<T: Transport> Server<T> {
             chain,
             chain_params,
             genesis_accounts,
-            sync_manager: Mutex::new(SyncManager::new(
+            sync_manager: Mutex::new(SyncManager::new_with_network_identity(
                 local_height,
                 local_header_height,
                 local_tip,
                 local_header_tip,
                 chain_id,
+                expected_genesis_hash,
+                expected_chain_params_hash,
             )),
         }))
     }
@@ -199,6 +211,8 @@ impl<T: Transport> Server<T> {
         mut rx: Receiver<Rpc>,
         mut shutdown: tokio::sync::oneshot::Receiver<()>,
     ) {
+        let mut sync_ticker = interval(SYNC_TICK_INTERVAL);
+        sync_ticker.tick().await;
         loop {
             tokio::select! {
                 Some(rpc) = rx.recv() => {
@@ -209,6 +223,15 @@ impl<T: Transport> Server<T> {
                             }
                         },
                         Err(e) => error!("failed to decode rpc: {}", e)
+                    }
+                }
+                _ = sync_ticker.tick() => {
+                    let action = {
+                        let mut sync = self.sync_manager.lock().unwrap();
+                        sync.on_tick()
+                    };
+                    if let Err(e) = self.execute_sync_action(action).await {
+                        warn!("failed to execute sync tick action: {e}");
                     }
                 }
                 _ = &mut shutdown => {
@@ -274,6 +297,103 @@ impl<T: Transport> Server<T> {
             .await
     }
 
+    fn refresh_sync_manager_local_state(&self) {
+        let mut sync = self.sync_manager.lock().unwrap();
+        sync.update_local_state(
+            self.chain.height(),
+            self.chain.header_height(),
+            self.chain.storage_tip(),
+        );
+        sync.update_local_header_tip(self.chain.best_header_tip());
+    }
+
+    fn build_header_locators(&self, max: usize) -> Vec<Hash> {
+        let mut locators = Vec::new();
+        let mut height = self.chain.header_height();
+        let mut step = 1u64;
+
+        loop {
+            if let Some(header) = self.chain.get_header_by_height(height) {
+                locators.push(header.header_hash(self.chain.id));
+            }
+            if height == 0 || locators.len() >= max {
+                break;
+            }
+            height = height.saturating_sub(step);
+            if locators.len() >= 10 {
+                step = step.saturating_mul(2);
+            }
+        }
+
+        locators
+    }
+
+    fn prepare_sync_reorg_if_needed(&self) -> Result<(), ServerError> {
+        let canonical_tip = self.chain.storage_tip();
+        let best_header_tip = self.chain.best_header_tip();
+
+        if best_header_tip == canonical_tip {
+            return Ok(());
+        }
+
+        // No meaningful header lead; keep the current chain and let future sync status/headers decide.
+        if self.chain.header_height() < self.chain.height() {
+            return Ok(());
+        }
+
+        let Some(lca) = self
+            .chain
+            .find_header_lca(canonical_tip, best_header_tip)
+            .map_err(ServerError::Storage)?
+        else {
+            return Ok(());
+        };
+
+        if lca == canonical_tip {
+            return Ok(());
+        }
+
+        let lca_height = self.chain.get_header(lca).map(|h| h.height).unwrap_or(0);
+        info!(
+            "sync rollback to lca: local_tip={} best_header_tip={} lca={} lca_height={}",
+            canonical_tip, best_header_tip, lca, lca_height
+        );
+        self.chain
+            .rollback_canonical_to(lca)
+            .map_err(ServerError::Storage)?;
+        self.refresh_sync_manager_local_state();
+        Ok(())
+    }
+
+    fn collect_missing_body_hashes(&self, target: u64, limit: u64) -> Vec<Hash> {
+        let start = self.chain.height().saturating_add(1);
+        if start > target {
+            return Vec::new();
+        }
+        let end = min(
+            target,
+            min(
+                self.chain.header_height(),
+                start.saturating_add(limit).saturating_sub(1),
+            ),
+        );
+        if start > end {
+            return Vec::new();
+        }
+
+        let mut hashes = Vec::with_capacity((end - start + 1) as usize);
+        for height in start..=end {
+            let Some(header) = self.chain.get_header_by_height(height) else {
+                break;
+            };
+            let hash = header.header_hash(self.chain.id);
+            if self.chain.get_block(hash).is_none() {
+                hashes.push(hash);
+            }
+        }
+        hashes
+    }
+
     /// Returns true if actively syncing (downloading headers/blocks/snapshots).
     fn is_syncing(&self) -> bool {
         let sync = self.sync_manager.lock().unwrap();
@@ -286,8 +406,13 @@ impl<T: Transport> Server<T> {
             SyncAction::RequestSyncStatus { peer } => {
                 self.send_get_sync_status_message(peer).await?;
             }
-            SyncAction::RequestHeaders { peer, start, end } => {
-                let msg = GetHeadersMessage { start, end };
+            SyncAction::RequestHeaders { peer, limit } => {
+                let locators = self.build_header_locators(32);
+                let msg = GetHeadersMessage {
+                    locators,
+                    stop_hash: Hash::zero(),
+                    limit,
+                };
                 let message = Message::new(MessageType::GetHeaders, msg.to_bytes());
                 self.transport
                     .send_message(peer, self.transport.peer_id(), message.to_bytes())
@@ -297,6 +422,53 @@ impl<T: Transport> Server<T> {
             SyncAction::RequestSnapshot { peer, height } => {
                 let msg = GetSnapshotStateMessage { height };
                 let message = Message::new(MessageType::GetSnapshotState, msg.to_bytes());
+                self.transport
+                    .send_message(peer, self.transport.peer_id(), message.to_bytes())
+                    .await
+                    .map_err(ServerError::Transport)?;
+            }
+            SyncAction::RequestBlockBodies {
+                peer,
+                target,
+                limit,
+            } => {
+                if let Err(e) = self.prepare_sync_reorg_if_needed() {
+                    warn!("failed to prepare sync reorg: {e}");
+                    let next_action = {
+                        let mut sync = self.sync_manager.lock().unwrap();
+                        sync.on_request_failed(peer)
+                    };
+                    return Box::pin(self.execute_sync_action(next_action)).await;
+                }
+
+                let hashes = self.collect_missing_body_hashes(target, limit);
+                if hashes.is_empty() {
+                    if self.chain.height() >= target {
+                        self.refresh_sync_manager_local_state();
+                        let next_action = {
+                            let mut sync = self.sync_manager.lock().unwrap();
+                            sync.on_blocks(peer, &[], self.chain.height())
+                        };
+                        return Box::pin(self.execute_sync_action(next_action)).await;
+                    }
+
+                    // Headers may have been truncated (e.g. after snapshot import). Fall back to
+                    // height-range block replay so sync can continue without local header hashes.
+                    let start = self.chain.height().saturating_add(1);
+                    let end = min(start.saturating_add(limit).saturating_sub(1), target);
+                    let msg = GetBlocksMessage { start, end };
+                    let message = Message::new(MessageType::GetBlocks, msg.to_bytes());
+                    self.transport
+                        .send_message(peer, self.transport.peer_id(), message.to_bytes())
+                        .await
+                        .map_err(ServerError::Transport)?;
+                    return Ok(());
+                }
+
+                let msg = GetBlockBodiesMessage {
+                    hashes: hashes.into_boxed_slice(),
+                };
+                let message = Message::new(MessageType::GetBlockBodies, msg.to_bytes());
                 self.transport
                     .send_message(peer, self.transport.peer_id(), message.to_bytes())
                     .await
@@ -465,12 +637,7 @@ impl<T: Transport> Server<T> {
             match self.chain.replay_from_last_snapshot() {
                 Ok(height) => {
                     info!("replayed from snapshot to height={height}");
-                    let mut sync = self.sync_manager.lock().unwrap();
-                    sync.update_local_state(
-                        self.chain.height(),
-                        self.chain.header_height(),
-                        self.chain.storage_tip(),
-                    );
+                    self.refresh_sync_manager_local_state();
                 }
                 Err(_) => {
                     let action = {
@@ -511,21 +678,14 @@ impl<T: Transport> Server<T> {
         self.tx_pool.remove_batch(&hashes);
 
         self.chain
-            .apply_block(block)
+            .ingest_block(block)
             .map_err(|e| ServerError::BlockRejected {
                 hash: header_hash,
                 source: e,
             })?;
 
         // Update sync manager with new local state
-        {
-            let mut sync = self.sync_manager.lock().unwrap();
-            sync.update_local_state(
-                self.chain.height(),
-                self.chain.header_height(),
-                self.chain.storage_tip(),
-            );
-        }
+        self.refresh_sync_manager_local_state();
 
         // Gossip to all peers except origin
         tokio::spawn(async move { self.broadcast(from, bytes, MessageType::Block).await });
@@ -541,13 +701,27 @@ impl<T: Transport> Server<T> {
             .chain
             .snapshot_heights()
             .map_err(ServerError::Storage)?;
+        let best_header_height = self.chain.header_height();
+        let best_header_tip = self.chain.best_header_tip();
+        let tip = self.chain.storage_tip();
+        let genesis_hash = self
+            .chain_params
+            .genesis
+            .build_genesis_block(self.chain.id)
+            .header_hash(self.chain.id);
 
         let status = SendSyncStatusMessage {
             version: 1,
+            genesis_hash,
+            chain_params_hash: self.chain_params.hash(),
             height: self.chain.height(),
-            tip: self.chain.storage_tip(),
+            tip,
+            best_header_height,
+            best_header_tip,
             finalized_height: self.chain.height(), // For now, treat all blocks as finalized
+            finalized_tip: tip,
             snapshot_heights,
+            capabilities: SYNC_CAP_HEADER_LOCATORS | SYNC_CAP_BLOCK_BODIES_BY_HASH,
         };
         let message = Message::new(MessageType::SendSyncStatus, status.to_bytes());
 
@@ -579,36 +753,42 @@ impl<T: Transport> Server<T> {
         req: GetHeadersMessage,
     ) -> Result<(), ServerError> {
         let current_header_height = self.chain.header_height();
-        let end = if req.end == 0 && req.start > 0 {
-            current_header_height
+        let max_headers = 500u64;
+        let limit = if req.limit == 0 {
+            max_headers
         } else {
-            req.end
+            req.limit.min(max_headers)
         };
 
-        // No headers to send; range is invalid
-        if req.start > end || end > current_header_height {
-            let msg = Message::new(
-                MessageType::SendHeaders,
-                SendHeadersMessage {
-                    headers: Box::new([]),
+        let start_height = req
+            .locators
+            .iter()
+            .find_map(|locator| {
+                let header = self.chain.get_header(*locator)?;
+                let canonical = self.chain.get_header_by_height(header.height)?;
+                if canonical.header_hash(self.chain.id) == *locator {
+                    Some(header.height.saturating_add(1))
+                } else {
+                    None
                 }
-                .to_bytes(),
-            );
-            return self
-                .transport
-                .send_message(from, self.transport.peer_id(), msg.to_bytes())
-                .await
-                .map_err(ServerError::Transport);
-        }
+            })
+            .unwrap_or(0);
 
-        // Collect headers in range
-        let mut headers = Vec::with_capacity((end - req.start + 1) as usize);
-        for height in req.start..=end {
-            if let Some(header) = self.chain.get_header_by_height(height) {
+        let mut headers = Vec::new();
+        if start_height <= current_header_height {
+            headers.reserve(limit.min(current_header_height - start_height + 1) as usize);
+            for (sent, height) in (start_height..=current_header_height).enumerate() {
+                if sent >= limit as usize {
+                    break;
+                }
+                let Some(header) = self.chain.get_header_by_height(height) else {
+                    break;
+                };
+                let header_hash = header.header_hash(self.chain.id);
                 headers.push(header);
-            } else {
-                // Header not found, send what we have
-                break;
+                if req.stop_hash != Hash::zero() && header_hash == req.stop_hash {
+                    break;
+                }
             }
         }
 
@@ -628,41 +808,36 @@ impl<T: Transport> Server<T> {
         from: PeerId,
         response: SendHeadersMessage,
     ) -> Result<(), ServerError> {
-        // Validate headers first before storing them
+        // Store and validate headers via the storage DAG first; SyncManager only orchestrates.
+        if !response.headers.is_empty()
+            && let Err(err) = self.chain.store_headers(&response.headers)
+        {
+            warn!("invalid headers from peer {from}: {err}");
+            let action = {
+                let mut sync = self.sync_manager.lock().unwrap();
+                sync.on_request_failed(from)
+            };
+            return self.execute_sync_action(action).await;
+        }
+
+        self.refresh_sync_manager_local_state();
+
         let action = {
             let mut sync = self.sync_manager.lock().unwrap();
-            sync.update_local_state(
-                self.chain.height(),
-                self.chain.header_height(),
-                self.chain.storage_tip(),
-            );
             sync.on_headers(from, &response.headers)
         };
 
         let action = match action {
             Ok(action) => action,
             Err(err) => {
-                warn!("invalid headers from peer {from}: {err:?}");
+                warn!("sync manager rejected headers from peer {from}: {err:?}");
                 let action = {
                     let mut sync = self.sync_manager.lock().unwrap();
-                    sync.trigger_resync()
+                    sync.on_request_failed(from)
                 };
                 return self.execute_sync_action(action).await;
             }
         };
-
-        // Store headers after validation
-        if !response.headers.is_empty() {
-            self.chain
-                .store_headers(&response.headers)
-                .map_err(ServerError::Storage)?;
-            let mut sync = self.sync_manager.lock().unwrap();
-            sync.update_local_state(
-                self.chain.height(),
-                self.chain.header_height(),
-                self.chain.storage_tip(),
-            );
-        }
 
         self.execute_sync_action(action).await
     }
@@ -782,7 +957,7 @@ impl<T: Transport> Server<T> {
                 break;
             }
 
-            if let Err(err) = self.chain.apply_block(block.clone()) {
+            if let Err(err) = self.chain.ingest_block(block.clone()) {
                 let err_str = err.to_string();
                 if err_str.contains("block already exists") {
                     // Block already applied, skip and continue
@@ -831,6 +1006,7 @@ impl<T: Transport> Server<T> {
                             self.chain.header_height(),
                             self.chain.storage_tip(),
                         );
+                        sync.update_local_header_tip(self.chain.best_header_tip());
                         sync.trigger_resync()
                     };
                     let _ = self.execute_sync_action(action).await;
@@ -839,7 +1015,7 @@ impl<T: Transport> Server<T> {
                 warn!("block apply failed during sync: {err}");
                 let action = {
                     let mut sync = self.sync_manager.lock().unwrap();
-                    sync.trigger_resync()
+                    sync.on_request_failed(from)
                 };
                 let _ = self.execute_sync_action(action).await;
                 return Ok(());
@@ -848,16 +1024,47 @@ impl<T: Transport> Server<T> {
         }
 
         // Update sync manager and get next action
+        self.refresh_sync_manager_local_state();
         let action = {
             let mut sync = self.sync_manager.lock().unwrap();
-            sync.update_local_state(
-                self.chain.height(),
-                self.chain.header_height(),
-                self.chain.storage_tip(),
-            );
             sync.on_blocks(from, &response.blocks, last_applied_height)
         };
         self.execute_sync_action(action).await
+    }
+
+    /// Handles a block-bodies-by-hash request.
+    async fn process_get_block_bodies_message(
+        self: Arc<Self>,
+        from: PeerId,
+        req: GetBlockBodiesMessage,
+    ) -> Result<(), ServerError> {
+        let blocks = req
+            .hashes
+            .iter()
+            .filter_map(|hash| self.chain.get_block(*hash).map(|b| b.as_ref().clone()))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let response = SendBlockBodiesMessage { blocks };
+        let msg = Message::new(MessageType::SendBlockBodies, response.to_bytes());
+        self.transport
+            .send_message(from, self.transport.peer_id(), msg.to_bytes())
+            .await
+            .map_err(ServerError::Transport)
+    }
+
+    /// Handles a block-bodies-by-hash response using the same sync path as range block responses.
+    async fn process_send_block_bodies_message(
+        self: Arc<Self>,
+        from: PeerId,
+        response: SendBlockBodiesMessage,
+    ) -> Result<(), ServerError> {
+        self.process_send_blocks_message(
+            from,
+            SendBlocksMessage {
+                blocks: response.blocks,
+            },
+        )
+        .await
     }
 
     /// Handles a snapshot state request by exporting state at the requested height.
@@ -1029,15 +1236,11 @@ impl<T: Transport> Server<T> {
         };
 
         // Notify sync manager and get next action
+        if success {
+            self.refresh_sync_manager_local_state();
+        }
         let action = {
             let mut sync = self.sync_manager.lock().unwrap();
-            if success {
-                sync.update_local_state(
-                    self.chain.height(),
-                    self.chain.header_height(),
-                    self.chain.storage_tip(),
-                );
-            }
             sync.on_snapshot_received(from, response.height, success)
         };
         self.execute_sync_action(action).await
@@ -1080,6 +1283,14 @@ impl<T: Transport> RpcProcessor for Server<T> {
                 }
                 DecodedMessageData::SendBlocks(response) => {
                     self.process_send_blocks_message(decoded_message.peer_id, response)
+                        .await
+                }
+                DecodedMessageData::GetBlockBodies(request) => {
+                    self.process_get_block_bodies_message(decoded_message.peer_id, request)
+                        .await
+                }
+                DecodedMessageData::SendBlockBodies(response) => {
+                    self.process_send_block_bodies_message(decoded_message.peer_id, response)
                         .await
                 }
                 DecodedMessageData::GetSnapshotState(request) => {
@@ -1161,6 +1372,22 @@ fn handle_rpc(rpc: Rpc) -> Result<DecodedMessage, RpcError> {
             Ok(DecodedMessage {
                 peer_id: rpc.peer_id,
                 data: DecodedMessageData::SendBlocks(send_blocks_msg),
+            })
+        }
+        MessageType::GetBlockBodies => {
+            let get_block_bodies_msg = GetBlockBodiesMessage::from_bytes(msg.data.as_ref())
+                .map_err(|e| RpcError::Decode(format!("{e:?}")))?;
+            Ok(DecodedMessage {
+                peer_id: rpc.peer_id,
+                data: DecodedMessageData::GetBlockBodies(get_block_bodies_msg),
+            })
+        }
+        MessageType::SendBlockBodies => {
+            let send_block_bodies_msg = SendBlockBodiesMessage::from_bytes(msg.data.as_ref())
+                .map_err(|e| RpcError::Decode(format!("{e:?}")))?;
+            Ok(DecodedMessage {
+                peer_id: rpc.peer_id,
+                data: DecodedMessageData::SendBlockBodies(send_block_bodies_msg),
             })
         }
         MessageType::GetSnapshotState => {
@@ -1251,6 +1478,26 @@ pub mod tests {
 
     fn build_tx(data: &[u8], key: PrivateKey) -> Transaction {
         new_tx(Bytes::new(data), key, TEST_CHAIN_ID)
+    }
+
+    fn make_sync_status(
+        height: u64,
+        tip: Hash,
+        snapshot_heights: Vec<u64>,
+    ) -> SendSyncStatusMessage {
+        SendSyncStatusMessage {
+            version: 1,
+            genesis_hash: Hash::zero(),
+            chain_params_hash: Hash::zero(),
+            height,
+            tip,
+            best_header_height: height,
+            best_header_tip: tip,
+            finalized_height: height,
+            finalized_tip: tip,
+            snapshot_heights,
+            capabilities: 0,
+        }
     }
 
     fn build_header_chain(start: u64, end: u64, mut prev_hash: Hash) -> Vec<Header> {
@@ -1461,13 +1708,7 @@ pub mod tests {
     #[test]
     fn handle_rpc_decodes_send_sync_status() {
         let peer = addr();
-        let status = SendSyncStatusMessage {
-            version: 1,
-            height: 100,
-            tip: Hash::zero(),
-            finalized_height: 100,
-            snapshot_heights: vec![],
-        };
+        let status = make_sync_status(100, Hash::zero(), vec![]);
         let msg = Message::new(MessageType::SendSyncStatus, status.to_bytes());
         let rpc = test_rpc(peer, msg.to_bytes());
         let result = handle_rpc(rpc).expect("should decode");
@@ -1637,13 +1878,11 @@ pub mod tests {
         let server_a = default_server(tr_a.clone()).await;
 
         // Both nodes at height 0 (new nodes) - sync completes immediately
-        let status = SendSyncStatusMessage {
-            version: 1,
-            height: 0,
-            tip: server_a.chain.storage_tip(), // Same tip means already in sync
-            finalized_height: 0,
-            snapshot_heights: vec![],
-        };
+        let status = make_sync_status(
+            0,
+            server_a.chain.storage_tip(), // Same tip means already in sync
+            vec![],
+        );
 
         let result = server_a
             .clone()
@@ -1666,13 +1905,7 @@ pub mod tests {
         let mut rx_b = tr_b.consume().await;
 
         // Peer reports height 5, ahead of our genesis-only chain (height 0)
-        let status = SendSyncStatusMessage {
-            version: 1,
-            height: 5,
-            tip: Hash::zero(),
-            finalized_height: 5,
-            snapshot_heights: vec![],
-        };
+        let status = make_sync_status(5, Hash::zero(), vec![]);
 
         server_a
             .clone()
@@ -1686,7 +1919,8 @@ pub mod tests {
         assert!(matches!(msg.header, MessageType::GetHeaders));
 
         let get_headers = GetHeadersMessage::from_bytes(&msg.data).expect("decode GetHeaders");
-        assert_eq!(get_headers.start, 1); // Start from height 1 (after genesis)
+        assert_eq!(get_headers.limit, 500); // SyncManager requests the capped header batch size
+        assert!(!get_headers.locators.is_empty()); // Starts after our current tip/genesis locator
     }
 
     #[tokio::test]
@@ -1928,7 +2162,8 @@ pub mod tests {
         let msg = Message::from_bytes(&rpc.payload).expect("decode");
         assert!(matches!(msg.header, MessageType::GetHeaders));
         let get_headers = GetHeadersMessage::from_bytes(&msg.data).expect("decode GetHeaders");
-        assert_eq!(get_headers.start, 1);
+        assert_eq!(get_headers.limit, 500);
+        assert!(!get_headers.locators.is_empty());
 
         // Established processes GetHeaders and sends SendHeaders
         server_established
@@ -1951,34 +2186,39 @@ pub mod tests {
             .await
             .unwrap();
 
-        // Established receives GetBlocks
+        // Established receives GetBlockBodies
         let rpc = rx_established
             .recv()
             .await
-            .expect("should receive GetBlocks");
+            .expect("should receive GetBlockBodies");
         let msg = Message::from_bytes(&rpc.payload).expect("decode");
-        assert!(matches!(msg.header, MessageType::GetBlocks));
-        let get_blocks = GetBlocksMessage::from_bytes(&msg.data).expect("decode GetBlocks");
-        assert_eq!(get_blocks.start, 1);
+        assert!(matches!(msg.header, MessageType::GetBlockBodies));
+        let get_bodies =
+            GetBlockBodiesMessage::from_bytes(&msg.data).expect("decode GetBlockBodies");
+        assert_eq!(get_bodies.hashes.len(), 3);
 
-        // Established processes GetBlocks and sends SendBlocks
+        // Established processes GetBlockBodies and sends SendBlockBodies
         server_established
             .clone()
-            .process_get_blocks_message(tr_late.peer_id(), get_blocks)
+            .process_get_block_bodies_message(tr_late.peer_id(), get_bodies)
             .await
             .unwrap();
 
-        // Late receives SendBlocks
-        let rpc = rx_late.recv().await.expect("should receive SendBlocks");
+        // Late receives SendBlockBodies
+        let rpc = rx_late
+            .recv()
+            .await
+            .expect("should receive SendBlockBodies");
         let msg = Message::from_bytes(&rpc.payload).expect("decode");
-        assert!(matches!(msg.header, MessageType::SendBlocks));
-        let send_blocks = SendBlocksMessage::from_bytes(&msg.data).expect("decode SendBlocks");
-        assert_eq!(send_blocks.blocks.len(), 3);
+        assert!(matches!(msg.header, MessageType::SendBlockBodies));
+        let send_bodies =
+            SendBlockBodiesMessage::from_bytes(&msg.data).expect("decode SendBlockBodies");
+        assert_eq!(send_bodies.blocks.len(), 3);
 
-        // Late processes SendBlocks - this should sync all 3 blocks
+        // Late processes SendBlockBodies - this should sync all 3 blocks
         server_late
             .clone()
-            .process_send_blocks_message(tr_established.peer_id(), send_blocks)
+            .process_send_block_bodies_message(tr_established.peer_id(), send_bodies)
             .await
             .unwrap();
 
@@ -2288,13 +2528,7 @@ pub mod tests {
         let peer = tr_b.peer_id();
 
         // Trigger header sync state and then transition to snapshot loading
-        let status = SendSyncStatusMessage {
-            version: 1,
-            height: 20,
-            tip: Hash::zero(),
-            finalized_height: 20,
-            snapshot_heights: vec![10],
-        };
+        let status = make_sync_status(20, Hash::zero(), vec![10]);
         server_a
             .clone()
             .process_send_sync_status_message(peer, status)
@@ -2367,13 +2601,7 @@ pub mod tests {
         let peer = tr_b.peer_id();
         let mut rx_b = tr_b.consume().await;
 
-        let status = SendSyncStatusMessage {
-            version: 1,
-            height: 20,
-            tip: Hash::zero(),
-            finalized_height: 20,
-            snapshot_heights: vec![10],
-        };
+        let status = make_sync_status(20, Hash::zero(), vec![10]);
         server_a
             .clone()
             .process_send_sync_status_message(peer, status)
@@ -2447,13 +2675,7 @@ pub mod tests {
         let peer = tr_b.peer_id();
         let mut rx_b = tr_b.consume().await;
 
-        let status = SendSyncStatusMessage {
-            version: 1,
-            height: 20,
-            tip: Hash::zero(),
-            finalized_height: 20,
-            snapshot_heights: vec![10],
-        };
+        let status = make_sync_status(20, Hash::zero(), vec![10]);
         server_a
             .clone()
             .process_send_sync_status_message(peer, status)
@@ -2517,13 +2739,7 @@ pub mod tests {
         let peer = tr_b.peer_id();
         let mut rx_b = tr_b.consume().await;
 
-        let status = SendSyncStatusMessage {
-            version: 1,
-            height: 20,
-            tip: Hash::zero(),
-            finalized_height: 20,
-            snapshot_heights: vec![10],
-        };
+        let status = make_sync_status(20, Hash::zero(), vec![10]);
         server_a
             .clone()
             .process_send_sync_status_message(peer, status)
@@ -2646,13 +2862,7 @@ pub mod tests {
         let peer = tr_b.peer_id();
         let mut rx_b = tr_b.consume().await;
 
-        let status = SendSyncStatusMessage {
-            version: 1,
-            height: 20,
-            tip: Hash::zero(),
-            finalized_height: 20,
-            snapshot_heights: vec![10],
-        };
+        let status = make_sync_status(20, Hash::zero(), vec![10]);
         server_a
             .clone()
             .process_send_sync_status_message(peer, status)
@@ -2855,7 +3065,8 @@ pub mod tests {
         let snapshot =
             SendSnapshotStateMessage::from_bytes(&msg.data).expect("decode SendSnapshotState");
 
-        // Late imports snapshot -> requests blocks after snapshot height
+        // Late imports snapshot -> requests blocks after snapshot height (header hashes are not
+        // retained across snapshot import, so sync falls back to range replay here).
         server_late
             .clone()
             .process_send_snapshot_state_message(tr_established.peer_id(), snapshot)

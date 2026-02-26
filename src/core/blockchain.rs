@@ -195,6 +195,50 @@ impl Blockchain<BlockValidator, RocksDbStorage> {
         self.storage.store_headers(headers, self.id)
     }
 
+    /// Returns the best known header tip hash (header DAG tip), falling back to canonical tip.
+    pub fn best_header_tip(&self) -> Hash {
+        self.storage
+            .header_tip()
+            .unwrap_or_else(|| self.storage.tip())
+    }
+
+    /// Finds the lowest common ancestor of two known headers in the header DAG.
+    pub fn find_header_lca(&self, a: Hash, b: Hash) -> Result<Option<Hash>, StorageError> {
+        self.storage.find_lca(a, b)
+    }
+
+    /// Rolls back the canonical chain tip to `target_tip` using persisted undo records.
+    ///
+    /// This is a conservative helper used by sync catchup before replaying a better header branch.
+    pub fn rollback_canonical_to(&self, target_tip: Hash) -> Result<(), StorageError> {
+        if self.storage_tip() == target_tip {
+            return Ok(());
+        }
+        if self.get_header(target_tip).is_none() {
+            return Err(StorageError::ValidationFailed(format!(
+                "rollback target header not found: {target_tip}"
+            )));
+        }
+
+        while self.storage_tip() != target_tip {
+            let current = self.storage_tip();
+            self.storage.apply_reorg_disconnect(current)?;
+        }
+        Ok(())
+    }
+
+    /// Ingests a block body into the canonical execution path during sync/catchup.
+    ///
+    /// Currently this is a thin wrapper over `apply_block` that treats already-stored bodies as a
+    /// no-op and preserves all block/receipt validation (including `receipt_root` checks).
+    pub fn ingest_block(&self, block: Block) -> Result<(), StorageError> {
+        let hash = block.header_hash(self.id);
+        if self.has_block(hash) {
+            return Ok(());
+        }
+        self.apply_block(block)
+    }
+
     /// Resets to the nearest snapshot and replays stored block bodies forward.
     ///
     /// Reads all needed block bodies into memory before resetting state, since

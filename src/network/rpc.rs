@@ -6,8 +6,9 @@
 use crate::core::block::Block;
 use crate::core::transaction::Transaction;
 use crate::network::message::{
-    GetBlocksMessage, GetHeadersMessage, GetSnapshotStateMessage, SendBlocksMessage,
-    SendHeadersMessage, SendSnapshotStateMessage, SendSyncStatusMessage,
+    GetBlockBodiesMessage, GetBlocksMessage, GetHeadersMessage, GetSnapshotStateMessage,
+    SendBlockBodiesMessage, SendBlocksMessage, SendHeadersMessage, SendSnapshotStateMessage,
+    SendSyncStatusMessage,
 };
 use crate::types::bytes::Bytes;
 use crate::types::hash::Hash;
@@ -79,6 +80,10 @@ pub enum DecodedMessageData {
     GetBlocks(GetBlocksMessage),
     /// Block range response.
     SendBlocks(SendBlocksMessage),
+    /// Block bodies-by-hash request from a peer.
+    GetBlockBodies(GetBlockBodiesMessage),
+    /// Block bodies-by-hash response.
+    SendBlockBodies(SendBlockBodiesMessage),
     /// Snapshot state request from a peer.
     GetSnapshotState(GetSnapshotStateMessage),
     /// Snapshot state response containing full state.

@@ -203,58 +203,63 @@ Status note:
 
 ### Patch 10: Protocol / Message / RPC Extensions (Fork-Aware Sync)
 
-- [ ] Extend `SendSyncStatusMessage` with:
-  - [ ] `genesis_hash`
-  - [ ] `chain_params_hash`
-  - [ ] `best_header_height`
-  - [ ] `best_header_tip`
-  - [ ] `finalized_tip`
-  - [ ] capability flags
-- [ ] Replace height-range `GetHeadersMessage` with locator-based request:
-  - [ ] `locators`
-  - [ ] `stop_hash`
-  - [ ] `limit`
-- [ ] Add body-by-hash messages:
-  - [ ] `GetBlockBodiesMessage`
-  - [ ] `SendBlockBodiesMessage`
-- [ ] Update `DecodedMessageData` in `rpc.rs`
-- [ ] Update `handle_rpc(...)` decoding in `server.rs`
-- [ ] Add/adjust serialization tests
-- [ ] No receipt sync messages (receipt root is locally verified from execution)
+- [x] Extend `SendSyncStatusMessage` with:
+  - [x] `genesis_hash`
+  - [x] `chain_params_hash`
+  - [x] `best_header_height`
+  - [x] `best_header_tip`
+  - [x] `finalized_tip`
+  - [x] capability flags
+- [x] Replace height-range `GetHeadersMessage` with locator-based request:
+  - [x] `locators`
+  - [x] `stop_hash`
+  - [x] `limit`
+- [x] Add body-by-hash messages:
+  - [x] `GetBlockBodiesMessage`
+  - [x] `SendBlockBodiesMessage`
+- [x] Update `DecodedMessageData` in `rpc.rs`
+- [x] Update `handle_rpc(...)` decoding in `server.rs`
+- [x] Add/adjust serialization tests
+- [x] No receipt sync messages (receipt root is locally verified from execution)
 
 ### Patch 11: `SyncManager` v2 (Locator Headers + Bodies + Retries)
 
-- [ ] Refactor `SyncAction` to locator/body-by-hash actions
-- [ ] Add in-flight request tracking:
-  - [ ] request kind
-  - [ ] peer
-  - [ ] timeout
-  - [ ] retries
-- [ ] Add backoff/failover and peer sync metadata
-- [ ] Remove linear-tip-only header validation assumptions from `SyncManager`
-- [ ] Add `on_tick(...)` for timeouts/retries
-- [ ] Let server/storage validate/store headers; `SyncManager` orchestrates only
-- [ ] Expand `sync.rs` state-machine tests
+- [x] Refactor `SyncAction` to locator/body-by-hash actions
+- [x] Add in-flight request tracking:
+  - [x] request kind
+  - [x] peer
+  - [x] timeout
+  - [x] retries
+- [x] Add backoff/failover and peer sync metadata
+- [x] Remove linear-tip-only header validation assumptions from `SyncManager`
+- [x] Add `on_tick(...)` for timeouts/retries
+- [x] Let server/storage validate/store headers; `SyncManager` orchestrates only
+- [x] Expand `sync.rs` state-machine tests
 
 ### Patch 12: Server Sync Integration (Locator + DAG + Reorg-Safe Catchup)
 
-- [ ] Update `execute_sync_action(...)` for new sync actions
-- [ ] `process_get_sync_status_message(...)` sends new chain params/genesis hashes
-- [ ] `process_get_headers_message(...)`:
-  - [ ] locator matching
-  - [ ] canonical continuation
-  - [ ] response caps
-- [ ] `process_send_headers_message(...)`:
-  - [ ] DAG store headers
-  - [ ] schedule missing body downloads by hash
-- [ ] Add:
-  - [ ] `process_get_block_bodies_message(...)`
-  - [ ] `process_send_block_bodies_message(...)`
-- [ ] Integrate `Blockchain::ingest_block(...)` / reorg-safe application
-- [ ] Preserve `receipt_root` validation through blockchain execution path
-- [ ] Update integration tests for new sync flow
-- [ ] `cargo check -q`
+- [x] Update `execute_sync_action(...)` for new sync actions
+- [x] `process_get_sync_status_message(...)` sends new chain params/genesis hashes
+- [x] `process_get_headers_message(...)`:
+  - [x] locator matching
+  - [x] canonical continuation
+  - [x] response caps
+- [x] `process_send_headers_message(...)`:
+  - [x] DAG store headers
+  - [x] schedule missing body downloads by hash
+- [x] Add:
+  - [x] `process_get_block_bodies_message(...)`
+  - [x] `process_send_block_bodies_message(...)`
+- [x] Integrate `Blockchain::ingest_block(...)` / reorg-safe application
+- [x] Preserve `receipt_root` validation through blockchain execution path
+- [x] Update integration tests for new sync flow
+- [x] `cargo check -q`
 - [ ] Commit: `Add locator-based header sync and reorg-safe body catchup`
+
+Implementation note:
+
+- Snapshot import resets local `HEADER_TIP`, so post-snapshot catchup falls back to range `GetBlocks`
+  when local header hashes are unavailable. Non-snapshot header-first catchup uses body-by-hash.
 
 ## Commit Group 5 (Patches 13-14)
 

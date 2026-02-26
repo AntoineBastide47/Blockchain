@@ -8,6 +8,13 @@ use crate::types::bytes::Bytes;
 use crate::types::hash::Hash;
 use blockchain_derive::BinaryCodec;
 
+/// Sync protocol capability bitflags advertised via [`SendSyncStatusMessage`].
+pub type SyncCapabilities = u64;
+/// Supports locator-based header requests (`GetHeadersMessage`).
+pub const SYNC_CAP_HEADER_LOCATORS: SyncCapabilities = 1 << 0;
+/// Supports requesting block bodies by hash (`GetBlockBodiesMessage`).
+pub const SYNC_CAP_BLOCK_BODIES_BY_HASH: SyncCapabilities = 1 << 1;
+
 /// Discriminant for message payload types.
 ///
 /// Used as a header to identify how to deserialize the message body.
@@ -33,6 +40,10 @@ pub enum MessageType {
     GetSnapshotState,
     /// Response containing a full state snapshot.
     SendSnapshotState,
+    /// Request for block bodies by hash.
+    GetBlockBodies,
+    /// Response containing block bodies for requested hashes.
+    SendBlockBodies,
 }
 
 /// Framed message with type header and serialized payload.
@@ -62,23 +73,37 @@ impl Message {
 pub struct SendSyncStatusMessage {
     /// Protocol version number.
     pub version: u32,
+    /// Genesis block hash (network compatibility check).
+    pub genesis_hash: Hash,
+    /// Deterministic hash of chain parameters.
+    pub chain_params_hash: Hash,
     /// Current blockchain height (highest block).
     pub height: u64,
     /// Current tip hash.
     pub tip: Hash,
+    /// Highest known header height (may exceed block height during header-first sync).
+    pub best_header_height: u64,
+    /// Hash of the best known header tip.
+    pub best_header_tip: Hash,
     /// Highest finalized height (for PoS chains).
     pub finalized_height: u64,
+    /// Hash of the finalized tip.
+    pub finalized_tip: Hash,
     /// Available snapshot heights this peer can serve.
     pub snapshot_heights: Vec<u64>,
+    /// Supported sync protocol capabilities.
+    pub capabilities: SyncCapabilities,
 }
 
-/// Request message to retrieve a range of headers from a peer.
+/// Request message to retrieve headers using block locators.
 #[derive(Debug, BinaryCodec)]
 pub struct GetHeadersMessage {
-    /// Starting block height (inclusive).
-    pub start: u64,
-    /// Ending block height (inclusive). When 0, retrieves to tip.
-    pub end: u64,
+    /// Locator hashes ordered newest -> oldest.
+    pub locators: Vec<Hash>,
+    /// Optional stop hash (all-zero hash means "no stop hash").
+    pub stop_hash: Hash,
+    /// Maximum headers to return (0 => responder default cap).
+    pub limit: u64,
 }
 
 /// Response message containing requested headers.
@@ -101,6 +126,20 @@ pub struct GetBlocksMessage {
 #[derive(Debug, BinaryCodec)]
 pub struct SendBlocksMessage {
     /// Blocks in ascending height order.
+    pub blocks: Box<[Block]>,
+}
+
+/// Request message to retrieve block bodies by hash.
+#[derive(Debug, BinaryCodec)]
+pub struct GetBlockBodiesMessage {
+    /// Requested block hashes.
+    pub hashes: Box<[Hash]>,
+}
+
+/// Response message containing block bodies for requested hashes.
+#[derive(Debug, BinaryCodec)]
+pub struct SendBlockBodiesMessage {
+    /// Resolved block bodies in request order.
     pub blocks: Box<[Block]>,
 }
 
@@ -178,6 +217,8 @@ mod tests {
         let send_blocks_msg = Message::new(MessageType::SendBlocks, vec![]);
         let get_snapshot_msg = Message::new(MessageType::GetSnapshotState, vec![]);
         let send_snapshot_msg = Message::new(MessageType::SendSnapshotState, vec![]);
+        let get_block_bodies_msg = Message::new(MessageType::GetBlockBodies, vec![]);
+        let send_block_bodies_msg = Message::new(MessageType::SendBlockBodies, vec![]);
 
         let tx_bytes = tx_msg.to_bytes();
         let block_bytes = block_msg.to_bytes();
@@ -189,6 +230,8 @@ mod tests {
         let send_blocks_bytes = send_blocks_msg.to_bytes();
         let get_snapshot_bytes = get_snapshot_msg.to_bytes();
         let send_snapshot_bytes = send_snapshot_msg.to_bytes();
+        let get_block_bodies_bytes = get_block_bodies_msg.to_bytes();
+        let send_block_bodies_bytes = send_block_bodies_msg.to_bytes();
 
         // First byte is the discriminant
         assert_eq!(tx_bytes[0], 0, "Transaction discriminant should be 0");
@@ -222,37 +265,79 @@ mod tests {
             send_snapshot_bytes[0], 9,
             "SendSnapshotState discriminant should be 9"
         );
+        assert_eq!(
+            get_block_bodies_bytes[0], 10,
+            "GetBlockBodies discriminant should be 10"
+        );
+        assert_eq!(
+            send_block_bodies_bytes[0], 11,
+            "SendBlockBodies discriminant should be 11"
+        );
     }
 
     #[test]
     fn send_sync_status_message_roundtrip() {
         let msg = SendSyncStatusMessage {
             version: 1,
+            genesis_hash: Hash::from_slice(&[0x11u8; 32]).unwrap(),
+            chain_params_hash: Hash::from_slice(&[0x22u8; 32]).unwrap(),
             height: 1000,
             tip: Hash::zero(),
+            best_header_height: 1005,
+            best_header_tip: Hash::from_slice(&[0x33u8; 32]).unwrap(),
             finalized_height: 990,
+            finalized_tip: Hash::from_slice(&[0x44u8; 32]).unwrap(),
             snapshot_heights: vec![100, 200, 300],
+            capabilities: SYNC_CAP_HEADER_LOCATORS | SYNC_CAP_BLOCK_BODIES_BY_HASH,
         };
 
         let bytes = msg.to_bytes();
         let decoded = SendSyncStatusMessage::from_bytes(&bytes).expect("decode failed");
 
         assert_eq!(decoded.version, 1);
+        assert_eq!(
+            decoded.genesis_hash,
+            Hash::from_slice(&[0x11u8; 32]).unwrap()
+        );
+        assert_eq!(
+            decoded.chain_params_hash,
+            Hash::from_slice(&[0x22u8; 32]).unwrap()
+        );
         assert_eq!(decoded.height, 1000);
         assert_eq!(decoded.tip, Hash::zero());
+        assert_eq!(decoded.best_header_height, 1005);
+        assert_eq!(
+            decoded.best_header_tip,
+            Hash::from_slice(&[0x33u8; 32]).unwrap()
+        );
         assert_eq!(decoded.finalized_height, 990);
+        assert_eq!(
+            decoded.finalized_tip,
+            Hash::from_slice(&[0x44u8; 32]).unwrap()
+        );
         assert_eq!(decoded.snapshot_heights, vec![100, 200, 300]);
+        assert_eq!(
+            decoded.capabilities,
+            SYNC_CAP_HEADER_LOCATORS | SYNC_CAP_BLOCK_BODIES_BY_HASH
+        );
     }
 
     #[test]
     fn get_headers_message_roundtrip() {
-        let msg = GetHeadersMessage { start: 5, end: 15 };
+        let msg = GetHeadersMessage {
+            locators: vec![Hash::zero(), Hash::from_slice(&[1u8; 32]).unwrap()],
+            stop_hash: Hash::from_slice(&[2u8; 32]).unwrap(),
+            limit: 15,
+        };
 
         let bytes = msg.to_bytes();
         let decoded = GetHeadersMessage::from_bytes(&bytes).expect("decode failed");
 
-        assert_eq!(decoded.start, 5);
-        assert_eq!(decoded.end, 15);
+        assert_eq!(decoded.locators.len(), 2);
+        assert_eq!(decoded.locators[0], Hash::zero());
+        assert_eq!(decoded.locators[1], Hash::from_slice(&[1u8; 32]).unwrap());
+        assert_eq!(decoded.stop_hash, Hash::from_slice(&[2u8; 32]).unwrap());
+        assert_eq!(decoded.limit, 15);
     }
 
     #[test]
@@ -295,6 +380,20 @@ mod tests {
     }
 
     #[test]
+    fn get_block_bodies_message_roundtrip() {
+        let msg = GetBlockBodiesMessage {
+            hashes: vec![Hash::zero(), Hash::from_slice(&[7u8; 32]).unwrap()].into_boxed_slice(),
+        };
+
+        let bytes = msg.to_bytes();
+        let decoded = GetBlockBodiesMessage::from_bytes(&bytes).expect("decode failed");
+
+        assert_eq!(decoded.hashes.len(), 2);
+        assert_eq!(decoded.hashes[0], Hash::zero());
+        assert_eq!(decoded.hashes[1], Hash::from_slice(&[7u8; 32]).unwrap());
+    }
+
+    #[test]
     fn send_blocks_message_empty() {
         let msg = SendBlocksMessage {
             blocks: Box::new([]),
@@ -317,6 +416,29 @@ mod tests {
 
         let bytes = msg.to_bytes();
         let decoded = SendBlocksMessage::from_bytes(&bytes).expect("decode failed");
+
+        assert_eq!(decoded.blocks.len(), 2);
+        assert_eq!(
+            decoded.blocks[0].header_hash(TEST_CHAIN_ID),
+            block1.header_hash(TEST_CHAIN_ID)
+        );
+        assert_eq!(
+            decoded.blocks[1].header_hash(TEST_CHAIN_ID),
+            block2.header_hash(TEST_CHAIN_ID)
+        );
+    }
+
+    #[test]
+    fn send_block_bodies_message_with_blocks() {
+        let block1 = create_test_block(1, Hash::zero(), TEST_CHAIN_ID);
+        let block2 = create_test_block(2, block1.header_hash(TEST_CHAIN_ID), TEST_CHAIN_ID);
+
+        let msg = SendBlockBodiesMessage {
+            blocks: vec![block1.clone(), block2.clone()].into_boxed_slice(),
+        };
+
+        let bytes = msg.to_bytes();
+        let decoded = SendBlockBodiesMessage::from_bytes(&bytes).expect("decode failed");
 
         assert_eq!(decoded.blocks.len(), 2);
         assert_eq!(

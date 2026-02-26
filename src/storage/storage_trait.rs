@@ -10,6 +10,9 @@ use crate::virtual_machine::errors::VMError;
 use blockchain_derive::Error;
 use std::sync::Arc;
 
+/// Canonical storage state write entry `(key, value)` where `None` means delete.
+pub type StateWrite = (Hash, Option<Vec<u8>>);
+
 /// Errors that can occur while interacting with storage backends.
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -90,4 +93,31 @@ pub trait Storage: Send + Sync {
 
     /// Returns the hash of the current chain tip.
     fn tip(&self) -> Hash;
+}
+
+/// Optional fork-aware storage primitives used by header DAG tracking and reorg logic.
+///
+/// This trait extends [`Storage`] without forcing all call sites to depend on
+/// fork/reorg-specific methods immediately.
+pub trait ForkStore: Storage {
+    /// Returns the canonical header hash at `height`, if present.
+    fn canonical_hash_at_height(&self, height: u64) -> Option<Hash>;
+
+    /// Finds the lowest common ancestor of two known headers, if both can be resolved.
+    fn find_lca(&self, a: Hash, b: Hash) -> Result<Option<Hash>, StorageError>;
+
+    /// Captures prior values for the given state keys before a canonical state transition.
+    ///
+    /// Implementations return `(key, previous_value)` tuples suitable for embedding in
+    /// backend-specific undo records.
+    fn capture_state_undo(
+        &self,
+        state_writes: &[StateWrite],
+    ) -> Result<Vec<StateWrite>, StorageError>;
+
+    /// Marks the start of a reorg operation for crash recovery.
+    fn begin_reorg_marker(&self, marker: Vec<u8>) -> Result<(), StorageError>;
+
+    /// Clears any persisted in-progress reorg marker.
+    fn clear_reorg_marker(&self) -> Result<(), StorageError>;
 }

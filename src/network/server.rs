@@ -1191,7 +1191,8 @@ pub mod tests {
     use crate::network::rpc::Rpc;
     use crate::network::sync::SyncState;
     use crate::storage::rocksdb_storage::{
-        CF_BLOCKS, CF_HEADERS, CF_META, CF_RECEIPTS, CF_SNAPSHOTS, CF_STATE,
+        CF_BLOCKS, CF_BRANCH_TIPS, CF_CANONICAL_INDEX, CF_HEADER_META, CF_HEADERS, CF_META,
+        CF_PARENT_CHILDREN, CF_RECEIPTS, CF_REORG, CF_SNAPSHOTS, CF_STATE, CF_UNDO,
     };
     use crate::utils::test_utils::utils::{new_tx, test_rpc};
     use crate::virtual_machine::vm::BLOCK_GAS_LIMIT;
@@ -1216,6 +1217,12 @@ pub mod tests {
             ColumnFamilyDescriptor::new(CF_STATE, Options::default()),
             ColumnFamilyDescriptor::new(CF_SNAPSHOTS, Options::default()),
             ColumnFamilyDescriptor::new(CF_RECEIPTS, Options::default()),
+            ColumnFamilyDescriptor::new(CF_HEADER_META, Options::default()),
+            ColumnFamilyDescriptor::new(CF_CANONICAL_INDEX, Options::default()),
+            ColumnFamilyDescriptor::new(CF_BRANCH_TIPS, Options::default()),
+            ColumnFamilyDescriptor::new(CF_PARENT_CHILDREN, Options::default()),
+            ColumnFamilyDescriptor::new(CF_UNDO, Options::default()),
+            ColumnFamilyDescriptor::new(CF_REORG, Options::default()),
         ];
 
         // Leak the tempdir to keep it alive for the duration of the test

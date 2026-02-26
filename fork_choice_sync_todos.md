@@ -125,71 +125,79 @@ Status note:
 
 ### Patch 6: Fork-Aware Storage Schema Groundwork (Receipt-Aware)
 
-- [ ] Add new RocksDB CF constants in `src/storage/rocksdb_storage.rs`:
-  - [ ] `CF_HEADER_META`
-  - [ ] `CF_CANONICAL_INDEX`
-  - [ ] `CF_BRANCH_TIPS`
-  - [ ] `CF_PARENT_CHILDREN`
-  - [ ] `CF_UNDO`
-  - [ ] `CF_REORG`
-- [ ] Keep and preserve `CF_RECEIPTS`
-- [ ] Add new meta keys:
-  - [ ] finalized tip/height
-  - [ ] reorg progress marker
-  - [ ] explicit canonical tip marker (if separate from `TIP`)
-- [ ] Add serialized storage structs:
-  - [ ] `HeaderMetaRecord`
-  - [ ] `ChainScore`
-  - [ ] `BranchTipRecord`
-  - [ ] `UndoRecord`
-  - [ ] `ReorgProgressRecord`
-- [ ] Update DB CF registrations in:
-  - [ ] `src/main.rs`
-  - [ ] `src/network/server.rs` test DB helper
-- [ ] Document receipt semantics for reorgs (canonical-only recommended)
+- [x] Add new RocksDB CF constants in `src/storage/rocksdb_storage.rs`:
+  - [x] `CF_HEADER_META`
+  - [x] `CF_CANONICAL_INDEX`
+  - [x] `CF_BRANCH_TIPS`
+  - [x] `CF_PARENT_CHILDREN`
+  - [x] `CF_UNDO`
+  - [x] `CF_REORG`
+- [x] Keep and preserve `CF_RECEIPTS`
+- [x] Add new meta keys:
+  - [x] finalized tip/height
+  - [x] reorg progress marker
+  - [x] explicit canonical tip marker (if separate from `TIP`)
+- [x] Add serialized storage structs:
+  - [x] `HeaderMetaRecord`
+  - [x] `ChainScore`
+  - [x] `BranchTipRecord`
+  - [x] `UndoRecord`
+  - [x] `ReorgProgressRecord`
+- [x] Update DB CF registrations in:
+  - [x] `src/main.rs`
+  - [x] `src/network/server.rs` test DB helper
+- [x] Document receipt semantics for reorgs (canonical-only recommended)
 
 ### Patch 7: Header DAG Insertion + Canonical Index APIs
 
-- [ ] Add header DAG insert APIs:
-  - [ ] `store_header_dag(...)`
-  - [ ] `store_headers_dag(...)`
-- [ ] Persist parent->children links and competing tips
-- [ ] Compute/store `ChainScore` per header
-- [ ] Track header metadata flags:
-  - [ ] `has_body`
-  - [ ] `has_receipts`
-  - [ ] `is_canonical` (optional if derived)
-- [ ] Replace `get_header_by_height(...)` tip-walk with canonical index lookup
-- [ ] Replace `get_blocks_in_range(...)` tip-walk with canonical index iteration
-- [ ] Keep existing `Blockchain::store_headers(...)` as wrapper initially
-- [ ] Add tests for competing branches and canonical height lookups
+- [x] Add header DAG insert APIs:
+  - [x] `store_header_dag(...)`
+  - [x] `store_headers_dag(...)`
+- [x] Persist parent->children links and competing tips
+- [x] Compute/store `ChainScore` per header
+- [x] Track header metadata flags:
+  - [x] `has_body`
+  - [x] `has_receipts`
+  - [x] `is_canonical` (optional if derived)
+- [x] Replace `get_header_by_height(...)` tip-walk with canonical index lookup
+- [x] Replace `get_blocks_in_range(...)` tip-walk with canonical index iteration
+- [x] Keep existing `Blockchain::store_headers(...)` as wrapper initially
+- [x] Add tests for competing branches and canonical height lookups
 
 ### Patch 8: Undo Journals + Reorg Primitives (State + Receipts + Canonical Metadata)
 
-- [ ] Add new trait(s) for fork/reorg operations (do not bloat `Storage` too much)
-- [ ] Add undo capture / rollback methods:
-  - [ ] capture state undo for canonical commits
-  - [ ] rollback block via undo record
-  - [ ] LCA lookup
-  - [ ] canonical hash lookup by height
-- [ ] Add crash-safe reorg primitives:
-  - [ ] `begin_reorg(...)`
-  - [ ] `apply_reorg_disconnect(...)`
-  - [ ] `apply_reorg_connect(...)`
-  - [ ] `finish_reorg(...)`
-- [ ] Persist `REORG_IN_PROGRESS` marker
-- [ ] Make canonical commit path atomic with:
-  - [ ] block/header
-  - [ ] receipts (`CF_RECEIPTS`)
-  - [ ] state root/state
-  - [ ] canonical index
-  - [ ] undo record
-- [ ] Reorg receipt behavior (canonical-only receipts):
-  - [ ] delete receipts for disconnected canonical blocks
-  - [ ] write receipts for newly connected canonical blocks after execution
-- [ ] Add tests for rollback + reorg + receipt replacement
-- [ ] `cargo check -q`
+- [x] Add new trait(s) for fork/reorg operations (do not bloat `Storage` too much)
+- [x] Add undo capture / rollback methods:
+  - [x] capture state undo for canonical commits
+  - [x] rollback block via undo record
+  - [x] LCA lookup
+  - [x] canonical hash lookup by height
+- [x] Add crash-safe reorg primitives:
+  - [x] `begin_reorg(...)`
+  - [x] `apply_reorg_disconnect(...)`
+  - [x] `apply_reorg_connect(...)`
+  - [x] `finish_reorg(...)`
+- [x] Persist `REORG_IN_PROGRESS` marker
+- [x] Make canonical commit path atomic with:
+  - [x] block/header
+  - [x] receipts (`CF_RECEIPTS`)
+  - [x] state root/state
+  - [x] canonical index
+  - [x] undo record
+- [x] Reorg receipt behavior (canonical-only receipts):
+  - [x] delete receipts for disconnected canonical blocks
+  - [x] write receipts for newly connected canonical blocks after execution
+- [x] Add tests for rollback + reorg + receipt replacement
+- [x] `cargo check -q`
 - [ ] Commit: `Add fork-aware storage schema, header DAG, and reorg undo primitives`
+
+Status note:
+
+- The current undo journal path is conservative: `append_block(...)` writes metadata-only undo records
+  (no state key diffs yet), so `rollback_block_with_undo(...)` is only safe for no-state-change blocks
+  unless callers provide explicit state diffs via `capture_undo(...)`.
+- Full reorg state rollback for non-empty blocks still needs blockchain/storage integration to pass the
+  exact state writes into the canonical commit path.
 
 ## Commit Group 4 (Patches 10-12)
 

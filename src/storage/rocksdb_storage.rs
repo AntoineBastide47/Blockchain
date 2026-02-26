@@ -17,11 +17,11 @@ use crate::core::receipt::Receipt;
 use crate::crypto::key_pair::Address;
 use crate::storage::state_store::{AccountStorage, StateStore, VmStorage};
 use crate::storage::state_view::{StateView, StateViewProvider};
-use crate::storage::storage_trait::Storage;
-use crate::storage::storage_trait::StorageError;
+use crate::storage::storage_trait::{ForkStore, StateWrite, Storage, StorageError};
 use crate::types::encoding::{Decode, Encode};
 use crate::types::hash::Hash;
 use crate::{error, info, warn};
+use blockchain_derive::BinaryCodec;
 use rocksdb::{ColumnFamily, DB, IteratorMode, ReadOptions, WriteBatch};
 use sparse_merkle_tree::blake2b::Blake2bHasher;
 use sparse_merkle_tree::default_store::DefaultStore;
@@ -42,6 +42,18 @@ pub const CF_STATE: &str = "state";
 pub const CF_SNAPSHOTS: &str = "snapshots";
 /// Column family name for transaction receipts indexed by block hash.
 pub const CF_RECEIPTS: &str = "receipts";
+/// Column family for fork-aware header metadata indexed by header hash.
+pub const CF_HEADER_META: &str = "header_meta";
+/// Column family for canonical height index (`height -> header hash`).
+pub const CF_CANONICAL_INDEX: &str = "canonical_index";
+/// Column family for competing branch tips indexed by tip hash.
+pub const CF_BRANCH_TIPS: &str = "branch_tips";
+/// Column family for parent->children header links indexed by parent hash.
+pub const CF_PARENT_CHILDREN: &str = "parent_children";
+/// Column family for per-block undo journals used by canonical rollback/reorg.
+pub const CF_UNDO: &str = "undo";
+/// Column family for reorg progress markers and crash-recovery records.
+pub const CF_REORG: &str = "reorg";
 
 /// Default snapshot interval in blocks.
 #[cfg(not(test))]
@@ -101,6 +113,18 @@ pub mod meta_keys {
     pub const SNAPSHOT_HEIGHTS: &[u8] = b"snapshot_heights";
     /// Prefix for snapshot metadata entries.
     pub const SNAPSHOT_META_PREFIX: &[u8] = b"snapshot_meta:";
+    /// Explicit canonical tip hash (same value as `TIP`, added for clarity in fork-aware code).
+    pub const CANONICAL_TIP: &[u8] = b"canonical_tip";
+    /// Finalized tip hash under the configured finality-depth heuristic.
+    pub const FINALIZED_TIP: &[u8] = b"finalized_tip";
+    /// Finalized height encoded as little-endian `u64`.
+    pub const FINALIZED_HEIGHT: &[u8] = b"finalized_height";
+}
+
+/// Keys stored in the reorg column family.
+pub mod reorg_keys {
+    /// Marker written while a reorg is in progress (crash recovery hook).
+    pub const IN_PROGRESS: &[u8] = b"reorg_in_progress";
 }
 
 /// Constructs the metadata key for a snapshot at the given height.
@@ -119,6 +143,144 @@ fn snapshot_entry_key(height: u64, state_key: &[u8]) -> Vec<u8> {
     key
 }
 
+fn canonical_height_key(height: u64) -> [u8; 8] {
+    height.to_le_bytes()
+}
+
+/// Composite score used to compare candidate chains while tracking forks.
+///
+/// Ordering favors higher cumulative work, then higher height, then higher cumulative gas.
+/// For PoS v1, `total_work` is a monotonic header count proxy (1 per valid header).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, BinaryCodec)]
+pub struct ChainScore {
+    /// Cumulative synthetic work / weight.
+    pub total_work: u128,
+    /// Header height.
+    pub height: u64,
+    /// Cumulative gas used across ancestors (tie-breaker).
+    pub cumulative_gas_used: u128,
+}
+
+impl ChainScore {
+    /// Returns the score of a child header extending `self`.
+    pub fn extend(self, header: &Header) -> Self {
+        Self {
+            total_work: self.total_work.saturating_add(1),
+            height: header.height,
+            cumulative_gas_used: self
+                .cumulative_gas_used
+                .saturating_add(header.gas_used as u128),
+        }
+    }
+
+    /// Compares two scores using deterministic fork-choice tie breakers.
+    pub fn better_than(&self, other: &Self) -> bool {
+        (self.total_work, self.height, self.cumulative_gas_used)
+            > (other.total_work, other.height, other.cumulative_gas_used)
+    }
+}
+
+/// Fork-aware metadata stored for each header hash.
+#[derive(Clone, Debug, PartialEq, Eq, BinaryCodec)]
+pub struct HeaderMetaRecord {
+    /// Header hash.
+    pub hash: Hash,
+    /// Parent header hash.
+    pub parent_hash: Hash,
+    /// Header height.
+    pub height: u64,
+    /// Aggregate score used for best-tip selection.
+    pub score: ChainScore,
+    /// Whether a full block body is stored for this header.
+    pub has_body: bool,
+    /// Whether canonical receipts are stored for this block hash.
+    pub has_receipts: bool,
+    /// Whether this header is currently canonical (also derivable from canonical index).
+    pub is_canonical: bool,
+}
+
+/// Persisted competing tip record used to track fork leaves.
+#[derive(Clone, Debug, PartialEq, Eq, BinaryCodec)]
+pub struct BranchTipRecord {
+    /// Tip hash.
+    pub hash: Hash,
+    /// Tip height.
+    pub height: u64,
+    /// Tip score.
+    pub score: ChainScore,
+}
+
+/// Prior value for a state key captured before a canonical state transition.
+#[derive(Clone, Debug, PartialEq, Eq, BinaryCodec)]
+pub struct UndoStateEntry {
+    /// State key that changed.
+    pub key: Hash,
+    /// Prior value (`None` if key did not exist).
+    pub previous_value: Option<Vec<u8>>,
+}
+
+/// Undo journal entry for a canonical-applied block.
+///
+/// The initial integration stores metadata and receipts rollback data unconditionally.
+/// `state_entries` may be empty when the caller does not provide explicit state diffs yet.
+#[derive(Clone, Debug, PartialEq, Eq, BinaryCodec)]
+pub struct UndoRecord {
+    /// Block hash this undo record reverses.
+    pub block_hash: Hash,
+    /// Canonical height assigned to the block.
+    pub block_height: u64,
+    /// Previous canonical tip before this block was applied.
+    pub previous_tip: Hash,
+    /// Previous header tip before this block was applied.
+    pub previous_header_tip: Option<Hash>,
+    /// Previous state root before this block was applied.
+    pub previous_state_root: Hash,
+    /// Previous canonical index value for `block_height` (usually `None` on append).
+    pub previous_canonical_hash_at_height: Option<Hash>,
+    /// Prior values of modified state keys for rollback.
+    pub state_entries: Vec<UndoStateEntry>,
+}
+
+/// Crash-recovery progress marker for an in-flight reorg.
+#[derive(Clone, Debug, PartialEq, Eq, BinaryCodec)]
+pub struct ReorgProgressRecord {
+    /// Canonical tip before reorg began.
+    pub old_tip: Hash,
+    /// Candidate tip being promoted.
+    pub new_tip: Hash,
+    /// Last disconnected block hash (if any).
+    pub last_disconnected: Option<Hash>,
+    /// Last connected block hash (if any).
+    pub last_connected: Option<Hash>,
+}
+
+/// Result of inserting a single header into the header DAG.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeaderInsertResult {
+    /// Header already existed and no metadata changed.
+    AlreadyPresent,
+    /// Header was inserted as a new DAG node.
+    Inserted {
+        /// Inserted header hash.
+        hash: Hash,
+        /// Whether this header became the best known header tip.
+        updated_header_tip: bool,
+    },
+}
+
+/// Summary of a batched header DAG insertion.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HeadersInsertSummary {
+    /// Number of newly inserted headers.
+    pub inserted: usize,
+    /// Number of headers already present.
+    pub already_present: usize,
+    /// Highest inserted header hash (if any).
+    pub highest_inserted_tip: Option<Hash>,
+    /// Whether the best header tip was updated.
+    pub updated_header_tip: bool,
+}
+
 struct Inner {
     /// RocksDB instance with column families for headers, blocks, meta, and state.
     db: Arc<DB>,
@@ -133,6 +295,15 @@ struct Inner {
     state_root: Hash,
     /// Whether the in-memory SMT is loaded with the full state.
     state_loaded: bool,
+}
+
+#[derive(Clone, Copy)]
+struct HeaderDagCfs<'a> {
+    headers: &'a ColumnFamily,
+    meta: &'a ColumnFamily,
+    header_meta: &'a ColumnFamily,
+    branch_tips: &'a ColumnFamily,
+    parent_children: &'a ColumnFamily,
 }
 
 impl Inner {
@@ -296,6 +467,15 @@ impl RocksDbStorage {
             let genesis_hash = genesis.header_hash(chain_id);
             let cf_headers = db.cf_handle(CF_HEADERS).expect("CF_HEADERS must exist");
             let cf_blocks = db.cf_handle(CF_BLOCKS).expect("CF_BLOCKS must exist");
+            let cf_header_meta = db
+                .cf_handle(CF_HEADER_META)
+                .expect("CF_HEADER_META must exist");
+            let cf_canonical = db
+                .cf_handle(CF_CANONICAL_INDEX)
+                .expect("CF_CANONICAL_INDEX must exist");
+            let cf_branch_tips = db
+                .cf_handle(CF_BRANCH_TIPS)
+                .expect("CF_BRANCH_TIPS must exist");
 
             batch.put_cf(
                 cf_headers,
@@ -308,7 +488,42 @@ impl RocksDbStorage {
                 genesis.to_bytes().as_slice(),
             );
             batch.put_cf(cf_meta, meta_keys::TIP, genesis_hash.as_slice());
+            batch.put_cf(cf_meta, meta_keys::CANONICAL_TIP, genesis_hash.as_slice());
+            batch.put_cf(cf_meta, meta_keys::HEADER_TIP, genesis_hash.as_slice());
+            batch.put_cf(cf_meta, meta_keys::FINALIZED_TIP, genesis_hash.as_slice());
+            batch.put_cf(cf_meta, meta_keys::FINALIZED_HEIGHT, 0u64.to_le_bytes());
             batch.put_cf(cf_meta, meta_keys::STATE_ROOT, state_root.as_slice());
+            Self::set_canonical_hash_by_height_batch(&mut batch, cf_canonical, 0, genesis_hash);
+            Self::put_header_meta_batch(
+                &mut batch,
+                cf_header_meta,
+                &HeaderMetaRecord {
+                    hash: genesis_hash,
+                    parent_hash: genesis.header.previous_block,
+                    height: 0,
+                    score: ChainScore {
+                        total_work: 1,
+                        height: 0,
+                        cumulative_gas_used: genesis.header.gas_used as u128,
+                    },
+                    has_body: true,
+                    has_receipts: false,
+                    is_canonical: true,
+                },
+            );
+            Self::put_branch_tip_batch(
+                &mut batch,
+                cf_branch_tips,
+                &BranchTipRecord {
+                    hash: genesis_hash,
+                    height: 0,
+                    score: ChainScore {
+                        total_work: 1,
+                        height: 0,
+                        cumulative_gas_used: genesis.header.gas_used as u128,
+                    },
+                },
+            );
 
             db.write(batch)
                 .map_err(|e| StorageError::ValidationFailed(e.to_string()))?;
@@ -486,6 +701,262 @@ impl RocksDbStorage {
         }
     }
 
+    fn get_header_meta_by_hash(
+        db: &DB,
+        cf_header_meta: &ColumnFamily,
+        hash: Hash,
+    ) -> Result<Option<HeaderMetaRecord>, StorageError> {
+        Ok(db
+            .get_cf(cf_header_meta, hash.as_slice())
+            .map_err(|e| StorageError::ValidationFailed(e.to_string()))?
+            .and_then(|bytes| HeaderMetaRecord::decode(&mut bytes.as_slice()).ok()))
+    }
+
+    fn put_header_meta_batch(
+        batch: &mut WriteBatch,
+        cf_header_meta: &ColumnFamily,
+        record: &HeaderMetaRecord,
+    ) {
+        batch.put_cf(
+            cf_header_meta,
+            record.hash.as_slice(),
+            record.to_bytes().as_slice(),
+        );
+    }
+
+    fn get_canonical_hash_by_height_db(
+        db: &DB,
+        cf_canonical: &ColumnFamily,
+        height: u64,
+    ) -> Result<Option<Hash>, StorageError> {
+        let key = canonical_height_key(height);
+        Ok(db
+            .get_cf(cf_canonical, key)
+            .map_err(|e| StorageError::ValidationFailed(e.to_string()))?
+            .and_then(|b| Hash::from_slice(&b)))
+    }
+
+    fn set_canonical_hash_by_height_batch(
+        batch: &mut WriteBatch,
+        cf_canonical: &ColumnFamily,
+        height: u64,
+        hash: Hash,
+    ) {
+        let key = canonical_height_key(height);
+        batch.put_cf(cf_canonical, key, hash.as_slice());
+    }
+
+    fn delete_canonical_hash_by_height_batch(
+        batch: &mut WriteBatch,
+        cf_canonical: &ColumnFamily,
+        height: u64,
+    ) {
+        let key = canonical_height_key(height);
+        batch.delete_cf(cf_canonical, key);
+    }
+
+    fn get_parent_children(
+        db: &DB,
+        cf_parent_children: &ColumnFamily,
+        parent_hash: Hash,
+    ) -> Result<Vec<Hash>, StorageError> {
+        let bytes = db
+            .get_cf(cf_parent_children, parent_hash.as_slice())
+            .map_err(|e| StorageError::ValidationFailed(e.to_string()))?;
+        match bytes {
+            Some(b) => Vec::<Hash>::decode(&mut b.as_slice())
+                .map_err(|e| StorageError::DecodeError(e.to_string())),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn put_parent_children_batch(
+        batch: &mut WriteBatch,
+        cf_parent_children: &ColumnFamily,
+        parent_hash: Hash,
+        children: &[Hash],
+    ) {
+        batch.put_cf(
+            cf_parent_children,
+            parent_hash.as_slice(),
+            children.to_vec().to_bytes().as_slice(),
+        );
+    }
+
+    fn put_branch_tip_batch(
+        batch: &mut WriteBatch,
+        cf_branch_tips: &ColumnFamily,
+        record: &BranchTipRecord,
+    ) {
+        batch.put_cf(
+            cf_branch_tips,
+            record.hash.as_slice(),
+            record.to_bytes().as_slice(),
+        );
+    }
+
+    fn delete_branch_tip_batch(batch: &mut WriteBatch, cf_branch_tips: &ColumnFamily, hash: Hash) {
+        batch.delete_cf(cf_branch_tips, hash.as_slice());
+    }
+
+    fn current_header_tip_hash_db(
+        db: &DB,
+        cf_meta: &ColumnFamily,
+    ) -> Result<Option<Hash>, StorageError> {
+        Ok(db
+            .get_cf(cf_meta, meta_keys::HEADER_TIP)
+            .map_err(|e| StorageError::ValidationFailed(e.to_string()))?
+            .and_then(|b| Hash::from_slice(&b)))
+    }
+
+    fn current_header_tip_score_db(
+        db: &DB,
+        cf_meta: &ColumnFamily,
+        cf_header_meta: &ColumnFamily,
+    ) -> Result<Option<(Hash, ChainScore)>, StorageError> {
+        let Some(hash) = Self::current_header_tip_hash_db(db, cf_meta)? else {
+            return Ok(None);
+        };
+        let Some(meta) = Self::get_header_meta_by_hash(db, cf_header_meta, hash)? else {
+            return Ok(None);
+        };
+        Ok(Some((hash, meta.score)))
+    }
+
+    fn mark_header_canonical_batch(
+        db: &DB,
+        batch: &mut WriteBatch,
+        cf_header_meta: &ColumnFamily,
+        hash: Hash,
+        is_canonical: bool,
+    ) -> Result<(), StorageError> {
+        if let Some(mut meta) = Self::get_header_meta_by_hash(db, cf_header_meta, hash)? {
+            meta.is_canonical = is_canonical;
+            if is_canonical && meta.has_body && !meta.has_receipts {
+                // `has_receipts` is maintained separately by append/reorg connect, leave false.
+            }
+            Self::put_header_meta_batch(batch, cf_header_meta, &meta);
+        }
+        Ok(())
+    }
+
+    fn compute_header_meta(
+        db: &DB,
+        cf_headers: &ColumnFamily,
+        cf_header_meta: &ColumnFamily,
+        header: &Header,
+        hash: Hash,
+    ) -> Result<HeaderMetaRecord, StorageError> {
+        let score = if header.height == 0 {
+            ChainScore {
+                total_work: 1,
+                height: 0,
+                cumulative_gas_used: header.gas_used as u128,
+            }
+        } else {
+            let parent_header = Self::get_header_by_hash(db, cf_headers, header.previous_block)?
+                .ok_or_else(|| {
+                    StorageError::ValidationFailed(format!(
+                        "missing parent header {} for height {}",
+                        header.previous_block, header.height
+                    ))
+                })?;
+            if parent_header.height.saturating_add(1) != header.height {
+                return Err(StorageError::ValidationFailed(format!(
+                    "header height mismatch: parent={} child={}",
+                    parent_header.height, header.height
+                )));
+            }
+            let parent_meta =
+                Self::get_header_meta_by_hash(db, cf_header_meta, header.previous_block)?
+                    .ok_or_else(|| {
+                        StorageError::ValidationFailed(format!(
+                            "missing parent header meta {} for height {}",
+                            header.previous_block, header.height
+                        ))
+                    })?;
+            parent_meta.score.extend(header)
+        };
+
+        Ok(HeaderMetaRecord {
+            hash,
+            parent_hash: header.previous_block,
+            height: header.height,
+            score,
+            has_body: false,
+            has_receipts: false,
+            is_canonical: false,
+        })
+    }
+
+    fn maybe_update_header_tip_batch(
+        db: &DB,
+        batch: &mut WriteBatch,
+        cf_meta: &ColumnFamily,
+        cf_header_meta: &ColumnFamily,
+        new_meta: &HeaderMetaRecord,
+    ) -> Result<bool, StorageError> {
+        let should_update = match Self::current_header_tip_score_db(db, cf_meta, cf_header_meta)? {
+            None => true,
+            Some((_current_hash, current_score)) => new_meta.score.better_than(&current_score),
+        };
+        if should_update {
+            batch.put_cf(cf_meta, meta_keys::HEADER_TIP, new_meta.hash.as_slice());
+        }
+        Ok(should_update)
+    }
+
+    fn insert_header_dag_in_batch(
+        db: &DB,
+        batch: &mut WriteBatch,
+        cfs: HeaderDagCfs<'_>,
+        header: &Header,
+        hash: Hash,
+    ) -> Result<HeaderInsertResult, StorageError> {
+        if db
+            .get_cf(cfs.headers, hash.as_slice())
+            .map_err(|e| StorageError::ValidationFailed(e.to_string()))?
+            .is_some()
+        {
+            return Ok(HeaderInsertResult::AlreadyPresent);
+        }
+
+        let meta = Self::compute_header_meta(db, cfs.headers, cfs.header_meta, header, hash)?;
+
+        batch.put_cf(cfs.headers, hash.as_slice(), header.to_bytes().as_slice());
+        Self::put_header_meta_batch(batch, cfs.header_meta, &meta);
+
+        if header.height > 0 {
+            let mut children =
+                Self::get_parent_children(db, cfs.parent_children, header.previous_block)?;
+            if !children.contains(&hash) {
+                children.push(hash);
+            }
+            Self::put_parent_children_batch(
+                batch,
+                cfs.parent_children,
+                header.previous_block,
+                &children,
+            );
+            Self::delete_branch_tip_batch(batch, cfs.branch_tips, header.previous_block);
+        }
+
+        let branch_tip = BranchTipRecord {
+            hash,
+            height: header.height,
+            score: meta.score,
+        };
+        Self::put_branch_tip_batch(batch, cfs.branch_tips, &branch_tip);
+
+        let updated_header_tip =
+            Self::maybe_update_header_tip_batch(db, batch, cfs.meta, cfs.header_meta, &meta)?;
+
+        Ok(HeaderInsertResult::Inserted {
+            hash,
+            updated_header_tip,
+        })
+    }
+
     fn create_snapshot_with_inner(
         inner: &mut Inner,
         height: u64,
@@ -595,6 +1066,20 @@ impl RocksDbStorage {
         let cf_state = db.cf_handle(CF_STATE).expect("CF_STATE must exist");
         let cf_snapshots = db.cf_handle(CF_SNAPSHOTS).expect("CF_SNAPSHOTS must exist");
         let cf_receipts = db.cf_handle(CF_RECEIPTS).expect("CF_RECEIPTS must exist");
+        let cf_header_meta = db
+            .cf_handle(CF_HEADER_META)
+            .expect("CF_HEADER_META must exist");
+        let cf_canonical = db
+            .cf_handle(CF_CANONICAL_INDEX)
+            .expect("CF_CANONICAL_INDEX must exist");
+        let cf_branch_tips = db
+            .cf_handle(CF_BRANCH_TIPS)
+            .expect("CF_BRANCH_TIPS must exist");
+        let cf_parent_children = db
+            .cf_handle(CF_PARENT_CHILDREN)
+            .expect("CF_PARENT_CHILDREN must exist");
+        let cf_undo = db.cf_handle(CF_UNDO).expect("CF_UNDO must exist");
+        let cf_reorg = db.cf_handle(CF_REORG).expect("CF_REORG must exist");
 
         let mut batch = WriteBatch::default();
         for cf in [
@@ -604,6 +1089,12 @@ impl RocksDbStorage {
             cf_state,
             cf_snapshots,
             cf_receipts,
+            cf_header_meta,
+            cf_canonical,
+            cf_branch_tips,
+            cf_parent_children,
+            cf_undo,
+            cf_reorg,
         ] {
             let iter = db.iterator_cf(cf, IteratorMode::Start);
             for item in iter {
@@ -641,7 +1132,39 @@ impl RocksDbStorage {
             genesis.to_bytes().as_slice(),
         );
         batch.put_cf(cf_meta, meta_keys::TIP, genesis_hash.as_slice());
+        batch.put_cf(cf_meta, meta_keys::CANONICAL_TIP, genesis_hash.as_slice());
+        batch.put_cf(cf_meta, meta_keys::HEADER_TIP, genesis_hash.as_slice());
+        batch.put_cf(cf_meta, meta_keys::FINALIZED_TIP, genesis_hash.as_slice());
+        batch.put_cf(cf_meta, meta_keys::FINALIZED_HEIGHT, 0u64.to_le_bytes());
         batch.put_cf(cf_meta, meta_keys::STATE_ROOT, state_root.as_slice());
+        Self::set_canonical_hash_by_height_batch(&mut batch, cf_canonical, 0, genesis_hash);
+        let genesis_score = ChainScore {
+            total_work: 1,
+            height: 0,
+            cumulative_gas_used: genesis.header.gas_used as u128,
+        };
+        Self::put_header_meta_batch(
+            &mut batch,
+            cf_header_meta,
+            &HeaderMetaRecord {
+                hash: genesis_hash,
+                parent_hash: genesis.header.previous_block,
+                height: 0,
+                score: genesis_score,
+                has_body: true,
+                has_receipts: false,
+                is_canonical: true,
+            },
+        );
+        Self::put_branch_tip_batch(
+            &mut batch,
+            cf_branch_tips,
+            &BranchTipRecord {
+                hash: genesis_hash,
+                height: 0,
+                score: genesis_score,
+            },
+        );
 
         db.write(batch)
             .map_err(|e| StorageError::ValidationFailed(e.to_string()))?;
@@ -673,6 +1196,380 @@ impl RocksDbStorage {
         Ok(bytes.and_then(|b| Hash::from_slice(&b)))
     }
 
+    /// Returns the canonical header hash recorded at the given height.
+    pub fn canonical_hash_at_height(&self, height: u64) -> Option<Hash> {
+        let inner = self.read_inner();
+        let cf_canonical = inner
+            .db
+            .cf_handle(CF_CANONICAL_INDEX)
+            .expect("CF_CANONICAL_INDEX must exist");
+        Self::get_canonical_hash_by_height_db(&inner.db, cf_canonical, height)
+            .ok()
+            .flatten()
+    }
+
+    /// Finds the lowest common ancestor header hash of two known header hashes.
+    pub fn find_lca(&self, a: Hash, b: Hash) -> Result<Option<Hash>, StorageError> {
+        let inner = self.read_inner();
+        let db = &inner.db;
+        let cf_headers = db.cf_handle(CF_HEADERS).expect("CF_HEADERS must exist");
+        let cf_header_meta = db
+            .cf_handle(CF_HEADER_META)
+            .expect("CF_HEADER_META must exist");
+
+        let Some(mut ma) = Self::get_header_meta_by_hash(db, cf_header_meta, a)? else {
+            return Ok(None);
+        };
+        let Some(mut mb) = Self::get_header_meta_by_hash(db, cf_header_meta, b)? else {
+            return Ok(None);
+        };
+        let mut ha = ma.hash;
+        let mut hb = mb.hash;
+
+        while ma.height > mb.height {
+            let Some(h) = Self::get_header_by_hash(db, cf_headers, ha)? else {
+                return Ok(None);
+            };
+            ha = h.previous_block;
+            ma = match Self::get_header_meta_by_hash(db, cf_header_meta, ha)? {
+                Some(m) => m,
+                None => return Ok(None),
+            };
+        }
+
+        while mb.height > ma.height {
+            let Some(h) = Self::get_header_by_hash(db, cf_headers, hb)? else {
+                return Ok(None);
+            };
+            hb = h.previous_block;
+            mb = match Self::get_header_meta_by_hash(db, cf_header_meta, hb)? {
+                Some(m) => m,
+                None => return Ok(None),
+            };
+        }
+
+        while ha != hb {
+            let Some(ah) = Self::get_header_by_hash(db, cf_headers, ha)? else {
+                return Ok(None);
+            };
+            let Some(bh) = Self::get_header_by_hash(db, cf_headers, hb)? else {
+                return Ok(None);
+            };
+            ha = ah.previous_block;
+            hb = bh.previous_block;
+        }
+
+        Ok(Some(ha))
+    }
+
+    /// Returns all persisted branch tips (canonical and competing) in arbitrary order.
+    pub fn list_branch_tips(&self) -> Result<Vec<BranchTipRecord>, StorageError> {
+        let inner = self.read_inner();
+        let db = &inner.db;
+        let cf = db
+            .cf_handle(CF_BRANCH_TIPS)
+            .expect("CF_BRANCH_TIPS must exist");
+        let iter = db.iterator_cf(cf, IteratorMode::Start);
+        let mut out = Vec::new();
+        for item in iter {
+            let (_key, value) = item.map_err(|e| StorageError::ValidationFailed(e.to_string()))?;
+            let rec = BranchTipRecord::decode(&mut value.as_ref())
+                .map_err(|e| StorageError::DecodeError(e.to_string()))?;
+            out.push(rec);
+        }
+        Ok(out)
+    }
+
+    /// Stores a single header in the fork-aware DAG and updates competing tips metadata.
+    pub fn store_header_dag(
+        &self,
+        header: &Header,
+        chain_id: u64,
+    ) -> Result<HeaderInsertResult, StorageError> {
+        let inner = self.write_inner();
+        let db = &inner.db;
+        let cf_headers = db.cf_handle(CF_HEADERS).expect("CF_HEADERS must exist");
+        let cf_meta = db.cf_handle(CF_META).expect("CF_META must exist");
+        let cf_header_meta = db
+            .cf_handle(CF_HEADER_META)
+            .expect("CF_HEADER_META must exist");
+        let cf_branch_tips = db
+            .cf_handle(CF_BRANCH_TIPS)
+            .expect("CF_BRANCH_TIPS must exist");
+        let cf_parent_children = db
+            .cf_handle(CF_PARENT_CHILDREN)
+            .expect("CF_PARENT_CHILDREN must exist");
+
+        let hash = header.header_hash(chain_id);
+        let mut batch = WriteBatch::default();
+        let cfs = HeaderDagCfs {
+            headers: cf_headers,
+            meta: cf_meta,
+            header_meta: cf_header_meta,
+            branch_tips: cf_branch_tips,
+            parent_children: cf_parent_children,
+        };
+        let result = Self::insert_header_dag_in_batch(db, &mut batch, cfs, header, hash)?;
+        db.write(batch)
+            .map_err(|e| StorageError::ValidationFailed(e.to_string()))?;
+        Ok(result)
+    }
+
+    /// Stores multiple headers in the fork-aware DAG and updates best header metadata.
+    pub fn store_headers_dag(
+        &self,
+        headers: &[Header],
+        chain_id: u64,
+    ) -> Result<HeadersInsertSummary, StorageError> {
+        if headers.is_empty() {
+            return Ok(HeadersInsertSummary::default());
+        }
+        let mut summary = HeadersInsertSummary::default();
+        let mut highest: Option<(Hash, u64)> = None;
+
+        for header in headers {
+            match self.store_header_dag(header, chain_id)? {
+                HeaderInsertResult::AlreadyPresent => {
+                    summary.already_present += 1;
+                }
+                HeaderInsertResult::Inserted {
+                    hash,
+                    updated_header_tip,
+                } => {
+                    summary.inserted += 1;
+                    summary.updated_header_tip |= updated_header_tip;
+                    match highest {
+                        None => highest = Some((hash, header.height)),
+                        Some((_, h)) if header.height >= h => highest = Some((hash, header.height)),
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        summary.highest_inserted_tip = highest.map(|(h, _)| h);
+        Ok(summary)
+    }
+
+    /// Captures undo state entries for the provided state writes by reading current values.
+    pub fn capture_undo(
+        &self,
+        state_writes: &[(Hash, Option<Vec<u8>>)],
+        block_hash: Hash,
+        block_height: u64,
+    ) -> Result<UndoRecord, StorageError> {
+        let previous_header_tip = self.header_tip();
+        let previous_canonical_hash_at_height = self.canonical_hash_at_height(block_height);
+        let state_entries = state_writes
+            .iter()
+            .map(|(key, _)| UndoStateEntry {
+                key: *key,
+                previous_value: self.get(*key),
+            })
+            .collect();
+
+        Ok(UndoRecord {
+            block_hash,
+            block_height,
+            previous_tip: self.tip(),
+            previous_header_tip,
+            previous_state_root: self.state_root(),
+            previous_canonical_hash_at_height,
+            state_entries,
+        })
+    }
+
+    /// Persists a reorg progress marker used for crash-safe reorg recovery.
+    pub fn begin_reorg(&self, marker: &ReorgProgressRecord) -> Result<(), StorageError> {
+        let inner = self.read_inner();
+        let db = &inner.db;
+        let cf_reorg = db.cf_handle(CF_REORG).expect("CF_REORG must exist");
+        let bytes = marker.to_vec();
+        db.put_cf(cf_reorg, reorg_keys::IN_PROGRESS, bytes)
+            .map_err(|e| StorageError::ValidationFailed(e.to_string()))
+    }
+
+    /// Clears the persisted reorg progress marker.
+    pub fn finish_reorg(&self) -> Result<(), StorageError> {
+        let inner = self.read_inner();
+        let db = &inner.db;
+        let cf_reorg = db.cf_handle(CF_REORG).expect("CF_REORG must exist");
+        db.delete_cf(cf_reorg, reorg_keys::IN_PROGRESS)
+            .map_err(|e| StorageError::ValidationFailed(e.to_string()))
+    }
+
+    /// Returns the current in-progress reorg marker, if present.
+    pub fn reorg_progress(&self) -> Result<Option<ReorgProgressRecord>, StorageError> {
+        let inner = self.read_inner();
+        let db = &inner.db;
+        let cf_reorg = db.cf_handle(CF_REORG).expect("CF_REORG must exist");
+        let bytes = db
+            .get_cf(cf_reorg, reorg_keys::IN_PROGRESS)
+            .map_err(|e| StorageError::ValidationFailed(e.to_string()))?;
+        match bytes {
+            Some(b) => ReorgProgressRecord::decode(&mut b.as_slice())
+                .map(Some)
+                .map_err(|e| StorageError::DecodeError(e.to_string())),
+            None => Ok(None),
+        }
+    }
+
+    /// Rolls back the current canonical tip using a persisted undo record.
+    ///
+    /// This conservative v1 implementation only supports rolling back the current tip and
+    /// requires either explicit state undo entries or an unchanged state root (e.g. empty blocks).
+    pub fn rollback_block_with_undo(&self, block_hash: Hash) -> Result<(), StorageError> {
+        let mut inner = self.write_inner();
+        Self::ensure_state_loaded(&mut inner)?;
+        let db = inner.db.clone();
+
+        if inner.tip != block_hash {
+            return Err(StorageError::ValidationFailed(
+                "rollback_block_with_undo currently only supports canonical tip rollback".into(),
+            ));
+        }
+
+        let cf_headers = db.cf_handle(CF_HEADERS).expect("CF_HEADERS must exist");
+        let cf_meta = db.cf_handle(CF_META).expect("CF_META must exist");
+        let cf_state = db.cf_handle(CF_STATE).expect("CF_STATE must exist");
+        let cf_receipts = db.cf_handle(CF_RECEIPTS).expect("CF_RECEIPTS must exist");
+        let cf_header_meta = db
+            .cf_handle(CF_HEADER_META)
+            .expect("CF_HEADER_META must exist");
+        let cf_canonical = db
+            .cf_handle(CF_CANONICAL_INDEX)
+            .expect("CF_CANONICAL_INDEX must exist");
+        let cf_branch_tips = db
+            .cf_handle(CF_BRANCH_TIPS)
+            .expect("CF_BRANCH_TIPS must exist");
+        let cf_undo = db.cf_handle(CF_UNDO).expect("CF_UNDO must exist");
+
+        let undo_bytes = db
+            .get_cf(cf_undo, block_hash.as_slice())
+            .map_err(|e| StorageError::ValidationFailed(e.to_string()))?
+            .ok_or_else(|| StorageError::ValidationFailed("missing undo record".into()))?;
+        let undo = UndoRecord::decode(&mut undo_bytes.as_slice())
+            .map_err(|e| StorageError::DecodeError(e.to_string()))?;
+        let header = Self::get_header_by_hash(&db, cf_headers, block_hash)?
+            .ok_or_else(|| StorageError::ValidationFailed("missing header for rollback".into()))?;
+        if header.height != undo.block_height {
+            return Err(StorageError::ValidationFailed(
+                "undo record height mismatch".into(),
+            ));
+        }
+
+        if undo.state_entries.is_empty() && inner.state_root != undo.previous_state_root {
+            return Err(StorageError::ValidationFailed(
+                "undo record lacks state entries for state-changing block".into(),
+            ));
+        }
+
+        for entry in &undo.state_entries {
+            let value = entry.previous_value.clone().unwrap_or_default();
+            inner
+                .state
+                .update(hash_to_h256(&entry.key), SmtValue(value))
+                .map_err(|e| StorageError::ValidationFailed(e.to_string()))?;
+        }
+        let computed_root = h256_to_hash(inner.state.root());
+        if computed_root != undo.previous_state_root {
+            return Err(StorageError::ValidationFailed(format!(
+                "rollback state_root mismatch: expected {} got {}",
+                undo.previous_state_root, computed_root
+            )));
+        }
+        inner.state_root = computed_root;
+
+        let mut batch = WriteBatch::default();
+        // Re-write state and state_root atomically.
+        // We first clear state entries in the batch and then rewrite current in-memory SMT.
+        let iter = db.iterator_cf(cf_state, IteratorMode::Start);
+        for item in iter {
+            let (key, _) = item.map_err(|e| StorageError::ValidationFailed(e.to_string()))?;
+            batch.delete_cf(cf_state, key);
+        }
+        for (key, value) in inner.state.store().leaves_map().iter() {
+            if !value.0.is_empty() {
+                batch.put_cf(cf_state, key.as_slice(), &value.0);
+            }
+        }
+        batch.put_cf(cf_meta, meta_keys::STATE_ROOT, inner.state_root.as_slice());
+        batch.put_cf(cf_meta, meta_keys::TIP, undo.previous_tip.as_slice());
+        batch.put_cf(
+            cf_meta,
+            meta_keys::CANONICAL_TIP,
+            undo.previous_tip.as_slice(),
+        );
+        if let Some(prev_header_tip) = undo.previous_header_tip {
+            batch.put_cf(cf_meta, meta_keys::HEADER_TIP, prev_header_tip.as_slice());
+        }
+        batch.delete_cf(cf_receipts, block_hash.as_slice());
+        if let Some(prev_hash) = undo.previous_canonical_hash_at_height {
+            Self::set_canonical_hash_by_height_batch(
+                &mut batch,
+                cf_canonical,
+                undo.block_height,
+                prev_hash,
+            );
+        } else {
+            Self::delete_canonical_hash_by_height_batch(
+                &mut batch,
+                cf_canonical,
+                undo.block_height,
+            );
+        }
+        if let Some(mut meta) = Self::get_header_meta_by_hash(&db, cf_header_meta, block_hash)? {
+            meta.is_canonical = false;
+            meta.has_receipts = false;
+            Self::put_header_meta_batch(&mut batch, cf_header_meta, &meta);
+        }
+        // Restore branch tips bookkeeping conservatively: old tip becomes a tip, rolled back block no longer is.
+        Self::delete_branch_tip_batch(&mut batch, cf_branch_tips, block_hash);
+        if let Some(prev_meta) =
+            Self::get_header_meta_by_hash(&db, cf_header_meta, undo.previous_tip)?
+        {
+            Self::put_branch_tip_batch(
+                &mut batch,
+                cf_branch_tips,
+                &BranchTipRecord {
+                    hash: undo.previous_tip,
+                    height: prev_meta.height,
+                    score: prev_meta.score,
+                },
+            );
+            Self::mark_header_canonical_batch(
+                &db,
+                &mut batch,
+                cf_header_meta,
+                undo.previous_tip,
+                true,
+            )?;
+        }
+
+        db.write(batch)
+            .map_err(|e| StorageError::ValidationFailed(e.to_string()))?;
+        inner.tip = undo.previous_tip;
+
+        Ok(())
+    }
+
+    /// Applies a single reorg disconnect step by rolling back the current canonical tip.
+    pub fn apply_reorg_disconnect(&self, block_hash: Hash) -> Result<(), StorageError> {
+        self.rollback_block_with_undo(block_hash)
+    }
+
+    /// Applies a single reorg connect step by canonically appending the provided block.
+    ///
+    /// The full reorg engine will eventually provide explicit state undo records for this path.
+    pub fn apply_reorg_connect(
+        &self,
+        block: Block,
+        receipts: Vec<Receipt>,
+        chain_id: u64,
+    ) -> Result<(), StorageError> {
+        self.append_block(block, receipts, chain_id)
+    }
+
     // ========== Header-only storage methods for header-first sync ==========
 
     /// Stores a header without its block body.
@@ -684,44 +1581,27 @@ impl RocksDbStorage {
         let db = &inner.db;
         let cf_headers = db.cf_handle(CF_HEADERS).expect("CF_HEADERS must exist");
         let cf_meta = db.cf_handle(CF_META).expect("CF_META must exist");
-
-        // Check if header already exists
-        if db
-            .get_cf(cf_headers, hash.as_slice())
-            .map_err(|e| StorageError::ValidationFailed(e.to_string()))?
-            .is_some()
-        {
-            return Ok(()); // Already have this header
-        }
+        let cf_header_meta = db
+            .cf_handle(CF_HEADER_META)
+            .expect("CF_HEADER_META must exist");
+        let cf_branch_tips = db
+            .cf_handle(CF_BRANCH_TIPS)
+            .expect("CF_BRANCH_TIPS must exist");
+        let cf_parent_children = db
+            .cf_handle(CF_PARENT_CHILDREN)
+            .expect("CF_PARENT_CHILDREN must exist");
 
         let mut batch = WriteBatch::default();
-        batch.put_cf(cf_headers, hash.as_slice(), header.to_bytes().as_slice());
-
-        // Update header_tip if this extends the chain
-        let current_header_tip = db
-            .get_cf(cf_meta, meta_keys::HEADER_TIP)
-            .map_err(|e| StorageError::ValidationFailed(e.to_string()))?;
-
-        let should_update_tip = match current_header_tip {
-            None => true,
-            Some(tip_bytes) => {
-                let tip_hash = Hash::from_slice(&tip_bytes)
-                    .ok_or_else(|| StorageError::ValidationFailed("invalid header tip".into()))?;
-                if let Some(tip_header) = Self::get_header_by_hash(db, cf_headers, tip_hash)? {
-                    header.height > tip_header.height
-                } else {
-                    true
-                }
-            }
+        let cfs = HeaderDagCfs {
+            headers: cf_headers,
+            meta: cf_meta,
+            header_meta: cf_header_meta,
+            branch_tips: cf_branch_tips,
+            parent_children: cf_parent_children,
         };
-
-        if should_update_tip {
-            batch.put_cf(cf_meta, meta_keys::HEADER_TIP, hash.as_slice());
-        }
-
+        let _ = Self::insert_header_dag_in_batch(db, &mut batch, cfs, header, hash)?;
         db.write(batch)
             .map_err(|e| StorageError::ValidationFailed(e.to_string()))?;
-
         Ok(())
     }
 
@@ -730,70 +1610,7 @@ impl RocksDbStorage {
     /// Headers should be in ascending height order. Updates header_tip to the
     /// highest header if it extends the current header chain.
     pub fn store_headers(&self, headers: &[Header], chain_id: u64) -> Result<(), StorageError> {
-        if headers.is_empty() {
-            return Ok(());
-        }
-
-        let inner = self.write_inner();
-        let db = &inner.db;
-        let cf_headers = db.cf_handle(CF_HEADERS).expect("CF_HEADERS must exist");
-        let cf_meta = db.cf_handle(CF_META).expect("CF_META must exist");
-
-        let mut batch = WriteBatch::default();
-        let mut highest_header: Option<(Hash, u64)> = None;
-
-        for header in headers {
-            let hash = header.header_hash(chain_id);
-
-            // Skip if already exists
-            if db
-                .get_cf(cf_headers, hash.as_slice())
-                .map_err(|e| StorageError::ValidationFailed(e.to_string()))?
-                .is_some()
-            {
-                continue;
-            }
-
-            batch.put_cf(cf_headers, hash.as_slice(), header.to_bytes().as_slice());
-
-            match &highest_header {
-                None => highest_header = Some((hash, header.height)),
-                Some((_, h)) if header.height > *h => {
-                    highest_header = Some((hash, header.height));
-                }
-                _ => {}
-            }
-        }
-
-        // Update header_tip if we have a new highest header
-        if let Some((new_tip_hash, new_height)) = highest_header {
-            let current_header_tip = db
-                .get_cf(cf_meta, meta_keys::HEADER_TIP)
-                .map_err(|e| StorageError::ValidationFailed(e.to_string()))?;
-
-            let should_update = match current_header_tip {
-                None => true,
-                Some(tip_bytes) => {
-                    let tip_hash = Hash::from_slice(&tip_bytes).ok_or_else(|| {
-                        StorageError::ValidationFailed("invalid header tip".into())
-                    })?;
-                    if let Some(tip_header) = Self::get_header_by_hash(db, cf_headers, tip_hash)? {
-                        new_height > tip_header.height
-                    } else {
-                        true
-                    }
-                }
-            };
-
-            if should_update {
-                batch.put_cf(cf_meta, meta_keys::HEADER_TIP, new_tip_hash.as_slice());
-            }
-        }
-
-        db.write(batch)
-            .map_err(|e| StorageError::ValidationFailed(e.to_string()))?;
-
-        Ok(())
+        self.store_headers_dag(headers, chain_id).map(|_| ())
     }
 
     /// Returns the hash of the highest synced header.
@@ -829,6 +1646,18 @@ impl RocksDbStorage {
         let db = &inner.db;
         let cf_headers = db.cf_handle(CF_HEADERS).expect("CF_HEADERS must exist");
         let cf_meta = db.cf_handle(CF_META).expect("CF_META must exist");
+        let cf_canonical = db
+            .cf_handle(CF_CANONICAL_INDEX)
+            .expect("CF_CANONICAL_INDEX must exist");
+
+        // Fast path: canonical index lookup (fork-aware canonical chain).
+        if let Ok(Some(hash)) =
+            Self::get_canonical_hash_by_height_db(db, cf_canonical, target_height)
+        {
+            return Self::get_header_by_hash(db, cf_headers, hash)
+                .ok()
+                .flatten();
+        }
 
         // Start from header_tip if available, otherwise use block tip
         let start_hash = db
@@ -926,6 +1755,15 @@ impl RocksDbStorage {
         let cf_meta = db.cf_handle(CF_META).expect("CF_META must exist");
         let cf_state = db.cf_handle(CF_STATE).expect("CF_STATE must exist");
         let cf_snapshots = db.cf_handle(CF_SNAPSHOTS).expect("CF_SNAPSHOTS must exist");
+        let cf_header_meta = db
+            .cf_handle(CF_HEADER_META)
+            .expect("CF_HEADER_META must exist");
+        let cf_canonical = db
+            .cf_handle(CF_CANONICAL_INDEX)
+            .expect("CF_CANONICAL_INDEX must exist");
+        let cf_branch_tips = db
+            .cf_handle(CF_BRANCH_TIPS)
+            .expect("CF_BRANCH_TIPS must exist");
 
         // Verify the block height matches
         if block.header.height != height {
@@ -979,8 +1817,39 @@ impl RocksDbStorage {
 
         // Update metadata
         batch.put_cf(cf_meta, meta_keys::TIP, block_hash.as_slice());
+        batch.put_cf(cf_meta, meta_keys::CANONICAL_TIP, block_hash.as_slice());
         batch.put_cf(cf_meta, meta_keys::HEADER_TIP, block_hash.as_slice());
+        batch.put_cf(cf_meta, meta_keys::FINALIZED_TIP, block_hash.as_slice());
+        batch.put_cf(cf_meta, meta_keys::FINALIZED_HEIGHT, height.to_le_bytes());
         batch.put_cf(cf_meta, meta_keys::STATE_ROOT, state_root.as_slice());
+        Self::set_canonical_hash_by_height_batch(&mut batch, cf_canonical, height, block_hash);
+        let score = ChainScore {
+            total_work: height as u128 + 1,
+            height,
+            cumulative_gas_used: block.header.gas_used as u128,
+        };
+        Self::put_header_meta_batch(
+            &mut batch,
+            cf_header_meta,
+            &HeaderMetaRecord {
+                hash: block_hash,
+                parent_hash: block.header.previous_block,
+                height,
+                score,
+                has_body: true,
+                has_receipts: false,
+                is_canonical: true,
+            },
+        );
+        Self::put_branch_tip_batch(
+            &mut batch,
+            cf_branch_tips,
+            &BranchTipRecord {
+                hash: block_hash,
+                height,
+                score,
+            },
+        );
 
         // Create a snapshot at this height
         for (key, value) in &entries {
@@ -1018,6 +1887,12 @@ impl RocksDbStorage {
         let cf_state = db.cf_handle(CF_STATE).expect("CF_STATE must exist");
         let cf_snapshots = db.cf_handle(CF_SNAPSHOTS).expect("CF_SNAPSHOTS must exist");
         let cf_receipts = db.cf_handle(CF_RECEIPTS).expect("CF_RECEIPTS must exist");
+        let cf_canonical = db
+            .cf_handle(CF_CANONICAL_INDEX)
+            .expect("CF_CANONICAL_INDEX must exist");
+        let cf_header_meta = db
+            .cf_handle(CF_HEADER_META)
+            .expect("CF_HEADER_META must exist");
 
         let meta_key = snapshot_meta_key(height);
         let tip_bytes = db
@@ -1074,6 +1949,8 @@ impl RocksDbStorage {
             batch.delete_cf(cf_headers, current.as_slice());
             batch.delete_cf(cf_blocks, current.as_slice());
             batch.delete_cf(cf_receipts, current.as_slice());
+            Self::delete_canonical_hash_by_height_batch(&mut batch, cf_canonical, header.height);
+            Self::mark_header_canonical_batch(db, &mut batch, cf_header_meta, current, false)?;
             current = header.previous_block;
         }
 
@@ -1084,7 +1961,12 @@ impl RocksDbStorage {
         }
 
         batch.put_cf(cf_meta, meta_keys::TIP, snapshot_tip.as_slice());
+        batch.put_cf(cf_meta, meta_keys::CANONICAL_TIP, snapshot_tip.as_slice());
         batch.put_cf(cf_meta, meta_keys::HEADER_TIP, snapshot_tip.as_slice());
+        batch.put_cf(cf_meta, meta_keys::FINALIZED_TIP, snapshot_tip.as_slice());
+        batch.put_cf(cf_meta, meta_keys::FINALIZED_HEIGHT, height.to_le_bytes());
+        Self::set_canonical_hash_by_height_batch(&mut batch, cf_canonical, height, snapshot_tip);
+        Self::mark_header_canonical_batch(db, &mut batch, cf_header_meta, snapshot_tip, true)?;
 
         db.write(batch)
             .map_err(|e| StorageError::ValidationFailed(e.to_string()))?;
@@ -1145,6 +2027,36 @@ impl RocksDbStorage {
         let db = &inner.db;
         let cf_headers = db.cf_handle(CF_HEADERS).expect("CF_HEADERS must exist");
         let cf_blocks = db.cf_handle(CF_BLOCKS).expect("CF_BLOCKS must exist");
+        let cf_canonical = db
+            .cf_handle(CF_CANONICAL_INDEX)
+            .expect("CF_CANONICAL_INDEX must exist");
+
+        // Fast path: canonical index.
+        let mut indexed = Vec::with_capacity((end - start + 1) as usize);
+        let mut all_found = true;
+        for height in start..=end {
+            match Self::get_canonical_hash_by_height_db(db, cf_canonical, height) {
+                Ok(Some(hash)) => {
+                    let block = db
+                        .get_cf(cf_blocks, hash.as_slice())
+                        .ok()
+                        .flatten()
+                        .and_then(|bytes| Block::decode(&mut bytes.as_slice()).ok());
+                    indexed.push(block);
+                }
+                Ok(None) => {
+                    all_found = false;
+                    break;
+                }
+                Err(_) => {
+                    all_found = false;
+                    break;
+                }
+            }
+        }
+        if all_found {
+            return indexed;
+        }
 
         // Walk back from tip to the hash at height `end`.
         let mut hash = inner.tip;
@@ -1253,17 +2165,79 @@ impl Storage for RocksDbStorage {
         let cf_blocks = db.cf_handle(CF_BLOCKS).expect("CF_BLOCKS must exist");
         let cf_meta = db.cf_handle(CF_META).expect("CF_META must exist");
         let cf_receipts = db.cf_handle(CF_RECEIPTS).expect("CF_RECEIPTS must exist");
+        let cf_header_meta = db
+            .cf_handle(CF_HEADER_META)
+            .expect("CF_HEADER_META must exist");
+        let cf_canonical = db
+            .cf_handle(CF_CANONICAL_INDEX)
+            .expect("CF_CANONICAL_INDEX must exist");
+        let cf_branch_tips = db
+            .cf_handle(CF_BRANCH_TIPS)
+            .expect("CF_BRANCH_TIPS must exist");
+        let cf_parent_children = db
+            .cf_handle(CF_PARENT_CHILDREN)
+            .expect("CF_PARENT_CHILDREN must exist");
+        let cf_undo = db.cf_handle(CF_UNDO).expect("CF_UNDO must exist");
+
+        let previous_tip = inner.tip;
+        let previous_header_tip = Self::current_header_tip_hash_db(&db, cf_meta)?;
+        let previous_state_root = inner.state_root;
+        let previous_canonical_hash_at_height =
+            Self::get_canonical_hash_by_height_db(&db, cf_canonical, height)?;
 
         // Phase 1: atomic write — block + header + tip + receipts + state + state_root
         let mut batch = WriteBatch::default();
-        batch.put_cf(
-            cf_headers,
-            hash.as_slice(),
-            block.header.to_bytes().as_slice(),
+        let header_dag_cfs = HeaderDagCfs {
+            headers: cf_headers,
+            meta: cf_meta,
+            header_meta: cf_header_meta,
+            branch_tips: cf_branch_tips,
+            parent_children: cf_parent_children,
+        };
+        // Ensure header DAG metadata exists and branch tips/parent links are tracked.
+        let _ =
+            Self::insert_header_dag_in_batch(&db, &mut batch, header_dag_cfs, &block.header, hash)?;
+
+        // If the header already existed (header-first sync), upgrade its metadata flags.
+        let mut header_meta =
+            if let Some(meta) = Self::get_header_meta_by_hash(&db, cf_header_meta, hash)? {
+                meta
+            } else {
+                Self::compute_header_meta(&db, cf_headers, cf_header_meta, &block.header, hash)?
+            };
+        header_meta.has_body = true;
+        header_meta.has_receipts = true;
+        header_meta.is_canonical = true;
+        Self::put_header_meta_batch(&mut batch, cf_header_meta, &header_meta);
+        // Parent is no longer a tip when we extend it canonically.
+        if height > 0 {
+            Self::delete_branch_tip_batch(&mut batch, cf_branch_tips, block.header.previous_block);
+        }
+        Self::put_branch_tip_batch(
+            &mut batch,
+            cf_branch_tips,
+            &BranchTipRecord {
+                hash,
+                height,
+                score: header_meta.score,
+            },
         );
+
         batch.put_cf(cf_blocks, hash.as_slice(), block.to_bytes().as_slice());
         batch.put_cf(cf_meta, meta_keys::TIP, hash.as_slice());
+        batch.put_cf(cf_meta, meta_keys::CANONICAL_TIP, hash.as_slice());
         batch.put_cf(cf_receipts, hash.as_slice(), receipts.to_bytes().as_slice());
+        Self::set_canonical_hash_by_height_batch(&mut batch, cf_canonical, height, hash);
+        let undo = UndoRecord {
+            block_hash: hash,
+            block_height: height,
+            previous_tip,
+            previous_header_tip,
+            previous_state_root,
+            previous_canonical_hash_at_height,
+            state_entries: Vec::new(),
+        };
+        batch.put_cf(cf_undo, hash.as_slice(), undo.to_bytes().as_slice());
         Self::write_state_to_batch(&inner, &mut batch)?;
 
         db.write(batch)
@@ -1288,7 +2262,7 @@ impl Storage for RocksDbStorage {
                 let snapshot_heights = Self::load_snapshot_heights(&db, cf_meta)?;
                 if !snapshot_heights.contains(&target_height)
                     && let Some(prune_hash) =
-                        Self::find_hash_by_height(&db, cf_headers, hash, target_height)?
+                        Self::get_canonical_hash_by_height_db(&db, cf_canonical, target_height)?
                 {
                     let mut prune_batch = WriteBatch::default();
                     prune_batch.delete_cf(cf_blocks, prune_hash.as_slice());
@@ -1322,6 +2296,36 @@ impl Storage for RocksDbStorage {
 
     fn tip(&self) -> Hash {
         self.read_inner().tip
+    }
+}
+
+impl ForkStore for RocksDbStorage {
+    fn canonical_hash_at_height(&self, height: u64) -> Option<Hash> {
+        RocksDbStorage::canonical_hash_at_height(self, height)
+    }
+
+    fn find_lca(&self, a: Hash, b: Hash) -> Result<Option<Hash>, StorageError> {
+        RocksDbStorage::find_lca(self, a, b)
+    }
+
+    fn capture_state_undo(
+        &self,
+        state_writes: &[StateWrite],
+    ) -> Result<Vec<StateWrite>, StorageError> {
+        Ok(state_writes
+            .iter()
+            .map(|(key, _)| (*key, self.get(*key)))
+            .collect())
+    }
+
+    fn begin_reorg_marker(&self, marker: Vec<u8>) -> Result<(), StorageError> {
+        let progress = ReorgProgressRecord::decode(&mut marker.as_slice())
+            .map_err(|e| StorageError::DecodeError(e.to_string()))?;
+        self.begin_reorg(&progress)
+    }
+
+    fn clear_reorg_marker(&self) -> Result<(), StorageError> {
+        self.finish_reorg()
     }
 }
 
@@ -1475,6 +2479,12 @@ mod tests {
             ColumnFamilyDescriptor::new(CF_STATE, Options::default()),
             ColumnFamilyDescriptor::new(CF_SNAPSHOTS, Options::default()),
             ColumnFamilyDescriptor::new(CF_RECEIPTS, Options::default()),
+            ColumnFamilyDescriptor::new(CF_HEADER_META, Options::default()),
+            ColumnFamilyDescriptor::new(CF_CANONICAL_INDEX, Options::default()),
+            ColumnFamilyDescriptor::new(CF_BRANCH_TIPS, Options::default()),
+            ColumnFamilyDescriptor::new(CF_PARENT_CHILDREN, Options::default()),
+            ColumnFamilyDescriptor::new(CF_UNDO, Options::default()),
+            ColumnFamilyDescriptor::new(CF_REORG, Options::default()),
         ]
     }
 
@@ -2030,6 +3040,42 @@ mod tests {
         assert!(!storage.has_header_at_height(1)); // Not yet stored
     }
 
+    #[test]
+    fn store_header_dag_tracks_competing_branch_tips() {
+        let storage = create_storage(&[]);
+        let genesis_tip = storage.tip();
+
+        let header_a = Header {
+            version: 1,
+            height: 1,
+            timestamp: 100,
+            gas_used: 10,
+            previous_block: genesis_tip,
+            merkle_root: Hash::zero(),
+            state_root: Hash::zero(),
+            receipt_root: Hash::zero(),
+        };
+        let header_b = Header {
+            version: 1,
+            height: 1,
+            timestamp: 101,
+            gas_used: 20,
+            previous_block: genesis_tip,
+            merkle_root: Hash::zero(),
+            state_root: Hash::zero(),
+            receipt_root: Hash::zero(),
+        };
+
+        storage.store_header_dag(&header_a, TEST_CHAIN_ID).unwrap();
+        storage.store_header_dag(&header_b, TEST_CHAIN_ID).unwrap();
+
+        let tips = storage.list_branch_tips().expect("branch tips should load");
+        let tip_hashes: Vec<Hash> = tips.iter().map(|t| t.hash).collect();
+        assert!(tip_hashes.contains(&header_a.header_hash(TEST_CHAIN_ID)));
+        assert!(tip_hashes.contains(&header_b.header_hash(TEST_CHAIN_ID)));
+        assert!(!tip_hashes.contains(&genesis_tip));
+    }
+
     // ==================== Snapshot Tests ====================
 
     #[test]
@@ -2080,6 +3126,121 @@ mod tests {
             .append_block(block, vec![], TEST_CHAIN_ID)
             .expect("append_block failed");
         hash
+    }
+
+    fn append_empty_block_with_receipts(
+        storage: &RocksDbStorage,
+        height: u64,
+        previous: Hash,
+        receipts: Vec<Receipt>,
+    ) -> Hash {
+        let header = Header {
+            version: 1,
+            height,
+            timestamp: 0,
+            gas_used: 0,
+            previous_block: previous,
+            merkle_root: Hash::zero(),
+            state_root: storage.state_root(),
+            receipt_root: Hash::zero(),
+        };
+        let block = Block::new(header, PrivateKey::new(), vec![], TEST_CHAIN_ID);
+        let hash = block.header_hash(TEST_CHAIN_ID);
+        storage
+            .append_block(block, receipts, TEST_CHAIN_ID)
+            .expect("append_block failed");
+        hash
+    }
+
+    #[test]
+    fn canonical_index_lookup_returns_appended_block_hashes() {
+        let storage = create_storage(&[]);
+        let h1 = append_empty_block(&storage, 1, storage.tip());
+        let h2 = append_empty_block(&storage, 2, h1);
+
+        assert_eq!(storage.canonical_hash_at_height(1), Some(h1));
+        assert_eq!(storage.canonical_hash_at_height(2), Some(h2));
+    }
+
+    #[test]
+    fn rollback_block_with_undo_restores_tip_and_deletes_receipts_for_empty_block() {
+        let storage = create_storage(&[]);
+        let genesis_tip = storage.tip();
+        let receipt = Receipt {
+            tx_hash: Hash::sha3().chain(b"rollback_test_tx").finalize(),
+            success: true,
+            gas_used: 1,
+            cumulative_gas_used: 1,
+            return_data: vec![],
+        };
+
+        let block_hash =
+            append_empty_block_with_receipts(&storage, 1, genesis_tip, vec![receipt.clone()]);
+
+        assert_eq!(storage.tip(), block_hash);
+        assert!(storage.get_receipts(block_hash).is_some());
+        assert_eq!(storage.canonical_hash_at_height(1), Some(block_hash));
+
+        storage
+            .rollback_block_with_undo(block_hash)
+            .expect("rollback should succeed");
+
+        assert_eq!(storage.tip(), genesis_tip);
+        assert_eq!(storage.height(), 0);
+        assert_eq!(storage.canonical_hash_at_height(1), None);
+        assert!(storage.get_receipts(block_hash).is_none());
+    }
+
+    #[test]
+    fn reorg_disconnect_connect_replaces_canonical_receipts_for_empty_blocks() {
+        let storage = create_storage(&[]);
+        let genesis_tip = storage.tip();
+
+        let receipt_a = Receipt {
+            tx_hash: Hash::sha3().chain(b"reorg_a").finalize(),
+            success: true,
+            gas_used: 1,
+            cumulative_gas_used: 1,
+            return_data: vec![1],
+        };
+        let old_hash = append_empty_block_with_receipts(&storage, 1, genesis_tip, vec![receipt_a]);
+
+        storage
+            .apply_reorg_disconnect(old_hash)
+            .expect("disconnect should succeed");
+        assert_eq!(storage.tip(), genesis_tip);
+        assert!(storage.get_receipts(old_hash).is_none());
+
+        let header_b = Header {
+            version: 1,
+            height: 1,
+            timestamp: 123,
+            gas_used: 0,
+            previous_block: genesis_tip,
+            merkle_root: Hash::zero(),
+            state_root: storage.state_root(),
+            receipt_root: Hash::zero(),
+        };
+        let block_b = Block::new(header_b, PrivateKey::new(), vec![], TEST_CHAIN_ID);
+        let new_hash = block_b.header_hash(TEST_CHAIN_ID);
+        let receipt_b = Receipt {
+            tx_hash: Hash::sha3().chain(b"reorg_b").finalize(),
+            success: true,
+            gas_used: 2,
+            cumulative_gas_used: 2,
+            return_data: vec![2],
+        };
+
+        storage
+            .apply_reorg_connect(block_b, vec![receipt_b.clone()], TEST_CHAIN_ID)
+            .expect("connect should succeed");
+
+        assert_eq!(storage.tip(), new_hash);
+        let receipts = storage
+            .get_receipts(new_hash)
+            .expect("new canonical receipts should exist");
+        assert_eq!(receipts, vec![receipt_b]);
+        assert_eq!(storage.canonical_hash_at_height(1), Some(new_hash));
     }
 
     #[test]

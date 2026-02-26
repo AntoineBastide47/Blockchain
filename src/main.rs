@@ -34,7 +34,8 @@ use blockchain::network::server::{DEV_CHAIN_ID, Server};
 use blockchain::network::transport::Transport;
 use blockchain::storage::rocksdb_storage::RocksDbStorage;
 use blockchain::storage::rocksdb_storage::{
-    CF_BLOCKS, CF_HEADERS, CF_META, CF_RECEIPTS, CF_SNAPSHOTS, CF_STATE,
+    CF_BLOCKS, CF_BRANCH_TIPS, CF_CANONICAL_INDEX, CF_HEADER_META, CF_HEADERS, CF_META,
+    CF_PARENT_CHILDREN, CF_RECEIPTS, CF_REORG, CF_SNAPSHOTS, CF_STATE, CF_UNDO,
 };
 use blockchain::types::encoding::{Decode, Encode};
 use blockchain::virtual_machine::assembler::assemble_file;
@@ -476,6 +477,14 @@ fn rocksdb_init(chain_id: u64, node_name: &str) -> io::Result<DB> {
     let mut receipts_opts = cf_options_with_bloom(&cache, 10.0);
     receipts_opts.set_compression_type(DBCompressionType::Zstd);
 
+    // Fork/reorg metadata CFs
+    let header_meta_opts = cf_options_with_bloom(&cache, 10.0);
+    let canonical_index_opts = cf_options_with_bloom(&cache, 10.0);
+    let branch_tips_opts = cf_options_with_bloom(&cache, 10.0);
+    let parent_children_opts = cf_options_with_bloom(&cache, 10.0);
+    let undo_opts = cf_options_with_bloom(&cache, 10.0);
+    let reorg_opts = cf_options_with_bloom(&cache, 10.0);
+
     let cfs = vec![
         ColumnFamilyDescriptor::new(CF_HEADERS, headers_opts),
         ColumnFamilyDescriptor::new(CF_BLOCKS, blocks_opts),
@@ -483,6 +492,12 @@ fn rocksdb_init(chain_id: u64, node_name: &str) -> io::Result<DB> {
         ColumnFamilyDescriptor::new(CF_STATE, state_opts),
         ColumnFamilyDescriptor::new(CF_SNAPSHOTS, snapshots_opts),
         ColumnFamilyDescriptor::new(CF_RECEIPTS, receipts_opts),
+        ColumnFamilyDescriptor::new(CF_HEADER_META, header_meta_opts),
+        ColumnFamilyDescriptor::new(CF_CANONICAL_INDEX, canonical_index_opts),
+        ColumnFamilyDescriptor::new(CF_BRANCH_TIPS, branch_tips_opts),
+        ColumnFamilyDescriptor::new(CF_PARENT_CHILDREN, parent_children_opts),
+        ColumnFamilyDescriptor::new(CF_UNDO, undo_opts),
+        ColumnFamilyDescriptor::new(CF_REORG, reorg_opts),
     ];
 
     DB::open_cf_descriptors(&opts, &db_path, cfs)

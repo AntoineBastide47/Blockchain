@@ -7,9 +7,14 @@
 //! - [`state_store`]: State management traits ([`StateStore`](state_store::StateStore),
 //!   [`VmStorage`](state_store::VmStorage), [`AccountStorage`](state_store::AccountStorage))
 //! - [`state_view`]: Read-only state views for VM execution
-//! - [`rocksdb_storage`]: Production RocksDB-backed implementation with sparse Merkle tree
+//! - [`rocksdb_storage`]: Production RocksDB-backed implementation with sparse Merkle tree,
+//!   fork-aware header metadata, and reorg groundwork (undo journals / canonical index)
 //! - [`test_storage`]: In-memory implementation for testing
 //! - [`txpool`]: Transaction pool for pending transactions
+//!
+//! Receipt storage semantics (current default):
+//! - Receipts are treated as canonical-chain data (`CF_RECEIPTS`)
+//! - Side branches may store headers/bodies without receipts until executed
 
 pub mod rocksdb_storage;
 pub mod state_store;

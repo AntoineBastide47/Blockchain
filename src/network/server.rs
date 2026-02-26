@@ -29,9 +29,9 @@ use crate::{error, info, warn};
 use sparse_merkle_tree::H256;
 use sparse_merkle_tree::default_store::DefaultStore;
 use std::cmp::min;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task::JoinHandle;
 use tokio::time::interval;
@@ -49,6 +49,173 @@ pub const DEV_CHAIN_ID: u64 = 0;
 pub const BLOCK_TIME: Duration = Duration::from_secs(6);
 /// Sync manager timeout/retry tick interval.
 const SYNC_TICK_INTERVAL: Duration = Duration::from_secs(1);
+/// Maximum number of orphan/stale block bodies kept in memory.
+const MAX_ORPHAN_BLOCKS: usize = 256;
+/// Maximum orphan block memory footprint retained in RAM.
+const MAX_ORPHAN_BYTES: usize = 8 * 1024 * 1024;
+/// Sliding window size for inbound sync request rate-limits.
+const SYNC_RATE_WINDOW: Duration = Duration::from_secs(1);
+/// Inbound request caps per peer / rate window.
+const MAX_HEADER_REQS_PER_WINDOW: u32 = 8;
+const MAX_BODY_REQS_PER_WINDOW: u32 = 8;
+const MAX_SNAPSHOT_REQS_PER_WINDOW: u32 = 2;
+/// Peer penalty scores.
+const PENALTY_RATE_LIMIT: u32 = 2;
+const PENALTY_MALFORMED_MESSAGE: u32 = 10;
+const PENALTY_INVALID_SYNC_DATA: u32 = 20;
+/// Peers above this score are locally throttled/ignored for sync requests.
+const PENALTY_BLOCK_THRESHOLD: u32 = 100;
+
+#[derive(Clone, Copy, Debug)]
+enum SyncRequestKind {
+    Headers,
+    Bodies,
+    Snapshot,
+}
+
+#[derive(Clone, Debug)]
+struct OrphanBlockEntry {
+    block: Block,
+    source: PeerId,
+    bytes: usize,
+    inserted_seq: u64,
+}
+
+#[derive(Default)]
+struct OrphanBlockPool {
+    blocks: HashMap<Hash, OrphanBlockEntry>,
+    children_by_parent: HashMap<Hash, Vec<Hash>>,
+    total_bytes: usize,
+    next_seq: u64,
+}
+
+impl OrphanBlockPool {
+    fn insert(&mut self, block: Block, source: PeerId, chain_id: u64) {
+        let hash = block.header_hash(chain_id);
+        let parent = block.header.previous_block;
+        let bytes = block.to_bytes().len();
+        let inserted_seq = self.next_seq;
+        self.next_seq = self.next_seq.saturating_add(1);
+
+        if let Some(old) = self.blocks.remove(&hash) {
+            self.total_bytes = self.total_bytes.saturating_sub(old.bytes);
+            if let Some(children) = self
+                .children_by_parent
+                .get_mut(&old.block.header.previous_block)
+            {
+                children.retain(|h| *h != hash);
+                if children.is_empty() {
+                    self.children_by_parent
+                        .remove(&old.block.header.previous_block);
+                }
+            }
+        }
+
+        self.total_bytes = self.total_bytes.saturating_add(bytes);
+        self.blocks.insert(
+            hash,
+            OrphanBlockEntry {
+                block,
+                source,
+                bytes,
+                inserted_seq,
+            },
+        );
+        self.children_by_parent
+            .entry(parent)
+            .or_default()
+            .push(hash);
+    }
+
+    fn remove(&mut self, hash: Hash, chain_id: u64) -> Option<OrphanBlockEntry> {
+        let entry = self.blocks.remove(&hash)?;
+        self.total_bytes = self.total_bytes.saturating_sub(entry.bytes);
+        let parent = entry.block.header.previous_block;
+        if let Some(children) = self.children_by_parent.get_mut(&parent) {
+            children.retain(|h| *h != hash);
+            if children.is_empty() {
+                self.children_by_parent.remove(&parent);
+            }
+        }
+        let _ = chain_id; // keep signature aligned with callers that already have chain_id handy
+        Some(entry)
+    }
+
+    fn take_children(&mut self, parent: Hash, chain_id: u64) -> Vec<OrphanBlockEntry> {
+        let hashes = self.children_by_parent.remove(&parent).unwrap_or_default();
+        let mut out = Vec::with_capacity(hashes.len());
+        for hash in hashes {
+            if let Some(entry) = self.remove(hash, chain_id) {
+                out.push(entry);
+            }
+        }
+        out
+    }
+
+    fn evict_oldest_until_bounded(&mut self, chain_id: u64) {
+        while self.blocks.len() > MAX_ORPHAN_BLOCKS || self.total_bytes > MAX_ORPHAN_BYTES {
+            let Some((&oldest_hash, _)) = self
+                .blocks
+                .iter()
+                .min_by_key(|(_, entry)| entry.inserted_seq)
+            else {
+                break;
+            };
+            let _ = self.remove(oldest_hash, chain_id);
+        }
+    }
+
+    fn prune_stale(&mut self, current_finalized_height: u64, chain_id: u64) {
+        let stale: Vec<Hash> = self
+            .blocks
+            .iter()
+            .filter_map(|(hash, entry)| {
+                (entry.block.header.height <= current_finalized_height).then_some(*hash)
+            })
+            .collect();
+        for hash in stale {
+            let _ = self.remove(hash, chain_id);
+        }
+        self.evict_oldest_until_bounded(chain_id);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RateWindow {
+    started_at: Instant,
+    count: u32,
+}
+
+impl Default for RateWindow {
+    fn default() -> Self {
+        Self {
+            started_at: Instant::now(),
+            count: 0,
+        }
+    }
+}
+
+impl RateWindow {
+    fn allow(&mut self, now: Instant, window: Duration, max: u32) -> bool {
+        if now.duration_since(self.started_at) >= window {
+            self.started_at = now;
+            self.count = 0;
+        }
+        if self.count >= max {
+            return false;
+        }
+        self.count = self.count.saturating_add(1);
+        true
+    }
+}
+
+#[derive(Default)]
+struct PeerControlState {
+    penalty_score: u32,
+    header_requests: RateWindow,
+    body_requests: RateWindow,
+    snapshot_requests: RateWindow,
+}
 
 /// Errors produced by the server while handling RPCs and storage updates.
 #[derive(Debug, blockchain_derive::Error)]
@@ -100,6 +267,10 @@ pub struct Server<T: Transport> {
     genesis_accounts: Box<[(Address, Account)]>,
     /// Sync manager handling the synchronization state machine.
     sync_manager: Mutex<SyncManager>,
+    /// Per-peer rate limits and local penalty scores.
+    peer_controls: Mutex<HashMap<PeerId, PeerControlState>>,
+    /// Bounded cache of non-tip / missing-parent blocks awaiting future connection.
+    orphan_blocks: Mutex<OrphanBlockPool>,
 }
 
 impl<T: Transport> Server<T> {
@@ -186,6 +357,8 @@ impl<T: Transport> Server<T> {
                 expected_genesis_hash,
                 expected_chain_params_hash,
             )),
+            peer_controls: Mutex::new(HashMap::new()),
+            orphan_blocks: Mutex::new(OrphanBlockPool::default()),
         }))
     }
 
@@ -216,13 +389,17 @@ impl<T: Transport> Server<T> {
         loop {
             tokio::select! {
                 Some(rpc) = rx.recv() => {
+                    let peer_id = rpc.peer_id;
                     match handle_rpc(rpc) {
                         Ok(msg) => {
                             if let Err(e) = &self.clone().process_message(msg).await {
                                 error!("failed to process rpc: {}", e);
                             }
                         },
-                        Err(e) => error!("failed to decode rpc: {}", e)
+                        Err(e) => {
+                            self.penalize_peer(peer_id, PENALTY_MALFORMED_MESSAGE, "malformed rpc");
+                            error!("failed to decode rpc: {}", e)
+                        }
                     }
                 }
                 _ = sync_ticker.tick() => {
@@ -307,6 +484,150 @@ impl<T: Transport> Server<T> {
         sync.update_local_header_tip(self.chain.best_header_tip());
     }
 
+    /// Returns the height of the best known header tip.
+    pub fn best_header_height(&self) -> u64 {
+        self.chain.best_header_height()
+    }
+
+    /// Returns the hash of the best known header tip.
+    pub fn best_header_tip(&self) -> Hash {
+        self.chain.best_header_tip()
+    }
+
+    /// Returns the finalized height under the configured finality-depth heuristic.
+    pub fn finalized_height(&self) -> u64 {
+        self.chain
+            .finalized_height_at_depth(self.chain_params.fork_choice.finality_depth)
+    }
+
+    /// Returns the finalized tip hash under the configured finality-depth heuristic.
+    pub fn finalized_tip(&self) -> Hash {
+        self.chain
+            .finalized_tip_at_depth(self.chain_params.fork_choice.finality_depth)
+    }
+
+    fn peer_penalty_score(&self, peer: PeerId) -> u32 {
+        self.peer_controls
+            .lock()
+            .unwrap()
+            .get(&peer)
+            .map(|s| s.penalty_score)
+            .unwrap_or(0)
+    }
+
+    fn peer_is_penalized(&self, peer: PeerId) -> bool {
+        self.peer_penalty_score(peer) >= PENALTY_BLOCK_THRESHOLD
+    }
+
+    fn penalize_peer(&self, peer: PeerId, points: u32, reason: &str) {
+        let score = {
+            let mut controls = self.peer_controls.lock().unwrap();
+            let state = controls.entry(peer).or_default();
+            state.penalty_score = state.penalty_score.saturating_add(points);
+            state.penalty_score
+        };
+        warn!("peer penalty: peer={peer} +{points} score={score} reason={reason}");
+    }
+
+    fn allow_sync_request(&self, peer: PeerId, kind: SyncRequestKind) -> bool {
+        let now = Instant::now();
+        let allowed = {
+            let mut controls = self.peer_controls.lock().unwrap();
+            let state = controls.entry(peer).or_default();
+            if state.penalty_score >= PENALTY_BLOCK_THRESHOLD {
+                return false;
+            }
+            match kind {
+                SyncRequestKind::Headers => {
+                    state
+                        .header_requests
+                        .allow(now, SYNC_RATE_WINDOW, MAX_HEADER_REQS_PER_WINDOW)
+                }
+                SyncRequestKind::Bodies => {
+                    state
+                        .body_requests
+                        .allow(now, SYNC_RATE_WINDOW, MAX_BODY_REQS_PER_WINDOW)
+                }
+                SyncRequestKind::Snapshot => state.snapshot_requests.allow(
+                    now,
+                    SYNC_RATE_WINDOW,
+                    MAX_SNAPSHOT_REQS_PER_WINDOW,
+                ),
+            }
+        };
+        if !allowed {
+            self.penalize_peer(peer, PENALTY_RATE_LIMIT, "sync request rate limit");
+        }
+        allowed
+    }
+
+    fn cache_orphan_block(&self, source: PeerId, block: Block) {
+        let mut orphans = self.orphan_blocks.lock().unwrap();
+        orphans.insert(block, source, self.chain.id);
+        orphans.prune_stale(self.finalized_height(), self.chain.id);
+    }
+
+    fn drain_orphan_blocks(&self) {
+        let mut applied_any = false;
+        loop {
+            let tip = self.chain.storage_tip();
+            let children = {
+                let mut orphans = self.orphan_blocks.lock().unwrap();
+                orphans.take_children(tip, self.chain.id)
+            };
+            if children.is_empty() {
+                break;
+            }
+
+            let mut progressed = false;
+            for entry in children {
+                let block = entry.block;
+                let expected_height = self.chain.height().saturating_add(1);
+                if block.header.previous_block != self.chain.storage_tip()
+                    || block.header.height != expected_height
+                {
+                    self.cache_orphan_block(entry.source, block);
+                    continue;
+                }
+
+                if let Err(err) = self.chain.ingest_block(block.clone()) {
+                    let err_str = err.to_string();
+                    if !err_str.contains("block already exists") {
+                        self.penalize_peer(
+                            entry.source,
+                            PENALTY_INVALID_SYNC_DATA,
+                            "invalid orphan block body",
+                        );
+                        warn!("failed to connect orphan block during drain: {err}");
+                    }
+                    continue;
+                }
+
+                let tx_hashes: Vec<Hash> = block
+                    .transactions
+                    .iter()
+                    .map(|tx| tx.id(self.chain.id))
+                    .collect();
+                self.tx_pool.remove_batch(&tx_hashes);
+                progressed = true;
+                applied_any = true;
+            }
+
+            if !progressed {
+                break;
+            }
+        }
+
+        {
+            let mut orphans = self.orphan_blocks.lock().unwrap();
+            orphans.prune_stale(self.finalized_height(), self.chain.id);
+        }
+
+        if applied_any {
+            self.refresh_sync_manager_local_state();
+        }
+    }
+
     fn build_header_locators(&self, max: usize) -> Vec<Hash> {
         let mut locators = Vec::new();
         let mut height = self.chain.header_height();
@@ -330,14 +651,14 @@ impl<T: Transport> Server<T> {
 
     fn prepare_sync_reorg_if_needed(&self) -> Result<(), ServerError> {
         let canonical_tip = self.chain.storage_tip();
-        let best_header_tip = self.chain.best_header_tip();
+        let best_header_tip = self.best_header_tip();
 
         if best_header_tip == canonical_tip {
             return Ok(());
         }
 
         // No meaningful header lead; keep the current chain and let future sync status/headers decide.
-        if self.chain.header_height() < self.chain.height() {
+        if self.best_header_height() < self.chain.height() {
             return Ok(());
         }
 
@@ -354,6 +675,14 @@ impl<T: Transport> Server<T> {
         }
 
         let lca_height = self.chain.get_header(lca).map(|h| h.height).unwrap_or(0);
+        let finalized_height = self.finalized_height();
+        if lca_height < finalized_height {
+            return Err(ServerError::Storage(StorageError::ValidationFailed(
+                format!(
+                    "reorg below finalized height rejected: lca={lca_height} finalized={finalized_height}"
+                ),
+            )));
+        }
         info!(
             "sync rollback to lca: local_tip={} best_header_tip={} lca={} lca_height={}",
             canonical_tip, best_header_tip, lca, lca_height
@@ -407,11 +736,14 @@ impl<T: Transport> Server<T> {
                 self.send_get_sync_status_message(peer).await?;
             }
             SyncAction::RequestHeaders { peer, limit } => {
-                let locators = self.build_header_locators(32);
+                let max_locators = self.chain_params.sync_limits.max_locator_hashes as usize;
+                let locators = self.build_header_locators(max_locators);
+                let capped_limit =
+                    limit.min(self.chain_params.sync_limits.max_headers_per_request as u64);
                 let msg = GetHeadersMessage {
                     locators,
                     stop_hash: Hash::zero(),
-                    limit,
+                    limit: capped_limit,
                 };
                 let message = Message::new(MessageType::GetHeaders, msg.to_bytes());
                 self.transport
@@ -455,7 +787,9 @@ impl<T: Transport> Server<T> {
                     // Headers may have been truncated (e.g. after snapshot import). Fall back to
                     // height-range block replay so sync can continue without local header hashes.
                     let start = self.chain.height().saturating_add(1);
-                    let end = min(start.saturating_add(limit).saturating_sub(1), target);
+                    let capped_limit =
+                        limit.min(self.chain_params.sync_limits.max_blocks_per_request as u64);
+                    let end = min(start.saturating_add(capped_limit).saturating_sub(1), target);
                     let msg = GetBlocksMessage { start, end };
                     let message = Message::new(MessageType::GetBlocks, msg.to_bytes());
                     self.transport
@@ -466,7 +800,11 @@ impl<T: Transport> Server<T> {
                 }
 
                 let msg = GetBlockBodiesMessage {
-                    hashes: hashes.into_boxed_slice(),
+                    hashes: hashes
+                        .into_iter()
+                        .take(self.chain_params.sync_limits.max_blocks_per_request as usize)
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
                 };
                 let message = Message::new(MessageType::GetBlockBodies, msg.to_bytes());
                 self.transport
@@ -475,7 +813,12 @@ impl<T: Transport> Server<T> {
                     .map_err(ServerError::Transport)?;
             }
             SyncAction::RequestBlocks { peer, start, end } => {
-                let msg = GetBlocksMessage { start, end };
+                let max_blocks = self.chain_params.sync_limits.max_blocks_per_request as u64;
+                let capped_end = min(end, start.saturating_add(max_blocks).saturating_sub(1));
+                let msg = GetBlocksMessage {
+                    start,
+                    end: capped_end,
+                };
                 let message = Message::new(MessageType::GetBlocks, msg.to_bytes());
                 self.transport
                     .send_message(peer, self.transport.peer_id(), message.to_bytes())
@@ -615,6 +958,9 @@ impl<T: Transport> Server<T> {
     /// Returns `Ok` if the block was successfully added, or an error if
     /// validation failed or the block was already present.
     async fn process_block(self: Arc<Self>, from: PeerId, block: Block) -> Result<(), ServerError> {
+        if self.peer_is_penalized(from) {
+            return Ok(());
+        }
         if self.is_syncing() {
             let hash = block.header_hash(self.chain.id);
             warn!(
@@ -655,10 +1001,28 @@ impl<T: Transport> Server<T> {
         let expected_height = self.chain.height().saturating_add(1);
         if block.header.height != expected_height {
             let hash = block.header_hash(self.chain.id);
+            let parent_known = self.chain.get_header(block.header.previous_block).is_some();
             warn!(
-                "out-of-order block received: height={} expected={} hash={hash}",
-                block.header.height, expected_height
+                "out-of-order block received: height={} expected={} hash={} parent_known={}",
+                block.header.height, expected_height, hash, parent_known
             );
+            if parent_known {
+                if let Err(err) = self
+                    .chain
+                    .store_headers(std::slice::from_ref(&block.header))
+                {
+                    self.penalize_peer(
+                        from,
+                        PENALTY_INVALID_SYNC_DATA,
+                        "invalid side-branch header",
+                    );
+                    warn!("failed to store side-branch header from peer {from}: {err}");
+                    return Ok(());
+                }
+                self.cache_orphan_block(from, block);
+                return Ok(());
+            }
+            self.cache_orphan_block(from, block);
             let action = {
                 let mut sync = self.sync_manager.lock().unwrap();
                 sync.trigger_resync()
@@ -686,6 +1050,7 @@ impl<T: Transport> Server<T> {
 
         // Update sync manager with new local state
         self.refresh_sync_manager_local_state();
+        self.drain_orphan_blocks();
 
         // Gossip to all peers except origin
         tokio::spawn(async move { self.broadcast(from, bytes, MessageType::Block).await });
@@ -701,14 +1066,17 @@ impl<T: Transport> Server<T> {
             .chain
             .snapshot_heights()
             .map_err(ServerError::Storage)?;
-        let best_header_height = self.chain.header_height();
-        let best_header_tip = self.chain.best_header_tip();
+        let best_header_height = self.best_header_height();
+        let best_header_tip = self.best_header_tip();
         let tip = self.chain.storage_tip();
         let genesis_hash = self
             .chain_params
             .genesis
             .build_genesis_block(self.chain.id)
             .header_hash(self.chain.id);
+
+        let finalized_height = self.finalized_height();
+        let finalized_tip = self.finalized_tip();
 
         let status = SendSyncStatusMessage {
             version: 1,
@@ -718,8 +1086,8 @@ impl<T: Transport> Server<T> {
             tip,
             best_header_height,
             best_header_tip,
-            finalized_height: self.chain.height(), // For now, treat all blocks as finalized
-            finalized_tip: tip,
+            finalized_height,
+            finalized_tip,
             snapshot_heights,
             capabilities: SYNC_CAP_HEADER_LOCATORS | SYNC_CAP_BLOCK_BODIES_BY_HASH,
         };
@@ -752,8 +1120,11 @@ impl<T: Transport> Server<T> {
         from: PeerId,
         req: GetHeadersMessage,
     ) -> Result<(), ServerError> {
+        if !self.allow_sync_request(from, SyncRequestKind::Headers) {
+            return Ok(());
+        }
         let current_header_height = self.chain.header_height();
-        let max_headers = 500u64;
+        let max_headers = self.chain_params.sync_limits.max_headers_per_request as u64;
         let limit = if req.limit == 0 {
             max_headers
         } else {
@@ -813,6 +1184,7 @@ impl<T: Transport> Server<T> {
             && let Err(err) = self.chain.store_headers(&response.headers)
         {
             warn!("invalid headers from peer {from}: {err}");
+            self.penalize_peer(from, PENALTY_INVALID_SYNC_DATA, "invalid headers");
             let action = {
                 let mut sync = self.sync_manager.lock().unwrap();
                 sync.on_request_failed(from)
@@ -831,6 +1203,7 @@ impl<T: Transport> Server<T> {
             Ok(action) => action,
             Err(err) => {
                 warn!("sync manager rejected headers from peer {from}: {err:?}");
+                self.penalize_peer(from, PENALTY_INVALID_SYNC_DATA, "unexpected headers");
                 let action = {
                     let mut sync = self.sync_manager.lock().unwrap();
                     sync.on_request_failed(from)
@@ -858,12 +1231,18 @@ impl<T: Transport> Server<T> {
         // Check if all the available blocks were requested
         // Note: end=0 means "all blocks to tip" ONLY if start > 0
         // If start=0 and end=0, requester wants just the genesis block
+        if !self.allow_sync_request(from, SyncRequestKind::Bodies) {
+            return Ok(());
+        }
+
         let current_height = self.chain.height();
         let end = if req.end == 0 && req.start > 0 {
             current_height
         } else {
             req.end
         };
+        let max_blocks = self.chain_params.sync_limits.max_blocks_per_request as u64;
+        let end = min(end, req.start.saturating_add(max_blocks).saturating_sub(1));
 
         // No blocks to send; range is invalid or empty
         if req.start > end || end > current_height {
@@ -1013,6 +1392,11 @@ impl<T: Transport> Server<T> {
                     return Ok(());
                 }
                 warn!("block apply failed during sync: {err}");
+                self.penalize_peer(
+                    from,
+                    PENALTY_INVALID_SYNC_DATA,
+                    "invalid block body during sync",
+                );
                 let action = {
                     let mut sync = self.sync_manager.lock().unwrap();
                     sync.on_request_failed(from)
@@ -1025,6 +1409,7 @@ impl<T: Transport> Server<T> {
 
         // Update sync manager and get next action
         self.refresh_sync_manager_local_state();
+        self.drain_orphan_blocks();
         let action = {
             let mut sync = self.sync_manager.lock().unwrap();
             sync.on_blocks(from, &response.blocks, last_applied_height)
@@ -1038,9 +1423,14 @@ impl<T: Transport> Server<T> {
         from: PeerId,
         req: GetBlockBodiesMessage,
     ) -> Result<(), ServerError> {
+        if !self.allow_sync_request(from, SyncRequestKind::Bodies) {
+            return Ok(());
+        }
+        let max_blocks = self.chain_params.sync_limits.max_blocks_per_request as usize;
         let blocks = req
             .hashes
             .iter()
+            .take(max_blocks)
             .filter_map(|hash| self.chain.get_block(*hash).map(|b| b.as_ref().clone()))
             .collect::<Vec<_>>()
             .into_boxed_slice();
@@ -1073,6 +1463,9 @@ impl<T: Transport> Server<T> {
         from: PeerId,
         req: GetSnapshotStateMessage,
     ) -> Result<(), ServerError> {
+        if !self.allow_sync_request(from, SyncRequestKind::Snapshot) {
+            return Ok(());
+        }
         // Check if we have a snapshot at this height
         let snapshot_heights = self
             .chain
@@ -1190,6 +1583,7 @@ impl<T: Transport> Server<T> {
                 "snapshot height mismatch: expected={} got={}",
                 height, response.height
             );
+            self.penalize_peer(from, PENALTY_INVALID_SYNC_DATA, "snapshot height mismatch");
             let action = {
                 let mut sync = self.sync_manager.lock().unwrap();
                 sync.on_snapshot_received(from, response.height, false)
@@ -1230,6 +1624,7 @@ impl<T: Transport> Server<T> {
                 }
                 Err(e) => {
                     warn!("failed to import snapshot: {e}");
+                    self.penalize_peer(from, PENALTY_INVALID_SYNC_DATA, "invalid snapshot state");
                     false
                 }
             }
@@ -2955,13 +3350,18 @@ pub mod tests {
 
         let validator_key = PrivateKey::new();
         let validator_account = (validator_key.public_key().address(), Account::new(0));
+        let mut chain_params =
+            ChainParams::dev_from_initial_accounts(std::slice::from_ref(&validator_account));
+        // Snapshot sync now only uses finalized snapshots; lower finality depth so the test chain
+        // advertises a finalized snapshot within ~35 blocks.
+        chain_params.fork_choice.finality_depth = 4;
 
-        let server_established = Server::new(
+        let server_established = Server::new_with_chain_params(
             tr_established.clone(),
             test_db(),
             Some(validator_key.clone()),
             None,
-            std::slice::from_ref(&validator_account),
+            chain_params.clone(),
         )
         .await
         .unwrap();
@@ -2981,15 +3381,10 @@ pub mod tests {
         );
         let expected_snapshot_height = *snapshot_heights.last().unwrap();
 
-        let server_late = Server::new(
-            tr_late.clone(),
-            test_db(),
-            None,
-            None,
-            std::slice::from_ref(&validator_account),
-        )
-        .await
-        .unwrap();
+        let server_late =
+            Server::new_with_chain_params(tr_late.clone(), test_db(), None, None, chain_params)
+                .await
+                .unwrap();
 
         let mut rx_established = tr_established.consume().await;
         let mut rx_late = tr_late.consume().await;
@@ -3111,6 +3506,167 @@ pub mod tests {
             server_late.chain.state_root(),
             server_established.chain.state_root()
         );
+    }
+
+    #[tokio::test]
+    async fn process_block_caches_non_tip_block_when_parent_header_exists() {
+        let tr = LocalTransport::new(addr());
+        let validator_key = PrivateKey::new();
+        let validator_account = (validator_key.public_key().address(), Account::new(0));
+        let server = Server::new(
+            tr.clone(),
+            test_db(),
+            Some(validator_key.clone()),
+            None,
+            std::slice::from_ref(&validator_account),
+        )
+        .await
+        .unwrap();
+
+        for _ in 0..2 {
+            server
+                .chain
+                .build_block(validator_key.clone(), &TxPool::new(Some(1), TEST_CHAIN_ID))
+                .expect("build_block failed");
+        }
+
+        let canonical_height = server.chain.height();
+        let parent = server
+            .chain
+            .get_header_by_height(1)
+            .expect("height-1 header should exist");
+        let parent_hash = parent.header_hash(DEV_CHAIN_ID);
+        let side_header = Header {
+            version: 1,
+            height: 2,
+            timestamp: parent.timestamp.saturating_add(1),
+            gas_used: 0,
+            previous_block: parent_hash,
+            merkle_root: Hash::zero(),
+            state_root: parent.state_root,
+            receipt_root: Hash::zero(),
+        };
+        let side_block = Block::new(side_header, PrivateKey::new(), vec![], DEV_CHAIN_ID);
+
+        server
+            .clone()
+            .process_block(Hash::from_slice(&[0x11; 32]).unwrap(), side_block)
+            .await
+            .unwrap();
+
+        assert_eq!(server.chain.height(), canonical_height);
+        let orphans = server.orphan_blocks.lock().unwrap();
+        assert_eq!(orphans.blocks.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn orphan_cache_is_bounded_by_count() {
+        let server = default_server(LocalTransport::new(addr())).await;
+        let peer = Hash::from_slice(&[0x22; 32]).unwrap();
+
+        for i in 0..(MAX_ORPHAN_BLOCKS + 32) {
+            let header = Header {
+                version: 1,
+                height: (i as u64) + 5,
+                timestamp: i as u64 + 1,
+                gas_used: 0,
+                previous_block: Hash::sha3().chain(&i.to_le_bytes()).finalize(),
+                merkle_root: Hash::zero(),
+                state_root: Hash::zero(),
+                receipt_root: Hash::zero(),
+            };
+            let block = Block::new(header, PrivateKey::new(), vec![], DEV_CHAIN_ID);
+            server.cache_orphan_block(peer, block);
+        }
+
+        let orphans = server.orphan_blocks.lock().unwrap();
+        assert!(orphans.blocks.len() <= MAX_ORPHAN_BLOCKS);
+        assert!(orphans.total_bytes <= MAX_ORPHAN_BYTES);
+    }
+
+    #[tokio::test]
+    async fn header_request_rate_limit_penalizes_peer() {
+        let server = default_server(LocalTransport::new(addr())).await;
+        let peer = Hash::from_slice(&[0x33; 32]).unwrap();
+
+        for _ in 0..MAX_HEADER_REQS_PER_WINDOW {
+            assert!(server.allow_sync_request(peer, SyncRequestKind::Headers));
+        }
+        assert!(!server.allow_sync_request(peer, SyncRequestKind::Headers));
+        assert!(server.peer_penalty_score(peer) >= PENALTY_RATE_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn prepare_sync_reorg_rejects_lca_below_finalized_height() {
+        let tr = LocalTransport::new(addr());
+        let validator_key = PrivateKey::new();
+        let validator_account = (validator_key.public_key().address(), Account::new(0));
+        let server = Server::new(
+            tr.clone(),
+            test_db(),
+            Some(validator_key.clone()),
+            None,
+            std::slice::from_ref(&validator_account),
+        )
+        .await
+        .unwrap();
+
+        let target_height = server.chain_params.fork_choice.finality_depth + 6;
+        for _ in 0..target_height {
+            server
+                .chain
+                .build_block(validator_key.clone(), &TxPool::new(Some(1), TEST_CHAIN_ID))
+                .expect("build_block failed");
+        }
+
+        let tip_before = server.chain.storage_tip();
+        let fork_parent = server
+            .chain
+            .get_header_by_height(1)
+            .expect("fork parent should exist");
+        let alt_headers =
+            build_header_chain(2, target_height + 5, fork_parent.header_hash(DEV_CHAIN_ID));
+        server
+            .chain
+            .store_headers(&alt_headers)
+            .expect("alternate headers should store");
+
+        let err = server
+            .prepare_sync_reorg_if_needed()
+            .expect_err("reorg below finalized height should be rejected");
+        assert!(err.to_string().contains("reorg below finalized height"));
+        assert_eq!(server.chain.storage_tip(), tip_before);
+    }
+
+    #[tokio::test]
+    async fn invalid_body_receipt_root_mismatch_penalizes_peer() {
+        let server = default_server(LocalTransport::new(addr())).await;
+        let peer = Hash::from_slice(&[0x44; 32]).unwrap();
+
+        let bad_header = Header {
+            version: 1,
+            height: 1,
+            timestamp: 1,
+            gas_used: 0,
+            previous_block: server.chain.storage_tip(),
+            merkle_root: Hash::zero(),
+            state_root: server.chain.state_root(),
+            receipt_root: Hash::sha3().chain(b"bad_receipt_root").finalize(),
+        };
+        let bad_block = Block::new(bad_header, PrivateKey::new(), vec![], DEV_CHAIN_ID);
+
+        server
+            .clone()
+            .process_send_block_bodies_message(
+                peer,
+                SendBlockBodiesMessage {
+                    blocks: vec![bad_block].into_boxed_slice(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(server.peer_penalty_score(peer) >= PENALTY_INVALID_SYNC_DATA);
     }
 
     #[tokio::test]

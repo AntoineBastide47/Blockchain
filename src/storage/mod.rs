@@ -15,6 +15,9 @@
 //! Receipt storage semantics (current default):
 //! - Receipts are treated as canonical-chain data (`CF_RECEIPTS`)
 //! - Side branches may store headers/bodies without receipts until executed
+//! - Reorg disconnect removes receipts for blocks that leave the canonical chain
+//! - Reorg connect writes receipts for newly canonical blocks after execution
+//! - Reset/snapshot import/replay may prune and later rebuild canonical receipts
 
 pub mod rocksdb_storage;
 pub mod state_store;

@@ -188,6 +188,11 @@ impl Blockchain<BlockValidator, RocksDbStorage> {
         self.storage.get_header_by_height(height)
     }
 
+    /// Returns the height of the best known header tip (header DAG best-tip view).
+    pub fn best_header_height(&self) -> u64 {
+        self.storage.header_height()
+    }
+
     /// Stores multiple headers and validates the chain.
     ///
     /// Used during header-first sync to store headers before downloading blocks.
@@ -200,6 +205,34 @@ impl Blockchain<BlockValidator, RocksDbStorage> {
         self.storage
             .header_tip()
             .unwrap_or_else(|| self.storage.tip())
+    }
+
+    /// Returns the canonical block hash at `height`, if available.
+    pub fn canonical_hash_at_height(&self, height: u64) -> Option<Hash> {
+        self.storage.canonical_hash_at_height(height)
+    }
+
+    /// Returns the finalized height under a depth-based finality heuristic.
+    pub fn finalized_height_at_depth(&self, finality_depth: u64) -> u64 {
+        self.height().saturating_sub(finality_depth)
+    }
+
+    /// Returns the finalized tip hash under a depth-based finality heuristic.
+    pub fn finalized_tip_at_depth(&self, finality_depth: u64) -> Hash {
+        let finalized_height = self.finalized_height_at_depth(finality_depth);
+        self.get_header_by_height(finalized_height)
+            .map(|h| h.header_hash(self.id))
+            .unwrap_or_else(|| self.storage.tip())
+    }
+
+    /// Returns receipts for a canonical-applied block hash, if present.
+    ///
+    /// Receipt semantics (v1):
+    /// - Receipts are stored for canonical executed blocks only.
+    /// - Reorg disconnects delete receipts for blocks leaving the canonical chain.
+    /// - Reset/snapshot replay may prune or rebuild canonical receipts alongside blocks.
+    pub fn get_receipts(&self, block_hash: Hash) -> Option<Vec<Receipt>> {
+        self.storage.get_receipts(block_hash)
     }
 
     /// Finds the lowest common ancestor of two known headers in the header DAG.
